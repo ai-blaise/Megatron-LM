@@ -6,6 +6,7 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.models.gpt import GPTModel
+from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerAuxLossState
 from megatron.training import get_args
 from megatron.training.utils import unwrap_model
 
@@ -54,6 +55,15 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: GPTMo
     loss = loss_lm
     num_tokens = loss_mask.sum().clone().detach().to(torch.int)
     report = {'lm loss': torch.cat([loss_lm.clone().detach().view(1), num_tokens.view(1)])}
+
+    dsa_indexer_loss = DSAIndexerAuxLossState.total()
+    DSAIndexerAuxLossState.clear()
+    if dsa_indexer_loss is not None:
+        loss = loss + dsa_indexer_loss
+        report["dsa indexer loss"] = torch.cat(
+            [dsa_indexer_loss.clone().detach().view(1), num_tokens.view(1)]
+        )
+        report["total loss"] = torch.cat([loss.clone().detach().view(1), num_tokens.view(1)])
 
     if args.export_kd_teacher_load:
         # [ModelOpt]: Handle knowledge distillation

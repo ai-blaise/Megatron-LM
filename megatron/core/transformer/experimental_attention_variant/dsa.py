@@ -158,6 +158,26 @@ class DSAIndexerLossLoggingHelper:
         DSAIndexerLossLoggingHelper.clean_loss_in_tracker()
 
 
+class DSAIndexerAuxLossState:
+    """Track per-microbatch DSA auxiliary losses for explicit loss composition."""
+
+    losses = []
+
+    @classmethod
+    def add(cls, loss: torch.Tensor):
+        cls.losses.append(loss)
+
+    @classmethod
+    def total(cls) -> Optional[torch.Tensor]:
+        if not cls.losses:
+            return None
+        return torch.stack(cls.losses).sum()
+
+    @classmethod
+    def clear(cls):
+        cls.losses.clear()
+
+
 def compute_dsa_indexer_loss(
     index_scores: torch.Tensor,
     topk_indices: torch.Tensor,
@@ -1092,21 +1112,19 @@ class DSAttention(MegatronModule):
                 getattr(self.config, "dsa_indexer_use_sparse_loss", False),
                 self.indexer.pg_collection,
             )
-            # Save indexer loss for logging
+            # Save indexer loss for logging and explicit auxiliary loss composition.
             if indexer_loss_coeff > 0:
                 DSAIndexerLossLoggingHelper.save_loss_to_tracker(
                     loss=indexer_loss,
                     layer_number=self.layer_number,
                     num_layers=self.config.num_layers,
                 )
+                DSAIndexerAuxLossState.add(indexer_loss)
 
             # ===================================
             # Run sparse attention kernel
             # ===================================
             output = unfused_dsa_fn(query, key, value, topk_indices, self.softmax_scale)
-
-            # Attach loss to output
-            output = DSAIndexerLossAutoScaler.apply(output, indexer_loss)
 
         else:
             # ===================================
