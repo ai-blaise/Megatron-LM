@@ -155,6 +155,14 @@ def _load_teacher_model(config, config_raw: Namespace, model_kwargs: Dict[str, A
 
     return teacher
 
+# this function should freeze mlp.router.weight and mlp.router.bias (if present)
+def _freeze_router_parameters(model):
+      frozen = []
+      for name, param in model.named_parameters():
+          if ".mlp.router." in name:
+              param.requires_grad = False
+              frozen.append(name)
+      return frozen
 
 def modelopt_gpt_mamba_builder(
     args,
@@ -257,6 +265,13 @@ def modelopt_gpt_mamba_builder(
             "pg_collection": pg_collection,
         }
         model = MCoreGPTModel(config=config, **model_kwargs)
+
+        if getattr(args, "freeze_router", False):
+            frozen = _freeze_router_parameters(model)
+            print_rank_0(f"froze {len(frozen)} router parameters")
+            for name in frozen:
+                print_rank_0(f"  {name}")
+
     elif args.export_model_type == "MambaModel" or args.is_hybrid_model:
         from megatron.core.post_training.modelopt.mamba.model_specs import get_mamba_stack_modelopt_spec
 

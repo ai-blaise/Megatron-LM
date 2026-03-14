@@ -127,4 +127,10 @@ def add_modelopt_args(parser):
              'configures all YaRN parameters with GPT-OSS defaults.',
     )
 
+    # Freeze router
+    group.add_argument(
+        '--freeze-router',
+        action='store_true',
+        help='Freeze MoE router parameters during sft'
+    )
     return parser
