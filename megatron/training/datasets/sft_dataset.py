@@ -43,13 +43,14 @@ class SFTLowLevelDataset:
             raise ImportError(
                 "SFTDataset currently requires datasets library to be installed"
             )
-        self.dataset = load_dataset("json", data_files=dataset_path, split="all")
+        self.dataset = load_dataset(data_files=dataset_path, split="all")
 
     def __len__(self) -> int:
         return len(self.dataset)
 
     def __getitem__(self, idx: int) -> list:
-        return self.dataset[idx]["messages"]
+        item = self.dataset[idx]
+        return item.get("messages", item.get("conversations"))
 
 
 class SFTDataset(MegatronDataset):
