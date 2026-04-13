@@ -201,8 +201,6 @@ torchrun ${DISTRIBUTED_ARGS[@]} \
 ### Purpose
 Full DeepSeek-V3.2 MoE training with NVFP4 + precision-aware optimizer + DSA (DeepSeek Sparse Attention) + SFT + finetune.
 
-> **Why DSA for DeepSeek but NOT for LLaMA 8B test:** DSA (DeepSeek Sparse Attention) is a specialized attention mechanism for DeepSeek models. The simple LLaMA 8B smoke test is just to verify NVFP4 runs at all — adding DSA complexity would conflate two tests. DSA builds ON TOP of MLA (Multi-Latent Attention), not a replacement.
-
 ### Configuration
 
 | Aspect | Value |
