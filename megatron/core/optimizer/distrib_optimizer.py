@@ -512,11 +512,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             assert self.ddp_config == model_chunk.ddp_config
         self.distributed_optimizer_instance_id = distributed_optimizer_instance_id
 
-        assert (
-            isinstance(optimizer, (Adam, torch.optim.AdamW, HybridDeviceOptimizer))
-            or optimizer is None
-        ), (
-            "Only Adam and HybridDeviceOptimizer currently supported, "
+        _allowed_optimizer_types = (Adam, torch.optim.AdamW, HybridDeviceOptimizer)
+        try:
+            from .flash_optimizers import FlashAdamW as _FlashAdamW
+
+            _allowed_optimizer_types = (*_allowed_optimizer_types, _FlashAdamW)
+        except ImportError:
+            pass
+        assert isinstance(optimizer, _allowed_optimizer_types) or optimizer is None, (
+            "Only Adam, FlashAdamW, and HybridDeviceOptimizer currently supported, "
             "due to checkpointing requirements."
         )
 
@@ -608,7 +612,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             )
         else:
             self.optimizer.param_groups = [g["orig_group"] for g in self.opt_group_ranges]
-            self.optimizer.load_state_dict(self.optimizer.state_dict())
+            # FlashAdamW's state_dict() assumes state is already initialized for all
+            # params, but at this point state is empty (lazily initialized on first step).
+            # The round-trip is only needed to rebuild internal param index mappings.
+            try:
+                self.optimizer.load_state_dict(self.optimizer.state_dict())
+            except KeyError:
+                # FlashAdamW: param_groups already updated above, and state will be
+                # initialized via init_state_fn before the first step.
+                pass
 
         if self.config.offload_optimizer_states:
             self._state_offloader = OptimizerStateOffloader(self)
@@ -917,6 +929,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             for k, v in optim_state.items():
                 if isinstance(v, torch.Tensor):
                     tensors[k] = v
+                elif hasattr(v, 'materialize'):
+                    # FlashAdamW stores exp_avg/exp_avg_sq as _MaybeQuantizedTensor.
+                    # materialize() dequantizes to a plain fp32 torch.Tensor.
+                    tensors[k] = v.materialize()
         return tensors
 
     def _set_main_param_and_optimizer_states(self, model_param, tensors):
@@ -948,14 +964,17 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         else:
             main_param = self.optimizer.param_groups[group_index]["params"][group_order]
             optim_state = self.optimizer.state[main_param]
-            dst_tensors = {"param": main_param}
+            # Copy the main param.
+            main_param.copy_(tensors["param"])
+            # Copy optimizer states, handling both plain tensors and
+            # FlashAdamW's _MaybeQuantizedTensor (which uses set_data to re-quantize).
             for k, v in optim_state.items():
-                if isinstance(v, torch.Tensor):
-                    dst_tensors[k] = v
-            for key in dst_tensors:
-                if not isinstance(tensors[key], torch.Tensor):
+                if k not in tensors:
                     continue
-                dst_tensors[key].copy_(tensors[key])
+                if isinstance(v, torch.Tensor):
+                    v.copy_(tensors[k])
+                elif hasattr(v, 'set_data'):
+                    v.set_data(tensors[k])
 
     def get_parameter_state_dp_reshardable(self):
         """Get internal representation of parameter state without any copies and modifications.

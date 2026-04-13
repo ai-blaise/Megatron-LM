@@ -412,6 +412,27 @@ def _get_megatron_optimizer_based_on_param_groups(
                             else:
                                 opt.initialize_state(p)
 
+        elif config.optimizer == 'flash_adamw':
+            from .flash_optimizers import FlashAdamW
+
+            optimizer = FlashAdamW(
+                params=param_groups,
+                lr=config.lr,
+                betas=(config.adam_beta1, config.adam_beta2),
+                eps=config.adam_eps,
+                weight_decay=config.weight_decay,
+                quantize=config.flash_adamw_quantize,
+                master_weight_bits=None,  # Mode A: fp32 shards, ECC not applicable
+                fused=config.flash_adamw_fused,
+                eco=config.flash_adamw_eco,
+            )
+
+            def init_state_fn(opt, config=None):
+                for group in opt.param_groups:
+                    for p in group['params']:
+                        if len(opt.state[p]) == 0:
+                            opt._ensure_state_initialized(p, hparams=group)
+
         elif config.optimizer == 'sgd':
             optimizer = SGD(
                 param_groups,
@@ -689,7 +710,7 @@ def get_megatron_optimizer(
 
     # TODO: the standard and emerging optimizer paths handle pg_collection differently;
     # unify them so both use a single pg_collection-based flow.
-    if config.optimizer not in ('adam', 'sgd'):
+    if config.optimizer not in ('adam', 'sgd', 'flash_adamw'):
         return _get_megatron_emerging_optimizer(
             config=config,
             model_chunks=model_chunks,

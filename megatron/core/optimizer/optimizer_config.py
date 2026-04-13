@@ -280,6 +280,20 @@ class OptimizerConfig:
     muon_extra_scale_factor: float = 1.0
     """Additional scale factor for the muon update."""
 
+    # FlashAdamW.
+    flash_adamw_quantize: bool = True
+    """If true, FlashAdamW quantizes exp_avg and exp_avg_sq to int8 (~8.5 bits/param instead
+    of 32). Requires CUDA. Disable with --no-flash-adamw-quantize for debugging."""
+
+    flash_adamw_fused: bool = True
+    """If true, FlashAdamW uses a fused Triton kernel for the entire optimizer step.
+    Disable with --no-flash-adamw-fused for debugging."""
+
+    flash_adamw_eco: bool = False
+    """If true, enable Error-Compensating Optimization (ECO). ECO eliminates fp32 master weights
+    by injecting quantization error back into the momentum buffer. Reserved for future Mode B
+    integration where FlashAdamW operates on bf16 param shards directly."""
+
     #######################
     # Distributed optimizer
     #######################
@@ -435,6 +449,15 @@ class OptimizerConfig:
             assert (
                 self.exp_avg_sq_dtype == torch.float32
             ), "exp_avg_sq_dtype can only be fp32 when not using precision-aware optimizer"
+
+        if self.optimizer == 'flash_adamw':
+            assert not self.use_precision_aware_optimizer, (
+                '--use-precision-aware-optimizer is not supported with --optimizer flash_adamw'
+            )
+            assert not self.offload_optimizer_states, (
+                '--offload-optimizer-states is not supported with --optimizer flash_adamw '
+                '(OptimizerStateOffloader requires TE FusedAdam)'
+            )
 
 
 # Backward-compatible aliases (deprecated; use OptimizerConfig directly).

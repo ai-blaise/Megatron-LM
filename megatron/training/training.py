@@ -2740,6 +2740,12 @@ def train(
         with one_logger.get_context_manager():
             one_logger.store_set('get_e2e_base_metrics', get_e2e_base_metrics)
 
+    # Enable CUDA memory history recording so that _snapshot() captures full
+    # allocation/free timeline with stack traces, not just a point-in-time map.
+    # Scoped to last rank to match the snapshot dump guard at line ~2097.
+    if args.record_memory_history and (is_last_rank() or torch.distributed.get_backend() == 'fake'):
+        torch.cuda.memory._record_memory_history(max_entries=100000)
+
     prof = None
     nsys_nvtx_context = None # reference to context for nsys profiling, so it can be cleaned up
     if (
@@ -3161,6 +3167,10 @@ def train(
         if getattr(args, 'perform_rl_step', False):
             rl_utils.rl_inference_interface_shutdown()
         sys.exit(exit_code)
+
+    # Stop CUDA memory history recording if it was enabled.
+    if args.record_memory_history and (is_last_rank() or torch.distributed.get_backend() == 'fake'):
+        torch.cuda.memory._record_memory_history(enabled=None)
 
     return iteration, num_floating_point_operations_so_far
 

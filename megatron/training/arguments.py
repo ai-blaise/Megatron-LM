@@ -2062,6 +2062,17 @@ def _add_regularization_args(parser):
                        help='How to perform NS calculation for tensor model parallel weights')
     group.add_argument('--muon-extra-scale-factor', type=float, default=1.0,
                        help='Additional scale factor for the muon update')
+    group.add_argument('--no-flash-adamw-quantize', action='store_false',
+                       dest='flash_adamw_quantize',
+                       help='FlashAdamW: disable int8 quantization of optimizer states '
+                       '(keep exp_avg/exp_avg_sq in fp32). Useful for debugging.')
+    group.add_argument('--no-flash-adamw-fused', action='store_false',
+                       dest='flash_adamw_fused',
+                       help='FlashAdamW: disable fused Triton kernel. '
+                       'Useful for debugging.')
+    group.add_argument('--flash-adamw-eco', action='store_true', default=False,
+                       help='FlashAdamW: enable Error-Compensating Optimization (ECO). '
+                       'Reserved for future Mode B integration.')
 
     group.add_argument('--no-weight-decay-cond-type', type=str, choices=['apply_wd_to_qk_layernorm'],
                        help='Type of no weight decay condition. Choices: '
@@ -2256,7 +2267,7 @@ def _add_training_args(parser):
                        help='use FlashAttention implementation of attention. '
                        'https://arxiv.org/abs/2205.14135')
     group.add_argument('--optimizer', type=str, default='adam',
-                       choices=['adam', 'sgd', 'muon', 'dist_muon'],
+                       choices=['adam', 'sgd', 'muon', 'dist_muon', 'flash_adamw'],
                        help='Optimizer function. '
                             'Note: dist_muon is deprecated; use --optimizer muon '
                             'with --use-distributed-optimizer instead.')
