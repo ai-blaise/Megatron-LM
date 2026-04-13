@@ -177,9 +177,6 @@ no-build-isolation-package = [
 link-mode = "copy"
 conflicts = [[{ extra = "lts" }, { extra = "dev" }]]
 override-dependencies = [
-    "torch; sys_platform == 'never'",
-    "torchvision; sys_platform == 'never'",
-    "triton; sys_platform == 'never'",
 ]
 
 [tool.uv.extra-build-dependencies]
