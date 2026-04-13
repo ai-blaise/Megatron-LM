@@ -72,34 +72,6 @@ mlm = [
     "accelerate",
 ]
 
-dev = [
-    "nvidia-modelopt[torch]; sys_platform != 'darwin'",
-    "transformer-engine[pytorch,core_cu13]>=2.9.0a0,<2.12.0",
-    "nvidia-resiliency-ext",
-    "tqdm",
-    "einops~=0.8",
-    "tensorstore~=0.1,!=0.1.46,!=0.1.72",
-    "nvtx~=0.2",
-    "multi-storage-client~=0.27",
-    "opentelemetry-api~=1.33.1",
-    "mamba-ssm~=2.2",
-    "causal-conv1d~=1.5",
-    "flash-linear-attention~=0.4.0",
-    "nv-grouped-gemm~=1.1",
-    "megatron-energon[av_decode]~=6.0",
-    "av",
-    "flashinfer-python~=0.5.0",
-    "wget",
-    "onnxscript",
-    "fastapi~=0.50",                                          # Forcing a little bit more recent version of fastapi to be compatible with pydantic 2.0
-    "datasets",
-    "emerging_optimizers",
-    "flask[async]",
-    "hypercorn",
-    "openai",
-    "fast-hadamard-transform",
-]
-
 lts = [
     "tqdm",
     "einops~=0.8",
@@ -161,10 +133,38 @@ linting = [
     "pylint==3.2.6",
 ]
 ci = ["python-gitlab", "slack-sdk", "pandas"]
+dev = [
+    "nvidia-modelopt; sys_platform != 'darwin'",
+    "transformer-engine>=2.9.0a0,<2.12.0",
+    "nvidia-resiliency-ext",
+    "tqdm",
+    "einops~=0.8",
+    "tensorstore~=0.1,!=0.1.46,!=0.1.72",
+    "nvtx~=0.2",
+    "multi-storage-client~=0.27",
+    "opentelemetry-api~=1.33.1",
+    "mamba-ssm~=1.5",
+    "causal-conv1d~=1.5",
+    "flash-linear-attention~=0.4.0",
+    "nv-grouped-gemm~=1.1",
+    "megatron-energon[av_decode]~=6.0",
+    "av",
+    "flashinfer-python~=0.5.0",
+    "wget",
+    "onnxscript",
+    "fastapi~=0.50",
+    "datasets",
+    "emerging_optimizers",
+    "flask[async]",
+    "hypercorn",
+    "openai",
+    "fast-hadamard-transform",
+    "pandas",
+]
 no_pypi_wheels = ["flash_mla", "emerging_optimizers"]
 
 [tool.uv]
-default-groups = ["linting", "build", "test"]
+default-groups = ["linting", "build", "test", "dev"]
 no-build-isolation-package = [
     "causal-conv1d",
     "nv-grouped-gemm",

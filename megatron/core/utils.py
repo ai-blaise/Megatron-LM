@@ -167,12 +167,16 @@ def experimental_fn(introduced_with_version: str):
         @wraps(func)
         def wrapped_func(*args, **kwargs):
             if config.is_experimental_enabled() is not True:
-                raise ExperimentalNotEnabledError(f"Flag config.ENABLE_EXPERIMENTAL not enabled.")
+                raise ExperimentalNotEnabledError(
+                    f"Flag config.ENABLE_EXPERIMENTAL not enabled."
+                )
             # log once on one rank
             if func.__name__ not in logged_functions:
                 logged_functions.add(func.__name__)
                 log_single_rank(
-                    logger, logging.INFO, "ENABLE_EXPERIMENTAL is True, running experimental code."
+                    logger,
+                    logging.INFO,
+                    "ENABLE_EXPERIMENTAL is True, running experimental code.",
                 )
 
             return func(*args, **kwargs)
@@ -367,9 +371,12 @@ def is_te_min_version(version, check_equality=True):
             "packaging is not installed. Please install it with `pip install packaging`."
         )
 
+    te_ver = get_te_version()
+    if te_ver is None:
+        return False
     if check_equality:
-        return get_te_version() >= PkgVersion(version)
-    return get_te_version() > PkgVersion(version)
+        return te_ver >= PkgVersion(version)
+    return te_ver > PkgVersion(version)
 
 
 def get_torch_version():
@@ -526,7 +533,9 @@ def is_flashinfer_min_version(version, check_equality=True):
 
 def ensure_divisibility(numerator, denominator):
     """Ensure that numerator is divisible by the denominator."""
-    assert numerator % denominator == 0, "{} is not divisible by {}".format(numerator, denominator)
+    assert numerator % denominator == 0, "{} is not divisible by {}".format(
+        numerator, denominator
+    )
 
 
 def divide(numerator, denominator):
@@ -536,7 +545,9 @@ def divide(numerator, denominator):
     return numerator // denominator
 
 
-def get_tensor_model_parallel_group_if_none(tp_group, is_expert=False, check_initialized=True):
+def get_tensor_model_parallel_group_if_none(
+    tp_group, is_expert=False, check_initialized=True
+):
     """Issue a deprecation warning if tp_group is None and return the default tp group."""
     # TODO(zijiey): remove this function later.
     if not torch.distributed.is_initialized():
@@ -629,7 +640,9 @@ def get_attr_wrapped_model(model, attr, allow_none=True, return_model_obj=False)
 
     while condition(model, attr):
         if not hasattr(model, "module"):
-            raise RuntimeError(f"_get_attr_wrapped_model couldn't find attribute {attr}")
+            raise RuntimeError(
+                f"_get_attr_wrapped_model couldn't find attribute {attr}"
+            )
 
         model = model.module
 
@@ -664,7 +677,9 @@ class GlobalMemoryBuffer:
     def __init__(self):
         self.buffer = {}
 
-    def get_tensor(self, tensor_shape, dtype, name, mem_alloc_context: Optional[Callable] = None):
+    def get_tensor(
+        self, tensor_shape, dtype, name, mem_alloc_context: Optional[Callable] = None
+    ):
         """
         Returns (potentially) a sub-tensor from the self.buffer for the given shape.
         """
@@ -703,7 +718,9 @@ class GlobalSymmetricMemoryBuffer:
             numel = int(size_in_mb * 1024 * 1024)  # size in bytes
             try:
                 symm_mem.enable_symm_mem_for_group(process_group.group_name)
-                self.symm_buffer = symm_mem.empty(numel, dtype=torch.uint8, device='cuda')
+                self.symm_buffer = symm_mem.empty(
+                    numel, dtype=torch.uint8, device="cuda"
+                )
                 self.symm_mem_hdl = symm_mem.rendezvous(self.symm_buffer, process_group)
             except RuntimeError as e:
                 # If symmetric memory initialization fails, set buffer and handle to None
@@ -753,7 +770,9 @@ def _kernel_make_viewless_tensor(inp, requires_grad):
     data, without linking the viewed tensor, referenced via the '._base'
     field.
     """
-    out = torch.empty((1,), dtype=inp.dtype, device=inp.device, requires_grad=requires_grad)
+    out = torch.empty(
+        (1,), dtype=inp.dtype, device=inp.device, requires_grad=requires_grad
+    )
     out.data = inp.data
     return out
 
@@ -887,7 +906,9 @@ def log_on_each_pipeline_stage(
         tp_rank = tp_group.rank()
         dp_cp_rank = dp_cp_group.rank()
     else:
-        raise ValueError("tp_group and dp_cp_group must be provided or not provided together")
+        raise ValueError(
+            "tp_group and dp_cp_group must be provided or not provided together"
+        )
 
     if tp_rank == 0 and dp_cp_rank == 0:
         logger.log(*args, **kwargs)
@@ -922,7 +943,10 @@ def check_param_hashes_across_dp_replicas(
         for param_name, param in model_chunk.named_parameters():
             param_hash = torch.frombuffer(
                 array.array(
-                    "B", hashlib.sha1(param.data.to("cpu").float().numpy(force=True)).digest()
+                    "B",
+                    hashlib.sha1(
+                        param.data.to("cpu").float().numpy(force=True)
+                    ).digest(),
                 ),
                 dtype=torch.uint8,
             )
@@ -939,7 +963,10 @@ def check_param_hashes_across_dp_replicas(
     for params, local_param_hashes, all_gather_group in zip(
         [non_expert_params, expert_params],
         [local_non_expert_param_hashes, local_expert_param_hashes],
-        [parallel_state.get_data_parallel_group(), parallel_state.get_expert_data_parallel_group()],
+        [
+            parallel_state.get_data_parallel_group(),
+            parallel_state.get_expert_data_parallel_group(),
+        ],
     ):
         # Collect per-parameter hashes across all ranks in group.
         assert len(params) == len(local_param_hashes)
@@ -949,7 +976,9 @@ def check_param_hashes_across_dp_replicas(
         all_param_hashes = [
             torch.zeros_like(local_param_hashes) for _ in range(all_gather_group.size())
         ]
-        torch.distributed.all_gather(all_param_hashes, local_param_hashes, group=all_gather_group)
+        torch.distributed.all_gather(
+            all_param_hashes, local_param_hashes, group=all_gather_group
+        )
 
         # Make sure local per-parameter hash matches DP rank 0.
         param_hashes_match = torch.equal(local_param_hashes, all_param_hashes[0])
@@ -992,13 +1021,14 @@ def make_tp_sharded_tensor_for_checkpoint(
               (default: None, falls back to parallel_state)
     """
     # Pop group parameters from kwargs
-    tp_group = kwargs.pop('tp_group', None)
-    dp_cp_group = kwargs.pop('dp_cp_group', None)
+    tp_group = kwargs.pop("tp_group", None)
+    dp_cp_group = kwargs.pop("dp_cp_group", None)
     # If there are any additional kwargs left, surface them for visibility
     # (these will be forwarded to ShardedTensor.from_rank_offsets).
     if kwargs:
         logger.warning(
-            "make_tp_sharded_tensor_for_checkpoint received extra kwargs: %s", list(kwargs.keys())
+            "make_tp_sharded_tensor_for_checkpoint received extra kwargs: %s",
+            list(kwargs.keys()),
         )
 
     prepend_axis_num = len(prepend_offsets)
@@ -1028,7 +1058,11 @@ def make_tp_sharded_tensor_for_checkpoint(
             # both FSDP2 and TP shards axis 0
             # default MCore uses tp-cp-ep-dp-pp
             # FSDP2 is compatibile with TP, CP
-            new_offsets[0] = (prepend_axis_num, tp_rank * dp_size + dp_rank, tp_size * dp_size)
+            new_offsets[0] = (
+                prepend_axis_num,
+                tp_rank * dp_size + dp_rank,
+                tp_size * dp_size,
+            )
         else:
             # FSDP2 shards axis 0 and TP shards some other axis
             new_offsets.append((prepend_axis_num, dp_rank, dp_size))
@@ -1047,7 +1081,9 @@ def make_tp_sharded_tensor_for_checkpoint(
     )
 
 
-def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_id=None, **kwargs):
+def make_sharded_tensor_for_checkpoint(
+    tensor, key, prepend_offsets=(), replica_id=None, **kwargs
+):
     """Helper for instantiating a non-sharded ShardedTensor (replicated across TP and DP group).
 
     Optionally, can provide offsets which prepend new dimensions to the tensor.
@@ -1063,13 +1099,14 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
               (default: None, falls back to parallel_state)
     """
     # Pop group parameters from kwargs
-    tp_group = kwargs.pop('tp_group', None)
-    dp_cp_group = kwargs.pop('dp_cp_group', None)
+    tp_group = kwargs.pop("tp_group", None)
+    dp_cp_group = kwargs.pop("dp_cp_group", None)
     # If there are any additional kwargs left, surface them for visibility
     # (these will be forwarded to ShardedTensor.from_rank_offsets).
     if kwargs:
         logger.warning(
-            "make_sharded_tensor_for_checkpoint received extra kwargs: %s", list(kwargs.keys())
+            "make_sharded_tensor_for_checkpoint received extra kwargs: %s",
+            list(kwargs.keys()),
         )
 
     prepend_axis_num = len(prepend_offsets)
@@ -1125,7 +1162,11 @@ def get_full_tensor_if_necessary(tensor):
 def to_local_if_dtensor(tensor: Union[torch.Tensor, "DTensor"]) -> torch.Tensor:
     """Returns the local shard of the given tensor if it is a DTensor."""
     with torch.no_grad():
-        return tensor.to_local() if HAVE_DTENSOR and isinstance(tensor, DTensor) else tensor
+        return (
+            tensor.to_local()
+            if HAVE_DTENSOR and isinstance(tensor, DTensor)
+            else tensor
+        )
 
 
 def get_data_parallel_group_if_dtensor(
@@ -1153,7 +1194,8 @@ def prepare_input_tensors_for_wgrad_compute(grad_output, all_gathered_input):
             grad_output.shape[0] * grad_output.shape[1], grad_output.shape[2]
         )
         all_gathered_input = all_gathered_input.view(
-            all_gathered_input.shape[0] * all_gathered_input.shape[1], all_gathered_input.shape[2]
+            all_gathered_input.shape[0] * all_gathered_input.shape[1],
+            all_gathered_input.shape[2],
         )
 
     return grad_output, all_gathered_input
@@ -1178,9 +1220,9 @@ def drain_embedding_wgrad_compute(
     fusion are enabled.
     """
 
-    assert len(embedding_activation_buffer) == len(
-        grad_output_buffer
-    ), "Length of activation and gradient buffers need to be equal!"
+    assert len(embedding_activation_buffer) == len(grad_output_buffer), (
+        "Length of activation and gradient buffers need to be equal!"
+    )
 
     import fused_weight_gradient_mlp_cuda
 
@@ -1193,8 +1235,12 @@ def drain_embedding_wgrad_compute(
 
     all_gathered_input = [None, None]
     if config.sequence_parallel:
-        all_gather_buffer = get_global_memory_buffer().get_tensor(dim_size, input.dtype, "mpu_0")
-        handle = dist_all_gather_func(all_gather_buffer, input, group=tp_group, async_op=False)
+        all_gather_buffer = get_global_memory_buffer().get_tensor(
+            dim_size, input.dtype, "mpu_0"
+        )
+        handle = dist_all_gather_func(
+            all_gather_buffer, input, group=tp_group, async_op=False
+        )
 
         all_gathered_input[0] = all_gather_buffer
         all_gather_buffer = None
@@ -1221,7 +1267,9 @@ def drain_embedding_wgrad_compute(
                     all_gathered_input, grad_output, weight.main_grad
                 )
             else:
-                raise RuntimeError("Unsupported gradient type for gradient accumulation fusion")
+                raise RuntimeError(
+                    "Unsupported gradient type for gradient accumulation fusion"
+                )
 
     # We have all_gathered_input list acting as a double buffer here,
     # since we are pipelining the AllGather and GEMM,one buffer all gathers
@@ -1231,8 +1279,12 @@ def drain_embedding_wgrad_compute(
         input = embedding_activation_buffer.pop(0)
         if config.sequence_parallel:
             name = "mpu_" + str((i + 1) % 2)
-            all_gather_buffer = get_global_memory_buffer().get_tensor(dim_size, input.dtype, name)
-            handle = dist_all_gather_func(all_gather_buffer, input, group=tp_group, async_op=True)
+            all_gather_buffer = get_global_memory_buffer().get_tensor(
+                dim_size, input.dtype, name
+            )
+            handle = dist_all_gather_func(
+                all_gather_buffer, input, group=tp_group, async_op=True
+            )
 
             all_gathered_input[(i + 1) % 2] = all_gather_buffer
             all_gather_buffer = None
@@ -1264,7 +1316,9 @@ def local_multi_tensor_l2_norm(chunk_size, noop_flag, tensor_lists, per_tensor, 
     Computes l2 norm for a list of contiguous tensors
     works as a drop-in replacement for amp_C.multi_tensor_l2norm
     """
-    l2 = [[(torch.norm(tensor)) for tensor in tensor_list] for tensor_list in tensor_lists]
+    l2 = [
+        [(torch.norm(tensor)) for tensor in tensor_list] for tensor_list in tensor_lists
+    ]
     l2_reduced = torch.norm(torch.tensor(l2))
     l2_cuda = torch.tensor([float(l2_reduced)], dtype=torch.float, device="cuda")
     return l2_cuda, None
@@ -1693,14 +1747,22 @@ class StragglerDetector:
             elapsed, btime, temp, power, util, clock = self.elapsed()  # get raw time
             # btime (get_batch time is max in the iteration)
             ptime = elapsed / (log_interval * 1.0)  # avg per iteration elapsed time, ms
-            api_flops = total_flops / (log_interval * 1.0)  # avg per iteration flops, ms
+            api_flops = total_flops / (
+                log_interval * 1.0
+            )  # avg per iteration flops, ms
             apir_flops = api_flops / (
                 ptime * 10**9 * self.world
             )  # this is avg per iteration this rank's thruput, TFLOP/s (note 10**9),
             et_flops = apir_flops / self.amp  # Estimated TFLOPs, not tracing backward
 
             o_dt = self._min_max(
-                ptime, btime, float(temp), float(power), float(util), float(clock), et_flops
+                ptime,
+                btime,
+                float(temp),
+                float(power),
+                float(util),
+                float(clock),
+                et_flops,
             )
             if self.rank == 0 and o_dt is not None and o_dt.aflops is not None:
                 now = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]"
@@ -1790,7 +1852,9 @@ class StragglerDetector:
                     _ = conn.recv(1024)
                     self.toggle = True
                     state = "ON" if self._off else "OFF"
-                    msg = f"Will turn StragglerDetector {state} at next logging interval"
+                    msg = (
+                        f"Will turn StragglerDetector {state} at next logging interval"
+                    )
                     msg_len = len(msg)
                     final_resp = f"{resp}{msg_len}\r\n\r\n{msg}"
                     conn.send(final_resp.encode())
@@ -2083,7 +2147,7 @@ def get_batch_on_this_cp_rank(
     if cp_size > 1:
         for key, val in batch.items():
             if val is not None:
-                seq_dim = 1 if key != 'attention_mask' else 2
+                seq_dim = 1 if key != "attention_mask" else 2
                 val = val.view(
                     *val.shape[0:seq_dim],
                     2 * cp_size,
@@ -2122,7 +2186,9 @@ def get_thd_batch_on_this_cp_rank(
         max_seqlen_kv=int(max_seqlen[0].item()),
     )
 
-    cp_size = parallel_state.get_context_parallel_world_size() if cp_size is None else cp_size
+    cp_size = (
+        parallel_state.get_context_parallel_world_size() if cp_size is None else cp_size
+    )
     cp_rank = parallel_state.get_context_parallel_rank() if cp_rank is None else cp_rank
     if cp_size > 1:  # slice batch along sequence dimension for context parallelism
         assert tex is not None and is_te_min_version("1.10.0"), (
@@ -2130,10 +2196,15 @@ def get_thd_batch_on_this_cp_rank(
             "Context Parallel with THD format data"
         )
         index = tex.thd_get_partitioned_indices(
-            cu_seqlens_padded, batch['tokens'].size(1), cp_size, cp_rank
+            cu_seqlens_padded, batch["tokens"].size(1), cp_size, cp_rank
         )
         for key, data in batch.items():
-            if key in {'attention_mask', 'cu_seqlens', 'cu_seqlens_padded', 'max_seqlen'}:
+            if key in {
+                "attention_mask",
+                "cu_seqlens",
+                "cu_seqlens_padded",
+                "max_seqlen",
+            }:
                 continue
             batch[key] = data.index_select(1, index)
 
@@ -2168,18 +2239,22 @@ def get_batch_on_this_hybrid_cp_rank(
     # Convert [seqlen] to [1, seqlen] similar to default collate_fn
     # as hybrid_context_parallel dataloader wrapper does not go through default collate_fn
     for key, data in batch.items():
-        if key in ['attention_mask']:
+        if key in ["attention_mask"]:
             continue
         batch[key] = torch.stack([data], 0)
-    sample_length = batch['tokens'].shape[1]
+    sample_length = batch["tokens"].shape[1]
     # TODO(pmannan): Take care of padding tokens here if not divisible by cp_size*2
     # Create packed_seq_params for SBHD format with cp group information.
     packed_seq_params = PackedSeqParams(
         qkv_format="sbhd",
         cu_seqlens_q=torch.tensor([0, sample_length], device="cuda", pin_memory=True),
         cu_seqlens_kv=torch.tensor([0, sample_length], device="cuda", pin_memory=True),
-        cu_seqlens_q_padded=torch.tensor([0, sample_length], device="cuda", pin_memory=True),
-        cu_seqlens_kv_padded=torch.tensor([0, sample_length], device="cuda", pin_memory=True),
+        cu_seqlens_q_padded=torch.tensor(
+            [0, sample_length], device="cuda", pin_memory=True
+        ),
+        cu_seqlens_kv_padded=torch.tensor(
+            [0, sample_length], device="cuda", pin_memory=True
+        ),
         max_seqlen_q=sample_length,
         max_seqlen_kv=sample_length,
         local_cp_size=local_cp_size,
@@ -2327,7 +2402,9 @@ def unwrap_model(model, module_instances=None):
     """Unwrap_model to return the final model instance"""
     if module_instances is None:
         from megatron.core.distributed import DistributedDataParallel as DDP
-        from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP
+        from megatron.core.distributed import (
+            TorchFullyShardedDataParallel as torch_FSDP,
+        )
         from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
             FullyShardedDataParallel as megatron_FSDP,
         )
@@ -2352,7 +2429,9 @@ def unwrap_model(model, module_instances=None):
 _ASYNC_IO_LOOP: asyncio.AbstractEventLoop | None = None
 
 
-def get_asyncio_loop(loop: asyncio.AbstractEventLoop | None = None) -> asyncio.AbstractEventLoop:
+def get_asyncio_loop(
+    loop: asyncio.AbstractEventLoop | None = None,
+) -> asyncio.AbstractEventLoop:
     """Creates an asyncio loop if necessary and then returns the current asyncio loop."""
     global _ASYNC_IO_LOOP
     if loop is None:
@@ -2440,7 +2519,9 @@ def trace_async_exceptions(func: Optional[Callable] = None, *, verbose: bool = F
                         _log_verbose(fn.__qualname__, start)
 
         else:
-            raise TypeError("trace_async_exceptions must be used on async functions or generators")
+            raise TypeError(
+                "trace_async_exceptions must be used on async functions or generators"
+            )
         return wrapper
 
     return _decorate if func is None else _decorate(func)
@@ -2583,7 +2664,8 @@ def experimental_api(func: Callable) -> Callable:
 
 
 def deprecate_args(
-    *deprecated_keys, message="Argument '{name}' has been deprecated and should not be used."
+    *deprecated_keys,
+    message="Argument '{name}' has been deprecated and should not be used.",
 ):
     """
     Intercepts specific keyword arguments to raise a custom TypeError.
