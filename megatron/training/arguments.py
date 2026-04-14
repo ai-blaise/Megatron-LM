@@ -26,6 +26,7 @@ from megatron.core.transformer.heterogeneous.heterogeneous_config import (
     MLPConfig,
 )
 from megatron.core.utils import (
+    get_te_version,
     get_torch_version,
     is_flashinfer_min_version,
     is_te_min_version,
