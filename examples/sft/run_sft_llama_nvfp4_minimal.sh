@@ -108,7 +108,6 @@ SFT_ARGS=(
     --sft
     --finetune
     --sft-tokenizer-prompt-format nemotron-h-aligned
-    --sft-mock-dataset-config-json '{"mode": "distribution", "num_samples": 100}'
 )
 
 # ======================
