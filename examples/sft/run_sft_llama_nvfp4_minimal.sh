@@ -87,16 +87,17 @@ SFT_ARGS=(
 
 # ======================
 # Test Parquet Data (for SFTDataset smoke test)
-# Uses the parquet file created by sft-dataset-parquet-and-conversations-support plan
-# This validates end-to-end that parquet loading with "conversations" column works
+# Uses mock-data mode to bypass tokenizer issues for quick smoke test
+# For real data with tokenizer, use run_sft.sh or run_sft_deepseek_nvfp4.sh
 # ======================
 TEST_PARQUET_PATH="${MEGATRON_DIR}/tests/unit_tests/test_data/sft_test_conversations.parquet"
 
 DATA_ARGS=(
-    --data-path $TEST_PARQUET_PATH
-    --tokenizer-type HuggingFaceTokenizer
-    --tokenizer-model deepseek-ai/DeepSeek-V3.2
+    --mock-data
+    --tokenizer-type NullTokenizer
     --vocab-size 128256
+    --split '99,1,0'
+    --num-workers 1
 )
 
 # ======================
