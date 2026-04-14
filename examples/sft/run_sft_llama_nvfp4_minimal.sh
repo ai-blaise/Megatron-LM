@@ -106,7 +106,6 @@ TENSORBOARD_ARGS=(
     --tensorboard-dir "$TENSORBOARD_LOGS_PATH"
     --log-throughput
     --log-memory-to-tensorboard
-    --log-l2-norm-grad-to-tensorboard
     --tensorboard-log-interval 10
 )
 
