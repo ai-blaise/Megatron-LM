@@ -25,14 +25,12 @@ export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
 # ======================
 # Distributed Setup (single node multi-GPU)
 # ======================
-GPUS_PER_NODE=8
 NUM_NODES=1
 MASTER_ADDR=${MASTER_ADDR:-localhost}
 MASTER_PORT=${MASTER_PORT:-6000}
 NODE_RANK=${NODE_RANK:-0}
 
 DISTRIBUTED_ARGS=(
-    --nproc_per_node $GPUS_PER_NODE
     --nnodes $NUM_NODES
     --node_rank $NODE_RANK
     --master_addr $MASTER_ADDR
