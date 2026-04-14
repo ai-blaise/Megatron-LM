@@ -114,6 +114,7 @@ TENSORBOARD_ARGS=(
 # ======================
 CKPT_ARGS=(
     --save "$CHECKPOINT_PATH"
+    --save-interval 1000
     --load "$CHECKPOINT_PATH"
 )
 
