@@ -16,4 +16,3 @@ data-parallel replicas, and a `finalize_model_grads` method to
 synchronize gradients across different parallelism modes (e.g., 'tied'
 layers on different pipeline stages, or gradients for experts in a MoE on
 different ranks due to expert parallelism).
-
