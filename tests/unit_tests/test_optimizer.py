@@ -529,6 +529,241 @@ def test_precision_aware_optimizer(
     test_optim.load_state_dict(state_dict)
 
 
+def _has_flash_adamw():
+    try:
+        from megatron.core.optimizer.flash_optimizers import FlashAdamW
+        return True
+    except ImportError:
+        return False
+
+
+@pytest.mark.skipif(not _has_flash_adamw(), reason="flashoptim not available")
+def test_flash_adamw_distrib_optimizer_construction():
+    """Test that FlashAdamW can be constructed as the inner optimizer for the distributed
+    optimizer, and that its state contains _MaybeQuantizedTensor objects (not plain fp32)."""
+    world = int(os.getenv('WORLD_SIZE', '1'))
+    rank = int(os.getenv('RANK', '0'))
+    _init_distributed(world, rank)
+    Utils.initialize_model_parallel()
+
+    model = torch.nn.Linear(256, 256, bias=False, dtype=torch.bfloat16, device='cuda')
+    model.requires_grad_(True)
+    ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=True)
+    model = DistributedDataParallel(
+        TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
+    )
+
+    optimizer_config = OptimizerConfig(
+        optimizer='flash_adamw',
+        lr=0.01,
+        bf16=True,
+        use_distributed_optimizer=True,
+    )
+    optim = get_megatron_optimizer(optimizer_config, [model])
+
+    # Run a step to populate state
+    input_data = torch.randn(4, 256, dtype=torch.bfloat16, device='cuda')
+    output = model(input_data)
+    loss = output.sum()
+    loss.backward()
+    optim.step()
+
+    # Verify the inner optimizer is FlashAdamW
+    from megatron.core.optimizer.flash_optimizers import FlashAdamW
+    distrib_optim = optim.chained_optimizers[0]
+    assert isinstance(distrib_optim.optimizer, FlashAdamW)
+
+    # Verify state contains quantized tensors (not plain fp32)
+    from megatron.core.optimizer.flash_optimizers import _MaybeQuantizedTensor
+    for param in distrib_optim.optimizer.state:
+        state = distrib_optim.optimizer.state[param]
+        if 'exp_avg' in state:
+            assert isinstance(state['exp_avg'], _MaybeQuantizedTensor), \
+                "exp_avg should be _MaybeQuantizedTensor with quantize=True"
+            assert isinstance(state['exp_avg_sq'], _MaybeQuantizedTensor), \
+                "exp_avg_sq should be _MaybeQuantizedTensor with quantize=True"
+
+
+@pytest.mark.skipif(not _has_flash_adamw(), reason="flashoptim not available")
+def test_flash_adamw_distrib_optimizer_state_roundtrip():
+    """Test that _get/_set_main_param_and_optimizer_states correctly handles
+    _MaybeQuantizedTensor: materialize on get, set_data on set."""
+    world = int(os.getenv('WORLD_SIZE', '1'))
+    rank = int(os.getenv('RANK', '0'))
+    _init_distributed(world, rank)
+    Utils.initialize_model_parallel()
+
+    model = torch.nn.Linear(256, 256, bias=False, dtype=torch.bfloat16, device='cuda')
+    model.requires_grad_(True)
+    ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=True)
+    model = DistributedDataParallel(
+        TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
+    )
+
+    optimizer_config = OptimizerConfig(
+        optimizer='flash_adamw',
+        lr=0.01,
+        bf16=True,
+        use_distributed_optimizer=True,
+    )
+    optim = get_megatron_optimizer(optimizer_config, [model])
+
+    # Run a step to populate state
+    input_data = torch.randn(4, 256, dtype=torch.bfloat16, device='cuda')
+    output = model(input_data)
+    loss = output.sum()
+    loss.backward()
+    optim.step()
+
+    distrib_optim = optim.chained_optimizers[0]
+
+    # Test _get_main_param_and_optimizer_states returns plain tensors
+    for gbuf_range_maps in distrib_optim.gbuf_ranges:
+        for gbuf_range_map_for_all_buckets in gbuf_range_maps.values():
+            for gbuf_range_map in gbuf_range_map_for_all_buckets:
+                for model_param in gbuf_range_map["param_map"]:
+                    tensors = distrib_optim._get_main_param_and_optimizer_states(model_param)
+                    assert 'param' in tensors
+                    assert 'exp_avg' in tensors
+                    assert 'exp_avg_sq' in tensors
+                    for k, v in tensors.items():
+                        assert isinstance(v, torch.Tensor), \
+                            f"_get should return plain tensors, got {type(v)} for '{k}'"
+
+    # Test roundtrip: get → perturb → set → get again
+    for gbuf_range_maps in distrib_optim.gbuf_ranges:
+        for gbuf_range_map_for_all_buckets in gbuf_range_maps.values():
+            for gbuf_range_map in gbuf_range_map_for_all_buckets:
+                for model_param in gbuf_range_map["param_map"]:
+                    original = distrib_optim._get_main_param_and_optimizer_states(model_param)
+                    # Perturb the tensors
+                    perturbed = {k: v.clone().fill_(0.42) for k, v in original.items()}
+                    distrib_optim._set_main_param_and_optimizer_states(model_param, perturbed)
+                    # Read back
+                    readback = distrib_optim._get_main_param_and_optimizer_states(model_param)
+                    for k in ('param', 'exp_avg', 'exp_avg_sq'):
+                        torch.testing.assert_close(
+                            readback[k],
+                            perturbed[k],
+                            atol=0.02,  # int8 quantization introduces small error
+                            rtol=0.02,
+                        )
+
+
+@pytest.mark.skipif(not _has_flash_adamw(), reason="flashoptim not available")
+def test_flash_adamw_distrib_optimizer_multi_gpu():
+    """Test FlashAdamW with distributed optimizer across all available GPUs.
+
+    Verifies that optimizer state is properly sharded — each rank should own
+    only 1/world_size of the total optimizer state. Run with:
+        torchrun --nproc_per_node=8 -m pytest test_optimizer.py -k flash_adamw_multi_gpu -xvs
+    """
+    world = int(os.getenv('WORLD_SIZE', '1'))
+    rank = int(os.getenv('RANK', '0'))
+    _init_distributed(world, rank)
+    Utils.initialize_model_parallel()
+
+    # Use a large enough model that sharding is meaningful
+    hidden = 2048
+    model = torch.nn.Linear(hidden, hidden, bias=False, dtype=torch.bfloat16, device='cuda')
+    model.requires_grad_(True)
+    model.weight.data.normal_()
+    total_params = hidden * hidden  # 4M params
+
+    ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=True)
+    model = DistributedDataParallel(
+        TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
+    )
+
+    optimizer_config = OptimizerConfig(
+        optimizer='flash_adamw',
+        lr=0.01,
+        bf16=True,
+        use_distributed_optimizer=True,
+    )
+    optim = get_megatron_optimizer(optimizer_config, [model])
+
+    # Run a step
+    input_data = torch.randn(4, hidden, dtype=torch.bfloat16, device='cuda')
+    output = model(input_data)
+    loss = output.sum()
+    loss.backward()
+    optim.step()
+
+    # Verify the inner optimizer's param groups contain sharded params
+    distrib_optim = optim.chained_optimizers[0]
+    inner_opt = distrib_optim.optimizer
+
+    local_param_numel = sum(p.numel() for group in inner_opt.param_groups for p in group['params'])
+    expected_shard_size = total_params // world
+
+    assert local_param_numel == expected_shard_size, (
+        f"Rank {rank}: expected {expected_shard_size} params per shard, got {local_param_numel}"
+    )
+
+    # Verify state is populated and quantized for all local params
+    from megatron.core.optimizer.flash_optimizers import _MaybeQuantizedTensor
+    for param in inner_opt.state:
+        state = inner_opt.state[param]
+        assert 'exp_avg' in state, f"Rank {rank}: missing exp_avg in state"
+        assert isinstance(state['exp_avg'], _MaybeQuantizedTensor), \
+            f"Rank {rank}: exp_avg should be quantized"
+
+    # Verify get/set roundtrip works with sharded state
+    for gbuf_range_maps in distrib_optim.gbuf_ranges:
+        for gbuf_range_map_for_all_buckets in gbuf_range_maps.values():
+            for gbuf_range_map in gbuf_range_map_for_all_buckets:
+                for model_param in gbuf_range_map["param_map"]:
+                    tensors = distrib_optim._get_main_param_and_optimizer_states(model_param)
+                    for k, v in tensors.items():
+                        assert isinstance(v, torch.Tensor), \
+                            f"Rank {rank}: _get returned {type(v)} for '{k}'"
+                    # Set back (should re-quantize)
+                    distrib_optim._set_main_param_and_optimizer_states(model_param, tensors)
+
+
+@pytest.mark.skipif(not _has_flash_adamw(), reason="flashoptim not available")
+def test_flash_adamw_memory_smaller_than_adam():
+    """Verify FlashAdamW optimizer state uses less GPU memory than standard Adam."""
+    torch.cuda.reset_peak_memory_stats()
+
+    # Measure Adam
+    param_size = 1024 * 1024  # 1M params
+    p_adam = torch.randn(param_size, device='cuda', dtype=torch.float32, requires_grad=True)
+    opt_adam = Adam([p_adam], lr=0.01)
+    p_adam.grad = torch.randn_like(p_adam)
+    opt_adam.step()
+    adam_mem = sum(
+        v.numel() * v.element_size()
+        for v in opt_adam.state[p_adam].values()
+        if isinstance(v, torch.Tensor)
+    )
+    del opt_adam, p_adam
+    torch.cuda.empty_cache()
+
+    # Measure FlashAdamW
+    from megatron.core.optimizer.flash_optimizers import FlashAdamW, _MaybeQuantizedTensor
+    p_flash = torch.randn(param_size, device='cuda', dtype=torch.float32, requires_grad=True)
+    opt_flash = FlashAdamW([p_flash], lr=0.01, quantize=True, master_weight_bits=None)
+    p_flash.grad = torch.randn_like(p_flash)
+    opt_flash.step()
+    flash_mem = 0
+    for v in opt_flash.state[p_flash].values():
+        if isinstance(v, _MaybeQuantizedTensor):
+            # int8 data + fp16 scales
+            flash_mem += v.quantized.numel() * v.quantized.element_size()
+            flash_mem += v.scales.numel() * v.scales.element_size()
+        elif isinstance(v, torch.Tensor):
+            flash_mem += v.numel() * v.element_size()
+
+    # Adam: 2 * 4MB (exp_avg + exp_avg_sq in fp32) = 8MB
+    # FlashAdamW: 2 * ~1.06MB (int8 + scales) = ~2.1MB
+    assert flash_mem < adam_mem * 0.5, (
+        f"FlashAdamW state ({flash_mem / 1e6:.1f} MB) should be <50% of "
+        f"Adam state ({adam_mem / 1e6:.1f} MB)"
+    )
+
+
 @pytest.mark.parametrize("use_precision_aware", [True, False])
 def test_distrib_optimizer_save_load_with_non_tensor_state(use_precision_aware):
     """Test that save/load of distributed optimizer handles non-tensor state entries.
