@@ -11,6 +11,7 @@ from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.fusions.fused_bias_geglu import bias_geglu_impl
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl
+from megatron.core.fusions.fused_g1_gate import g1_gate_impl
 from megatron.core.tensor_parallel.mappings import (
     copy_to_tensor_model_parallel_region,
     gather_from_sequence_parallel_region,
@@ -128,8 +129,11 @@ class SharedExpertMLP(MLP):
         output, _ = super().forward(hidden_states)
         if self.use_shared_expert_gate:
             logits = torch.nn.functional.linear(hidden_states, self.gate_weight)
-            gate_score = torch.nn.functional.sigmoid(logits)
-            output = output * gate_score
+            if output.dtype == torch.bfloat16 and output.is_cuda:
+                output = g1_gate_impl(logits, output)
+            else:
+                gate_score = torch.nn.functional.sigmoid(logits)
+                output = output * gate_score
         return output
 
     def sharded_state_dict(
