@@ -708,6 +708,15 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
         if group is None:
             group = self._find_group(p)
 
+        # NVFP4 + FlashAdamW + ECO: the param `p` is the NVFP4 model tensor
+        # (stable state key). Master weight is transient — dequantized each
+        # step. Optimizer state (exp_avg, exp_avg_sq) is sized to the shard,
+        # not the full NVFP4 tensor.
+        from ..fp4_utils import is_nvfp4tensor
+
+        if is_nvfp4tensor(p) and hasattr(p, "_fa_shard_offset"):
+            return self._step_nvfp4_transient(p, group)
+
         self._ensure_state_initialized(p, hparams=group)
         param_state = self.state[p]
 
@@ -2047,6 +2056,124 @@ class FlashAdam(FlashOptimizer):
         # Update state tensors
         exp_avg.set_data(exp_avg_f32)
         exp_avg_sq.set_data(exp_avg_sq_f32)
+
+    def _ensure_shard_state_initialized(
+        self,
+        p: torch.Tensor,
+        shard_size: int,
+        hparams: dict[str, Any],
+    ) -> None:
+        """Initialize optimizer state for NVFP4 params with transient BF16 master.
+
+        The state key is the NVFP4 model param, but exp_avg/exp_avg_sq are
+        sized to the shard (1/dp of the full param). State is initialized
+        to zeros on first encounter.
+        """
+        state = self.state[p]
+        quantize = hparams.get("quantize", self._quantize)
+        for key_quant, spec in self._quantized_state_spec().items():
+            if key_quant not in state:
+                zeros = torch.zeros(
+                    shard_size,
+                    dtype=torch.bfloat16,
+                    device=p.device,
+                )
+                state[key_quant] = _MaybeQuantizedTensor(
+                    zeros,
+                    try_quantize=quantize,
+                    signed=spec.signed,
+                    sqrt=spec.sqrt,
+                    softsign=spec.softsign,
+                    storage_dtype=torch.bfloat16,
+                )
+
+    def _step_nvfp4_transient(
+        self,
+        p: torch.Tensor,
+        group: dict[str, Any],
+    ) -> None:
+        """Adam step on an NVFP4 param with a transient BF16 master shard.
+
+        For memory efficiency: the NVFP4 model param is the optimizer state
+        key (stable), but the BF16 "master weight" is created fresh each
+        step by dequantizing NVFP4 and slicing out this rank's shard.
+        The updated BF16 shard is stashed on `p._fa_updated_shard` for
+        the distrib_optimizer to pick up and feed into TE's shard-aware
+        NVFP4 cast.
+        """
+        from ..fp4_utils import dequantize_fp4_tensor
+
+        shard_offset = p._fa_shard_offset
+        shard_size = p._fa_shard_size
+        if shard_size == 0:
+            return
+
+        self._ensure_shard_state_initialized(p, shard_size, group)
+        param_state = self.state[p]
+        if "step" not in param_state:
+            param_state["step"] = torch.zeros(1, dtype=torch.int32, device="cpu")
+
+        # Grab grad (already shard-sized, attached by distrib_optimizer).
+        p_grad = getattr(p, "decoupled_grad", None)
+        if p_grad is None:
+            p_grad = p.grad
+        if p_grad is None:
+            return
+        grad_local = self._get_local_tensor(p_grad)
+
+        # Dequant full NVFP4 → BF16, slice + upcast to FP32 for the transient
+        # master shard. FP32 is needed so sub-BF16 updates (η·m ≈ 1e-11)
+        # accumulate across steps rather than being immediately rounded to
+        # zero. TE's cast accepts FP32 master.
+        bf16_full = dequantize_fp4_tensor(p)
+        fp32_shard = (
+            bf16_full.view(-1)[shard_offset : shard_offset + shard_size]
+            .float()
+            .contiguous()
+        )
+        del bf16_full
+        bf16_shard = fp32_shard  # alias for backwards compat below
+
+        # Read hparams
+        lr = group["lr"]
+        beta1, beta2 = group["betas"]
+        eps = group["eps"]
+        weight_decay = group["weight_decay"]
+        if self._decoupled:
+            if self._decouple_lr:
+                weight_decay *= lr / group["initial_lr"]
+            else:
+                weight_decay *= lr
+
+        exp_avg = param_state["exp_avg"]
+        exp_avg_sq = param_state["exp_avg_sq"]
+        param_state["step"] += 1
+        step_int = int(param_state["step"].item())
+
+        # Run fused Adam step on the BF16 shard (in-kernel ECO disabled —
+        # NVFP4 error is injected post-cast by distrib_optimizer).
+        _fused_adam_step(
+            mom=exp_avg.kernel_tensor,
+            mom_scales_f16=exp_avg.kernel_scales_or_self,
+            var=exp_avg_sq.kernel_tensor,
+            var_scales_f16=exp_avg_sq.kernel_scales_or_self,
+            param=bf16_shard,
+            grad=grad_local,
+            errors=None,
+            lr=lr,
+            beta1=beta1,
+            beta2=beta2,
+            eps=eps,
+            step=step_int,
+            weight_decay=weight_decay,
+            decoupled=self._decoupled,
+            quantize_optim_states=exp_avg.is_quantized(),
+            eco=False,
+            eco_scalar=0.0,
+        )
+
+        # Stash for distrib_optimizer to pick up for TE cast + ECO inject.
+        p._fa_updated_shard = bf16_shard
 
     def inject_eco_error(
         self,

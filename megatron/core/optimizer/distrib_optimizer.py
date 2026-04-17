@@ -395,16 +395,29 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             shard_model_param.shared = model_param.shared
 
                     # Generate main param.
+                    # FlashAdamW+ECO+NVFP4: the "master weight" is a transient
+                    # BF16 shard created each step from the NVFP4 dequantization,
+                    # not a persistent allocation. The NVFP4 model param itself
+                    # is the optimizer state key. Annotate shard range on the
+                    # model param so FlashAdamW can produce the transient shard.
+                    _flash_eco_nvfp4 = (
+                        config.optimizer == 'flash_adamw'
+                        and getattr(config, 'flash_adamw_eco', False)
+                        and is_nvfp4tensor(model_param)
+                    )
                     if config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
                         # Precision-aware: main params held by FusedAdam internally.
                         shard_main_param = None
+                    elif _flash_eco_nvfp4:
+                        # No persistent master shard — attach shard info so
+                        # FlashAdamW can dequantize transiently each step.
+                        shard_main_param = None
+                        model_param._fa_shard_offset = param_range.start
+                        model_param._fa_shard_size = param_range.size
                     else:
-                        # Create FP32 (or BF16 for FlashAdamW) main param shards.
+                        # Create FP32 (or BF16 for FlashAdamW ECC) main param shards.
                         if is_nvfp4tensor(model_param):
                             # NVFP4Tensor doesn't support view(-1), dequantize first.
-                            # For FlashAdamW: keep as BF16 (smaller master weight + ECO
-                            # can compensate for BF16→NVFP4 quantization via injection
-                            # after TE's shard-aware cast).
                             shard_main_param = (
                                 dequantize_fp4_tensor(model_param)
                                 .view(-1)[param_range.start : param_range.end]
@@ -473,9 +486,21 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     *shard_float16_params_this_group,
                 ]
             else:
+                # For FlashAdamW+ECO+NVFP4, the master shard is transient.
+                # Substitute the NVFP4 model_param (stable) as the state key
+                # where shard_fp32_from_float16 is None.
+                f16_main_params = []
+                for shard_main, model_p in zip(
+                    shard_fp32_from_float16_params_this_group,
+                    model_float16_params_this_group,
+                ):
+                    if shard_main is None and is_nvfp4tensor(model_p):
+                        f16_main_params.append(model_p)
+                    else:
+                        f16_main_params.append(shard_main)
                 group_range["orig_group"]["params"] = [
                     *shard_fp32_params_this_group,
-                    *shard_fp32_from_float16_params_this_group,
+                    *f16_main_params,
                 ]
 
         return (
@@ -2596,11 +2621,24 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             for shard_main_group, model_group in zip(shard_main_groups, model_groups):
                 for shard_main_param, model_param in zip(shard_main_group, model_group):
                     if is_float8tensor(model_param) or is_nvfp4tensor(model_param):
+                        # FlashAdamW+ECO+NVFP4: no persistent master shard; the
+                        # updated BF16 shard is stashed on the model_param by
+                        # FlashAdamW._step_nvfp4_transient.
+                        if shard_main_param is None:
+                            effective_shard = getattr(
+                                model_param, "_fa_updated_shard", None
+                            )
+                            if effective_shard is None:
+                                # No state yet (first step before optimizer step
+                                # has run) — skip to avoid None in the cast list.
+                                continue
+                        else:
+                            effective_shard = shard_main_param
                         param_range_map = self._get_model_param_range_map(model_param)
                         param_range = param_range_map["param"]
-                        assert param_range.size == shard_main_param.nelement()
+                        assert param_range.size == effective_shard.nelement()
                         idx = fp8_param_to_idx_map[model_param]
-                        shard_fp32_from_fp8[idx] = shard_main_param
+                        shard_fp32_from_fp8[idx] = effective_shard
                         shard_offsets_in_fp8[idx] = param_range.start
 
         get_shard_fp32_from_fp8(
@@ -2628,6 +2666,19 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         def copy_group_grads(model_groups, shard_main_groups):
             for model_group, shard_main_group in zip(model_groups, shard_main_groups):
                 for model_param, shard_main_param in zip(model_group, shard_main_group):
+                    # FlashAdamW+ECO+NVFP4: no persistent master shard. Attach
+                    # grad to the NVFP4 model_param (which is the optimizer's
+                    # state key) via decoupled_grad.
+                    if shard_main_param is None and is_nvfp4tensor(model_param):
+                        param_range_map = self._get_model_param_range_map(model_param)
+                        param_range = param_range_map["param"]
+                        model_grad = model_param.main_grad
+                        shard_model_grad = model_grad.view(-1)[
+                            param_range.start : param_range.end
+                        ]
+                        model_param.decoupled_grad = shard_model_grad
+                        continue
+
                     param_range_map = self._get_model_param_range_map(model_param)
                     param_range = param_range_map["param"]
                     assert param_range.size == shard_main_param.nelement()
@@ -2692,8 +2743,16 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
             # main_param is the pre-cast BF16 shard (TE's cast doesn't modify it).
             # The fused kernel computes error = pre_cast - post_cast inside
-            # the kernel, avoiding any FP32 materialization of exp_avg.
-            self.optimizer.inject_eco_error(main_param, main_param, post_cast_shard)
+            # the kernel. The state key is either:
+            #   - main_param (persistent BF16 shard, ECC path)
+            #   - model_param (NVFP4, transient-master ECO path)
+            # Choose whichever one the optimizer has state for.
+            state_key = (
+                model_param
+                if model_param in self.optimizer.state
+                else main_param
+            )
+            self.optimizer.inject_eco_error(state_key, main_param, post_cast_shard)
             del post_cast_full
 
     def _copy_main_params_to_model_params(self):
@@ -2744,10 +2803,19 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 fp8_model_params, fp8_main_params, fp8_offsets
             )
 
+        # Free transient BF16 master shards for NVFP4+ECO params.
+        for p in fp8_model_params:
+            if is_nvfp4tensor(p) and hasattr(p, "_fa_updated_shard"):
+                del p._fa_updated_shard
+
         # Utility method for copying group params.
         def copy_group_params(shard_main_groups, model_groups):
             for shard_main_group, model_group in zip(shard_main_groups, model_groups):
                 for shard_main_param, model_param in zip(shard_main_group, model_group):
+                    # Skip NVFP4+ECO params (no persistent master shard).
+                    if shard_main_param is None and is_nvfp4tensor(model_param):
+                        continue
+
                     param_range_map = self._get_model_param_range_map(model_param)
                     world_range = param_range_map["gbuf_world_in_bucket"]
 
@@ -2870,6 +2938,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         def copy_group_params(model_groups, shard_main_groups):
             for model_group, shard_main_group in zip(model_groups, shard_main_groups):
                 for model_param, shard_main_param in zip(model_group, shard_main_group):
+                    # FlashAdamW+ECO+NVFP4: no persistent master shard.
+                    if shard_main_param is None and is_nvfp4tensor(model_param):
+                        continue
+
                     param_range_map = self._get_model_param_range_map(model_param)
                     param_range = param_range_map["param"]
                     assert param_range.size == shard_main_param.nelement()
