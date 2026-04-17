@@ -719,7 +719,12 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
         # similarly, distributed checkpoint logic needs state initialized for
         # every tensor in every group's params, even if it doesn't actually
         # need a gradient (as of torch 2.3). So don't early exit until here.
-        if not p.requires_grad or p.grad is None:
+        # Support decoupled_grad (used by Megatron's precision-aware optimizer
+        # path to allow grad dtype != param dtype).
+        p_grad = getattr(p, "decoupled_grad", None)
+        if p_grad is None:
+            p_grad = p.grad
+        if not p.requires_grad or p_grad is None:
             return
 
         # with the current learning rate and cached param statistics, should
@@ -734,9 +739,7 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
         # DTensors are distributed tensors that can't be passed to Triton directly.
         # to_local() returns a view of the local shard, so in-place ops work correctly.
         p_local = self._get_local_tensor(p)
-        # p.grad is guaranteed non-None by the early return above
-        assert p.grad is not None
-        grad_local = self._get_local_tensor(p.grad)
+        grad_local = self._get_local_tensor(p_grad)
 
         # Triton kernels use flat pointer arithmetic (ptr + offset) which
         # assumes contiguous memory. Non-contiguous tensors (e.g. transposed
@@ -1957,8 +1960,13 @@ class FlashAdam(FlashOptimizer):
             step_int = int(param_state["step"].item())
 
             # ECO scalar for Adam: (1-β₁^t)/η * (1-1/β₁)
+            # Skip ECO injection when lr=0 (e.g. during warmup start) to avoid
+            # division by zero.
             bc1 = 1 - beta1**step_int
-            eco_scalar = (bc1 / lr) * (1.0 - 1.0 / beta1) if self._eco else 0.0
+            if self._eco and lr != 0.0:
+                eco_scalar = (bc1 / lr) * (1.0 - 1.0 / beta1)
+            else:
+                eco_scalar = 0.0
 
             return _fused_adam_step(
                 mom=exp_avg.kernel_tensor,
@@ -2039,6 +2047,72 @@ class FlashAdam(FlashOptimizer):
         # Update state tensors
         exp_avg.set_data(exp_avg_f32)
         exp_avg_sq.set_data(exp_avg_sq_f32)
+
+    def inject_eco_error(
+        self,
+        param: torch.Tensor,
+        pre_cast: torch.Tensor,
+        post_cast: torch.Tensor,
+    ) -> None:
+        """Inject an externally-computed ECO error into the param's momentum.
+
+        Intended for NVFP4/FP8 training where the final quantization happens
+        outside the optimizer (e.g. in the distributed optimizer via TE's
+        shard-aware cast). The caller provides the pre-cast and post-cast
+        shard tensors; this method computes the error and updates the
+        momentum buffer in a single fused Triton kernel (no FP32
+        materialization of exp_avg or exp_avg_sq).
+
+        See https://arxiv.org/abs/2601.22101 (Algorithm 3, Line 7).
+
+        Args:
+            param: The master weight shard tensor (key into self.state).
+            pre_cast: BF16 shard before quantization (master weight value
+                fed into TE's cast).
+            post_cast: BF16 shard after the NVFP4 round-trip (dequantized
+                from the cast NVFP4 model param, sliced to this shard).
+        """
+        if not self._eco:
+            return
+        if pre_cast.numel() == 0:
+            return
+
+        param_state = self.state.get(param)
+        if param_state is None or "step" not in param_state:
+            # Optimizer state not yet initialized — skip first-step injection.
+            return
+
+        group = self._find_group(param)
+        lr = group["lr"]
+        if lr == 0.0:
+            return
+
+        beta1, beta2 = group["betas"]
+        eps = group["eps"]
+        step_int = int(param_state["step"].item())
+        if step_int < 1:
+            return
+
+        # ECO scalar: α = ((1-β₁^t) / η) · (1 - 1/β₁)
+        bc1 = 1.0 - beta1**step_int
+        eco_scalar = (bc1 / lr) * (1.0 - 1.0 / beta1)
+        bc2 = 1.0 - beta2**step_int
+
+        exp_avg = param_state["exp_avg"]
+        exp_avg_sq = param_state["exp_avg_sq"]
+
+        _fused_eco_inject(
+            mom=exp_avg.kernel_tensor,
+            mom_scales_f16=exp_avg.kernel_scales_or_self,
+            var=exp_avg_sq.kernel_tensor,
+            var_scales_f16=exp_avg_sq.kernel_scales_or_self,
+            pre_cast=pre_cast.contiguous(),
+            post_cast=post_cast.contiguous(),
+            eco_scalar=eco_scalar,
+            eps=eps,
+            bc2=bc2,
+            quantize_optim_states=exp_avg.is_quantized(),
+        )
 
 
 class FlashAdamW(FlashAdam):
@@ -2459,6 +2533,7 @@ def _triton_adam_kernel(
 
         # ECO: inject weight quantization error into first moment before requantizing.
         # Injection: m += eco_scalar * denom * error, where denom is the Adam denominator.
+        # For NVFP4 params, ECO is handled post-requant in _step_nvfp4 instead.
         if USE_ECO:
             quant_error = param - param_narrow.to(tl.float32)
             mom_f32 = mom_f32 + eco_scalar * denom * quant_error
@@ -2513,6 +2588,157 @@ def _triton_adam_kernel(
             # Store states at param precision
             tl.store(mom_ptr + absolute_offsets, mom_f32.to(PARAM_DTYPE), mask=mask)
             tl.store(var_ptr + absolute_offsets, var_f32.to(PARAM_DTYPE), mask=mask)
+
+
+# =========================================================== ECO Inject Kernel
+
+
+def _fused_eco_inject(
+    mom: torch.Tensor,
+    mom_scales_f16: torch.Tensor,
+    var: torch.Tensor,
+    var_scales_f16: torch.Tensor,
+    pre_cast: torch.Tensor,
+    post_cast: torch.Tensor,
+    eco_scalar: float,
+    eps: float,
+    bc2: float,
+    quantize_optim_states: bool,
+    group_size: int = 32,
+) -> None:
+    """Fused ECO error injection for an external (NVFP4) quantization error.
+
+    Reads int8/FP32 exp_avg and exp_avg_sq, computes the Adam denominator
+    from the variance, computes error = pre_cast - post_cast (BF16),
+    adds eco_scalar * denom * error to exp_avg, requantizes if needed,
+    and writes back in a single Triton kernel launch.
+    """
+    N = pre_cast.numel()
+    if N == 0:
+        return
+    grid = functools.partial(_make_grid, N)
+    _triton_eco_inject_kernel[grid](
+        mom,
+        mom_scales_f16,
+        var,
+        var_scales_f16,
+        pre_cast,
+        post_cast,
+        N,
+        eco_scalar,
+        eps,
+        bc2,
+        GROUP_SIZE=group_size,
+        PARAM_DTYPE=_TORCH_DTYPE_TO_TRITON_DTYPE[pre_cast.dtype],
+        QUANTIZE_OPTIM_STATES=quantize_optim_states,
+        BLOCK_SIZE_N=1024,
+    )
+
+
+@triton.jit
+def _triton_eco_inject_kernel(
+    mom_ptr: "Any",
+    mom_scales_f16_ptr: "Any",
+    var_ptr: "Any",
+    var_scales_f16_ptr: "Any",
+    pre_cast_ptr: "Any",
+    post_cast_ptr: "Any",
+    N: int,
+    eco_scalar: float,
+    eps: float,
+    bc2: float,
+    GROUP_SIZE: tl.constexpr,
+    PARAM_DTYPE: tl.constexpr,
+    QUANTIZE_OPTIM_STATES: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+):
+    """Single-kernel ECO injection for externally-computed quantization error.
+
+    For each element:
+      denom = sqrt(var_f32 / bc2) + eps
+      error = pre_cast - post_cast
+      mom_f32 += eco_scalar * denom * error
+    Then re-quantize mom back to int8 + scales if QUANTIZE_OPTIM_STATES.
+    """
+    pid_block = tl.program_id(axis=0)
+    num_blocks_launched = tl.num_programs(axis=0)
+    total_num_blocks = tl.cdiv(N, BLOCK_SIZE_N)
+    num_groups_per_block: tl.constexpr = BLOCK_SIZE_N // GROUP_SIZE
+
+    for block_idx in range(pid_block, total_num_blocks, num_blocks_launched):
+        block_base_offset = block_idx * BLOCK_SIZE_N
+        absolute_offsets = block_base_offset + tl.arange(0, BLOCK_SIZE_N)
+        scales_base_offset = block_base_offset // GROUP_SIZE
+        scales_offsets = scales_base_offset + tl.arange(0, num_groups_per_block)
+        mask = absolute_offsets < N
+        scales_mask = scales_offsets < tl.cdiv(N, GROUP_SIZE)
+
+        # Load + dequant exp_avg and exp_avg_sq
+        if QUANTIZE_OPTIM_STATES:
+            mom_i8 = tl.load(mom_ptr + absolute_offsets, mask=mask, other=0)
+            var_i8 = tl.load(var_ptr + absolute_offsets, mask=mask, other=0)
+            mom_scales = tl.load(
+                mom_scales_f16_ptr + scales_offsets, mask=scales_mask, other=1.0
+            )
+            var_scales = tl.load(
+                var_scales_f16_ptr + scales_offsets, mask=scales_mask, other=1.0
+            )
+            mom_f32 = mom_i8.to(tl.float32)
+            var_f32 = var_i8.to(tl.float32)
+            mom_groups = mom_f32.reshape((num_groups_per_block, GROUP_SIZE))
+            var_groups = var_f32.reshape((num_groups_per_block, GROUP_SIZE))
+            # Momentum: /127, inv_softsign, * scale
+            mom_transformed = mom_groups / 127.0
+            mom_normalized = mom_transformed / (2.0 - tl.abs(mom_transformed))
+            mom_f32 = (mom_normalized * mom_scales.to(tl.float32)[:, None]).reshape(
+                (BLOCK_SIZE_N,)
+            )
+            # Variance: /255, * scale, square (sqrt was applied at store time)
+            var_transformed = var_groups / 255.0
+            var_sqrt = (var_transformed * var_scales.to(tl.float32)[:, None]).reshape(
+                (BLOCK_SIZE_N,)
+            )
+            var_f32 = var_sqrt * var_sqrt
+        else:
+            mom_f32 = tl.load(mom_ptr + absolute_offsets, mask=mask, other=0.0).to(
+                tl.float32
+            )
+            var_f32 = tl.load(var_ptr + absolute_offsets, mask=mask, other=0.0).to(
+                tl.float32
+            )
+
+        # Load pre-cast and post-cast shard, compute error
+        pre = tl.load(pre_cast_ptr + absolute_offsets, mask=mask, other=0.0).to(
+            tl.float32
+        )
+        post = tl.load(post_cast_ptr + absolute_offsets, mask=mask, other=0.0).to(
+            tl.float32
+        )
+        error = pre - post
+
+        # Adam denominator (bias-corrected variance)
+        denom = tl.sqrt(var_f32 / bc2) + eps
+
+        # Inject: m += α · denom · e
+        mom_f32 = mom_f32 + eco_scalar * denom * error
+
+        # Quantize mom back to int8 + scales (matches _triton_adam_kernel)
+        if QUANTIZE_OPTIM_STATES:
+            mom_groups = mom_f32.reshape((num_groups_per_block, GROUP_SIZE))
+            mom_absmaxs = tl.max(tl.abs(mom_groups), axis=1)
+            mom_absmaxs = tl.maximum(mom_absmaxs, 1e-12)
+            mom_normalized = mom_groups / mom_absmaxs[:, None]
+            mom_transformed = 2.0 * mom_normalized / (1.0 + tl.abs(mom_normalized))
+            mom_out = (mom_transformed * 127.0).reshape((BLOCK_SIZE_N,))
+            mom_out_i8 = tl.floor(mom_out + 0.5).to(tl.int8)
+            tl.store(mom_ptr + absolute_offsets, mom_out_i8, mask=mask)
+            tl.store(
+                mom_scales_f16_ptr + scales_offsets,
+                mom_absmaxs.to(tl.float16),
+                mask=scales_mask,
+            )
+        else:
+            tl.store(mom_ptr + absolute_offsets, mom_f32.to(PARAM_DTYPE), mask=mask)
 
 
 # =========================================================== Triton + Wrappers

@@ -49,7 +49,7 @@ from ..dist_checkpointing.mapping import (
 from ..dist_checkpointing.utils import extract_sharded_tensors_and_factories
 from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer, partition_buckets
 from ..fp8_utils import dequantize_fp8_tensor, is_float8tensor, quantize_param_shard
-from ..fp4_utils import is_nvfp4tensor
+from ..fp4_utils import dequantize_fp4_tensor, is_nvfp4tensor
 from ..transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
 from ..transformer.module import MegatronModule
 from .cpu_offloading.optimizer_state_offloader import OptimizerStateOffloader
@@ -395,13 +395,24 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             shard_model_param.shared = model_param.shared
 
                     # Generate main param.
-                    if not config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
-                        # If we use FP8 params to initialize FP32 main params (compared to using the
-                        # bf16/fp16 params to initialize the main params), there will be a loss of
-                        # precision at the beginning of training (this problem will not occur if the
-                        # training is long enough or if the main params are loaded from a
-                        # checkpoint).
-                        if is_float8tensor(model_param):
+                    if config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+                        # Precision-aware: main params held by FusedAdam internally.
+                        shard_main_param = None
+                    else:
+                        # Create FP32 (or BF16 for FlashAdamW) main param shards.
+                        if is_nvfp4tensor(model_param):
+                            # NVFP4Tensor doesn't support view(-1), dequantize first.
+                            # For FlashAdamW: keep as BF16 (smaller master weight + ECO
+                            # can compensate for BF16→NVFP4 quantization via injection
+                            # after TE's shard-aware cast).
+                            shard_main_param = (
+                                dequantize_fp4_tensor(model_param)
+                                .view(-1)[param_range.start : param_range.end]
+                                .clone()
+                            )
+                            if config.optimizer != 'flash_adamw':
+                                shard_main_param = shard_main_param.float()
+                        elif is_float8tensor(model_param):
                             if hasattr(model_param, "get_high_precision_init_val"):
                                 shard_main_param = (
                                     model_param.get_high_precision_init_val()
@@ -423,9 +434,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         )
                         if hasattr(model_param, "shared"):
                             shard_main_param.shared = model_param.shared
-                    else:
-                        # When using precision-aware optimizer, main params are held by FusedAdam.
-                        shard_main_param = None
 
                     # Store handle to main_param.
                     model_param.main_param = shard_main_param
@@ -459,15 +467,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     )
 
             # Update optimizer's params.
-            if not config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+            if config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
                 group_range["orig_group"]["params"] = [
                     *shard_fp32_params_this_group,
-                    *shard_fp32_from_float16_params_this_group,
+                    *shard_float16_params_this_group,
                 ]
             else:
                 group_range["orig_group"]["params"] = [
                     *shard_fp32_params_this_group,
-                    *shard_float16_params_this_group,
+                    *shard_fp32_from_float16_params_this_group,
                 ]
 
         return (
@@ -2517,18 +2525,17 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         Note: this should be equivalent to the float-16 optimizer's method,
         but written differently, so the two should be combined.
         """
-        if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
-            return [
-                param.decoupled_grad.data
-                for group in self.optimizer.param_groups
-                for param in group["params"]
-            ]
-        else:
-            return [
-                param.grad.data
-                for group in self.optimizer.param_groups
-                for param in group["params"]
-            ]
+        grads = []
+        for group in self.optimizer.param_groups:
+            for param in group["params"]:
+                # Use decoupled_grad when available (precision-aware path and
+                # FlashAdamW with BF16 shards both set it).
+                grad = getattr(param, "decoupled_grad", None)
+                if grad is None:
+                    grad = param.grad
+                if grad is not None:
+                    grads.append(grad.data)
+        return grads
 
     def _get_model_and_main_params_data_float16(self):
         """
@@ -2549,8 +2556,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
     def _get_fp8_params_and_shard_fp32_from_fp8(self):
         """
-        Get lists of FP8 model params, corresponding shard main params, and the starting index of
-        the shard main param in the FP8 param. Parameters in all three lists are in the same order.
+        Get lists of FP8/NVFP4 model params, corresponding shard main params, and the starting
+        index of the shard main param in the FP8 param. Parameters in all three lists are in
+        the same order.
+
+        Both FP8 and NVFP4 params are included — TE's quantize_master_weights dispatches
+        correctly to per-quantizer implementations (including shard-level NVFP4 casting).
         """
         fp8_params = []
         shard_fp32_from_fp8 = []
@@ -2565,7 +2576,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         else:
             buffers = self.buffers
 
-        # Iterate over all parameters inside this optimizer to find FP8 parameters.
+        # Iterate over all parameters inside this optimizer to find FP8/NVFP4 parameters.
         fp8_param_to_idx_map = {}
         idx = 0
         for buffer in buffers:
@@ -2579,9 +2590,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         def get_shard_fp32_from_fp8(shard_main_groups, model_groups):
             """
-            Traverse the param groups and collect the fp8 params, their corresponding main params
-            and the starting offsets of the main params in the model params. Store them into three
-            different lists.
+            Traverse the param groups and collect the fp8/nvfp4 params, their corresponding
+            main params and the starting offsets. Store them into three different lists.
             """
             for shard_main_group, model_group in zip(shard_main_groups, model_groups):
                 for shard_main_param, model_param in zip(shard_main_group, model_group):
@@ -2626,12 +2636,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     shard_model_grad = model_grad.view(-1)[
                         param_range.start : param_range.end
                     ]
-                    if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
-                        # Pytorch requires a param and its' grad to be the same dtype, but we want
-                        # their types to be different in precision-aware optimizer. So we use
-                        # ".decoupled_grad" to replace ".grad".
-                        # Note that this requires corresponding modifications in the optimizer (Let
-                        # the optimizer read gradients from ".decoupled_grad" instead of ".grad").
+                    if (
+                        self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+                        or shard_main_param.dtype != torch.float32
+                    ):
+                        # Use decoupled_grad when param dtype != FP32 (e.g. BF16
+                        # master shards for FlashAdamW) to avoid PyTorch's
+                        # param/grad dtype matching requirement.
                         shard_main_param.decoupled_grad = shard_model_grad
                     else:
                         shard_main_param.grad = shard_model_grad.float()
@@ -2645,6 +2656,45 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 self.model_float16_groups, self.shard_fp32_from_float16_groups
             )
             copy_group_grads(self.model_fp32_groups, self.shard_fp32_groups)
+
+    def _inject_nvfp4_eco_errors(
+        self,
+        model_params: List[torch.Tensor],
+        main_params: List[Optional[torch.Tensor]],
+        start_offsets: List[Optional[int]],
+    ) -> None:
+        """Compute BF16→NVFP4 quantization error per shard and inject into
+        FlashAdamW's momentum buffer (ECO, arXiv:2601.22101).
+
+        Called AFTER quantize_param_shard has updated the NVFP4 model params
+        using TE's shard-aware cast. For each NVFP4 param: dequantize the
+        post-cast NVFP4 and pass the shard slice + pre-cast master to
+        FlashAdamW's fused ECO injection kernel (no FP32 materialization
+        of exp_avg/exp_avg_sq needed — the injection and re-quantization
+        happen in a single Triton kernel).
+        """
+        if not hasattr(self.optimizer, "inject_eco_error"):
+            return
+
+        for model_param, main_param, offset in zip(
+            model_params, main_params, start_offsets
+        ):
+            if main_param is None or not is_nvfp4tensor(model_param):
+                continue
+
+            # Dequantize full NVFP4 to BF16, slice to this rank's shard.
+            # TE's cast has written the shard region correctly.
+            post_cast_full = dequantize_fp4_tensor(model_param)
+            shard_size = main_param.numel()
+            post_cast_shard = post_cast_full.view(-1)[
+                offset : offset + shard_size
+            ]
+
+            # main_param is the pre-cast BF16 shard (TE's cast doesn't modify it).
+            # The fused kernel computes error = pre_cast - post_cast inside
+            # the kernel, avoiding any FP32 materialization of exp_avg.
+            self.optimizer.inject_eco_error(main_param, main_param, post_cast_shard)
+            del post_cast_full
 
     def _copy_main_params_to_model_params(self):
         """
@@ -2667,9 +2717,32 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
             return
 
-        quantize_param_shard(
-            *self._get_fp8_params_and_shard_fp32_from_fp8(), self.data_parallel_group
+        # Requantize FP8/NVFP4 params via TE's cast_master_weights_to_fp8.
+        # For NVFP4, this dispatches to _cast_master_weights_to_nvfp4_2d which
+        # handles shard-level casting, per-block amax computation, and cross-rank
+        # amax all-reduce. Supports TE >= 2.7.0.dev0.
+        fp8_model_params, fp8_main_params, fp8_offsets = (
+            self._get_fp8_params_and_shard_fp32_from_fp8()
         )
+
+        # ECO: TE's cast_master_weights_to_nvfp4_2d reads but does NOT modify
+        # the master weight, so we can use main_param directly as the pre-cast
+        # value (no clone needed). We compute the BF16→NVFP4 quantization
+        # error AFTER the cast using:
+        #   error = main_param - dequant(nvfp4_model_param)[shard_range]
+        eco_enabled = (
+            self.config.optimizer == 'flash_adamw'
+            and getattr(self.config, 'flash_adamw_eco', False)
+        )
+
+        quantize_param_shard(
+            fp8_model_params, fp8_main_params, fp8_offsets, self.data_parallel_group
+        )
+
+        if eco_enabled:
+            self._inject_nvfp4_eco_errors(
+                fp8_model_params, fp8_main_params, fp8_offsets
+            )
 
         # Utility method for copying group params.
         def copy_group_params(shard_main_groups, model_groups):
@@ -2689,8 +2762,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         world_range.start : world_range.end
                     ]
 
-                    if is_float8tensor(model_param) or is_nvfp4tensor(model_param): # here we skip the dequant step and add a checl for nvfp4 tensors
-                        # FP8 params are quantized in the above "quantize_param_shard" function.
+                    if is_float8tensor(model_param) or is_nvfp4tensor(model_param):
+                        # FP8: requantized by quantize_param_shard above.
+                        # NVFP4: requantized by _requantize_nvfp4_params above.
                         continue
                     else:
                         shard_model_param.data.copy_(shard_main_param)
@@ -2803,9 +2877,16 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     if state_dict is not None:
                         # Use param from state_dict to initialize main_param
                         model_param = model_param_to_state_dict_param_map[model_param]
-                    # NOTE: This is the dequant step that we must ignore
-                    if is_float8tensor(model_param) or is_nvfp4tensor(model_param):
+                    if is_float8tensor(model_param):
+                        # FP8 params: skip — handled by precision-aware optimizer
+                        # or separate quantize path.
                         continue
+                    elif is_nvfp4tensor(model_param):
+                        # NVFP4 doesn't support view(-1), dequantize first.
+                        shard_model_param = (
+                            dequantize_fp4_tensor(model_param)
+                            .view(-1)[param_range.start : param_range.end]
+                        )
                     else:
                         shard_model_param = model_param.view(-1)[
                             param_range.start : param_range.end

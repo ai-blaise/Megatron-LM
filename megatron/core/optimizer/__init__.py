@@ -415,6 +415,9 @@ def _get_megatron_optimizer_based_on_param_groups(
         elif config.optimizer == 'flash_adamw':
             from .flash_optimizers import FlashAdamW
 
+            # ECO eliminates master weights via error feedback through momentum.
+            # Without ECO, ECC provides 24-bit effective precision from BF16+int8.
+            master_bits = None if config.flash_adamw_eco else 24
             optimizer = FlashAdamW(
                 params=param_groups,
                 lr=config.lr,
@@ -422,7 +425,7 @@ def _get_megatron_optimizer_based_on_param_groups(
                 eps=config.adam_eps,
                 weight_decay=config.weight_decay,
                 quantize=config.flash_adamw_quantize,
-                master_weight_bits=None,  # Mode A: fp32 shards, ECC not applicable
+                master_weight_bits=master_bits,
                 fused=config.flash_adamw_fused,
                 eco=config.flash_adamw_eco,
             )

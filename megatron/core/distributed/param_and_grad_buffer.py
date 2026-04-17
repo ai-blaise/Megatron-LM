@@ -860,8 +860,15 @@ class _ParamAndGradBuffer:
             if not self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
                 # Assign param.data to appropriate segment of self.param_data.
                 if self.param_data is not None:
+                    # NVFP4 packs 2 elements per byte, so its physical storage
+                    # (_rowwise_data) is half the logical shape. Use that shape
+                    # for the buffer slice so replace_raw_data gets the right size.
+                    if is_nvfp4tensor(param) and hasattr(param, '_rowwise_data'):
+                        param_shape = param._rowwise_data.shape
+                    else:
+                        param_shape = param.data.shape
                     new_param_data = self._get(
-                        param.data.shape,
+                        param_shape,
                         param_start_index,
                         buffer_type=BufferType.PARAM,
                     )
