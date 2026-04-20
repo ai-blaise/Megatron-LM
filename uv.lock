@@ -2437,7 +2437,9 @@ dependencies = [
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11' or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
     { name = "numpy", version = "2.4.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11' or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
     { name = "packaging" },
+    { name = "psutil" },
     { name = "torch" },
+    { name = "transformers" },
 ]
 
 [package.optional-dependencies]
@@ -2594,6 +2596,7 @@ requires-dist = [
     { name = "opentelemetry-api", marker = "extra == 'dev'", specifier = "~=1.33.1" },
     { name = "opentelemetry-api", marker = "extra == 'lts'", specifier = "~=1.33.1" },
     { name = "packaging", specifier = ">=24.2" },
+    { name = "psutil", specifier = ">=7.2.2" },
     { name = "sentencepiece", marker = "extra == 'mlm'" },
     { name = "tensorstore", marker = "extra == 'dev'", specifier = "~=0.1,!=0.1.46,!=0.1.72" },
     { name = "tensorstore", marker = "extra == 'lts'", specifier = "~=0.1,!=0.1.46,!=0.1.72" },
@@ -2602,6 +2605,7 @@ requires-dist = [
     { name = "tqdm", marker = "extra == 'dev'" },
     { name = "tqdm", marker = "extra == 'lts'" },
     { name = "transformer-engine", extras = ["core-cu13", "pytorch"], marker = "extra == 'dev'", git = "https://github.com/NVIDIA/TransformerEngine.git?rev=c6853b65b7177ab3785c48c130166ec3f9324c46" },
+    { name = "transformers", specifier = ">=4.57.6" },
     { name = "transformers", marker = "extra == 'mlm'" },
     { name = "wandb", marker = "extra == 'mlm'" },
     { name = "wget", marker = "extra == 'dev'" },

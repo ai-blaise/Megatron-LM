@@ -2794,9 +2794,42 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             and getattr(self.config, 'flash_adamw_eco', False)
         )
 
-        quantize_param_shard(
-            fp8_model_params, fp8_main_params, fp8_offsets, self.data_parallel_group
-        )
+        # ECO requires stochastic rounding on the master-weight cast so
+        # sub-ULP updates accumulate in expectation (ECO paper §3.3). TE's
+        # deterministic round-to-nearest drops every such update. We route
+        # the ECO path through an SR-equipped cast that adds block-aware
+        # uniform dither before the final pack; mathematically equivalent
+        # to SR in the dominant |x_scaled| <= 2 NVFP4 regime.
+        if eco_enabled and any(is_nvfp4tensor(p) for p in fp8_model_params):
+            from .nvfp4_sr import cast_master_weights_to_nvfp4_2d_sr
+
+            nvfp4_sr_params = []
+            other_model = []
+            other_main = []
+            other_off = []
+            for model_p, main_p, off in zip(
+                fp8_model_params, fp8_main_params, fp8_offsets
+            ):
+                if is_nvfp4tensor(model_p):
+                    # (model_weight, master_weight, start_offset, fragment)
+                    nvfp4_sr_params.append((model_p, main_p, off, None))
+                else:
+                    other_model.append(model_p)
+                    other_main.append(main_p)
+                    other_off.append(off)
+            if other_model:
+                quantize_param_shard(
+                    other_model, other_main, other_off, self.data_parallel_group
+                )
+            cast_master_weights_to_nvfp4_2d_sr(
+                nvfp4_sr_params, self.data_parallel_group,
+                manual_post_all_gather_processing=True,
+            )
+        else:
+            quantize_param_shard(
+                fp8_model_params, fp8_main_params, fp8_offsets,
+                self.data_parallel_group,
+            )
 
         if eco_enabled:
             self._inject_nvfp4_eco_errors(

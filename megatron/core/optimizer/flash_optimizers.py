@@ -2228,6 +2228,7 @@ class FlashAdam(FlashOptimizer):
         exp_avg = param_state["exp_avg"]
         exp_avg_sq = param_state["exp_avg_sq"]
 
+
         _fused_eco_inject(
             mom=exp_avg.kernel_tensor,
             mom_scales_f16=exp_avg.kernel_scales_or_self,

@@ -16,8 +16,16 @@ MEGATRON_DIR="${SCRIPT_DIR}/../.."
 cd ${MEGATRON_DIR}
 
 OPTIMIZER=${OPTIMIZER:-adam}
+USE_ECO=${USE_ECO:-1}
 
-CHECKPOINT_PATH=${1:-"$HOME/checkpoints/sft_llama_nvfp4_minimal_${OPTIMIZER}"}
+# Suffix so ECC and ECO flash_adamw runs don't share a checkpoint dir.
+if [[ "$OPTIMIZER" == "flash_adamw" ]]; then
+    RUN_TAG="${OPTIMIZER}_$([[ "$USE_ECO" == "1" ]] && echo eco || echo ecc)"
+else
+    RUN_TAG="$OPTIMIZER"
+fi
+
+CHECKPOINT_PATH=${1:-"$HOME/checkpoints/sft_llama_nvfp4_minimal_${RUN_TAG}"}
 TENSORBOARD_LOGS_PATH=${2:-"$HOME/tensorboard_logs/sft_llama_nvfp4_minimal"}
 
 mkdir -p "$(dirname "$CHECKPOINT_PATH")"
@@ -101,11 +109,13 @@ MODEL_PARALLEL_ARGS=(
 # ======================
 # Training Args
 # ======================
+TRAIN_ITERS=${TRAIN_ITERS:-200}
+
 TRAINING_ARGS=(
     --optimizer $OPTIMIZER
     --micro-batch-size 1
     --global-batch-size 32
-    --train-iters 8
+    --train-iters $TRAIN_ITERS
     --lr 3e-5
     --min-lr 1e-6
     --lr-decay-style cosine
@@ -134,8 +144,6 @@ DTYPE_ARGS=(
 # Optimizer-specific args
 # flash_adamw and --use-precision-aware-optimizer are mutually exclusive.
 # ======================
-USE_ECO=${USE_ECO:-1}
-
 OPTIM_EXTRA_ARGS=()
 if [[ "$OPTIMIZER" == "flash_adamw" ]]; then
     if [[ "$USE_ECO" == "1" ]]; then
@@ -158,12 +166,14 @@ fi
 SFT_ARGS=()
 
 # ======================
-# Data Args (mock-data for smoke test)
+# Data Args — wikitext-103 tokenized with Llama 3.2 tokenizer
+# (byte-identical BPE to Llama 3.1-8B, non-gated)
 # ======================
+DATA_PATH=${DATA_PATH:-"$HOME/datasets/wikitext/wikitext103_llama3_text_document"}
 DATA_ARGS=(
-    --mock-data
-    --tokenizer-type NullTokenizer
-    --vocab-size 128256
+    --data-path $DATA_PATH
+    --tokenizer-type HuggingFaceTokenizer
+    --tokenizer-model meta-llama/Llama-3.2-1B
     --split '999,1,0'
     --num-workers 1
 )
