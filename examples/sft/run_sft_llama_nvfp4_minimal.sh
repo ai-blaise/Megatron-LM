@@ -78,7 +78,7 @@ TRAINING_ARGS=(
     --seq-length 8192
     --max-position-embeddings 8192
     --bf16
-    --log-interval 10
+    --log-interval 1
     --use-distributed-optimizer
     --overlap-grad-reduce
     --overlap-param-gather
@@ -128,7 +128,18 @@ TENSORBOARD_ARGS=(
     --tensorboard-dir "$TENSORBOARD_LOGS_PATH"
     --log-throughput
     --log-memory-to-tensorboard
-    --tensorboard-log-interval 10
+    --tensorboard-log-interval 1
+)
+
+# ======================
+# PyTorch Profiler (Chrome trace)
+# ======================
+PROFILING_ARGS=(
+    --profile
+    --use-pytorch-profiler
+    --profile-step-start 3
+    --profile-step-end 5
+    --profile-ranks 0
 )
 
 # ======================
@@ -153,4 +164,5 @@ torchrun ${DISTRIBUTED_ARGS[@]} \
     ${SFT_ARGS[@]} \
     ${DATA_ARGS[@]} \
     ${TENSORBOARD_ARGS[@]} \
+    ${PROFILING_ARGS[@]} \
     ${CKPT_ARGS[@]}

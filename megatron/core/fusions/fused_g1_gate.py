@@ -1,18 +1,21 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+
+# NOTE: I am going to add a lot of comments here for me to understand what the hell is going on.
+# We can remove these later
 import os
 import torch
 
 _g1_gate_cuda = None
 
-
+# NOTE: lazy load in the kernels
 def _load_kernel():
     """JIT-compile the G1 gate CUDA kernel on first use."""
     global _g1_gate_cuda
     if _g1_gate_cuda is not None:
         return _g1_gate_cuda
 
-    from torch.utils.cpp_extension import load
+    from torch.utils.cpp_extension import load # NOTE: I do not know why we ahve an import error here...
 
     kernel_dir = os.path.dirname(os.path.abspath(__file__))
     _g1_gate_cuda = load(
@@ -24,9 +27,10 @@ def _load_kernel():
         extra_cuda_cflags=["-O3", "--use_fast_math"],
         verbose=False,
     )
-    return _g1_gate_cuda
+    return _g1_gate_cuda # NOTE: I see this is where we actually return the cuda implementation and then can be used later
 
-
+# NOTE: This function is extremely important.
+# this is where the forward kernel is called 
 def _g1_gate_fwd(linear_out: torch.Tensor, attn_out: torch.Tensor):
     """Launch the fused G1 gate forward kernel.
 
@@ -44,9 +48,6 @@ def _g1_gate_fwd(linear_out: torch.Tensor, attn_out: torch.Tensor):
     assert linear_out.dtype == torch.bfloat16, f"Expected bf16, got {linear_out.dtype}"
     assert attn_out.dtype == torch.bfloat16, f"Expected bf16, got {attn_out.dtype}"
     assert linear_out.shape == attn_out.shape, "Shape mismatch"
-
-    linear_out = linear_out.contiguous()
-    attn_out = attn_out.contiguous()
 
     output = torch.empty_like(attn_out)
     gate = torch.empty_like(linear_out)
@@ -87,7 +88,9 @@ class G1GateFunction(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, linear_out, attn_out):
-        output, gate = _g1_gate_fwd(linear_out, attn_out)
+        linear_out = linear_out.contiguous()
+        attn_out = attn_out.contiguous()
+        output, gate = _g1_gate_fwd(linear_out, attn_out) # NOTE: this is where the forward pass is called 
         ctx.save_for_backward(attn_out, gate)
         return output
 
