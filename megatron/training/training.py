@@ -1785,8 +1785,76 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
     # Update parameters.
 
+    optimizer_probe = os.getenv("MEGATRON_OPTIMIZER_STEP_PROBE", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    optimizer_probe_start = None
+    optimizer_probe_alloc_before = None
+    optimizer_probe_reserved_before = None
+    if optimizer_probe:
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        optimizer_probe_alloc_before = torch.cuda.memory_allocated()
+        optimizer_probe_reserved_before = torch.cuda.memory_reserved()
+        optimizer_probe_start = time.perf_counter()
+
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+
+    if optimizer_probe:
+        torch.cuda.synchronize()
+        optimizer_probe_elapsed_ms = (time.perf_counter() - optimizer_probe_start) * 1000.0
+        optimizer_probe_alloc_after = torch.cuda.memory_allocated()
+        optimizer_probe_reserved_after = torch.cuda.memory_reserved()
+        optimizer_probe_peak_alloc = torch.cuda.max_memory_allocated()
+        optimizer_probe_peak_reserved = torch.cuda.max_memory_reserved()
+        mega_bytes = 1024.0 * 1024.0
+        optimizer_probe_stats = torch.tensor(
+            [
+                optimizer_probe_elapsed_ms,
+                optimizer_probe_alloc_before / mega_bytes,
+                optimizer_probe_peak_alloc / mega_bytes,
+                optimizer_probe_alloc_after / mega_bytes,
+                (optimizer_probe_alloc_after - optimizer_probe_alloc_before) / mega_bytes,
+                optimizer_probe_reserved_before / mega_bytes,
+                optimizer_probe_peak_reserved / mega_bytes,
+                optimizer_probe_reserved_after / mega_bytes,
+                (optimizer_probe_reserved_after - optimizer_probe_reserved_before) / mega_bytes,
+            ],
+            dtype=torch.float64,
+            device=torch.cuda.current_device(),
+        )
+        optimizer_probe_min = optimizer_probe_stats.clone()
+        optimizer_probe_max = optimizer_probe_stats.clone()
+        torch.distributed.all_reduce(
+            optimizer_probe_min, op=torch.distributed.ReduceOp.MIN
+        )
+        torch.distributed.all_reduce(
+            optimizer_probe_max, op=torch.distributed.ReduceOp.MAX
+        )
+        print_rank_0(
+            "[optimizer probe] iteration {:7d} | elapsed ms min/max: {:.2f}/{:.2f} "
+            "| allocated MB before/peak/after max: {:.2f}/{:.2f}/{:.2f} "
+            "| allocated delta MB min/max: {:.2f}/{:.2f} "
+            "| reserved MB before/peak/after max: {:.2f}/{:.2f}/{:.2f} "
+            "| reserved delta MB min/max: {:.2f}/{:.2f}".format(
+                (iteration + 1) if iteration is not None else 0,
+                optimizer_probe_min[0].item(),
+                optimizer_probe_max[0].item(),
+                optimizer_probe_max[1].item(),
+                optimizer_probe_max[2].item(),
+                optimizer_probe_max[3].item(),
+                optimizer_probe_min[4].item(),
+                optimizer_probe_max[4].item(),
+                optimizer_probe_max[5].item(),
+                optimizer_probe_max[6].item(),
+                optimizer_probe_max[7].item(),
+                optimizer_probe_min[8].item(),
+                optimizer_probe_max[8].item(),
+            )
+        )
 
     # get max attention logit for logging and run clip_qk()
     # Part of MuonClip Optimizer step

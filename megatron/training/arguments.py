@@ -78,6 +78,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_workload_inspector_server_args(parser)
     parser = _add_inference_args(parser)
     parser = _add_transformer_engine_args(parser)
+    parser = _add_spinquant_args(parser)
     parser = _add_experimental_args(parser)
     parser = _add_one_logger_args(parser)
     parser = _add_inprocess_restart_args(parser)
@@ -973,6 +974,21 @@ def validate_args(args, defaults={}):
             raise ValueError(
                 "--fp4-format requires Transformer Engine >= 2.7.0.dev0 for NVFP4BlockScaling support."
             )
+
+    if args.spinquant:
+        if args.spinquant_mode == "loaded" and args.spinquant_rotation_path is None:
+            raise ValueError("--spinquant-mode loaded requires --spinquant-rotation-path.")
+        for name in (
+            "spinquant_w_bits",
+            "spinquant_a_bits",
+            "spinquant_k_bits",
+            "spinquant_v_bits",
+        ):
+            value = getattr(args, name)
+            if value <= 0 or value > 16:
+                raise ValueError(f"--{name.replace('_', '-')} must be in [1, 16], got {value}.")
+        if args.spinquant_a_bits < 16 and not args.fp4:
+            raise ValueError("SpinQuant A<16 validation requires --fp4-format for activation FP4.")
 
     if (
         args.fp8_recipe == "mxfp8"
@@ -1983,6 +1999,72 @@ def _add_transformer_engine_args(parser):
     return parser
 
 
+def _add_spinquant_args(parser):
+    group = parser.add_argument_group(title="spinquant")
+    group.add_argument(
+        "--spinquant",
+        action="store_true",
+        default=False,
+        help="Enable SpinQuant rotation and quantization hooks.",
+    )
+    group.add_argument(
+        "--spinquant-mode",
+        type=str,
+        default="random",
+        choices=["random", "loaded", "identity"],
+        help="SpinQuant rotation source. Use 'loaded' with --spinquant-rotation-path.",
+    )
+    group.add_argument(
+        "--spinquant-rotation-path",
+        type=str,
+        default=None,
+        help="Path to optimized SpinQuant rotation matrices.",
+    )
+    group.add_argument(
+        "--spinquant-w-bits",
+        type=int,
+        default=4,
+        help="Target SpinQuant weight bit width.",
+    )
+    group.add_argument(
+        "--spinquant-a-bits",
+        type=int,
+        default=4,
+        help="Target SpinQuant activation bit width.",
+    )
+    group.add_argument(
+        "--spinquant-k-bits",
+        type=int,
+        default=4,
+        help="Target SpinQuant key-cache bit width.",
+    )
+    group.add_argument(
+        "--spinquant-v-bits",
+        type=int,
+        default=4,
+        help="Target SpinQuant value-cache bit width.",
+    )
+    group.add_argument(
+        "--spinquant-k-groupsize",
+        type=int,
+        default=-1,
+        help="Token-wise key quantization group size over head_dim. -1 uses full head_dim.",
+    )
+    group.add_argument(
+        "--spinquant-v-groupsize",
+        type=int,
+        default=-1,
+        help="Token-wise value quantization group size over head_dim. -1 uses full head_dim.",
+    )
+    group.add_argument(
+        "--spinquant-kv-asym",
+        action="store_false",
+        dest="spinquant_kv_sym",
+        help="Use asymmetric token-wise K/V quantization instead of symmetric quantization.",
+    )
+    return parser
+
+
 def _add_inference_args(parser):
     group = parser.add_argument_group(title="inference")
 
@@ -2291,6 +2373,16 @@ def _add_network_size_args(parser):
         "persist_layer_norm",
         "bias_dropout_fusion",
         "apply_rope_fusion",
+        "spinquant",
+        "spinquant_mode",
+        "spinquant_rotation_path",
+        "spinquant_w_bits",
+        "spinquant_a_bits",
+        "spinquant_k_bits",
+        "spinquant_v_bits",
+        "spinquant_k_groupsize",
+        "spinquant_v_groupsize",
+        "spinquant_kv_sym",
     ]
     transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
     transformer_group = transformer_factory.build_group(

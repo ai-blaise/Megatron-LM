@@ -1131,6 +1131,18 @@ class Attention(MegatronModule, ABC):
             # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
         nvtx_range_pop(suffix="rotary_pos_emb")
 
+        if (
+            split_qkv
+            and getattr(self.config, "spinquant", False)
+            and (
+                getattr(self.config, "spinquant_k_bits", 16) < 16
+                or getattr(self.config, "spinquant_v_bits", 16) < 16
+            )
+        ):
+            from megatron.core.quantization.spinquant import quantize_kv_cache_tokenwise
+
+            key, value = quantize_kv_cache_tokenwise(key, value, self.config)
+
         # ==================================
         # core attention computation
         # ==================================

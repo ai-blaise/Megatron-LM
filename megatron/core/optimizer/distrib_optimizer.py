@@ -1015,7 +1015,19 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         else:
             main_param = self.optimizer.param_groups[group_index]["params"][group_order]
             optim_state = self.optimizer.state[main_param]
-            tensors = {"param": main_param}
+            # FlashAdamW+ECO+NVFP4 has no persistent main/master param shard.
+            # The optimizer state key is the full logical NVFP4 model param,
+            # whose shape does not match the DP-local shard expected by
+            # distributed optimizer checkpointing. Save only shard-sized
+            # optimizer states; model weights are checkpointed separately.
+            if (
+                self.config.optimizer == 'flash_adamw'
+                and getattr(self.config, 'flash_adamw_eco', False)
+                and is_nvfp4tensor(model_param)
+            ):
+                tensors = {}
+            else:
+                tensors = {"param": main_param}
             for k, v in optim_state.items():
                 if isinstance(v, torch.Tensor):
                     tensors[k] = v
@@ -1058,8 +1070,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         else:
             main_param = self.optimizer.param_groups[group_index]["params"][group_order]
             optim_state = self.optimizer.state[main_param]
-            # Copy the main param.
-            main_param.copy_(tensors["param"])
+            # Copy the main param when one exists. FlashAdamW+ECO+NVFP4 does
+            # not checkpoint a persistent main param.
+            if "param" in tensors:
+                main_param.copy_(tensors["param"])
             # Copy optimizer states, handling both plain tensors and
             # FlashAdamW's _MaybeQuantizedTensor (which uses set_data to re-quantize).
             for k, v in optim_state.items():

@@ -17,6 +17,13 @@ cd ${MEGATRON_DIR}
 
 OPTIMIZER=${OPTIMIZER:-adam}
 USE_ECO=${USE_ECO:-1}
+PROBE_OPTIMIZER=${PROBE_OPTIMIZER:-0}
+if [[ "$PROBE_OPTIMIZER" == "1" ]]; then
+    export MEGATRON_OPTIMIZER_STEP_PROBE=1
+fi
+SPINQUANT=${SPINQUANT:-0}
+SPINQUANT_MODE=${SPINQUANT_MODE:-random}
+SPINQUANT_ROTATION_PATH=${SPINQUANT_ROTATION_PATH:-}
 
 # Suffix so ECC and ECO flash_adamw runs don't share a checkpoint dir.
 if [[ "$OPTIMIZER" == "flash_adamw" ]]; then
@@ -141,6 +148,24 @@ DTYPE_ARGS=(
 )
 
 # ======================
+# SpinQuant
+# ======================
+SPINQUANT_ARGS=()
+if [[ "$SPINQUANT" == "1" ]]; then
+    SPINQUANT_ARGS+=(
+        --spinquant
+        --spinquant-mode "$SPINQUANT_MODE"
+        --spinquant-w-bits 4
+        --spinquant-a-bits 4
+        --spinquant-k-bits 4
+        --spinquant-v-bits 4
+    )
+    if [[ -n "$SPINQUANT_ROTATION_PATH" ]]; then
+        SPINQUANT_ARGS+=(--spinquant-rotation-path "$SPINQUANT_ROTATION_PATH")
+    fi
+fi
+
+# ======================
 # Optimizer-specific args
 # flash_adamw and --use-precision-aware-optimizer are mutually exclusive.
 # ======================
@@ -207,6 +232,7 @@ uv run torchrun ${DISTRIBUTED_ARGS[@]} \
     ${MODEL_PARALLEL_ARGS[@]} \
     ${TRAINING_ARGS[@]} \
     ${DTYPE_ARGS[@]} \
+    ${SPINQUANT_ARGS[@]} \
     ${OPTIM_EXTRA_ARGS[@]} \
     ${SFT_ARGS[@]} \
     ${DATA_ARGS[@]} \

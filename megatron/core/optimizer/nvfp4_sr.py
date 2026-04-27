@@ -8,14 +8,14 @@ expectation. TE's batched master-weight cast does round-to-nearest only.
 
 This module reproduces TE's ``_cast_master_weights_to_nvfp4_2d`` pipeline
 (per-block amax, cross-rank all-reduce, global scale, per-block decode
-scale, final 4-bit pack) but inserts a block-aware uniform dither on the
-master shards before the final pack. In the dominant |x_scaled| <= 2
+scale, final 4-bit pack) but inserts a block-aware uniform dither on transient
+cast shards before the final pack. In the dominant |x_scaled| <= 2
 regime the NVFP4 grid is uniform (gap = 0.5), so pre-dither + round-to-
 nearest is statistically identical to SR.
 
-The dither is strictly in-place on the master shard, which is acceptable
-because the ECO path uses a transient master (``_fa_updated_shard``) that
-is discarded after the cast.
+The original transient master shard is preserved so ECO can inject the true
+error ``theta - q_sr(theta)`` rather than including the sampled dither in the
+error term.
 """
 
 from typing import List, Optional, Tuple, Any
@@ -60,7 +60,7 @@ def _triton_block_dither_kernel(
     BLOCK_SIZE: tl.constexpr,
     DITHER_COEF: tl.constexpr,
 ):
-    """Add block-aware uniform dither to master in-place.
+    """Add block-aware uniform dither to a cast shard in-place.
 
     For each element e at flat position p = shard_start_offset + offs:
       tile = (p // full_w // 16, p % full_w // 16)
@@ -253,18 +253,16 @@ def cast_master_weights_to_nvfp4_2d_sr(
     fused_scale_tile_cols_list: List[int] = []
     fused_scale_rows_padded_list: List[int] = []
 
-    partial_cast_inp_list: List[torch.Tensor] = []
-    partial_cast_out_list: List[torch.Tensor] = []
-    partial_cast_scale_list: List[torch.Tensor] = []
-    partial_cast_global_scale_list: List[torch.Tensor] = []
-    partial_cast_h_list: List[int] = []
-    partial_cast_w_list: List[int] = []
-    partial_cast_start_offset_list: List[int] = []
-
-    # Also remember per-tensor ingredients needed by the dither kernel.
+    # Per-tensor ingredients needed by the dither + cast path. We keep the
+    # original master shard undithered for ECO, and use a one-at-a-time scratch
+    # shard for SR so peak memory only includes the largest cast shard.
     dither_master_list: List[torch.Tensor] = []
+    dither_out_list: List[torch.Tensor] = []
+    dither_scale_list: List[torch.Tensor] = []
+    dither_global_scale_list: List[torch.Tensor] = []
     dither_decode_scale_list: List[torch.Tensor] = []
     dither_inv_global_scale_list: List[float] = []
+    dither_h_list: List[int] = []
     dither_full_w_list: List[int] = []
     dither_start_offset_list: List[int] = []
 
@@ -315,17 +313,13 @@ def cast_master_weights_to_nvfp4_2d_sr(
                 model_weight_fragment = rowwise_bytes[byte_start:byte_end]
             h, w = model_weight.shape
 
-            partial_cast_inp_list.append(master_weight)
-            partial_cast_out_list.append(model_weight_fragment)
-            partial_cast_scale_list.append(per_block_decode_scale)
-            partial_cast_global_scale_list.append(global_scale)
-            partial_cast_h_list.append(h)
-            partial_cast_w_list.append(w)
-            partial_cast_start_offset_list.append(start_offset)
-
             dither_master_list.append(master_weight)
+            dither_out_list.append(model_weight_fragment)
+            dither_scale_list.append(per_block_decode_scale)
+            dither_global_scale_list.append(global_scale)
             dither_decode_scale_list.append(per_block_decode_scale)
             dither_inv_global_scale_list.append(1.0 / float(global_scale.item()))
+            dither_h_list.append(h)
             dither_full_w_list.append(w)
             dither_start_offset_list.append(start_offset)
 
@@ -343,35 +337,52 @@ def cast_master_weights_to_nvfp4_2d_sr(
             block_len,
         )
 
-    # ---- Insert stochastic-rounding dither on master shards --------------
+    # ---- Insert stochastic-rounding dither on scratch shards and cast them.
     base_seed = _next_dither_seed()
-    for i, (master, dscale, inv_gs, full_w, offset) in enumerate(
+    for i, (
+        master,
+        out,
+        scale,
+        global_scale,
+        dscale,
+        inv_gs,
+        h,
+        full_w,
+        offset,
+    ) in enumerate(
         zip(
             dither_master_list,
+            dither_out_list,
+            dither_scale_list,
+            dither_global_scale_list,
             dither_decode_scale_list,
             dither_inv_global_scale_list,
+            dither_h_list,
             dither_full_w_list,
             dither_start_offset_list,
         )
     ):
+        # ECO needs the undithered updated weight for error injection:
+        #   error = theta - q_sr(theta)
+        # Apply dither to a transient cast shard only, then discard it after TE
+        # packs it into the NVFP4 model weight.
+        sr_cast_weight = master.clone()
         _apply_block_dither(
-            master=master,
+            master=sr_cast_weight,
             decode_scale=dscale,
             inv_global_scale=inv_gs,
             full_w=full_w,
             start_offset=offset,
             seed=(base_seed + i) & 0x7FFFFFFF,
         )
-
-    # ---- Final deterministic round-to-nearest pack (now SR in expectation).
-    if partial_cast_inp_list:
         tex.nvfp4_multi_tensor_2d_partial_cast(
-            partial_cast_inp_list,
-            partial_cast_out_list,
-            partial_cast_scale_list,
-            partial_cast_global_scale_list,
-            partial_cast_h_list,
-            partial_cast_w_list,
-            partial_cast_start_offset_list,
+            [sr_cast_weight],
+            [out],
+            [scale],
+            [global_scale],
+            [h],
+            [full_w],
+            [offset],
             block_len,
         )
+        del sr_cast_weight

@@ -551,6 +551,39 @@ class TransformerConfig(ModelParallelConfig):
     Required when fp4_recipe is custom."""
 
     ####################
+    # SpinQuant related
+    ####################
+    spinquant: bool = False
+    """Enable SpinQuant rotation/quantization hooks."""
+
+    spinquant_mode: Literal['random', 'loaded', 'identity'] = 'random'
+    """Rotation source for SpinQuant. ``loaded`` reads matrices from spinquant_rotation_path."""
+
+    spinquant_rotation_path: Optional[str] = None
+    """Path to optimized SpinQuant rotation matrices."""
+
+    spinquant_w_bits: int = 4
+    """Target weight bit width for SpinQuant validation/conversion."""
+
+    spinquant_a_bits: int = 4
+    """Target activation bit width for SpinQuant validation."""
+
+    spinquant_k_bits: int = 4
+    """Target key-cache bit width for SpinQuant validation."""
+
+    spinquant_v_bits: int = 4
+    """Target value-cache bit width for SpinQuant validation."""
+
+    spinquant_k_groupsize: int = -1
+    """Token-wise key quantization group size over head_dim. -1 means the full head_dim."""
+
+    spinquant_v_groupsize: int = -1
+    """Token-wise value quantization group size over head_dim. -1 means the full head_dim."""
+
+    spinquant_kv_sym: bool = True
+    """Use symmetric token-wise K/V quantization."""
+
+    ####################
     # MoE related
     ####################
     moe_shared_expert_intermediate_size: Optional[int] = None
