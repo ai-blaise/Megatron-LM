@@ -412,6 +412,30 @@ def _get_megatron_optimizer_based_on_param_groups(
                             else:
                                 opt.initialize_state(p)
 
+        elif config.optimizer == 'flash_adamw':
+            from .flash_optimizers import FlashAdamW
+
+            # ECO eliminates master weights via error feedback through momentum.
+            # Without ECO, ECC provides 24-bit effective precision from BF16+int8.
+            master_bits = None if config.flash_adamw_eco else 24
+            optimizer = FlashAdamW(
+                params=param_groups,
+                lr=config.lr,
+                betas=(config.adam_beta1, config.adam_beta2),
+                eps=config.adam_eps,
+                weight_decay=config.weight_decay,
+                quantize=config.flash_adamw_quantize,
+                master_weight_bits=master_bits,
+                fused=config.flash_adamw_fused,
+                eco=config.flash_adamw_eco,
+            )
+
+            def init_state_fn(opt, config=None):
+                for group in opt.param_groups:
+                    for p in group['params']:
+                        if len(opt.state[p]) == 0:
+                            opt._ensure_state_initialized(p, hparams=group)
+
         elif config.optimizer == 'sgd':
             optimizer = SGD(
                 param_groups,
@@ -689,7 +713,7 @@ def get_megatron_optimizer(
 
     # TODO: the standard and emerging optimizer paths handle pg_collection differently;
     # unify them so both use a single pg_collection-based flow.
-    if config.optimizer not in ('adam', 'sgd'):
+    if config.optimizer not in ('adam', 'sgd', 'flash_adamw'):
         return _get_megatron_emerging_optimizer(
             config=config,
             model_chunks=model_chunks,

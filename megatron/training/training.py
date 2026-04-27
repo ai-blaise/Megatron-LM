@@ -1617,6 +1617,27 @@ def setup_model_and_optimizer(
         if args.fp16:
             optimizer.reload_model_params()
 
+    if getattr(args, "spinquant", False) and getattr(args, "spinquant_fuse_weights", False):
+        if args.iteration == 0:
+            from megatron.core.quantization.spinquant import fuse_spinquant_weights
+
+            timers('spinquant-fuse-weights', log_level=0).start(barrier=True)
+            stats = fuse_spinquant_weights(unwrapped_model, get_model_config(unwrapped_model[0]))
+            timers('spinquant-fuse-weights').stop(barrier=True)
+            timers.log(['spinquant-fuse-weights'])
+            print_rank_0(
+                "SpinQuant fused rotations into weights: "
+                f"qkv={stats.attention_qkv}, attn_out={stats.attention_out}, "
+                f"mlp_fc1={stats.mlp_fc1}, mlp_fc2={stats.mlp_fc2}, skipped={stats.skipped}"
+            )
+            if optimizer is not None:
+                optimizer.reload_model_params()
+        else:
+            print_rank_0(
+                "Skipping SpinQuant weight fusion on nonzero checkpoint iteration "
+                f"{args.iteration}; assuming rotations were already fused."
+            )
+
     # Convert checkpoint format.
     if args.ckpt_convert_format is not None:
         load_ckpt_format = args.ckpt_format
@@ -1785,8 +1806,76 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
     # Update parameters.
 
+    optimizer_probe = os.getenv("MEGATRON_OPTIMIZER_STEP_PROBE", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    optimizer_probe_start = None
+    optimizer_probe_alloc_before = None
+    optimizer_probe_reserved_before = None
+    if optimizer_probe:
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        optimizer_probe_alloc_before = torch.cuda.memory_allocated()
+        optimizer_probe_reserved_before = torch.cuda.memory_reserved()
+        optimizer_probe_start = time.perf_counter()
+
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+
+    if optimizer_probe:
+        torch.cuda.synchronize()
+        optimizer_probe_elapsed_ms = (time.perf_counter() - optimizer_probe_start) * 1000.0
+        optimizer_probe_alloc_after = torch.cuda.memory_allocated()
+        optimizer_probe_reserved_after = torch.cuda.memory_reserved()
+        optimizer_probe_peak_alloc = torch.cuda.max_memory_allocated()
+        optimizer_probe_peak_reserved = torch.cuda.max_memory_reserved()
+        mega_bytes = 1024.0 * 1024.0
+        optimizer_probe_stats = torch.tensor(
+            [
+                optimizer_probe_elapsed_ms,
+                optimizer_probe_alloc_before / mega_bytes,
+                optimizer_probe_peak_alloc / mega_bytes,
+                optimizer_probe_alloc_after / mega_bytes,
+                (optimizer_probe_alloc_after - optimizer_probe_alloc_before) / mega_bytes,
+                optimizer_probe_reserved_before / mega_bytes,
+                optimizer_probe_peak_reserved / mega_bytes,
+                optimizer_probe_reserved_after / mega_bytes,
+                (optimizer_probe_reserved_after - optimizer_probe_reserved_before) / mega_bytes,
+            ],
+            dtype=torch.float64,
+            device=torch.cuda.current_device(),
+        )
+        optimizer_probe_min = optimizer_probe_stats.clone()
+        optimizer_probe_max = optimizer_probe_stats.clone()
+        torch.distributed.all_reduce(
+            optimizer_probe_min, op=torch.distributed.ReduceOp.MIN
+        )
+        torch.distributed.all_reduce(
+            optimizer_probe_max, op=torch.distributed.ReduceOp.MAX
+        )
+        print_rank_0(
+            "[optimizer probe] iteration {:7d} | elapsed ms min/max: {:.2f}/{:.2f} "
+            "| allocated MB before/peak/after max: {:.2f}/{:.2f}/{:.2f} "
+            "| allocated delta MB min/max: {:.2f}/{:.2f} "
+            "| reserved MB before/peak/after max: {:.2f}/{:.2f}/{:.2f} "
+            "| reserved delta MB min/max: {:.2f}/{:.2f}".format(
+                (iteration + 1) if iteration is not None else 0,
+                optimizer_probe_min[0].item(),
+                optimizer_probe_max[0].item(),
+                optimizer_probe_max[1].item(),
+                optimizer_probe_max[2].item(),
+                optimizer_probe_max[3].item(),
+                optimizer_probe_min[4].item(),
+                optimizer_probe_max[4].item(),
+                optimizer_probe_max[5].item(),
+                optimizer_probe_max[6].item(),
+                optimizer_probe_max[7].item(),
+                optimizer_probe_min[8].item(),
+                optimizer_probe_max[8].item(),
+            )
+        )
 
     # get max attention logit for logging and run clip_qk()
     # Part of MuonClip Optimizer step
@@ -2740,6 +2829,12 @@ def train(
         with one_logger.get_context_manager():
             one_logger.store_set('get_e2e_base_metrics', get_e2e_base_metrics)
 
+    # Enable CUDA memory history recording so that _snapshot() captures full
+    # allocation/free timeline with stack traces, not just a point-in-time map.
+    # Scoped to last rank to match the snapshot dump guard at line ~2097.
+    if args.record_memory_history and (is_last_rank() or torch.distributed.get_backend() == 'fake'):
+        torch.cuda.memory._record_memory_history(max_entries=100000)
+
     prof = None
     nsys_nvtx_context = None # reference to context for nsys profiling, so it can be cleaned up
     if (
@@ -3161,6 +3256,10 @@ def train(
         if getattr(args, 'perform_rl_step', False):
             rl_utils.rl_inference_interface_shutdown()
         sys.exit(exit_code)
+
+    # Stop CUDA memory history recording if it was enabled.
+    if args.record_memory_history and (is_last_rank() or torch.distributed.get_backend() == 'fake'):
+        torch.cuda.memory._record_memory_history(enabled=None)
 
     return iteration, num_floating_point_operations_so_far
 

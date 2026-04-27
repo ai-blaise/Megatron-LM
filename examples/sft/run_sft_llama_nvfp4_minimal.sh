@@ -1,6 +1,10 @@
 #!/bin/bash
 # Multi-GPU NVFP4 + SFT + finetune smoke test
 # Single node - direct torchrun (no SLURM)
+#
+# Usage:
+#   OPTIMIZER=adam      ./run_sft_llama_nvfp4_minimal.sh   # TE FusedAdam + precision-aware (default)
+#   OPTIMIZER=flash_adamw ./run_sft_llama_nvfp4_minimal.sh # FlashAdamW
 
 set -e
 
@@ -11,16 +15,55 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MEGATRON_DIR="${SCRIPT_DIR}/../.."
 cd ${MEGATRON_DIR}
 
-CHECKPOINT_PATH=${1:-"$HOME/checkpoints/sft_llama_nvfp4_minimal"}
+OPTIMIZER=${OPTIMIZER:-adam}
+USE_ECO=${USE_ECO:-1}
+PROBE_OPTIMIZER=${PROBE_OPTIMIZER:-0}
+if [[ "$PROBE_OPTIMIZER" == "1" ]]; then
+    export MEGATRON_OPTIMIZER_STEP_PROBE=1
+fi
+SPINQUANT=${SPINQUANT:-0}
+SPINQUANT_MODE=${SPINQUANT_MODE:-random}
+SPINQUANT_ROTATION_PATH=${SPINQUANT_ROTATION_PATH:-}
+SPINQUANT_FUSE_WEIGHTS=${SPINQUANT_FUSE_WEIGHTS:-0}
+
+# Suffix so ECC and ECO flash_adamw runs don't share a checkpoint dir.
+if [[ "$OPTIMIZER" == "flash_adamw" ]]; then
+    RUN_TAG="${OPTIMIZER}_$([[ "$USE_ECO" == "1" ]] && echo eco || echo ecc)"
+else
+    RUN_TAG="$OPTIMIZER"
+fi
+
+CHECKPOINT_PATH=${1:-"$HOME/checkpoints/sft_llama_nvfp4_minimal_${RUN_TAG}"}
 TENSORBOARD_LOGS_PATH=${2:-"$HOME/tensorboard_logs/sft_llama_nvfp4_minimal"}
 
 mkdir -p "$(dirname "$CHECKPOINT_PATH")"
 mkdir -p "$TENSORBOARD_LOGS_PATH"
+mkdir -p snapshots
 
 # ======================
 # Environment variables for performance tuning
 # ======================
 export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
+# Single-node NVLink: override cluster-level NCCL env vars that assume
+# multi-node IB fabric.
+export NCCL_NET_PLUGIN=none
+export NCCL_IB_DISABLE=1
+export NCCL_NET="Socket"
+export NCCL_SOCKET_IFNAME=eth0
+unset NCCL_ALGO
+unset NCCL_PROTO
+unset NCCL_IB_HCA
+unset NCCL_NET_GDR_LEVEL
+unset NCCL_NET_GDR_READ
+unset NCCL_IB_GID_INDEX
+unset NCCL_IB_SPLIT_DATA_ON_QPS
+unset NCCL_IB_QPS_PER_CONNECTION
+unset NCCL_IB_AR_THRESHOLD
+unset NCCL_IB_PCI_RELAXED_ORDERING
+unset NCCL_IB_RETRY_CNT
+unset NCCL_IB_TIMEOUT
+unset NCCL_CROSS_NIC
+unset NCCL_TOPO_DUMP_FILE
 
 # ======================
 # Distributed Setup (single node multi-GPU)
@@ -30,7 +73,10 @@ MASTER_ADDR=${MASTER_ADDR:-localhost}
 MASTER_PORT=${MASTER_PORT:-6000}
 NODE_RANK=${NODE_RANK:-0}
 
+GPUS_PER_NODE=${GPUS_PER_NODE:-8}
+
 DISTRIBUTED_ARGS=(
+    --nproc_per_node $GPUS_PER_NODE
     --nnodes $NUM_NODES
     --node_rank $NODE_RANK
     --master_addr $MASTER_ADDR
@@ -71,21 +117,30 @@ MODEL_PARALLEL_ARGS=(
 # ======================
 # Training Args
 # ======================
+TRAIN_ITERS=${TRAIN_ITERS:-200}
+
 TRAINING_ARGS=(
+    --optimizer $OPTIMIZER
     --micro-batch-size 1
     --global-batch-size 32
-    --train-iters 5
+    --train-iters $TRAIN_ITERS
+    --lr 3e-5
+    --min-lr 1e-6
+    --lr-decay-style cosine
+    --lr-warmup-iters 2
     --seq-length 8192
     --max-position-embeddings 8192
     --bf16
-    --log-interval 10
+    --log-interval 1
+    --eval-iters 1
+    --eval-interval 1000
     --use-distributed-optimizer
     --overlap-grad-reduce
     --overlap-param-gather
 )
 
 # ======================
-# NVFP4 + Precision-Aware
+# NVFP4
 # ======================
 DTYPE_ARGS=(
     --fp4-format e2m1
@@ -93,42 +148,74 @@ DTYPE_ARGS=(
     --fp4-param-gather
 )
 
-PRECISION_AWARE_ARGS=(
-    --use-precision-aware-optimizer
-    --exp-avg-dtype bf16
-    --exp-avg-sq-dtype bf16
-)
+# ======================
+# SpinQuant
+# ======================
+SPINQUANT_ARGS=()
+if [[ "$SPINQUANT" == "1" ]]; then
+    SPINQUANT_ARGS+=(
+        --spinquant
+        --spinquant-mode "$SPINQUANT_MODE"
+        --spinquant-w-bits 4
+        --spinquant-a-bits 4
+        --spinquant-k-bits 4
+        --spinquant-v-bits 4
+    )
+    if [[ "$SPINQUANT_FUSE_WEIGHTS" == "1" ]]; then
+        SPINQUANT_ARGS+=(--spinquant-fuse-weights)
+    fi
+    if [[ -n "$SPINQUANT_ROTATION_PATH" ]]; then
+        SPINQUANT_ARGS+=(--spinquant-rotation-path "$SPINQUANT_ROTATION_PATH")
+    fi
+fi
 
 # ======================
-# SFT + finetune
+# Optimizer-specific args
+# flash_adamw and --use-precision-aware-optimizer are mutually exclusive.
 # ======================
-SFT_ARGS=(
-    --sft
-    --finetune
-    --sft-tokenizer-prompt-format nemotron-h-aligned
-)
+OPTIM_EXTRA_ARGS=()
+if [[ "$OPTIMIZER" == "flash_adamw" ]]; then
+    if [[ "$USE_ECO" == "1" ]]; then
+        # ECO: error-compensating optimization eliminates master weights by
+        # feeding FP32→NVFP4 quantization error back through momentum.
+        OPTIM_EXTRA_ARGS+=(--flash-adamw-eco)
+    fi
+else
+    OPTIM_EXTRA_ARGS+=(
+        --use-precision-aware-optimizer
+        --exp-avg-dtype bf16
+        --exp-avg-sq-dtype bf16
+    )
+fi
 
 # ======================
-# Data Args (mock-data for smoke test)
-# Uses mock-data mode to bypass tokenizer issues for quick smoke test
-# For real data with tokenizer, use run_sft.sh or run_sft_deepseek_nvfp4.sh
+# No SFT flags — our optimizer changes are orthogonal to data format.
+# Using standard pretrain with mock data for clean profiling.
 # ======================
+SFT_ARGS=()
+
+# ======================
+# Data Args — wikitext-103 tokenized with Llama 3.2 tokenizer
+# (byte-identical BPE to Llama 3.1-8B, non-gated)
+# ======================
+DATA_PATH=${DATA_PATH:-"$HOME/datasets/wikitext/wikitext103_llama3_text_document"}
 DATA_ARGS=(
-    --mock-data
-    --tokenizer-type NullTokenizer
-    --vocab-size 128256
-    --split '99,1,0'
+    --data-path $DATA_PATH
+    --tokenizer-type HuggingFaceTokenizer
+    --tokenizer-model meta-llama/Llama-3.2-1B
+    --split '999,1,0'
     --num-workers 1
 )
 
 # ======================
-# TensorBoard
+# Profiling + Logging
 # ======================
-TENSORBOARD_ARGS=(
-    --tensorboard-dir "$TENSORBOARD_LOGS_PATH"
+EVAL_AND_LOGGING_ARGS=(
+    --tensorboard-dir "${TENSORBOARD_LOGS_PATH}/${OPTIMIZER}"
     --log-throughput
     --log-memory-to-tensorboard
-    --tensorboard-log-interval 10
+    --record-memory-history
+    --memory-snapshot-path "snapshots/sft_nvfp4_${OPTIMIZER}.pickle"
 )
 
 # ======================
@@ -143,14 +230,15 @@ CKPT_ARGS=(
 # ======================
 # LAUNCH
 # ======================
-torchrun ${DISTRIBUTED_ARGS[@]} \
+uv run torchrun ${DISTRIBUTED_ARGS[@]} \
     pretrain_gpt.py \
     ${MODEL_ARGS[@]} \
     ${MODEL_PARALLEL_ARGS[@]} \
     ${TRAINING_ARGS[@]} \
     ${DTYPE_ARGS[@]} \
-    ${PRECISION_AWARE_ARGS[@]} \
+    ${SPINQUANT_ARGS[@]} \
+    ${OPTIM_EXTRA_ARGS[@]} \
     ${SFT_ARGS[@]} \
     ${DATA_ARGS[@]} \
-    ${TENSORBOARD_ARGS[@]} \
+    ${EVAL_AND_LOGGING_ARGS[@]} \
     ${CKPT_ARGS[@]}
