@@ -2062,6 +2062,12 @@ def _add_spinquant_args(parser):
         dest="spinquant_kv_sym",
         help="Use asymmetric token-wise K/V quantization instead of symmetric quantization.",
     )
+    group.add_argument(
+        "--spinquant-fuse-weights",
+        action="store_true",
+        default=False,
+        help="Fuse SpinQuant R1/R2 rotations into QKV/O and MLP weights before training.",
+    )
     return parser
 
 
@@ -2383,6 +2389,7 @@ def _add_network_size_args(parser):
         "spinquant_k_groupsize",
         "spinquant_v_groupsize",
         "spinquant_kv_sym",
+        "spinquant_fuse_weights",
     ]
     transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
     transformer_group = transformer_factory.build_group(

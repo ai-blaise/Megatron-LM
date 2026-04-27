@@ -583,6 +583,10 @@ class TransformerConfig(ModelParallelConfig):
     spinquant_kv_sym: bool = True
     """Use symmetric token-wise K/V quantization."""
 
+    spinquant_fuse_weights: bool = False
+    """Fuse SpinQuant R1/R2 rotations into QKV/O and MLP weights before training."""
+
+
     ####################
     # MoE related
     ####################

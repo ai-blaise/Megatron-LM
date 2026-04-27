@@ -1617,6 +1617,27 @@ def setup_model_and_optimizer(
         if args.fp16:
             optimizer.reload_model_params()
 
+    if getattr(args, "spinquant", False) and getattr(args, "spinquant_fuse_weights", False):
+        if args.iteration == 0:
+            from megatron.core.quantization.spinquant import fuse_spinquant_weights
+
+            timers('spinquant-fuse-weights', log_level=0).start(barrier=True)
+            stats = fuse_spinquant_weights(unwrapped_model, get_model_config(unwrapped_model[0]))
+            timers('spinquant-fuse-weights').stop(barrier=True)
+            timers.log(['spinquant-fuse-weights'])
+            print_rank_0(
+                "SpinQuant fused rotations into weights: "
+                f"qkv={stats.attention_qkv}, attn_out={stats.attention_out}, "
+                f"mlp_fc1={stats.mlp_fc1}, mlp_fc2={stats.mlp_fc2}, skipped={stats.skipped}"
+            )
+            if optimizer is not None:
+                optimizer.reload_model_params()
+        else:
+            print_rank_0(
+                "Skipping SpinQuant weight fusion on nonzero checkpoint iteration "
+                f"{args.iteration}; assuming rotations were already fused."
+            )
+
     # Convert checkpoint format.
     if args.ckpt_convert_format is not None:
         load_ckpt_format = args.ckpt_format

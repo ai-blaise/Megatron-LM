@@ -24,6 +24,7 @@ fi
 SPINQUANT=${SPINQUANT:-0}
 SPINQUANT_MODE=${SPINQUANT_MODE:-random}
 SPINQUANT_ROTATION_PATH=${SPINQUANT_ROTATION_PATH:-}
+SPINQUANT_FUSE_WEIGHTS=${SPINQUANT_FUSE_WEIGHTS:-0}
 
 # Suffix so ECC and ECO flash_adamw runs don't share a checkpoint dir.
 if [[ "$OPTIMIZER" == "flash_adamw" ]]; then
@@ -160,6 +161,9 @@ if [[ "$SPINQUANT" == "1" ]]; then
         --spinquant-k-bits 4
         --spinquant-v-bits 4
     )
+    if [[ "$SPINQUANT_FUSE_WEIGHTS" == "1" ]]; then
+        SPINQUANT_ARGS+=(--spinquant-fuse-weights)
+    fi
     if [[ -n "$SPINQUANT_ROTATION_PATH" ]]; then
         SPINQUANT_ARGS+=(--spinquant-rotation-path "$SPINQUANT_ROTATION_PATH")
     fi

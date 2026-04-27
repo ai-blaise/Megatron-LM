@@ -25,6 +25,9 @@ except (ImportError, ModuleNotFoundError):
     HAVE_TE_NVFP4 = False
 
 
+_ROTATION_CACHE: dict[tuple, object] = {}
+
+
 @dataclass
 class SpinQuantRotationSet:
     """Container for SpinQuant's learned/global rotations.
@@ -35,6 +38,17 @@ class SpinQuantRotationSet:
 
     r1: torch.Tensor | None
     r2_by_layer: dict[int, torch.Tensor]
+
+
+@dataclass
+class SpinQuantFusionStats:
+    """Counts of modules rotated by SpinQuant weight fusion."""
+
+    attention_qkv: int = 0
+    attention_out: int = 0
+    mlp_fc1: int = 0
+    mlp_fc2: int = 0
+    skipped: int = 0
 
 
 def _is_power_of_two(value: int) -> bool:
@@ -118,6 +132,259 @@ def load_rotation_set(path: str | Path, *, map_location="cpu") -> SpinQuantRotat
             if layer_idx is not None:
                 r2_by_layer[layer_idx] = value
     return SpinQuantRotationSet(r1=r1, r2_by_layer=r2_by_layer)
+
+
+def _rotation_cache_key(config, name: str, layer_idx: int, size: int, device, dtype) -> tuple:
+    path = getattr(config, "spinquant_rotation_path", None)
+    mode = getattr(config, "spinquant_mode", "random")
+    return (
+        name,
+        mode,
+        str(path) if path is not None else None,
+        layer_idx,
+        size,
+        str(device),
+        str(dtype),
+    )
+
+
+def _get_rotation_set(config) -> SpinQuantRotationSet:
+    path = getattr(config, "spinquant_rotation_path", None)
+    if path is None:
+        raise ValueError("SpinQuant loaded rotation mode requires spinquant_rotation_path.")
+    key = ("rotation_set", str(path))
+    cached = _ROTATION_CACHE.get(key)
+    if cached is None:
+        cached = load_rotation_set(path)
+        _ROTATION_CACHE[key] = cached
+    return cached
+
+
+def get_spinquant_r1(config, device, dtype) -> torch.Tensor | None:
+    """Return the global R1 rotation for SpinQuant weight fusion."""
+
+    mode = getattr(config, "spinquant_mode", "random")
+    if mode == "identity":
+        return None
+
+    hidden_size = getattr(config, "hidden_size")
+    key = _rotation_cache_key(config, "r1", -1, hidden_size, device, dtype)
+    cached = _ROTATION_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    if mode == "loaded":
+        rotation_set = _get_rotation_set(config)
+        if rotation_set.r1 is None:
+            raise ValueError("Missing SpinQuant R1 in loaded rotation checkpoint.")
+        rotation = rotation_set.r1.to(device=device, dtype=dtype)
+    elif mode == "random":
+        rotation = random_hadamard_rotation(hidden_size, device=device, dtype=dtype)
+    else:
+        raise ValueError(f"Unknown SpinQuant mode {mode}.")
+
+    _ROTATION_CACHE[key] = rotation
+    return rotation
+
+
+def get_spinquant_r2(config, layer_number: int, head_dim: int, device, dtype) -> torch.Tensor | None:
+    """Return the per-head R2 rotation for an attention layer."""
+
+    mode = getattr(config, "spinquant_mode", "random")
+    if mode == "identity":
+        return None
+
+    layer_idx = max(layer_number - 1, 0)
+    key = _rotation_cache_key(config, "r2", layer_idx, head_dim, device, dtype)
+    cached = _ROTATION_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    if mode == "loaded":
+        rotation_set = _get_rotation_set(config)
+        if layer_idx not in rotation_set.r2_by_layer:
+            raise ValueError(f"Missing SpinQuant R2 for layer {layer_idx}.")
+        rotation = rotation_set.r2_by_layer[layer_idx].to(device=device, dtype=dtype)
+    elif mode == "random":
+        rotation = random_hadamard_rotation(
+            head_dim,
+            device=device,
+            dtype=dtype,
+            seed=1234 + layer_idx,
+        )
+    else:
+        raise ValueError(f"Unknown SpinQuant mode {mode}.")
+
+    _ROTATION_CACHE[key] = rotation
+    return rotation
+
+
+def _read_linear_weight(linear) -> torch.Tensor | None:
+    weight = getattr(linear, "weight", None)
+    if weight is None:
+        return None
+    if hasattr(weight, "dequantize"):
+        return weight.dequantize()
+    return weight.detach()
+
+
+def _write_linear_weight(linear, value: torch.Tensor) -> None:
+    weight = getattr(linear, "weight", None)
+    if weight is None:
+        return
+    value = value.to(device=weight.device, dtype=weight.dtype)
+    if hasattr(weight, "quantize_"):
+        weight.quantize_(value)
+    else:
+        weight.data.copy_(value)
+
+
+def _matmul_right(weight: torch.Tensor, rotation: torch.Tensor) -> torch.Tensor:
+    return torch.matmul(weight.float(), rotation.float()).to(weight.dtype)
+
+
+def _matmul_left(rotation: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    return torch.matmul(rotation.float(), weight.float()).to(weight.dtype)
+
+
+def _rotate_value_projection_rows(weight: torch.Tensor, r2: torch.Tensor) -> torch.Tensor:
+    head_dim = r2.shape[0]
+    if weight.shape[0] % head_dim != 0:
+        raise ValueError(
+            f"V projection rows {weight.shape[0]} are not divisible by head_dim {head_dim}."
+        )
+    original_shape = weight.shape
+    value_blocks = weight.reshape(-1, head_dim, original_shape[-1])
+    value_blocks = torch.matmul(r2.transpose(0, 1).float(), value_blocks.float()).to(weight.dtype)
+    return value_blocks.reshape(original_shape)
+
+
+def _rotate_output_projection_columns(weight: torch.Tensor, r2: torch.Tensor) -> torch.Tensor:
+    head_dim = r2.shape[0]
+    if weight.shape[1] % head_dim != 0:
+        raise ValueError(
+            f"Output projection columns {weight.shape[1]} are not divisible by head_dim {head_dim}."
+        )
+    original_shape = weight.shape
+    blocks = weight.reshape(original_shape[0], -1, head_dim)
+    blocks = torch.matmul(blocks.float(), r2.float()).to(weight.dtype)
+    return blocks.reshape(original_shape)
+
+
+def _rotate_interleaved_qkv_weight(attention, r1: torch.Tensor | None) -> bool:
+    weight = _read_linear_weight(attention.linear_qkv)
+    if weight is None:
+        return False
+    rotated = weight
+    if r1 is not None:
+        rotated = _matmul_right(rotated, r1)
+
+    r2 = get_spinquant_r2(
+        attention.config,
+        attention.layer_number,
+        attention.hidden_size_per_attention_head,
+        rotated.device,
+        rotated.dtype,
+    )
+    if r2 is not None:
+        num_query_heads_per_group = (
+            attention.num_attention_heads_per_partition
+            // attention.num_query_groups_per_partition
+        )
+        block_heads = num_query_heads_per_group + 2
+        if getattr(attention.config, "attention_output_gate", False):
+            block_heads += num_query_heads_per_group
+        block = block_heads * attention.hidden_size_per_attention_head
+        if getattr(attention.config, "attention_output_gate", False):
+            value_offset = (2 * num_query_heads_per_group + 1) * attention.hidden_size_per_attention_head
+        else:
+            value_offset = (num_query_heads_per_group + 1) * attention.hidden_size_per_attention_head
+        if rotated.shape[0] % block != 0:
+            raise ValueError(
+                f"linear_qkv rows {rotated.shape[0]} are not divisible by QKV block {block}."
+            )
+        rotated = rotated.clone()
+        for start in range(0, rotated.shape[0], block):
+            value_slice = slice(start + value_offset, start + value_offset + r2.shape[0])
+            rotated[value_slice, :] = _rotate_value_projection_rows(rotated[value_slice, :], r2)
+
+    _write_linear_weight(attention.linear_qkv, rotated)
+    return True
+
+
+def _rotate_attention_output_weight(attention, r1: torch.Tensor | None) -> bool:
+    weight = _read_linear_weight(attention.linear_proj)
+    if weight is None:
+        return False
+    rotated = weight
+    if r1 is not None:
+        rotated = _matmul_left(r1.transpose(0, 1), rotated)
+    r2 = get_spinquant_r2(
+        attention.config,
+        attention.layer_number,
+        attention.hidden_size_per_attention_head,
+        rotated.device,
+        rotated.dtype,
+    )
+    if r2 is not None:
+        rotated = _rotate_output_projection_columns(rotated, r2)
+    _write_linear_weight(attention.linear_proj, rotated)
+    return True
+
+
+def _rotate_mlp_weights(mlp, r1: torch.Tensor | None) -> tuple[bool, bool]:
+    fc1_done = False
+    fc2_done = False
+    if r1 is not None and hasattr(mlp, "linear_fc1"):
+        weight = _read_linear_weight(mlp.linear_fc1)
+        if weight is not None and weight.shape[1] == r1.shape[0]:
+            _write_linear_weight(mlp.linear_fc1, _matmul_right(weight, r1))
+            fc1_done = True
+    if r1 is not None and hasattr(mlp, "linear_fc2"):
+        weight = _read_linear_weight(mlp.linear_fc2)
+        if weight is not None and weight.shape[0] == r1.shape[0]:
+            _write_linear_weight(mlp.linear_fc2, _matmul_left(r1.transpose(0, 1), weight))
+            fc2_done = True
+    return fc1_done, fc2_done
+
+
+def fuse_spinquant_weights(model_or_models, config) -> SpinQuantFusionStats:
+    """Fuse SpinQuant R1/R2 rotations into Megatron linear weights.
+
+    This mirrors facebookresearch/SpinQuant's QuantizeLinear transformations:
+    Q/K/V and MLP input projections get ``W @ R1``; attention/MLP output
+    projections get ``R1.T @ W``; V and attention-output per-head paths get
+    the layer's R2 rotation. The forward pass stays on Megatron/TE kernels.
+    """
+
+    stats = SpinQuantFusionStats()
+    if not getattr(config, "spinquant", False) or not getattr(config, "spinquant_fuse_weights", False):
+        return stats
+
+    models = model_or_models if isinstance(model_or_models, (list, tuple)) else [model_or_models]
+    with torch.no_grad():
+        for model in models:
+            for module in model.modules():
+                if hasattr(module, "linear_qkv") and hasattr(module, "linear_proj"):
+                    sample_weight = _read_linear_weight(module.linear_qkv)
+                    if sample_weight is None:
+                        stats.skipped += 1
+                        continue
+                    r1 = get_spinquant_r1(config, sample_weight.device, sample_weight.dtype)
+                    if _rotate_interleaved_qkv_weight(module, r1):
+                        stats.attention_qkv += 1
+                    if _rotate_attention_output_weight(module, r1):
+                        stats.attention_out += 1
+                if hasattr(module, "linear_fc1") and hasattr(module, "linear_fc2"):
+                    sample_weight = _read_linear_weight(module.linear_fc1)
+                    if sample_weight is None:
+                        stats.skipped += 1
+                        continue
+                    r1 = get_spinquant_r1(config, sample_weight.device, sample_weight.dtype)
+                    fc1_done, fc2_done = _rotate_mlp_weights(module, r1)
+                    stats.mlp_fc1 += int(fc1_done)
+                    stats.mlp_fc2 += int(fc2_done)
+    return stats
 
 
 def _resolve_group_size(size: int, group_size: int) -> int:
