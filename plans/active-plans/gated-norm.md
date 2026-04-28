@@ -2,29 +2,21 @@
 
 ## Objective
 
-Add paper-faithful GatedNorm support to Megatron-Core with:
+Implement paper-faithful GatedNorm in Megatron-Core by:
 
-1. A single public Triton-backed function, `apply_gated_norm(...)`
-2. GatedNorm applied after residual-stream RMSNorm sites
-3. Clean call sites that work with Megatron's layernorm recompute path
-4. No gating of Q/K attention-space norms in the first implementation
+1. Adding a fused Triton op `apply_gated_norm(normed, W_down, W_up)`
+2. Keeping RMSNorm in the existing Megatron/TE normalization modules
+3. Applying GatedNorm after residual-stream RMSNorm sites
+4. Covering the standard, recompute, HyperConnection, and MoE bypass paths
+5. Avoiding Q/K norm, MLA compressed norm, SSM, MTP, cross-attention, and final-layernorm scope in the first patch
 
-@architect: The important distinction is that `apply_gated_norm` should be the G1-style kernel launcher, not a second Python implementation of the math. A small `TransformerLayer` helper is still useful because Megatron needs one callable boundary for `RMSNorm -> gate projection -> apply_gated_norm` when layernorm recompute is enabled.
+@architect: The critical design boundary is `RMSNorm outside, learned GatedNorm inside apply_gated_norm`. The Triton op starts from `normed`, not from raw hidden states.
 
 ---
 
-## Paper Basis
+## Paper-Grounded Rule
 
-The paper is `/home/archimedes/Documents/archimedesvault/academic-texts/ML/Gated-Norm.pdf`.
-
-Relevant claims from the paper:
-
-1. The paper focuses on pre-norm transformers and the residual stream `H_i`.
-2. It separates attention sinks from residual sinks:
-   - attention sinks are tied to softmax normalization in attention
-   - residual sinks are tied to RMSNorm on the residual stream
-3. GatedNorm is introduced as an explicit residual-stream rescaling mechanism after RMSNorm.
-4. The formula is:
+The paper defines GatedNorm as:
 
 ```text
 y = RMSNorm(x)
@@ -32,136 +24,98 @@ gate = sigmoid(W_up(swish(W_down(y))))
 y_prime = gate * y
 ```
 
-**Paper citations:**
+Implementation boundary:
+
+```text
+existing RMSNorm module
+-> normed
+-> apply_gated_norm(normed, W_down, W_up)
+-> attention or MLP/MoE
+```
+
+Do not implement this boundary:
+
+```text
+custom Triton RMSNorm plus GatedNorm
+```
+
+@architect: The paper's GatedNorm is learned. The learned parameters are `W_down` and `W_up`. The Triton op should own those learned gate projections, but it should not own RMSNorm.
+
+@architect: Keeping RMSNorm outside the kernel preserves the existing TE/local norm behavior, precision handling, sharded state dict behavior, and recompute hooks.
+
+### Paper Citations
 
 | Source | Relevance |
 |--------|-----------|
 | `Gated-Norm.pdf`, Sec. 2, p. 3 | Defines the pre-norm residual stream as the main object of study. |
-| `Gated-Norm.pdf`, Sec. 3.1, p. 4 | Separates transformer normalizations into softmax attention and residual normalization layers. |
-| `Gated-Norm.pdf`, Sec. 3.4, p. 6 | Defines GatedNorm as a low-rank elementwise gate after RMSNorm. |
-| `Gated-Norm.pdf`, App. A.2, p. 13 | Compares attention sinks and residual sinks; associates residual sinks with RMSNorm and GatedNorm. |
-
-@architect: The phrase "after every normalization layer" in Sec. 3.4 should be implemented as every residual-stream RMSNorm that matches `y = RMSNorm(x)`. It should not automatically include Q/K norms, MLA compressed-space norms, or unrelated SSM norms.
-
----
-
-## Design Decisions
-
-### 1. Public Kernel API
-
-The public API should mirror the existing G1 gate style:
-
-```python
-output = apply_gated_norm(gate_logits, normed)
-```
-
-It computes:
-
-```python
-output = normed * sigmoid(gate_logits)
-```
-
-This matches the existing G1 gate shape:
-
-```python
-output = g1_gate_impl(linear_out, attn_out)
-```
-
-**Citation:** `megatron/core/fusions/fused_g1_gate.py:104-117`
-
-@kernel: `apply_gated_norm` should launch Triton kernels for forward and backward. The RMSNorm module and the low-rank gate projections stay outside the Triton kernel.
-
-### 2. RMSNorm Stays Existing Megatron Code
-
-Do not implement RMSNorm inside the Triton kernel.
-
-Correct boundary:
-
-```text
-existing RMSNorm module
--> gate_down / SiLU / gate_up
--> apply_gated_norm Triton kernel
-```
-
-Incorrect boundary:
-
-```text
-custom Triton RMSNorm + gate projection + gated multiply
-```
-
-@architect: Keeping RMSNorm outside the kernel preserves the existing TE/local norm behavior, precision handling, sharded state dict behavior, and recompute hooks.
-
-### 3. One Helper Method Is Acceptable
-
-We should add one layer-local helper to avoid duplicating this block at every norm site:
-
-```python
-normed = apply_module(norm_module)(hidden_states)
-gate_logits = gate_up(F.silu(gate_down(normed)))
-return apply_gated_norm(gate_logits, normed)
-```
-
-This helper is not a second GatedNorm implementation. It is a call-site wrapper around:
-
-```text
-existing norm
--> existing PyTorch/TE linears
--> Triton apply_gated_norm
-```
-
-@architect: This helper is what makes activation recompute clean. Megatron can checkpoint one callable that contains the existing norm, the gate projections, and the Triton gated multiply.
-
-### 4. First Implementation Scope
-
-Implement:
-
-```text
-input_layernorm -> GatedNorm -> self_attention
-pre_mlp_layernorm -> GatedNorm -> MLP/MoE
-```
-
-Also cover duplicate execution paths that bypass the standard helper.
-
-Do not implement initially:
-
-```text
-Q/K layernorm -> GatedNorm
-MLA q/kv compressed-space layernorm -> GatedNorm
-SSM/Mamba norms -> GatedNorm
-```
-
-Optional later:
-
-```text
-pre_cross_attn_layernorm -> GatedNorm -> cross_attention
-final_layernorm -> GatedNorm -> output head
-MTP-specific norms -> GatedNorm
-```
+| `Gated-Norm.pdf`, Sec. 3.1, p. 4 | Separates softmax attention normalization from residual normalization layers. |
+| `Gated-Norm.pdf`, Sec. 3.4, p. 6 | Defines GatedNorm as low-rank elementwise gating after RMSNorm. |
+| `Gated-Norm.pdf`, App. A.2, p. 13 | Associates residual sinks with RMSNorm and GatedNorm. |
+| `Gated-Norm.pdf`, App. A.3, p. 14 | Notes GatedNorm overhead is affected by lightweight kernels and launch bubbles. |
 
 ---
 
-## Files To Modify
+## Architecture Scope
 
-| File | Purpose | Citation |
-|------|---------|----------|
-| `megatron/core/fusions/gated_norm.py` | New Triton `apply_gated_norm` op with autograd. | New file; mirror public API style from `fused_g1_gate.py:104-117`. |
-| `megatron/core/transformer/transformer_config.py` | Add GatedNorm config fields. | `transformer_config.py:220-243`, `transformer_config.py:429-437` |
-| `megatron/core/transformer/transformer_layer.py` | Add gate modules, helper, and main call sites. | `transformer_layer.py:306-357`, `580-602`, `692-707` |
-| `megatron/core/models/gpt/gpt_layer_specs.py` | Disable fused norm+linear when GatedNorm is enabled. | `gpt_layer_specs.py:283-302`, `520-533` |
-| `megatron/core/models/gpt/fine_grained_callables.py` | Cover MoE fine-grained callable bypass. | `fine_grained_callables.py:479-495` |
-| `megatron/core/transformer/transformer_block.py` | Optional final-layernorm support later. | `transformer_block.py:383-390`, `936-938` |
-| `tests/unit_tests/fusions/test_gated_norm.py` | Unit tests for Triton op forward/backward. | New file. |
-| `tests/unit_tests/transformer/test_gated_norm.py` | Integration tests for call-site behavior. | New file. |
+### Required First-Patch Sites
+
+| Location | Flow | Citation |
+|----------|------|----------|
+| Input norm | `input_layernorm -> GatedNorm -> self_attention` | `megatron/core/transformer/transformer_layer.py:580-602` |
+| Pre-MLP norm | `pre_mlp_layernorm -> GatedNorm -> MLP/MoE` | `megatron/core/transformer/transformer_layer.py:692-707` |
+| HyperConnection input norm | same as input norm | `megatron/core/transformer/transformer_layer.py:1426-1444` |
+| HyperConnection pre-MLP norm | same as pre-MLP norm | `megatron/core/transformer/transformer_layer.py:1527-1543` |
+| EP overlap / CUDA graph MoE bypass | `pre_mlp_layernorm -> GatedNorm -> router/shared experts` | `megatron/core/transformer/transformer_layer.py:1143-1152` |
+| Fine-grained MoE callable | call `layer._forward_pre_mlp_layernorm(hidden_states)` so recompute/offload stay centralized | `megatron/core/models/gpt/fine_grained_callables.py:479-495` |
+
+### Explicit Exclusions
+
+| Exclusion | Reason | Citation |
+|-----------|--------|----------|
+| Q/K norms | Attention-space norms, not residual-stream RMSNorm. Gating these changes attention geometry. | `megatron/core/transformer/attention.py:1494-1498` |
+| MLA q/kv compressed norms | Compressed attention-space norms, not residual-stream RMSNorm. | `megatron/core/transformer/multi_latent_attention.py:638-640` |
+| Absorbed MLA q/kv norms | Same exclusion as MLA norms. | `megatron/core/transformer/experimental_attention_variant/absorbed_mla.py:473-475` |
+| SSM/Mamba norms | Different architecture path. | `megatron/core/ssm/gated_delta_net.py:420-450`, `megatron/core/ssm/mamba_layer.py:91,141` |
+| Cross-attention norm | Not part of the first patch. | `megatron/core/transformer/transformer_layer.py:648-653` |
+| Final layernorm | Not part of the first patch. | `megatron/core/transformer/transformer_block.py:936-938` |
+| MTP norms | Separate path, not part of the first patch. | `megatron/core/transformer/multi_token_prediction.py:901-903`, `995` |
+
+@architect: "Every normalization layer" from the paper should be read as every residual-stream RMSNorm matching `y = RMSNorm(x)`, not every object with `layernorm` in its name.
+
+@architect: Gating Q/K norm would change attention geometry directly. That is not the GatedNorm intervention described in Sec. 3.4.
+
+---
+
+## Current Relevant Repo State
+
+| Existing Feature | Current Behavior | Citation |
+|------------------|------------------|----------|
+| G1 gate op | Existing custom gate pattern computes `x * sigmoid(gate)` | `megatron/core/fusions/fused_g1_gate.py:104-117` |
+| Attention output gate | Uses G1-style function call in attention | `megatron/core/transformer/attention.py:1224-1230` |
+| Layernorm recompute | Recomputes input and pre-MLP layernorm outputs | `megatron/core/transformer/transformer_config.py:429-437` |
+| TE fused norm+linear | Can hide the insertion point between RMSNorm and linear | `megatron/core/models/gpt/gpt_layer_specs.py:283-302`, `520-533` |
+| Sequence-parallel example | Non-TP-aware params are marked for grad sync via `sequence_parallel` | `megatron/core/transformer/hyper_connection.py:162-171` |
+
+### Constraints
+
+1. RMSNorm remains outside the Triton op.
+2. `W_down` and `W_up` are learned Torch parameters.
+3. First implementation assumes replicated `W_down` and `W_up` across tensor-parallel ranks, with `sequence_parallel` set on those weights when needed so gradients synchronize correctly.
+4. `rank = 16` is the default target from the paper and is also good for tensor-core friendliness.
+5. The production path should not materialize full-width `gate_logits` in HBM.
+6. Do not stage the production kernel behind a v0/v1/v2 ladder. Implement the direct fused op and its backward path as the target design.
+
+@kernel: Sharding the rank dimension would require communication between down projection and up projection. That breaks the clean single-op design, so replicated gate weights are the first implementation target.
 
 ---
 
 ## Phase 1: Config Surface
 
-### 1.1 Add TransformerConfig Fields
+### 1.1 Add `TransformerConfig` Fields
 
-Add fields near normalization / existing gate options:
+**File:** `megatron/core/transformer/transformer_config.py`
 
-**Source location:** `megatron/core/transformer/transformer_config.py:220-243`
+Add near existing normalization/gate config:
 
 ```python
 gated_norm: bool = False
@@ -169,140 +123,186 @@ gated_norm: bool = False
 
 gated_norm_rank: int = 16
 """Low-rank dimension for GatedNorm gate projections."""
-
-gated_norm_include_cross_attention: bool = False
-"""Whether to apply GatedNorm after pre_cross_attn_layernorm when cross-attention is active."""
-
-gated_norm_include_final_layernorm: bool = False
-"""Whether to apply GatedNorm after the decoder final layernorm."""
 ```
 
-@architect: Keep the default off. Rank 16 follows the paper example. Cross-attention and final-layernorm should be explicit because GPT-style first implementation does not need them.
+**Citation:** `megatron/core/transformer/transformer_config.py:220-243`
 
-### 1.2 CLI Handling
+@architect: Keep the default off. Rank 16 follows the paper example.
 
-`TransformerConfig` fields are automatically exposed by `ArgumentGroupFactory`.
+### 1.2 CLI Exposure
 
-**Citation:** `megatron/training/arguments.py:2295-2298`
+No dedicated parser changes should be needed for simple bool/int fields because `TransformerConfig` is exposed by `ArgumentGroupFactory`.
 
-```python
-transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
-transformer_group = transformer_factory.build_group(
-    parser, "transformer configuration"
-)
-```
+**Citations:**
 
-Config construction also copies matching dataclass fields from args:
+| Source | Relevance |
+|--------|-----------|
+| `megatron/training/arguments.py:2295-2298` | Builds CLI args from `TransformerConfig`. |
+| `megatron/training/arguments.py:1866-1885` | Copies matching args into core config. |
 
-**Citation:** `megatron/training/arguments.py:1866-1885`
-
-No manual parser changes should be needed for simple `bool` and `int` fields.
-
-Expected CLI:
+Expected flags:
 
 ```bash
 --gated-norm \
 --gated-norm-rank 16
 ```
 
-Optional:
-
-```bash
---gated-norm-include-cross-attention \
---gated-norm-include-final-layernorm
-```
-
 ### 1.3 Validation
 
-Add config validation in `TransformerConfig.__post_init__` or nearby validation logic:
+Add validation:
 
 ```text
 if gated_norm:
-    require normalization == "RMSNorm" for paper-faithful mode
+    require normalization == "RMSNorm"
     require gated_norm_rank > 0
+    require gated_norm_rank <= hidden_size
 ```
 
-@architect: The paper formula is explicitly `y = RMSNorm(x)`. We can support LayerNorm later, but the first implementation should reject or warn for non-RMSNorm.
+@architect: The paper formula is explicitly `y = RMSNorm(x)`. LayerNorm support can be a later extension, but the first implementation should be RMSNorm-only.
 
 ---
 
-## Phase 2: Triton Fusion Function
+## Phase 2: Triton Kernel
 
-### 2.1 New File
+### 2.1 Production Public API
 
-Create:
-
-```text
-megatron/core/fusions/gated_norm.py
-```
-
-Public function:
+**File:** `megatron/core/fusions/gated_norm.py`
 
 ```python
-def apply_gated_norm(gate_logits: torch.Tensor, normed: torch.Tensor) -> torch.Tensor:
-    return GatedNormFunction.apply(gate_logits, normed)
+def apply_gated_norm(
+    normed: torch.Tensor,
+    w_down: torch.Tensor,
+    w_up: torch.Tensor,
+) -> torch.Tensor:
+    return GatedNormFunction.apply(normed, w_down, w_up)
 ```
 
-Forward math:
+The function computes:
 
 ```text
-gate = sigmoid(gate_logits)
-output = normed * gate
+y = normed
+z = y @ W_down.T
+a = silu(z)
+logits = a @ W_up.T
+gate = sigmoid(logits)
+output = y * gate
 ```
 
-Backward math:
+Shape contract:
 
 ```text
-d_normed = d_output * gate
-d_gate_logits = d_output * normed * gate * (1 - gate)
+y:      [tokens, hidden]
+W_down: [rank, hidden]
+W_up:   [hidden, rank]
+z:      [tokens, rank]
+output: [tokens, hidden]
 ```
 
-@kernel: Save either `gate` and `normed`, or `gate_logits` and `normed`. Saving `gate` avoids recomputing sigmoid in backward but costs one activation tensor. Match G1's pattern first, then optimize if profiling shows pressure.
+### 2.2 Forward And Backward
 
-### 2.2 Shape And Dtype Contract
+Backward formulas:
+
+```text
+dlogits = dout * y * g * (1 - g)
+dW_up   = dlogits.T @ a
+da      = dlogits @ W_up
+dz      = da * silu_grad(z)
+dW_down = dz.T @ y
+dy      = dout * g + dz @ W_down
+```
+
+Implementation plan:
+
+```text
+forward:
+    compute z = normed @ W_down.T
+    compute a = silu(z)
+    compute gate = sigmoid(a @ W_up.T)
+    output = normed * gate
+
+backward:
+    recompute z and a or load saved z
+    compute dy
+    accumulate dW_up and dW_down
+```
+
+@kernel: Keep the production path direct. Use saved rank-sized `z` if it helps, otherwise recompute it. Do not add a staged production path.
+
+### 2.3 Saved Tensors
+
+Save:
+
+```text
+y
+W_down
+W_up
+```
+
+Optionally save:
+
+```text
+z = y @ W_down.T
+```
+
+Do not save:
+
+```text
+gate_logits: [tokens, hidden]
+gate:        [tokens, hidden]
+```
+
+@kernel: Saving rank-sized `z` is probably worthwhile because it is small. Saving full-width gate/logit tensors defeats the memory benefit.
+
+### 2.4 Shape, Dtype, And Layout Contract
 
 Initial contract:
 
 ```text
-gate_logits.shape == normed.shape
-gate_logits.is_cuda
 normed.is_cuda
+w_down.is_cuda
+w_up.is_cuda
+normed.shape[-1] == w_down.shape[1]
+w_down.shape[0] == w_up.shape[1]
+w_up.shape[0] == normed.shape[-1]
+rank == w_down.shape[0]
 dtype in {bf16, fp16, fp32}
 output dtype == normed dtype
 ```
 
-Prefer contiguous tensors inside the autograd function:
+Require contiguous tensors for the first implementation:
 
 ```python
-gate_logits = gate_logits.contiguous()
 normed = normed.contiguous()
+w_down = w_down.contiguous()
+w_up = w_up.contiguous()
 ```
 
-**Citation:** G1 uses this pattern at `megatron/core/fusions/fused_g1_gate.py:89-100`.
+@kernel: Contiguity copies in the hot path are a risk. The first implementation may call `.contiguous()` for correctness, but tests and profiling should verify the caller normally supplies contiguous tensors. A later kernel can support strides if needed.
 
-### 2.3 No Separate Python Fallback
+### 2.5 PyTorch Reference Only For Tests
 
-Avoid adding a second Python fallback implementation in the production path.
+Avoid adding a production Python fallback implementation.
 
-Allowed only in tests:
+Allowed in tests:
 
 ```python
-expected = normed * torch.sigmoid(gate_logits.float()).to(normed.dtype)
+z = normed @ w_down.T
+a = F.silu(z)
+gate = torch.sigmoid(a @ w_up.T)
+expected = normed * gate
 ```
 
-@kernel: This keeps the production API aligned with the user's requested design: Triton implementation first, then source call sites call `apply_gated_norm`.
+@kernel: Keep the production path Triton-first. PyTorch formula code belongs in tests and debugging comparisons, not in the runtime GatedNorm path.
 
 ---
 
-## Phase 3: Gate Parameters In TransformerLayer
+## Phase 3: Gate Parameters And Layer Helper
 
-### 3.1 Add Gate Projection Modules
+### 3.1 Add Gate Modules
 
-Add gate projection modules after the existing norm modules are constructed.
+**File:** `megatron/core/transformer/transformer_layer.py`
 
-**Source location:** `megatron/core/transformer/transformer_layer.py:306-357`
-
-Existing modules:
+Existing norm construction:
 
 ```text
 self.input_layernorm
@@ -310,7 +310,9 @@ self.pre_cross_attn_layernorm
 self.pre_mlp_layernorm
 ```
 
-Add, gated by config and by whether the corresponding norm is not `IdentityOp`:
+**Citation:** `megatron/core/transformer/transformer_layer.py:306-357`
+
+Add learned modules:
 
 ```python
 self.input_gated_norm_down
@@ -319,61 +321,36 @@ self.pre_mlp_gated_norm_down
 self.pre_mlp_gated_norm_up
 ```
 
-Optional:
+Recommended module form:
 
 ```python
-self.pre_cross_attn_gated_norm_down
-self.pre_cross_attn_gated_norm_up
+torch.nn.Linear(hidden_size, gated_norm_rank, bias=False)
+torch.nn.Linear(gated_norm_rank, hidden_size, bias=False)
 ```
+
+The helper should pass `.weight` into the fused op instead of calling these modules directly.
+If `config.sequence_parallel` is enabled, mark the gate weights with `sequence_parallel=True` so gradient synchronization follows the same convention used elsewhere for non-TP-aware parameters.
 
 @architect: Bias should be disabled initially because the paper formula only names `W_down` and `W_up`. If later checkpoint retrofit needs identity-ish initialization, add that as a separate compatibility option.
 
-### 3.2 Parameter Shape
+### 3.2 Parameter Count
 
 For hidden size `d` and rank `r`:
 
 ```text
-gate_down: d -> r
-gate_up: r -> d
+W_down: r * d
+W_up:   d * r
+per GatedNorm site: 2 * d * r
+two required sites per layer: 4 * d * r
 ```
 
-For each gated residual norm:
-
-```text
-parameters = d*r + r*d = 2*d*r
-```
-
-For the two required sites per layer:
-
-```text
-per-layer parameters = 4*d*r
-```
-
-With `r = 16`, this is small relative to attention and FFN GEMMs.
-
-### 3.3 Tensor Parallelism Decision
-
-Start with replicated low-rank modules, because:
-
-1. GatedNorm needs the full hidden vector after RMSNorm.
-2. Rank 16 is small and awkward to shard across tensor-parallel ranks.
-3. LayerNorm parameters are already small replicated parameters in the residual path.
-
-Validation item:
-
-```text
-Confirm gradients for replicated gate parameters are synchronized correctly under TP/DP.
-```
-
-If replicated parameter handling is not correct under tensor parallelism, revise to match the repo's established non-tensor-parallel parameter treatment for LayerNorm-like modules.
+For `r = 16`, this is small relative to attention and FFN parameters.
 
 @architect: Do not prematurely shard the rank dimension. If `r < tp_size`, a tensor-parallel split creates avoidable edge cases.
 
----
+### 3.3 Helper Function
 
-## Phase 4: Layer Helper
-
-Add one helper method to `TransformerLayer`:
+Add one helper:
 
 ```python
 def _apply_norm_with_gated_norm(
@@ -388,30 +365,28 @@ def _apply_norm_with_gated_norm(
     if gate_down is None or gate_up is None:
         return normed
 
-    gate_logits = gate_up(F.silu(gate_down(normed)))
-    return apply_gated_norm(gate_logits, normed)
+    return apply_gated_norm(normed, gate_down.weight, gate_up.weight)
 ```
 
-Imports needed:
+Import:
 
 ```python
-import torch.nn.functional as F
 from megatron.core.fusions.gated_norm import apply_gated_norm
 ```
 
-**Source location for imports:** `megatron/core/transformer/transformer_layer.py:14-18`
+**Citation:** `megatron/core/transformer/transformer_layer.py:14-18`
 
-@architect: This is the only helper we need in `TransformerLayer`. It exists to keep all call sites consistent and to let checkpointing recompute the full logical unit.
+@architect: This helper is the recompute-friendly boundary for `existing norm -> fused learned GatedNorm`.
 
 ---
 
-## Phase 5: Required Call Sites
+## Phase 4: Call-Site Integration
 
-### 5.1 Standard Input LayerNorm
+### 4.1 Standard Input LayerNorm
 
 **Source:** `megatron/core/transformer/transformer_layer.py:580-602`
 
-Current flow:
+Current:
 
 ```text
 hidden_states
@@ -419,27 +394,16 @@ hidden_states
 -> self_attention
 ```
 
-Target flow:
+Target:
 
 ```text
 hidden_states
 -> input_layernorm
--> input GatedNorm
+-> apply_gated_norm(normed, input_W_down, input_W_up)
 -> self_attention
 ```
 
-Normal path example:
-
-```python
-input_layernorm_output = self._apply_norm_with_gated_norm(
-    hidden_states,
-    self.input_layernorm,
-    self.input_gated_norm_down,
-    self.input_gated_norm_up,
-)
-```
-
-Recompute path example:
+Recompute path should checkpoint the helper:
 
 ```python
 input_layernorm_output = self.input_layernorm_checkpoint.checkpoint(
@@ -453,41 +417,26 @@ input_layernorm_output = self.input_layernorm_checkpoint.checkpoint(
 )
 ```
 
-@architect: Update the nearby comments from "input layernorm" to "input norm/gated norm" when `gated_norm` is enabled. The recompute hook still sits after attention at `transformer_layer.py:614-619`.
+Existing recompute hook remains after attention.
 
-### 5.2 Standard Pre-MLP LayerNorm
+**Citation:** `megatron/core/transformer/transformer_layer.py:614-619`
+
+@architect: Update the nearby comments from "input layernorm" to "input norm/gated norm" when `gated_norm` is enabled. The recompute hook still sits after attention.
+
+### 4.2 Standard Pre-MLP LayerNorm
 
 **Source:** `megatron/core/transformer/transformer_layer.py:692-707`
 
-Current flow:
+Target:
 
 ```text
 hidden_states
 -> pre_mlp_layernorm
+-> apply_gated_norm(normed, mlp_W_down, mlp_W_up)
 -> MLP/MoE
 ```
 
-Target flow:
-
-```text
-hidden_states
--> pre_mlp_layernorm
--> pre-MLP GatedNorm
--> MLP/MoE
-```
-
-Normal path example:
-
-```python
-pre_mlp_layernorm_output = self._apply_norm_with_gated_norm(
-    hidden_states,
-    self.pre_mlp_layernorm,
-    self.pre_mlp_gated_norm_down,
-    self.pre_mlp_gated_norm_up,
-)
-```
-
-Recompute path example:
+Recompute path should checkpoint the helper:
 
 ```python
 pre_mlp_layernorm_output = self.pre_mlp_norm_checkpoint.checkpoint(
@@ -501,206 +450,28 @@ pre_mlp_layernorm_output = self.pre_mlp_norm_checkpoint.checkpoint(
 )
 ```
 
-The existing discard/recompute registration remains after MLP output.
+Existing recompute hook remains after MLP output.
 
 **Citation:** `megatron/core/transformer/transformer_layer.py:832-837`
 
----
+### 4.3 Duplicate Paths
 
-## Phase 6: Duplicate Execution Paths To Cover
+| Path | Required Change | Citation |
+|------|-----------------|----------|
+| EP overlap / CUDA graph bypass | Replace direct `pre_mlp_layernorm` call with helper | `megatron/core/transformer/transformer_layer.py:1143-1152` |
+| HyperConnection input norm | Use same helper/checkpoint pattern as standard input norm | `megatron/core/transformer/transformer_layer.py:1426-1444` |
+| HyperConnection pre-MLP norm | Use same helper/checkpoint pattern as standard pre-MLP norm | `megatron/core/transformer/transformer_layer.py:1527-1543` |
+| Fine-grained MoE callable | Reuse the layer's pre-MLP norm wrapper so recompute/offload stay centralized | `megatron/core/models/gpt/fine_grained_callables.py:479-495` |
 
-These are not new mathematical locations. They are alternate code paths that currently bypass the standard norm helpers.
-
-### 6.1 EP Overlap / CUDA Graph MoE Bypass
-
-**Source:** `megatron/core/transformer/transformer_layer.py:1143-1152`
-
-Current:
-
-```python
-hidden_states = apply_module(self.pre_mlp_layernorm)(residual)
-```
-
-Target:
-
-```python
-hidden_states = self._apply_norm_with_gated_norm(
-    residual,
-    self.pre_mlp_layernorm,
-    self.pre_mlp_gated_norm_down,
-    self.pre_mlp_gated_norm_up,
-)
-```
-
-### 6.2 HyperConnection Input LayerNorm
-
-**Source:** `megatron/core/transformer/transformer_layer.py:1426-1444`
-
-Target:
-
-```text
-hidden_states
--> input_layernorm
--> GatedNorm
--> self_attention
-```
-
-Use the same helper and checkpoint pattern as the standard input norm path.
-
-### 6.3 HyperConnection Pre-MLP LayerNorm
-
-**Source:** `megatron/core/transformer/transformer_layer.py:1527-1543`
-
-Target:
-
-```text
-hidden_states
--> pre_mlp_layernorm
--> GatedNorm
--> MLP/MoE
-```
-
-Use the same helper and checkpoint pattern as the standard pre-MLP path.
-
-### 6.4 Fine-Grained MoE Callable
-
-**Source:** `megatron/core/models/gpt/fine_grained_callables.py:479-495`
-
-Current:
-
-```python
-pre_mlp_layernorm_output = apply_module(layer.pre_mlp_layernorm)(hidden_states)
-```
-
-Target:
-
-```python
-pre_mlp_layernorm_output = layer._apply_norm_with_gated_norm(
-    hidden_states,
-    layer.pre_mlp_layernorm,
-    layer.pre_mlp_gated_norm_down,
-    layer.pre_mlp_gated_norm_up,
-)
-```
+@implementer: These are not extra paper locations. They are alternate code paths that must be covered so the feature is not silently skipped in specific training modes.
 
 @architect: Fine-grained callables use `layer`, so the helper can remain on `TransformerLayer`; do not add another GatedNorm implementation here.
 
 ---
 
-## Phase 7: Conditional And Optional Sites
+## Phase 5: TE Fused Norm+Linear Handling
 
-### 7.1 Cross-Attention Norm
-
-**Source:** `megatron/core/transformer/transformer_layer.py:648-653`
-
-Current:
-
-```text
-hidden_states
--> pre_cross_attn_layernorm
--> cross_attention
-```
-
-Target only when `config.gated_norm_include_cross_attention`:
-
-```text
-hidden_states
--> pre_cross_attn_layernorm
--> GatedNorm
--> cross_attention
-```
-
-@architect: GPT-style decoder-only models usually have this as `IdentityOp`. Keep it off by default to avoid creating unused parameters.
-
-### 7.2 Final LayerNorm
-
-**Sources:**
-
-| Source | Relevance |
-|--------|-----------|
-| `megatron/core/transformer/transformer_block.py:383-390` | Builds `final_layernorm`. |
-| `megatron/core/transformer/transformer_block.py:936-938` | Applies `final_layernorm`. |
-| `megatron/core/models/gpt/fine_grained_callables.py:610-613` | Fine-grained final norm path. |
-
-Target only when `config.gated_norm_include_final_layernorm`:
-
-```text
-hidden_states
--> final_layernorm
--> GatedNorm
--> output head
-```
-
-@architect: This is paper-literal but not the first priority. It does not feed attention or MLP inside a residual block, so keep it behind an explicit flag.
-
-### 7.3 MTP Norms
-
-**Sources:**
-
-| Source | Relevance |
-|--------|-----------|
-| `megatron/core/transformer/multi_token_prediction.py:786-796` | Builds `enorm` and `hnorm`. |
-| `megatron/core/transformer/multi_token_prediction.py:901-903` | Applies MTP input norms. |
-| `megatron/core/transformer/multi_token_prediction.py:995` | Applies MTP final norm. |
-
-Out of first scope. Revisit only after the transformer-layer implementation is validated.
-
----
-
-## Phase 8: Explicit Exclusions
-
-### 8.1 Do Not Gate Q/K Norms Initially
-
-**Sources:**
-
-| Source | Relevance |
-|--------|-----------|
-| `megatron/core/transformer/attention.py:1298-1314` | Builds Q/K layernorm modules. |
-| `megatron/core/transformer/attention.py:1494-1498` | Applies Q/K layernorm. |
-
-Reason:
-
-```text
-Q/K norms operate inside attention projection space.
-The paper's GatedNorm targets residual-stream RMSNorm.
-Attention-side rescaling is a separate Gated Attention mechanism.
-```
-
-@architect: Gating Q/K norm would change attention geometry directly. That is not the GatedNorm intervention described in Sec. 3.4.
-
-### 8.2 Do Not Gate MLA Compressed-Space Norms Initially
-
-**Sources:**
-
-| Source | Relevance |
-|--------|-----------|
-| `megatron/core/transformer/multi_latent_attention.py:500-510` | Builds MLA q/kv norms. |
-| `megatron/core/transformer/multi_latent_attention.py:638-640` | Applies MLA q/kv norms. |
-| `megatron/core/transformer/experimental_attention_variant/absorbed_mla.py:298-306` | Builds absorbed MLA q/kv norms. |
-| `megatron/core/transformer/experimental_attention_variant/absorbed_mla.py:473-475` | Applies absorbed MLA q/kv norms. |
-
-Reason:
-
-```text
-These are not residual-stream RMSNorm outputs feeding a transformer sublayer.
-```
-
-### 8.3 Do Not Gate SSM/Mamba Norms Initially
-
-**Sources:**
-
-| Source | Relevance |
-|--------|-----------|
-| `megatron/core/ssm/gated_delta_net.py:420-450` | Already has a gated norm-like pattern. |
-| `megatron/core/ssm/mamba_layer.py:91,141` | Mamba norm construction and call. |
-
-Out of first scope.
-
----
-
-## Phase 9: TE Fused Norm+Linear Handling
-
-GatedNorm requires an explicit tensor between normalization and the next linear/sublayer:
+GatedNorm needs an explicit insertion point:
 
 ```text
 RMSNorm output
@@ -710,53 +481,59 @@ RMSNorm output
 
 TE fused norm+linear removes that insertion point.
 
-### 9.1 Attention Input Norm
+### 5.1 Attention Input Norm
 
-In TE GPT specs, common self-attention currently uses fused layernorm+QKV:
-
-**Source:** `megatron/core/models/gpt/gpt_layer_specs.py:283-302`
+Current TE path can use:
 
 ```python
-linear_qkv=backend.column_parallel_layer_norm_linear()
+linear_qkv = backend.column_parallel_layer_norm_linear()
 ```
 
-When `gated_norm` is enabled, this must become:
+When `gated_norm=True`, force:
 
 ```text
-input_layernorm=backend.layer_norm()
-linear_qkv=backend.column_parallel_linear()
+input_layernorm = backend.layer_norm()
+linear_qkv = backend.column_parallel_linear()
 ```
 
-### 9.2 Dense MLP Pre-MLP Norm
+**Citation:** `megatron/core/models/gpt/gpt_layer_specs.py:283-302`
 
-Dense MLP selection currently uses fused norm+linear when available:
+If `use_te_op_fuser` is requested together with `gated_norm=True`, fail fast or route to the unfused path; the fused layernorm-linear op hides the insertion point GatedNorm needs.
 
-**Source:** `megatron/core/models/gpt/gpt_layer_specs.py:520-533`
+### 5.2 Dense MLP Pre-MLP Norm
 
-When `gated_norm` is enabled, force:
+Current dense MLP path can use fused norm+linear:
+
+```python
+linear_fc1 = backend.column_parallel_layer_norm_linear()
+```
+
+When `gated_norm=True`, force:
 
 ```text
-pre_mlp_layernorm=backend.layer_norm()
-linear_fc1=backend.column_parallel_linear()
+pre_mlp_layernorm = backend.layer_norm()
+linear_fc1 = backend.column_parallel_linear()
 ```
 
-### 9.3 TE Provider
+**Citation:** `megatron/core/models/gpt/gpt_layer_specs.py:520-533`
 
-TE provider returns fused norm+linear support:
+If `use_te_op_fuser` is requested together with `gated_norm=True`, fail fast or route to the unfused path for the same reason.
 
-**Source:** `megatron/core/extensions/transformer_engine_spec_provider.py:52-58`
+### 5.3 Provider Rule
 
-Do not change TE provider globally. Instead, make GPT spec construction choose unfused modules when `config.gated_norm` is true.
+Do not change TE provider globally.
 
-@architect: This avoids regressing non-GatedNorm TE performance. The unfused path should only be selected when the new feature needs the insertion point.
+**Citation:** `megatron/core/extensions/transformer_engine_spec_provider.py:52-58`
+
+@architect: This should be a spec-selection change gated by `config.gated_norm`, not a global TE behavior change.
 
 ---
 
-## Phase 10: Checkpointing And State Dicts
+## Phase 6: Checkpointing And State Dicts
 
-### 10.1 New Parameters
+### 6.1 New Parameter Names
 
-New parameter names should be stable and descriptive:
+Use stable, descriptive names:
 
 ```text
 layers.N.input_gated_norm_down.weight
@@ -765,16 +542,7 @@ layers.N.pre_mlp_gated_norm_down.weight
 layers.N.pre_mlp_gated_norm_up.weight
 ```
 
-Optional:
-
-```text
-layers.N.pre_cross_attn_gated_norm_down.weight
-layers.N.pre_cross_attn_gated_norm_up.weight
-decoder.final_gated_norm_down.weight
-decoder.final_gated_norm_up.weight
-```
-
-### 10.2 Loading Existing Checkpoints
+### 6.2 Existing Checkpoint Loading
 
 First implementation should expect missing GatedNorm weights when enabling the feature on an old checkpoint.
 
@@ -783,16 +551,12 @@ Plan:
 ```text
 from-scratch training: works normally
 loading old checkpoints with gated_norm=True: allow missing gate weights only if existing checkpoint load supports non-strict mode
-pretrained retrofit: out of first scope unless the user requests it
+pretrained retrofit: out of first scope unless explicitly requested
 ```
 
 @architect: The paper experiments appear to train with the architecture enabled, not patch a trained checkpoint. Avoid identity-initialization compatibility work until needed.
 
-### 10.3 TE Sharded State Dict Key Maps
-
-TE/local specs already contain state dict key maps for fused norm paths.
-
-**Citation:** `megatron/core/models/gpt/gpt_layer_specs.py:442-444`
+### 6.3 State Dict Expectations
 
 When disabling fused norm+linear for GatedNorm, verify:
 
@@ -804,96 +568,65 @@ new gate keys are included in sharded state dict
 
 ---
 
-## Phase 11: Tests
+## Phase 7: Tests
 
-### 11.1 Triton Op Unit Tests
+### 7.1 Triton Op Tests
 
-New file:
-
-```text
-tests/unit_tests/fusions/test_gated_norm.py
-```
-
-Tests:
+**File:** `tests/unit_tests/fusions/test_gated_norm.py`
 
 | Test | Description |
 |------|-------------|
-| `test_apply_gated_norm_forward_bf16` | Compare Triton output with `normed * sigmoid(gate_logits)` |
-| `test_apply_gated_norm_forward_fp16` | Same for fp16 |
-| `test_apply_gated_norm_backward` | Compare gradients against PyTorch reference |
-| `test_apply_gated_norm_shape_mismatch` | Assert shape mismatch fails clearly |
-| `test_apply_gated_norm_requires_cuda` | Assert CPU tensors fail clearly |
+| `test_apply_gated_norm_forward_bf16` | Compare Triton output with full PyTorch GatedNorm formula. |
+| `test_apply_gated_norm_forward_fp16` | Same for fp16. |
+| `test_apply_gated_norm_backward` | Compare `dy`, `dW_down`, and `dW_up` against PyTorch reference. |
+| `test_apply_gated_norm_rank16_default` | Verify rank-16 path works. |
+| `test_apply_gated_norm_shape_mismatch` | Assert shape mismatch fails clearly. |
+| `test_apply_gated_norm_requires_cuda` | Assert CPU tensors fail clearly. |
 
-Reference math only inside tests:
+Reference math:
 
 ```python
-expected = normed * torch.sigmoid(gate_logits.float()).to(normed.dtype)
+z = normed @ w_down.T
+a = F.silu(z)
+gate = torch.sigmoid(a @ w_up.T)
+expected = normed * gate
 ```
 
-### 11.2 TransformerLayer Integration Tests
+### 7.2 Transformer Integration Tests
 
-New file:
-
-```text
-tests/unit_tests/transformer/test_gated_norm.py
-```
-
-Tests:
+**File:** `tests/unit_tests/transformer/test_gated_norm.py`
 
 | Test | Description |
 |------|-------------|
-| `test_gated_norm_modules_created_when_enabled` | Enables `gated_norm`; verifies input/pre-MLP gate modules exist. |
+| `test_gated_norm_modules_created_when_enabled` | Verifies input/pre-MLP gate modules exist. |
 | `test_gated_norm_modules_absent_when_disabled` | Confirms default behavior unchanged. |
-| `test_gated_norm_called_after_input_layernorm` | Monkeypatch or hook `apply_gated_norm`; verify self-attention receives gated tensor. |
-| `test_gated_norm_called_after_pre_mlp_layernorm` | Verify MLP/MoE receives gated tensor. |
-| `test_qk_layernorm_not_gated` | Enables `qk_layernorm`; verifies no Q/K gate modules are created. |
+| `test_gated_norm_called_after_input_layernorm` | Verifies self-attention receives gated norm output. |
+| `test_gated_norm_called_after_pre_mlp_layernorm` | Verifies MLP/MoE receives gated norm output. |
+| `test_qk_layernorm_not_gated` | Ensures Q/K norms do not create GatedNorm modules. |
+| `test_layernorm_recompute_with_gated_norm` | Verifies backward succeeds with `recompute_modules=["layernorm"]`. |
+| `test_sequence_parallel_marks_gate_weights` | Verifies gate weights are marked for sequence-parallel gradient sync. |
+| `test_te_op_fuser_rejected_with_gated_norm` | Verifies fused norm+linear paths are not used with `gated_norm=True`. |
 
-### 11.3 Recompute Tests
+### 7.3 TE Spec Tests
 
-Add a targeted test with:
-
-```bash
---recompute-granularity selective \
---recompute-modules layernorm \
---gated-norm
-```
-
-Expected:
+Verify:
 
 ```text
-forward succeeds
-backward succeeds
-gate parameters receive gradients
-CheckpointWithoutOutput recomputes norm+gate helper without stale activation errors
-```
+gated_norm=False:
+    TE fused norm+linear behavior remains unchanged
 
-**Citation:** `megatron/core/transformer/transformer_config.py:429-437`
-
-### 11.4 TE Spec Tests
-
-Add or extend spec tests to verify:
-
-```text
-gated_norm=False with TE:
-    fused norm+linear remains allowed
-
-gated_norm=True with TE:
+gated_norm=True:
     input_layernorm is explicit
     linear_qkv is not layernorm-linear fused
     pre_mlp_layernorm is explicit where applicable
     linear_fc1 is not layernorm-linear fused
 ```
 
-**Citations:**
+---
 
-| Source | Relevance |
-|--------|-----------|
-| `megatron/core/models/gpt/gpt_layer_specs.py:283-302` | TE attention fused norm+linear path. |
-| `megatron/core/models/gpt/gpt_layer_specs.py:520-533` | Dense MLP fused norm+linear path. |
+## Phase 8: Smoke Commands
 
-### 11.5 Smoke Commands
-
-Minimal local smoke:
+### Minimal Smoke
 
 ```bash
 torchrun --nproc_per_node=1 pretrain_gpt.py \
@@ -918,7 +651,7 @@ torchrun --nproc_per_node=1 pretrain_gpt.py \
     --log-interval 1
 ```
 
-Recompute smoke:
+### Recompute Smoke
 
 ```bash
 torchrun --nproc_per_node=1 pretrain_gpt.py \
@@ -950,37 +683,32 @@ torchrun --nproc_per_node=1 pretrain_gpt.py \
 ## Implementation Order
 
 1. Add `TransformerConfig` fields and validation.
-2. Implement `megatron/core/fusions/gated_norm.py` with Triton forward/backward.
-3. Add gate projection modules to `TransformerLayer`.
+2. Implement `megatron/core/fusions/gated_norm.py` with API `apply_gated_norm(normed, W_down, W_up)`.
+3. Add gate modules to `TransformerLayer`.
 4. Add `_apply_norm_with_gated_norm(...)`.
 5. Replace standard input/pre-MLP norm call sites.
-6. Update recompute paths to checkpoint the helper, not just raw RMSNorm.
+6. Update recompute paths to checkpoint the helper, not raw RMSNorm alone.
 7. Cover HyperConnection, EP overlap, and fine-grained MoE bypass paths.
 8. Disable TE fused norm+linear only when `gated_norm=True`.
-9. Add Triton op unit tests.
+9. Add Triton op tests.
 10. Add TransformerLayer integration tests.
 11. Add recompute and TE spec tests.
 12. Run smoke commands.
-
-@implementer: Do not start with optional final-layernorm or MTP support. Land the two core residual-stream sites first and keep the patch reviewable.
 
 ---
 
 ## Success Criteria
 
 1. `--gated-norm` adds GatedNorm after `input_layernorm` and `pre_mlp_layernorm`.
-2. `apply_gated_norm(gate_logits, normed)` is the only production public kernel call for the gated multiply.
-3. Existing RMSNorm modules still own normalization.
-4. Gate projections use the paper's low-rank sigmoid gate:
-
-```text
-sigmoid(W_up(swish(W_down(y))))
-```
-
-5. Q/K norms are not gated.
-6. Layernorm recompute works with GatedNorm enabled.
-7. TE fused norm+linear is disabled only where GatedNorm requires an insertion point.
-8. Default behavior is unchanged when `gated_norm=False`.
+2. `apply_gated_norm(normed, W_down, W_up)` is the production public kernel API.
+3. RMSNorm remains in existing Megatron/TE norm modules.
+4. The Triton op implements `sigmoid(W_up(swish(W_down(y)))) * y`.
+5. Full-width `gate_logits` and `gate` tensors are not materialized by the caller.
+6. Q/K norms, MLA compressed norms, SSM/Mamba norms, cross-attention, and final-layernorm are not gated in the first patch.
+7. Gate weights are Torch-owned parameters and are marked for sequence-parallel sync when needed.
+8. Layernorm recompute works with GatedNorm enabled.
+9. TE fused norm+linear is disabled only where GatedNorm needs an insertion point.
+10. Default behavior is unchanged when `gated_norm=False`.
 
 ---
 
@@ -988,42 +716,34 @@ sigmoid(W_up(swish(W_down(y))))
 
 | Source | Relevance |
 |--------|-----------|
-| `Gated-Norm.pdf`, Sec. 3.4, p. 6 | Defines GatedNorm formula after RMSNorm. |
-| `Gated-Norm.pdf`, App. A.2, p. 13 | Associates residual sinks with RMSNorm and GatedNorm. |
-| `megatron/core/fusions/fused_g1_gate.py:104-117` | Existing public fused gate API style to mirror. |
-| `megatron/core/transformer/transformer_config.py:220-243` | Existing normalization and attention gate config area. |
-| `megatron/core/transformer/transformer_config.py:429-437` | Layernorm recompute config documentation. |
-| `megatron/training/arguments.py:1866-1885` | Args copied into core transformer config. |
-| `megatron/training/arguments.py:2295-2298` | TransformerConfig automatically exposed as CLI args. |
-| `megatron/core/transformer/transformer_layer.py:306-357` | Builds input/pre-cross/pre-MLP norm modules. |
-| `megatron/core/transformer/transformer_layer.py:580-602` | Standard input norm before self-attention. |
-| `megatron/core/transformer/transformer_layer.py:614-619` | Input layernorm recompute hook registration. |
-| `megatron/core/transformer/transformer_layer.py:648-653` | Cross-attention norm site. |
-| `megatron/core/transformer/transformer_layer.py:692-707` | Standard pre-MLP norm helper. |
-| `megatron/core/transformer/transformer_layer.py:832-837` | Pre-MLP layernorm recompute hook registration. |
-| `megatron/core/transformer/transformer_layer.py:1143-1152` | EP overlap/CUDA graph pre-MLP norm bypass. |
+| `Gated-Norm.pdf`, Sec. 3.4, p. 6 | Defines GatedNorm after RMSNorm. |
+| `Gated-Norm.pdf`, App. A.3, p. 14 | Motivates kernel fusion by discussing launch overhead. |
+| `megatron/core/fusions/fused_g1_gate.py:104-117` | Existing public fused gate API style. |
+| `megatron/core/transformer/transformer_config.py:220-243` | Existing normalization/gate config area. |
+| `megatron/core/transformer/transformer_config.py:429-437` | Layernorm recompute documentation. |
+| `megatron/training/arguments.py:1866-1885` | Args copied into core config. |
+| `megatron/training/arguments.py:2295-2298` | Config fields exposed as CLI args. |
+| `megatron/core/transformer/transformer_layer.py:306-357` | Builds residual-stream norm modules. |
+| `megatron/core/transformer/transformer_layer.py:580-602` | Input norm before self-attention. |
+| `megatron/core/transformer/transformer_layer.py:692-707` | Pre-MLP norm helper. |
+| `megatron/core/transformer/transformer_layer.py:1143-1152` | EP overlap/CUDA graph pre-MLP bypass. |
 | `megatron/core/transformer/transformer_layer.py:1426-1444` | HyperConnection input norm path. |
 | `megatron/core/transformer/transformer_layer.py:1527-1543` | HyperConnection pre-MLP norm path. |
-| `megatron/core/models/gpt/fine_grained_callables.py:479-495` | Fine-grained MoE pre-MLP norm bypass. |
-| `megatron/core/transformer/attention.py:1298-1314` | Q/K norm construction, excluded from first GatedNorm scope. |
-| `megatron/core/transformer/attention.py:1494-1498` | Q/K norm application, excluded from first GatedNorm scope. |
-| `megatron/core/transformer/multi_latent_attention.py:638-640` | MLA q/kv norms, excluded from first GatedNorm scope. |
-| `megatron/core/models/gpt/gpt_layer_specs.py:283-302` | TE attention fused norm+linear path that must be disabled for GatedNorm. |
-| `megatron/core/models/gpt/gpt_layer_specs.py:520-533` | Dense MLP fused norm+linear path that must be disabled for GatedNorm. |
-| `megatron/core/extensions/transformer_engine_spec_provider.py:52-58` | TE provider exposes fused norm+linear support. |
-| `megatron/core/transformer/transformer_block.py:383-390` | Final layernorm construction, optional later scope. |
-| `megatron/core/transformer/transformer_block.py:936-938` | Final layernorm application, optional later scope. |
+| `megatron/core/models/gpt/fine_grained_callables.py:479-495` | Fine-grained MoE bypass path. |
+| `megatron/core/transformer/attention.py:1494-1498` | Q/K norms excluded from first scope. |
+| `megatron/core/models/gpt/gpt_layer_specs.py:283-302` | TE attention fused norm+linear path. |
+| `megatron/core/models/gpt/gpt_layer_specs.py:520-533` | Dense MLP fused norm+linear path. |
+| `megatron/core/extensions/transformer_engine_spec_provider.py:52-58` | TE provider fused norm+linear support. |
+| `megatron/core/transformer/hyper_connection.py:162-171` | Example of marking non-TP-aware parameters for sequence-parallel sync. |
 
 ---
 
 ## Out Of Scope For First Patch
 
-1. Gated Attention implementation.
-2. Q/K norm gating.
-3. MLA compressed-space norm gating.
-4. SSM/Mamba norm gating.
-5. MTP norm gating.
-6. Final-layernorm gating unless explicitly requested.
-7. Pretrained checkpoint retrofit or identity-preserving initialization.
-8. Fully fused `RMSNorm + gate projection + gated multiply` Triton kernel.
-
+1. Gated Attention implementation
+2. Q/K norm gating
+3. MLA compressed-space norm gating
+4. SSM/Mamba norm gating
+5. MTP norm gating
+6. Pretrained checkpoint retrofit or identity-preserving initialization
+7. Any Triton kernel that computes RMSNorm itself

@@ -220,6 +220,12 @@ class TransformerConfig(ModelParallelConfig):
     normalization: Literal['LayerNorm', 'RMSNorm'] = "LayerNorm"
     """Which norm to use for normalization layers, valid options are `LayerNorm` and `RMSNorm`."""
 
+    gated_norm: bool = False
+    """Whether to apply GatedNorm after residual-stream normalization layers."""
+
+    gated_norm_rank: int = 16
+    """Low-rank dimension for GatedNorm gate projections."""
+
     qk_layernorm: bool = False
     """Whether to apply `normalization` type of normalization to the query and key embeddings."""
 
@@ -1139,6 +1145,20 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.apply_query_key_layer_scaling:
             self.attention_softmax_in_fp32 = True
+
+        if self.gated_norm:
+            if self.normalization != "RMSNorm":
+                raise ValueError("gated_norm requires normalization == 'RMSNorm'.")
+            if self.gated_norm_rank <= 0:
+                raise ValueError("gated_norm_rank must be positive when gated_norm is enabled.")
+            if self.gated_norm_rank > self.hidden_size:
+                raise ValueError(
+                    "gated_norm_rank must be less than or equal to hidden_size when gated_norm is enabled."
+                )
+            if self.transformer_impl == "inference_optimized":
+                raise ValueError(
+                    "gated_norm is not supported with transformer_impl='inference_optimized'."
+                )
 
         if self.expert_model_parallel_size > 1 and self.num_moe_experts is None:
             raise ValueError("num_moe_experts must be non None to use expert-parallel.")
