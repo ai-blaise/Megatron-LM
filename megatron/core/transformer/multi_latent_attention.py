@@ -78,6 +78,7 @@ class MLASelfAttentionSubmodules:
     linear_q_up_proj: Union[ModuleSpec, type] = None
     linear_kv_down_proj: Union[ModuleSpec, type] = None
     linear_kv_up_proj: Union[ModuleSpec, type] = None
+    linear_gate_proj: Union[ModuleSpec, type] = None
     core_attention: Union[ModuleSpec, type] = None
     linear_proj: Union[ModuleSpec, type] = None
 
@@ -246,7 +247,7 @@ class MultiLatentAttention(Attention):
         # self or cross attn.
         # query: [96, 1, 16, 128], key:[96, 1, 16, 128], value:[96, 1, 16, 128]
         with off_interface(self.offload_qkv_linear, hidden_states, "qkv_linear") as hidden_states:
-            query, key, value, q_compressed, kv_compressed = self.get_query_key_value_tensors(
+            query, key, value, q_compressed, kv_compressed, gate = self.get_query_key_value_tensors(
                 hidden_states,
                 key_value_states,
                 position_ids,
@@ -347,6 +348,17 @@ class MultiLatentAttention(Attention):
             assert self.qkv_up_checkpoint is not None
             self.qkv_up_checkpoint.discard_output_and_register_recompute(core_attn_out)
             self.qkv_up_checkpoint = None
+
+        #NOTE: Paper-faithful G1 placement for MLA-family attention. Standard SelfAttention
+        # applies this in attention.py, but MLA owns its own forward path. Placing the gate
+        # here covers normal MLA, DSA (DSAttention is MLA's core_attention), and FlashMLA
+        # after any decode-only up-projection/flattening, while still gating before Wo.
+        # Old behavior was:
+        #   core_attn_out -> linear_proj
+        # New behavior when attention_output_gate is enabled:
+        #   core_attn_out -> G1 gate -> linear_proj
+        if gate is not None:
+            core_attn_out = self._apply_output_gate(core_attn_out, gate)
 
         # =================
         # Output. [sq, b, h]
@@ -496,6 +508,27 @@ class MLASelfAttention(MultiLatentAttention):
             tp_group=pg_collection.tp,
         )
 
+        #NOTE: MLA does not use Attention.forward(), so the standard G1 gate in attention.py
+        # does not cover MLA, DSA, or FlashMLA. Build a separate gate projection here so
+        # MultiLatentAttention.forward() can apply the same paper placement:
+        # attention output -> G1 gate -> Wo.
+        if self.config.attention_output_gate:
+            self.linear_gate_proj = build_module(
+                submodules.linear_gate_proj,
+                self.config.hidden_size,
+                self.query_projection_size,
+                config=self.config,
+                init_method=self.config.init_method,
+                gather_output=False,
+                bias=False,
+                skip_bias_add=False,
+                is_expert=False,
+                tp_comm_buffer_name='gate_proj',
+                tp_group=pg_collection.tp,
+            )
+        else:
+            self.linear_gate_proj = None
+
         if self.config.q_lora_rank is not None:
             self.q_layernorm = submodules.q_layernorm(
                 hidden_size=self.config.q_lora_rank,
@@ -534,6 +567,18 @@ class MLASelfAttention(MultiLatentAttention):
             Please disable hybrid_context_parallel."
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
+
+        gate = None
+        if self.config.attention_output_gate:
+            #NOTE: G1 needs a query-shaped, head-specific gate for the final attention output.
+            # Keep it outside MLA's Q/KV low-rank projections so the old MLA projection flow
+            # remains easy to restore: remove this block and the later gate application.
+            gate, _ = self.linear_gate_proj(hidden_states)
+            gate = gate.view(
+                *gate.size()[:-1],
+                self.num_attention_heads_per_partition,
+                self.config.v_head_dim,
+            )
 
         # =========================================
         # Prepare RoPE and seqlen related params
@@ -856,7 +901,7 @@ class MLASelfAttention(MultiLatentAttention):
                     q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb
                 )
 
-        return query, key, value, q_compressed, kv_compressed
+        return query, key, value, q_compressed, kv_compressed, gate
 
     def uncompress_kv_from_cache(self, kv_cached):
         """
@@ -949,6 +994,7 @@ class MLASelfAttention(MultiLatentAttention):
         """Execute weight gradient computation"""
         self._backward_kv_proj()
         self._backward_q_proj()
+        self._backward_gate_proj()
         self._backward_output_proj()
 
     def _backward_kv_proj(self):
@@ -963,6 +1009,13 @@ class MLASelfAttention(MultiLatentAttention):
         else:
             self.linear_q_down_proj.backward_dw()
             self.linear_q_up_proj.backward_dw()
+
+    def _backward_gate_proj(self):
+        """Computes weight gradients of the optional MLA G1 gate projection."""
+        #NOTE: The old MLA path had no gate projection. Keep this isolated so rollback is
+        # just removing the G1 gate build/apply path without touching Q/KV/WO gradients.
+        if self.linear_gate_proj is not None:
+            self.linear_gate_proj.backward_dw()
 
     def _backward_output_proj(self):
         """Computes weight gradients of output projection layer"""

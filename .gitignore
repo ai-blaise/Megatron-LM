@@ -24,5 +24,6 @@ docs/apidocs
 
 .beads
 .opencode
+.claude
 .codex
 snapshots/*

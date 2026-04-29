@@ -214,8 +214,20 @@ EVAL_AND_LOGGING_ARGS=(
     --tensorboard-dir "${TENSORBOARD_LOGS_PATH}/${OPTIMIZER}"
     --log-throughput
     --log-memory-to-tensorboard
+    --tensorboard-log-interval 1
     --record-memory-history
     --memory-snapshot-path "snapshots/sft_nvfp4_${OPTIMIZER}.pickle"
+)
+
+# ======================
+# PyTorch Profiler (Chrome trace)
+# ======================
+PROFILING_ARGS=(
+    --profile
+    --use-pytorch-profiler
+    --profile-step-start 3
+    --profile-step-end 5
+    --profile-ranks 0
 )
 
 # ======================
@@ -241,4 +253,5 @@ uv run torchrun ${DISTRIBUTED_ARGS[@]} \
     ${SFT_ARGS[@]} \
     ${DATA_ARGS[@]} \
     ${EVAL_AND_LOGGING_ARGS[@]} \
+    ${PROFILING_ARGS[@]} \
     ${CKPT_ARGS[@]}

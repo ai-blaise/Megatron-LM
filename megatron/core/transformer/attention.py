@@ -11,6 +11,7 @@ import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
+from megatron.core.fusions.fused_g1_gate import g1_gate_impl
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
 from megatron.core.models.common.embeddings.rope_utils import (
@@ -1215,7 +1216,7 @@ class Attention(MegatronModule, ABC):
         # Output gate
         if gate is not None:
             nvtx_range_push(suffix="output_gate")
-            core_attn_out = self._apply_output_gate(core_attn_out, gate)
+            core_attn_out = self._apply_output_gate(core_attn_out, gate) #NOTE: This is where the output gate is called
             nvtx_range_pop(suffix="output_gate")
 
         # =================
@@ -1232,11 +1233,22 @@ class Attention(MegatronModule, ABC):
 
         return output, bias
 
+    def _apply_output_gate(self, x, gate): #NOTE: output gate alreadu here? All we gotta do is call the kernel here?
+        # Previous implementation:
+        # x_dtype = x.dtype
+        # gate = gate.contiguous() #NOTE: Idk wtf this is
+        # gate = gate.view(*x.shape)
+        # x = x * torch.sigmoid(gate.float()) #NOTE: sigmoid here
+        # x = x.to(x_dtype)
+        # return x
+        gate = gate.contiguous().view(*x.shape)
+        if x.is_cuda and gate.is_cuda and x.dtype == torch.bfloat16 and gate.dtype == torch.bfloat16:
+            return g1_gate_impl(gate, x)
+        return self._apply_output_gate_torch(x, gate) #NOTE: This implementation takes care of the standard self attnetion. for DSA it requites extra work
+
     @jit_fuser
-    def _apply_output_gate(self, x, gate):
+    def _apply_output_gate_torch(self, x, gate):
         x_dtype = x.dtype
-        gate = gate.contiguous()
-        gate = gate.view(*x.shape)
         x = x * torch.sigmoid(gate.float())
         x = x.to(x_dtype)
         return x
@@ -1438,6 +1450,7 @@ class SelfAttention(Attention):
             num_qkv_heads_per_group * self.hidden_size_per_attention_head,
         )
         mixed_qkv = mixed_qkv.view(*new_tensor_shape)
+        #NOTE: Generally it apepars when output_gate is present there are increases in the copies inside split_arg_list
 
         # Split the tensor into query, gate, key, and value.
         if output_gate:
@@ -1447,7 +1460,7 @@ class SelfAttention(Attention):
             # --> [sq, b, ng, np/ng * hn], [sq, b, ng, np/ng * hn],
             # [sq, b, ng, hn], [sq, b, ng, hn]
             split_arg_list = [
-                num_query_heads_per_group * self.hidden_size_per_attention_head,
+                num_query_heads_per_group * self.hidden_size_per_attention_head, #NOTE: Two copies each here?
                 num_query_heads_per_group * self.hidden_size_per_attention_head,
                 self.hidden_size_per_attention_head,
                 self.hidden_size_per_attention_head,
@@ -1510,7 +1523,7 @@ class SelfAttention(Attention):
                     self.world_size // self.config.num_query_groups
                 )
                 gate = gate[:, :, idx * size : (idx + 1) * size, :]
-            return query, key, value, gate
+            return query, key, value, gate #NOTE: the gate is here
 
         return query, key, value
 

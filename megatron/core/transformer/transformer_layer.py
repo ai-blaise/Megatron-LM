@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 
 import torch
 import torch.distributed
+import torch.nn as nn
 from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
@@ -29,6 +30,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module, copy_signature
+from megatron.core.fusions.gated_norm import apply_gated_norm
 from megatron.core.utils import (
     deprecate_inference_params,
     get_pg_rank,
@@ -338,6 +340,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             eps=self.config.layernorm_epsilon,
         )
 
+        self.input_gated_norm_down: nn.Linear | None = None
+        self.input_gated_norm_up: nn.Linear | None = None
+        self.pre_mlp_gated_norm_down: nn.Linear | None = None
+        self.pre_mlp_gated_norm_up: nn.Linear | None = None
+
         # [Module 5: CrossAttention]
         self.cross_attention = build_module(
             submodules.cross_attention,
@@ -355,6 +362,16 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
         )
+        if self.config.gated_norm:
+            if isinstance(self.input_layernorm, IdentityOp) or isinstance(
+                self.pre_mlp_layernorm, IdentityOp
+            ):
+                raise ValueError(
+                    "gated_norm requires explicit input_layernorm and pre_mlp_layernorm modules."
+                )
+            self.input_gated_norm_down, self.input_gated_norm_up = self._build_gated_norm_pair()
+            self.pre_mlp_gated_norm_down, self.pre_mlp_gated_norm_up = self._build_gated_norm_pair()
+
         # [Module 8: MLP block]
         additional_mlp_kwargs = {}
         # import here to avoid circular import
@@ -486,6 +503,43 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # self.bias_dropout_add_exec_handler = nullcontext if use_nvfuser else torch.enable_grad
         self.bias_dropout_add_exec_handler = torch.enable_grad
 
+    def _build_gated_norm_pair(self) -> tuple[nn.Linear, nn.Linear]:
+        """Build the learned low-rank gate projections used by GatedNorm."""
+
+        gate_down = nn.Linear(self.config.hidden_size, self.config.gated_norm_rank, bias=False)
+        gate_up = nn.Linear(self.config.gated_norm_rank, self.config.hidden_size, bias=False)
+
+        if self.config.perform_initialization:
+            if self.config.init_method is not None:
+                self.config.init_method(gate_down.weight)
+            if self.config.output_layer_init_method is not None:
+                self.config.output_layer_init_method(gate_up.weight)
+            elif self.config.init_method is not None:
+                self.config.init_method(gate_up.weight)
+
+        gate_down = gate_down.to(dtype=self.config.params_dtype)
+        gate_up = gate_up.to(dtype=self.config.params_dtype)
+
+        if self.config.sequence_parallel:
+            setattr(gate_down.weight, "sequence_parallel", True)
+            setattr(gate_up.weight, "sequence_parallel", True)
+
+        return gate_down, gate_up
+
+    def _apply_norm_with_gated_norm(
+        self,
+        norm_module,
+        hidden_states: Tensor,
+        gate_down: nn.Linear | None = None,
+        gate_up: nn.Linear | None = None,
+    ) -> Tensor:
+        """Apply the norm module and optional learned GatedNorm projections."""
+
+        normed = apply_module(norm_module)(hidden_states)
+        if gate_down is not None and gate_up is not None:
+            normed = apply_gated_norm(normed, gate_down.weight, gate_up.weight)
+        return normed
+
     def create_mcore_cudagraph_manager(self, config):
         """Register the transformer layer for cudagraphs."""
 
@@ -582,11 +636,22 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
             with off_interface(self.offload_attn_norm, hidden_states, "attn_norm") as hidden_states:
                 input_layernorm_output = self.input_layernorm_checkpoint.checkpoint(
-                    apply_module(self.input_layernorm), hidden_states
+                    lambda x: self._apply_norm_with_gated_norm(
+                        self.input_layernorm,
+                        x,
+                        self.input_gated_norm_down,
+                        self.input_gated_norm_up,
+                    ),
+                    hidden_states,
                 )
         else:
             with off_interface(self.offload_attn_norm, hidden_states, "attn_norm") as hidden_states:
-                input_layernorm_output = apply_module(self.input_layernorm)(hidden_states)
+                input_layernorm_output = self._apply_norm_with_gated_norm(
+                    self.input_layernorm,
+                    hidden_states,
+                    self.input_gated_norm_down,
+                    self.input_gated_norm_up,
+                )
 
         using_fused_tp_inference_kernel = (not self.training) and (
             self.config.inference_fuse_tp_communication
@@ -698,11 +763,22 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
             with off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm") as hidden_states:
                 pre_mlp_layernorm_output = self.pre_mlp_norm_checkpoint.checkpoint(
-                    apply_module(self.pre_mlp_layernorm), hidden_states
+                    lambda x: self._apply_norm_with_gated_norm(
+                        self.pre_mlp_layernorm,
+                        x,
+                        self.pre_mlp_gated_norm_down,
+                        self.pre_mlp_gated_norm_up,
+                    ),
+                    hidden_states,
                 )
         else:
             with off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm") as hidden_states:
-                pre_mlp_layernorm_output = apply_module(self.pre_mlp_layernorm)(hidden_states)
+                pre_mlp_layernorm_output = self._apply_norm_with_gated_norm(
+                    self.pre_mlp_layernorm,
+                    hidden_states,
+                    self.pre_mlp_gated_norm_down,
+                    self.pre_mlp_gated_norm_up,
+                )
 
         return pre_mlp_layernorm_output
 
@@ -983,18 +1059,22 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         submodules = []
         if CudaGraphScope.attn in self.config.cuda_graph_scope:
-            submodules += [
-                self.input_layernorm,
-                self.self_attention,
-                self.pre_cross_attn_layernorm,
-                self.cross_attention,
-            ]
+            submodules += [self.input_layernorm]
+            if self.config.gated_norm and self.input_gated_norm_down is not None:
+                submodules += [self.input_gated_norm_down, self.input_gated_norm_up]
+            submodules += [self.self_attention, self.pre_cross_attn_layernorm, self.cross_attention]
         if (not self.is_moe_layer and CudaGraphScope.mlp in self.config.cuda_graph_scope) or (
             self.is_moe_layer and CudaGraphScope.moe in self.config.cuda_graph_scope
         ):
-            submodules += [self.pre_mlp_layernorm, self.mlp]
+            submodules += [self.pre_mlp_layernorm]
+            if self.config.gated_norm and self.pre_mlp_gated_norm_down is not None:
+                submodules += [self.pre_mlp_gated_norm_down, self.pre_mlp_gated_norm_up]
+            submodules += [self.mlp]
         elif self.is_moe_layer and CudaGraphScope.moe_router in self.config.cuda_graph_scope:
-            submodules += [self.pre_mlp_layernorm, self.mlp.router]
+            submodules += [self.pre_mlp_layernorm]
+            if self.config.gated_norm and self.pre_mlp_gated_norm_down is not None:
+                submodules += [self.pre_mlp_gated_norm_down, self.pre_mlp_gated_norm_up]
+            submodules += [self.mlp.router]
             if (
                 self.config.moe_shared_expert_intermediate_size is not None
                 and not self.config.moe_shared_expert_overlap
@@ -1145,7 +1225,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 residual = cuda_graph_output.pop()
                 if not self.is_moe_layer:
                     return residual, None, None, None
-                hidden_states = apply_module(self.pre_mlp_layernorm)(residual)
+                hidden_states = self._apply_norm_with_gated_norm(
+                    self.pre_mlp_layernorm,
+                    residual,
+                    self.pre_mlp_gated_norm_down,
+                    self.pre_mlp_gated_norm_up,
+                )
                 shared_expert_output = self.mlp.shared_experts_compute(hidden_states)
                 probs, routing_map = self.mlp.route(hidden_states)
                 hidden_states, probs = self.mlp.preprocess(hidden_states, probs, routing_map)
@@ -1433,11 +1518,22 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             )
             with off_interface(self.offload_attn_norm, hidden_states, "attn_norm") as hidden_states:
                 input_layernorm_output = self.input_layernorm_checkpoint.checkpoint(
-                    self.input_layernorm, hidden_states
+                    lambda x: self._apply_norm_with_gated_norm(
+                        self.input_layernorm,
+                        x,
+                        self.input_gated_norm_down,
+                        self.input_gated_norm_up,
+                    ),
+                    hidden_states,
                 )
         else:
             with off_interface(self.offload_attn_norm, hidden_states, "attn_norm") as hidden_states:
-                input_layernorm_output = self.input_layernorm(hidden_states)
+                input_layernorm_output = self._apply_norm_with_gated_norm(
+                    self.input_layernorm,
+                    hidden_states,
+                    self.input_gated_norm_down,
+                    self.input_gated_norm_up,
+                )
 
         # Self attention.
         nvtx_range_push(suffix="self_attention")
@@ -1534,11 +1630,22 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             )
             with off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm") as hidden_states:
                 pre_mlp_layernorm_output = self.pre_mlp_norm_checkpoint.checkpoint(
-                    self.pre_mlp_layernorm, hidden_states
+                    lambda x: self._apply_norm_with_gated_norm(
+                        self.pre_mlp_layernorm,
+                        x,
+                        self.pre_mlp_gated_norm_down,
+                        self.pre_mlp_gated_norm_up,
+                    ),
+                    hidden_states,
                 )
         else:
             with off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm") as hidden_states:
-                pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
+                pre_mlp_layernorm_output = self._apply_norm_with_gated_norm(
+                    self.pre_mlp_layernorm,
+                    hidden_states,
+                    self.pre_mlp_gated_norm_down,
+                    self.pre_mlp_gated_norm_up,
+                )
 
         nvtx_range_push(suffix="mlp")
         should_chunk_mlp_for_prefill = (

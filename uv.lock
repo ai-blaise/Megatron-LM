@@ -2440,6 +2440,7 @@ dependencies = [
     { name = "psutil" },
     { name = "torch" },
     { name = "transformers" },
+    { name = "triton", marker = "sys_platform == 'linux' or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
 ]
 
 [package.optional-dependencies]
@@ -2607,6 +2608,7 @@ requires-dist = [
     { name = "transformer-engine", extras = ["core-cu13", "pytorch"], marker = "extra == 'dev'", git = "https://github.com/NVIDIA/TransformerEngine.git?rev=c6853b65b7177ab3785c48c130166ec3f9324c46" },
     { name = "transformers", specifier = ">=4.57.6" },
     { name = "transformers", marker = "extra == 'mlm'" },
+    { name = "triton", marker = "sys_platform == 'linux'", specifier = ">=2.0.0" },
     { name = "wandb", marker = "extra == 'mlm'" },
     { name = "wget", marker = "extra == 'dev'" },
     { name = "wget", marker = "extra == 'lts'" },

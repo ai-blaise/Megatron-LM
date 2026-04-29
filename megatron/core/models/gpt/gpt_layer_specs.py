@@ -79,6 +79,7 @@ def get_gpt_layer_with_inference_submodules(
     qk_layernorm: Optional[bool] = False,
     multi_latent_attention: Optional[bool] = False,
     qk_l2_norm: Optional[bool] = False,
+    gated_norm: bool = False,
 ) -> TransformerLayerSubmodules:
     """Use these submodules for inference optimized linear layers.
     Args:
@@ -86,6 +87,8 @@ def get_gpt_layer_with_inference_submodules(
         multi_latent_attention (bool, optional): To use MLA. Defaults to False.
         qk_l2_norm (bool, optional): To use l2 norm for queries/keys. Defaults to False.
     """
+    if gated_norm:
+        raise ValueError("gated_norm is not supported with inference optimized layer specs.")
     assert HAVE_TE, "--transformer-impl inference_optimized requires transformer engine"
     backend = InferenceSpecProvider()
 
@@ -121,6 +124,9 @@ def get_gpt_layer_with_inference_submodules(
                     linear_q_up_proj=linear_q_up_proj,
                     linear_kv_down_proj=backend.linear(),
                     linear_kv_up_proj=linear_kv_up_proj,
+                    #NOTE: Separate G1 gate projection for MLA-family attention.
+                    # MultiLatentAttention applies it after core attention and before Wo.
+                    linear_gate_proj=backend.column_parallel_linear(),
                     core_attention=backend.core_attention(),
                     linear_proj=backend.row_parallel_linear(),
                     q_layernorm=IdentityOp,
@@ -188,6 +194,7 @@ def get_gpt_layer_with_transformer_engine_submodules(
     use_kitchen_attention: bool = False,
     kitchen_attention_backend: str = "sdpa",
     enable_hyper_connection: bool = False,
+    gated_norm: bool = False,
 ) -> TransformerLayerSubmodules:
     """Use these submodules to use lower-level Transformer Engine modules (required for fp8
     training).
@@ -238,6 +245,7 @@ def get_gpt_layer_with_transformer_engine_submodules(
         moe_use_legacy_grouped_gemm=moe_use_legacy_grouped_gemm,
         use_te_op_fuser=use_te_op_fuser,
         use_te_activation_func=use_te_activation_func,
+        gated_norm=gated_norm,
     )
 
     hc_module = HyperConnectionModule if enable_hyper_connection else IdentityOp
@@ -265,6 +273,9 @@ def get_gpt_layer_with_transformer_engine_submodules(
                     linear_q_up_proj=linear_q_up_proj,
                     linear_kv_down_proj=backend.linear(),
                     linear_kv_up_proj=linear_kv_up_proj,
+                    #NOTE: Separate G1 gate projection for MLA-family attention.
+                    # MultiLatentAttention applies it after core attention and before Wo.
+                    linear_gate_proj=backend.column_parallel_linear(),
                     core_attention=backend.core_attention(),
                     linear_proj=backend.row_parallel_linear(),
                     q_layernorm=IdentityOp,
@@ -273,7 +284,7 @@ def get_gpt_layer_with_transformer_engine_submodules(
             ),
             self_attn_bda=get_bias_dropout_add,
             self_attention_hyper_connection=hc_module,
-            pre_mlp_layernorm=backend.layer_norm() if num_experts else IdentityOp,
+            pre_mlp_layernorm=backend.layer_norm() if (num_experts or gated_norm) else IdentityOp,
             mlp=mlp,
             mlp_bda=get_bias_dropout_add,
             mlp_hyper_connection=hc_module,
@@ -285,7 +296,11 @@ def get_gpt_layer_with_transformer_engine_submodules(
                 module=SelfAttention,
                 params={"attn_mask_type": AttnMaskType.causal},
                 submodules=SelfAttentionSubmodules(
-                    linear_qkv=backend.column_parallel_layer_norm_linear(),
+                    linear_qkv=(
+                        backend.column_parallel_linear()
+                        if gated_norm
+                        else backend.column_parallel_layer_norm_linear()
+                    ),
                     core_attention=backend.core_attention(),
                     linear_proj=backend.row_parallel_linear(),
                     q_layernorm=(
@@ -298,7 +313,7 @@ def get_gpt_layer_with_transformer_engine_submodules(
             ),
             self_attn_bda=get_bias_dropout_add,
             self_attention_hyper_connection=hc_module,
-            pre_mlp_layernorm=backend.layer_norm() if num_experts else IdentityOp,
+            pre_mlp_layernorm=backend.layer_norm() if (num_experts or gated_norm) else IdentityOp,
             mlp=mlp,
             mlp_bda=get_bias_dropout_add,
             mlp_hyper_connection=hc_module,
@@ -337,6 +352,7 @@ def get_gpt_layer_local_submodules(
     use_kitchen_attention: bool = False,
     kitchen_attention_backend: str = "sdpa",
     enable_hyper_connection: bool = False,
+    gated_norm: bool = False,
 ) -> TransformerLayerSubmodules:
     """Use these submodules for an implementation using only modules in Megatron-Core.
 
@@ -385,6 +401,7 @@ def get_gpt_layer_local_submodules(
         num_experts=num_experts,
         moe_grouped_gemm=moe_grouped_gemm,
         moe_use_legacy_grouped_gemm=moe_use_legacy_grouped_gemm,
+        gated_norm=gated_norm,
     )
 
     hc_module = HyperConnectionModule if enable_hyper_connection else IdentityOp
@@ -402,6 +419,9 @@ def get_gpt_layer_local_submodules(
                     linear_q_up_proj=backend.column_parallel_linear(),
                     linear_kv_down_proj=backend.column_parallel_linear(),
                     linear_kv_up_proj=backend.column_parallel_linear(),
+                    #NOTE: Separate G1 gate projection for MLA-family attention.
+                    # MultiLatentAttention applies it after core attention and before Wo.
+                    linear_gate_proj=backend.column_parallel_linear(),
                     core_attention=backend.core_attention(),
                     linear_proj=backend.row_parallel_linear(),
                     q_layernorm=qk_norm if qk_layernorm else IdentityOp,
@@ -517,6 +537,7 @@ def get_mlp_module_spec_for_backend(
     moe_use_legacy_grouped_gemm: Optional[bool] = False,
     use_te_op_fuser: Optional[bool] = False,
     use_te_activation_func: bool = False,
+    gated_norm: bool = False,
 ) -> ModuleSpec:
     """Helper function to get module spec for MLP/MoE"""
 
@@ -526,7 +547,7 @@ def get_mlp_module_spec_for_backend(
     if num_experts is None:
         # Dense MLP w/ or w/o TE modules.
         module = TEFusedMLP if use_te_op_fuser else MLP
-        if backend.fuse_layernorm_and_linear():
+        if backend.fuse_layernorm_and_linear() and not gated_norm:
             linear_fc1 = backend.column_parallel_layer_norm_linear()
             assert linear_fc1 is not None
         else:
@@ -571,6 +592,7 @@ def get_gpt_decoder_layer_specs(
             use_kitchen=config.use_kitchen,
             use_te_activation_func=config.use_te_activation_func,
             enable_hyper_connection=config.enable_hyper_connections,
+            gated_norm=config.gated_norm,
         )
         moe_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             num_experts=config.num_moe_experts,
@@ -582,6 +604,7 @@ def get_gpt_decoder_layer_specs(
             use_kitchen=config.use_kitchen,
             use_te_activation_func=config.use_te_activation_func,
             enable_hyper_connection=config.enable_hyper_connections,
+            gated_norm=config.gated_norm,
         )
     else:
         dense_layer_spec = get_gpt_layer_local_spec(
@@ -594,6 +617,7 @@ def get_gpt_decoder_layer_specs(
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,
             enable_hyper_connection=config.enable_hyper_connections,
+            gated_norm=config.gated_norm,
         )
         moe_layer_spec = get_gpt_layer_local_spec(
             num_experts=config.num_moe_experts,
@@ -605,6 +629,7 @@ def get_gpt_decoder_layer_specs(
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,
             enable_hyper_connection=config.enable_hyper_connections,
+            gated_norm=config.gated_norm,
         )
 
     # Parse config.moe_layer_freq to determine the pattern of expert/dense layers.
