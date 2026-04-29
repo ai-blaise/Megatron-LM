@@ -26,3 +26,4 @@ docs/apidocs
 .opencode
 .claude
 .codex
+snapshots/*

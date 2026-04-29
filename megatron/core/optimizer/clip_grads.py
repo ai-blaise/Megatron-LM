@@ -153,20 +153,21 @@ def clip_grad_by_total_norm_fp32(
         use_decoupled_grad (bool, optional): whether to read grad from ".grad" or ".decoupled_grad",
             default value is False.
     """
-    # Grads.
+    # Grads — check decoupled_grad first (used by precision-aware and
+    # FlashAdamW with non-FP32 params), then fall back to .grad.
     params = []
     grads = []
     for param in parameters:
-        if use_decoupled_grad:
-            if hasattr(param, "decoupled_grad") and param.decoupled_grad is not None:
-                assert param.decoupled_grad.dtype in [torch.float32, torch.bfloat16]
-                params.append(param)
-                grads.append(to_local_if_dtensor(param.decoupled_grad).detach())
-        else:
-            if param.grad is not None:
-                assert param.grad.type() == 'torch.cuda.FloatTensor'
-                params.append(param)
-                grads.append(to_local_if_dtensor(param.grad).detach())
+        grad = None
+        if hasattr(param, "decoupled_grad") and param.decoupled_grad is not None:
+            assert param.decoupled_grad.dtype in [torch.float32, torch.bfloat16]
+            grad = param.decoupled_grad
+        elif param.grad is not None:
+            assert param.grad.type() == 'torch.cuda.FloatTensor'
+            grad = param.grad
+        if grad is not None:
+            params.append(param)
+            grads.append(to_local_if_dtensor(grad).detach())
 
     # Scale.
     clip_coeff = max_norm / (total_norm + 1.0e-6)

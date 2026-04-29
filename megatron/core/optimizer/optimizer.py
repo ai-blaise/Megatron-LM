@@ -148,8 +148,8 @@ class MegatronOptimizer(ABC):
         for param in params:
             if getattr(param, "__fsdp_param__", False):
                 grad = param.grad._local_tensor if param.grad is not None else None
-            elif self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
-                grad = param.decoupled_grad if hasattr(param, "decoupled_grad") else None
+            elif hasattr(param, "decoupled_grad") and param.decoupled_grad is not None:
+                grad = param.decoupled_grad
             else:
                 grad = param.grad
             grad_not_none = grad is not None

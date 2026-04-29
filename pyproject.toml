@@ -20,7 +20,14 @@ dynamic = ["version", "readme"]
 description = "Megatron Core - a library for efficient and scalable training of transformer based models"
 requires-python = ">=3.10"
 license = { text = "Apache 2.0" }
-dependencies = ["torch>=2.6.0", "numpy", "packaging>=24.2", "triton>=2.0.0; sys_platform == 'linux'"]
+dependencies = [
+    "torch>=2.6.0",
+    "numpy",
+    "packaging>=24.2",
+    "triton>=2.0.0; sys_platform == 'linux'",
+    "transformers>=4.57.6",
+    "psutil>=7.2.2",
+]
 authors = [{ name = "NVIDIA", email = "nemo-toolkit@nvidia.com" }]
 maintainers = [{ name = "NVIDIA", email = "nemo-toolkit@nvidia.com" }]
 keywords = [
@@ -72,6 +79,34 @@ mlm = [
     "accelerate",
 ]
 
+dev = [
+    "nvidia-modelopt[torch]; sys_platform != 'darwin'",
+    "transformer-engine[pytorch,core_cu13]>=2.9.0a0,<2.12.0",
+    "nvidia-resiliency-ext",
+    "tqdm",
+    "einops~=0.8",
+    "tensorstore~=0.1,!=0.1.46,!=0.1.72",
+    "nvtx~=0.2",
+    "multi-storage-client~=0.27",
+    "opentelemetry-api~=1.33.1",
+    "mamba-ssm~=2.2",
+    "causal-conv1d~=1.5",
+    "flash-linear-attention~=0.4.0",
+    "nv-grouped-gemm~=1.1",
+    "megatron-energon[av_decode]~=6.0",
+    "av",
+    "flashinfer-python~=0.5.0",
+    "wget",
+    "onnxscript",
+    "fastapi~=0.50",                                          # Forcing a little bit more recent version of fastapi to be compatible with pydantic 2.0
+    "datasets",
+    "emerging_optimizers",
+    "flask[async]",
+    "hypercorn",
+    "openai",
+    "fast-hadamard-transform",
+]
+
 lts = [
     "tqdm",
     "einops~=0.8",
@@ -106,7 +141,6 @@ test = [
     "pydantic",
     "tensorboard",
     "pyyaml",
-    "nemo-run",
 ]
 docs = [
     "sphinx",
@@ -122,7 +156,7 @@ build = [
     "hatchling",
     "pybind11",
     "Cython>=3.0.0",
-    "torch",
+    "torch>=2.11",
     "nvidia-mathdx",              # for TE
 ]
 linting = [
@@ -133,62 +167,56 @@ linting = [
     "pylint==3.2.6",
 ]
 ci = ["python-gitlab", "slack-sdk", "pandas"]
-dev = [
-    "nvidia-modelopt; sys_platform != 'darwin'",
-    "transformer-engine>=2.9.0a0,<2.12.0",
-    'nvidia-resiliency-ext<0.5; sys_platform == "linux" and platform_machine == "x86_64"',
-    "tqdm",
-    "einops~=0.8",
-    "tensorstore~=0.1,!=0.1.46,!=0.1.72",
-    "nvtx~=0.2",
-    "multi-storage-client~=0.27",
-    "opentelemetry-api~=1.33.1",
-    "mamba-ssm~=2.2",
-    "causal-conv1d~=1.5",
-    "flash-linear-attention~=0.4.0",
-    "nv-grouped-gemm~=1.1",
-    "megatron-energon[av_decode]~=6.0",
-    "av",
-    "flashinfer-python~=0.5.0",
-    "wget",
-    "onnxscript",
-    "fastapi~=0.50",
-    "datasets",
-    "emerging_optimizers",
-    "flask[async]",
-    "hypercorn",
-    "openai",
-    "fast-hadamard-transform",
-    "pandas",
-]
 no_pypi_wheels = ["flash_mla", "emerging_optimizers"]
 
 [tool.uv]
+required-environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
 default-groups = ["linting", "build", "test"]
 no-build-isolation-package = [
     "causal-conv1d",
     "nv-grouped-gemm",
+    "flash_mla",
     "mamba-ssm",
+    "transformer-engine",
     "transformer-engine-torch",
+    "fast-hadamard-transform",
 ]
 link-mode = "copy"
 conflicts = [[{ extra = "lts" }, { extra = "dev" }]]
+# Force cu13 resolution (our B200s run CUDA 13 / SM100) by blocking cu12 packages.
+# Also pin nvidia-resiliency-ext<0.5.0 (0.5.0 requires glibc 2.39, we have 2.34).
 override-dependencies = [
+    "nvidia-resiliency-ext<0.5.0",
+    "nvidia-cublas-cu12; sys_platform == 'never'",
+    "nvidia-cuda-cupti-cu12; sys_platform == 'never'",
+    "nvidia-cuda-nvrtc-cu12; sys_platform == 'never'",
+    "nvidia-cuda-runtime-cu12; sys_platform == 'never'",
+    "nvidia-cudnn-cu12; sys_platform == 'never'",
+    "nvidia-cufft-cu12; sys_platform == 'never'",
+    "nvidia-cufile-cu12; sys_platform == 'never'",
+    "nvidia-curand-cu12; sys_platform == 'never'",
+    "nvidia-cusolver-cu12; sys_platform == 'never'",
+    "nvidia-cusparse-cu12; sys_platform == 'never'",
+    "nvidia-cusparselt-cu12; sys_platform == 'never'",
+    "nvidia-nccl-cu12; sys_platform == 'never'",
+    "nvidia-nvjitlink-cu12; sys_platform == 'never'",
+    "nvidia-nvshmem-cu12; sys_platform == 'never'",
+    "nvidia-nvtx-cu12; sys_platform == 'never'",
 ]
-
-[tool.uv.extra-build-dependencies]
-fast-hadamard-transform = ["torch"]
-flash_mla = ["torch"]
-transformer-engine = ["torch"]
 
 [tool.uv.sources]
 
 flash_mla = [
     { git = "https://github.com/deepseek-ai/FlashMLA", rev = "9edee0c022cd0938148a18e334203b0aab43aa19" },
 ]
-transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "5671fd3675906cda1ade26c24a65d3dedd88eb89" }
+transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "c6853b65b7177ab3785c48c130166ec3f9324c46" }
 emerging_optimizers = { git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git", rev = "v0.1.0" }
 fast-hadamard-transform = { git = "https://github.com/Dao-AILab/fast-hadamard-transform.git", rev = "f134af63deb2df17e1171a9ec1ea4a7d8604d5ca" }
+
+[tool.uv.extra-build-dependencies]
+fast-hadamard-transform = ["setuptools", "torch"]
+flash_mla = ["torch"]
+transformer-engine = ["torch"]
 
 [tool.isort]
 profile = "black"                                                          # black-compatible
