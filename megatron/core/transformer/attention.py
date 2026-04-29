@@ -1232,7 +1232,7 @@ class Attention(MegatronModule, ABC):
         gate = gate.contiguous().view(*x.shape)
         if x.is_cuda and gate.is_cuda and x.dtype == torch.bfloat16 and gate.dtype == torch.bfloat16:
             return g1_gate_impl(gate, x)
-        return self._apply_output_gate_torch(x, gate)
+        return self._apply_output_gate_torch(x, gate) #NOTE: This implementation takes care of the standard self attnetion. for DSA it requites extra work
 
     @jit_fuser
     def _apply_output_gate_torch(self, x, gate):

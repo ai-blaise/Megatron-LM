@@ -124,6 +124,9 @@ def get_gpt_layer_with_inference_submodules(
                     linear_q_up_proj=linear_q_up_proj,
                     linear_kv_down_proj=backend.linear(),
                     linear_kv_up_proj=linear_kv_up_proj,
+                    #NOTE: Separate G1 gate projection for MLA-family attention.
+                    # MultiLatentAttention applies it after core attention and before Wo.
+                    linear_gate_proj=backend.column_parallel_linear(),
                     core_attention=backend.core_attention(),
                     linear_proj=backend.row_parallel_linear(),
                     q_layernorm=IdentityOp,
@@ -270,6 +273,9 @@ def get_gpt_layer_with_transformer_engine_submodules(
                     linear_q_up_proj=linear_q_up_proj,
                     linear_kv_down_proj=backend.linear(),
                     linear_kv_up_proj=linear_kv_up_proj,
+                    #NOTE: Separate G1 gate projection for MLA-family attention.
+                    # MultiLatentAttention applies it after core attention and before Wo.
+                    linear_gate_proj=backend.column_parallel_linear(),
                     core_attention=backend.core_attention(),
                     linear_proj=backend.row_parallel_linear(),
                     q_layernorm=IdentityOp,
@@ -413,6 +419,9 @@ def get_gpt_layer_local_submodules(
                     linear_q_up_proj=backend.column_parallel_linear(),
                     linear_kv_down_proj=backend.column_parallel_linear(),
                     linear_kv_up_proj=backend.column_parallel_linear(),
+                    #NOTE: Separate G1 gate projection for MLA-family attention.
+                    # MultiLatentAttention applies it after core attention and before Wo.
+                    linear_gate_proj=backend.column_parallel_linear(),
                     core_attention=backend.core_attention(),
                     linear_proj=backend.row_parallel_linear(),
                     q_layernorm=qk_norm if qk_layernorm else IdentityOp,

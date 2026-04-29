@@ -2276,8 +2276,10 @@ class MLATransformerConfig(TransformerConfig):
         if self.multi_latent_attention and self.apply_rope_fusion and self.rope_type != "yarn":
             raise ValueError("apply_rope_fusion for MLA only works with YARN RoPE.")
 
-        if self.attention_output_gate:
-            raise NotImplementedError("Output gate is not supported for MLA yet.")
+        #NOTE: G1 output gating is now implemented in MultiLatentAttention.forward().
+        # Previous guard kept here for easy rollback:
+        # if self.attention_output_gate:
+        #     raise NotImplementedError("Output gate is not supported for MLA yet.")
 
         if self.cache_mla_latents:
             assert (

@@ -224,6 +224,9 @@ def get_mla_submodules(
         linear_q_up_proj=backend.column_parallel_linear(),
         linear_kv_down_proj=linear_kv_down_proj,
         linear_kv_up_proj=backend.column_parallel_linear(),
+        #NOTE: Keep test MLA specs structurally aligned with production specs.
+        # The projection is only built when attention_output_gate is enabled.
+        linear_gate_proj=backend.column_parallel_linear(),
         core_attention=MockCoreAttention,
         linear_proj=backend.row_parallel_linear(),
         q_layernorm=qk_norm,

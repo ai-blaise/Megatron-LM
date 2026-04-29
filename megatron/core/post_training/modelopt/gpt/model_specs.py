@@ -101,6 +101,9 @@ def get_gpt_modelopt_spec(
             linear_kv_down_proj=Linear,
             kv_layernorm=Norm,
             linear_kv_up_proj=ColumnParallelLinear,
+            #NOTE: MLA owns its own forward path, so G1 needs this gate projection
+            # in the MLA submodule spec rather than relying on attention.py.
+            linear_gate_proj=ColumnParallelLinear,
             core_attention=core_attention,
             linear_proj=RowParallelLinear,
         )
