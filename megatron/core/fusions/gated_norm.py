@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import os
 from unittest.mock import MagicMock
 
 import torch
+import torch.nn.functional as F
 from packaging import version
 
 from megatron.core.utils import null_decorator
@@ -21,6 +23,64 @@ if not HAVE_TRITON:
     triton = MagicMock()
     triton.jit = null_decorator
     tl = MagicMock()
+
+
+_NEVER_USE_TORCH_MM = 1 << 60
+_TORCH_MM_MIN_TOKENS_ENV = "MEGATRON_GATED_NORM_TORCH_MM_MIN_TOKENS"
+_TORCH_MM_RANK_MIN_TOKENS_ENV = {
+    1: "MEGATRON_GATED_NORM_TORCH_MM_R1_MIN_TOKENS",
+    8: "MEGATRON_GATED_NORM_TORCH_MM_R8_MIN_TOKENS",
+    32: "MEGATRON_GATED_NORM_TORCH_MM_R32_MIN_TOKENS",
+    64: "MEGATRON_GATED_NORM_TORCH_MM_R64_MIN_TOKENS",
+}
+
+
+def _parse_min_tokens(raw: str | None, default: int) -> int:
+    if raw is None or raw == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            "GatedNorm torch-MM token thresholds must be integers; "
+            f"got {raw!r}"
+        ) from exc
+    if value < 0:
+        return _NEVER_USE_TORCH_MM
+    return value
+
+
+def _default_torch_mm_min_tokens(rank: int) -> int:
+    if rank >= 64:
+        return 256
+    if rank >= 32:
+        return 512
+    if rank >= 8:
+        return 2048
+    if rank >= 1:
+        return 4096
+    return _NEVER_USE_TORCH_MM
+
+
+def _torch_mm_min_tokens(rank: int) -> int:
+    global_override = os.getenv(_TORCH_MM_MIN_TOKENS_ENV)
+    if global_override is not None:
+        return _parse_min_tokens(global_override, _default_torch_mm_min_tokens(rank))
+
+    default = _default_torch_mm_min_tokens(rank)
+    for rank_floor in (64, 32, 8, 1):
+        if rank >= rank_floor:
+            return _parse_min_tokens(
+                os.getenv(_TORCH_MM_RANK_MIN_TOKENS_ENV[rank_floor]),
+                default,
+            )
+    return default
+
+
+def _should_use_torch_mm(num_tokens: int, rank: int, dtype: torch.dtype) -> bool:
+    if dtype != torch.bfloat16:
+        return False
+    return num_tokens >= _torch_mm_min_tokens(rank)
 
 
 def _validate_gated_norm_inputs(
@@ -203,6 +263,21 @@ def _gated_norm_backward_kernel(
         )
 
 
+def _gated_norm_torch_mm_forward(
+    flat_normed: torch.Tensor,
+    w_down: torch.Tensor,
+    w_up: torch.Tensor,
+    output: torch.Tensor,
+    hidden_size: int,
+) -> torch.Tensor:
+    z = torch.mm(flat_normed, w_down.t()).float()
+    activation = F.silu(z).to(w_up.dtype)
+    logits = torch.mm(activation, w_up.t())
+    torch.sigmoid(logits, out=logits)
+    torch.mul(flat_normed, logits, out=output.reshape(-1, hidden_size))
+    return z
+
+
 def _gated_norm_forward(
     normed: torch.Tensor, w_down: torch.Tensor, w_up: torch.Tensor, hidden_size: int, rank: int
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -216,6 +291,13 @@ def _gated_norm_forward(
     num_tokens = flat_normed.shape[0]
     z = torch.empty((num_tokens, rank), device=normed.device, dtype=torch.float32)
     output = torch.empty_like(flat_normed)
+
+    if num_tokens == 0:
+        return output.reshape(input_shape), flat_normed, w_down, w_up, z
+
+    if _should_use_torch_mm(num_tokens, rank, normed.dtype):
+        z = _gated_norm_torch_mm_forward(flat_normed, w_down, w_up, output, hidden_size)
+        return output.reshape(input_shape), flat_normed, w_down, w_up, z
 
     block_h = _next_power_of_2(hidden_size, 128)
     block_r = _next_power_of_2(rank, 64)

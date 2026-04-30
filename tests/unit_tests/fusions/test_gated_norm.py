@@ -21,6 +21,18 @@ class TestGatedNorm:
             "_gated_norm_backward_kernel",
         }
 
+    def test_torch_mm_thresholds_are_rank_aware(self, monkeypatch):
+        monkeypatch.delenv("MEGATRON_GATED_NORM_TORCH_MM_MIN_TOKENS", raising=False)
+        for suffix in ("R1", "R8", "R32", "R64"):
+            monkeypatch.delenv(f"MEGATRON_GATED_NORM_TORCH_MM_{suffix}_MIN_TOKENS", raising=False)
+
+        assert gated_norm._torch_mm_min_tokens(1) == 4096
+        assert gated_norm._torch_mm_min_tokens(8) == 2048
+        assert gated_norm._torch_mm_min_tokens(32) == 512
+        assert gated_norm._torch_mm_min_tokens(64) == 256
+        assert gated_norm._should_use_torch_mm(4096, 1, torch.bfloat16)
+        assert not gated_norm._should_use_torch_mm(4096, 1, torch.float16)
+
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for gated_norm")
     def test_apply_gated_norm_forward_backward_matches_reference(self, dtype):
@@ -30,6 +42,41 @@ class TestGatedNorm:
         w_down = torch.randn(4, 8, device="cuda", dtype=dtype, requires_grad=True)
         w_up = torch.randn(8, 4, device="cuda", dtype=dtype, requires_grad=True)
         grad_output = torch.randn_like(normed)
+
+        out = apply_gated_norm(normed, w_down, w_up)
+        ref_normed = normed.detach().clone().requires_grad_(True)
+        ref_w_down = w_down.detach().clone().requires_grad_(True)
+        ref_w_up = w_up.detach().clone().requires_grad_(True)
+        ref_out = (ref_normed.reshape(-1, 8) * torch.sigmoid(
+            F.silu(ref_normed.reshape(-1, 8) @ ref_w_down.t()) @ ref_w_up.t()
+        )).reshape_as(normed)
+
+        grads = torch.autograd.grad(
+            outputs=out,
+            inputs=(normed, w_down, w_up),
+            grad_outputs=grad_output,
+        )
+        ref_grads = torch.autograd.grad(
+            outputs=ref_out,
+            inputs=(ref_normed, ref_w_down, ref_w_up),
+            grad_outputs=grad_output,
+        )
+
+        assert torch.allclose(out, ref_out, atol=1e-2, rtol=1e-2)
+        for grad, ref_grad in zip(grads, ref_grads, strict=True):
+            assert torch.allclose(grad, ref_grad, atol=1e-2, rtol=1e-2)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for gated_norm")
+    def test_apply_gated_norm_forced_torch_mm_bf16_matches_reference(self, monkeypatch):
+        monkeypatch.setenv("MEGATRON_GATED_NORM_TORCH_MM_MIN_TOKENS", "0")
+        torch.manual_seed(1234)
+
+        normed = torch.randn(6, 8, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        w_down = torch.randn(4, 8, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        w_up = torch.randn(8, 4, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        grad_output = torch.randn_like(normed)
+
+        assert gated_norm._should_use_torch_mm(normed.numel() // normed.shape[-1], 4, normed.dtype)
 
         out = apply_gated_norm(normed, w_down, w_up)
         ref_normed = normed.detach().clone().requires_grad_(True)

@@ -24,7 +24,8 @@ Boundaries:
 
 - `normed` is already RMSNorm output; GatedNorm does not compute RMSNorm.
 - Runtime API: `apply_gated_norm(normed, w_down, w_up)`.
-- Runtime path is Triton-first, not a PyTorch fallback.
+- Runtime path is Triton-first for decode/small batches, with a BF16 torch-MM
+  dispatch for prefill-sized batches where tensor-core matmuls are faster.
 - Save rank-sized `z`; do not save full-width `gate` or `gate_logits`.
 
 ## What Fused Means
@@ -35,6 +36,22 @@ Fused here means fewer production kernel launches and less HBM materialization.
 - Backward: one Triton kernel launch computes `dy`, `dW_down`, and `dW_up`.
 - Backward still has two internal hidden-block passes because `dy` needs completed `dz`.
 - This is still fused because it avoids separate gradient kernels and avoids writing full-width gate/logit tensors.
+- For BF16 prefill-sized forward calls, the runtime can route the two low-rank
+  projections through torch/cuBLAS matmuls and keep the original custom backward.
+  The default dispatch thresholds are rank-aware: `r>=64` at 256 tokens,
+  `r>=32` at 512, `r>=8` at 2048, and rank 1 at 4096.
+
+Thresholds can be tuned with:
+
+```bash
+MEGATRON_GATED_NORM_TORCH_MM_MIN_TOKENS=...
+MEGATRON_GATED_NORM_TORCH_MM_R1_MIN_TOKENS=...
+MEGATRON_GATED_NORM_TORCH_MM_R8_MIN_TOKENS=...
+MEGATRON_GATED_NORM_TORCH_MM_R32_MIN_TOKENS=...
+MEGATRON_GATED_NORM_TORCH_MM_R64_MIN_TOKENS=...
+```
+
+Set a threshold to a negative value to disable that torch-MM path.
 
 Backward formulas:
 
