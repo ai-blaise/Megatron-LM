@@ -40,17 +40,20 @@ __device__ __forceinline__ float block_reduce_sum_512(
   }
   __syncthreads();
 
-  float total = 0.0f;
+  // Lane 0 of warp 0 reduces the 16 warp partials in scratch[0..15].
+  // The result is broadcast to every thread via scratch[16] — a fresh slot
+  // distinct from the warp-partial slots so the write does not alias an
+  // earlier read and the compiler cannot fold the broadcast read into a
+  // value cached across the in-place reuse of scratch[0].
   if (tid < 32) {
-    total = tid < 16 ? scratch[tid] : 0.0f;
-    total = warp_reduce_sum(total);
+    float v = tid < 16 ? scratch[tid] : 0.0f;
+    v = warp_reduce_sum(v);
+    if (tid == 0) {
+      scratch[16] = v;
+    }
   }
   __syncthreads();
-  if (tid == 0) {
-    scratch[0] = total;
-  }
-  __syncthreads();
-  total = scratch[0];
+  const float total = scratch[16];
   __syncthreads();
   return total;
 }
