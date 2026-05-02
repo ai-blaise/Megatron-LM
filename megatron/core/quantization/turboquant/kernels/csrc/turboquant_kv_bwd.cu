@@ -79,9 +79,8 @@ __global__ void turboquant_kv_bwd_kernel(
   const int tid = threadIdx.x;
   if (row >= num_rows) return;
 
-  __shared__ float buf[kLatentDim];
-  __shared__ float scratch[kLatentDim];   // for w_hat recompute
-  __shared__ float reduce_scratch[kLatentDim];
+  __shared__ float scratch[kLatentDim];          // FWHT working area
+  __shared__ float reduce_scratch[kLatentDim];   // block_reduce_sum partials
 
   const scalar_t* grad_row = grad_out + row * row_stride;
   const scalar_t* x_row = x + row * row_stride;
