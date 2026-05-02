@@ -93,7 +93,7 @@ __global__ void turboquant_kv_fwd_kernel(
     uint8_t* __restrict__ ste_mask,
     float* __restrict__ norm_out,
     float* __restrict__ inner_norm_out,
-    float* __restrict__ w_hat_save,
+    __nv_bfloat16* __restrict__ w_hat_save,
     const float* __restrict__ signs1,
     const float* __restrict__ signs2,
     const float* __restrict__ boundaries_high,
@@ -186,7 +186,7 @@ __global__ void turboquant_kv_fwd_kernel(
   TQ_REGION_END(inv_rot);
 
   if (kSaveWHat) {
-    w_hat_save[row * kLatentDim + tid] = w_hat;
+    w_hat_save[row * kLatentDim + tid] = __float2bfloat16(w_hat);
   }
 
   // region: writeout — port of SGLang dequantize_selected_2p5_kernel final write
@@ -204,7 +204,7 @@ void launch_turboquant_kv_fwd(
     uint8_t* ste_mask,
     float* norm_out,
     float* inner_norm_out,
-    float* w_hat_save,
+    __nv_bfloat16* w_hat_save,
     const float* signs1,
     const float* signs2,
     const float* boundaries_high,
@@ -242,15 +242,15 @@ void launch_turboquant_kv_fwd(
 }
 
 template void launch_turboquant_kv_fwd<float>(
-    const float*, float*, uint8_t*, uint8_t*, float*, float*, float*,
+    const float*, float*, uint8_t*, uint8_t*, float*, float*, __nv_bfloat16*,
     const float*, const float*, const float*, const float*,
     const float*, const float*, int64_t, int64_t, bool, cudaStream_t);
 template void launch_turboquant_kv_fwd<__nv_bfloat16>(
-    const __nv_bfloat16*, __nv_bfloat16*, uint8_t*, uint8_t*, float*, float*, float*,
+    const __nv_bfloat16*, __nv_bfloat16*, uint8_t*, uint8_t*, float*, float*, __nv_bfloat16*,
     const float*, const float*, const float*, const float*,
     const float*, const float*, int64_t, int64_t, bool, cudaStream_t);
 template void launch_turboquant_kv_fwd<__half>(
-    const __half*, __half*, uint8_t*, uint8_t*, float*, float*, float*,
+    const __half*, __half*, uint8_t*, uint8_t*, float*, float*, __nv_bfloat16*,
     const float*, const float*, const float*, const float*,
     const float*, const float*, int64_t, int64_t, bool, cudaStream_t);
 

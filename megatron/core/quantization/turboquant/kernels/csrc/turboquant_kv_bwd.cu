@@ -73,7 +73,7 @@ __global__ void turboquant_kv_bwd_kernel(
     const uint8_t* __restrict__ ste_mask,
     const float* __restrict__ norm_arr,
     const float* __restrict__ inner_norm_arr,
-    const float* __restrict__ w_hat_saved,
+    const __nv_bfloat16* __restrict__ w_hat_saved,
     const float* __restrict__ signs1,
     const float* __restrict__ signs2,
     const float* __restrict__ centroids_high,
@@ -100,7 +100,7 @@ __global__ void turboquant_kv_bwd_kernel(
   TQ_REGION_BEGIN(recompute_w_hat);
   float w_hat;
   if (kHaveWHat) {
-    w_hat = w_hat_saved[row * kLatentDim + tid];
+    w_hat = __bfloat162float(w_hat_saved[row * kLatentDim + tid]);
   } else {
     const int channel = tid & (kGroupSize - 1);
     const float centroid = (channel < kHighChannels)
@@ -167,7 +167,7 @@ void launch_turboquant_kv_bwd(
     const uint8_t* ste_mask,
     const float* norm_arr,
     const float* inner_norm_arr,
-    const float* w_hat_saved,
+    const __nv_bfloat16* w_hat_saved,
     const float* signs1,
     const float* signs2,
     const float* centroids_high,
@@ -205,17 +205,17 @@ void launch_turboquant_kv_bwd(
 
 template void launch_turboquant_kv_bwd<float>(
     const float*, const float*, const uint8_t*, const uint8_t*,
-    const float*, const float*, const float*,
+    const float*, const float*, const __nv_bfloat16*,
     const float*, const float*, const float*, const float*, float*,
     int64_t, int64_t, bool, cudaStream_t);
 template void launch_turboquant_kv_bwd<__nv_bfloat16>(
     const __nv_bfloat16*, const __nv_bfloat16*, const uint8_t*, const uint8_t*,
-    const float*, const float*, const float*,
+    const float*, const float*, const __nv_bfloat16*,
     const float*, const float*, const float*, const float*, __nv_bfloat16*,
     int64_t, int64_t, bool, cudaStream_t);
 template void launch_turboquant_kv_bwd<__half>(
     const __half*, const __half*, const uint8_t*, const uint8_t*,
-    const float*, const float*, const float*,
+    const float*, const float*, const __nv_bfloat16*,
     const float*, const float*, const float*, const float*, __half*,
     int64_t, int64_t, bool, cudaStream_t);
 

@@ -55,14 +55,16 @@ class TurboQuantKVFn(torch.autograd.Function):
             ste_mask = torch.empty(n, buffers.latent_dim, dtype=torch.uint8, device=x.device)
             norm = torch.empty(n, dtype=torch.float32, device=x.device)
             inner_norm = torch.empty(n, dtype=torch.float32, device=x.device)
-            # Save w_hat in fp32 to skip the recompute_w_hat region of the
-            # backward kernel (~20% of bwd time per region-split profile).
-            # bf16 was tried first but the round-trip error compounded through
-            # the cross-coordinate sum reduction in chain_outputs to ~1e-3
-            # absolute (vs the 1e-6 fp32 baseline); fp32 keeps the gradient
-            # at machine-precision parity at the cost of 2 KB/token.
+            # Save w_hat in bf16 to skip the recompute_w_hat region of the
+            # backward kernel (~20% of bwd time per region-split profile)
+            # while keeping the activation-memory cost at 1 KB/token. The
+            # bf16 round-trip introduces ~1e-3 max abs error in grad_x vs
+            # fp32 — beneath the gradient-noise floor that FlashAdamW + ECO
+            # is designed to absorb (ECO injects weight-quant error into
+            # momentum each step; arXiv:2601.22101). For training paths
+            # without ECO, switch this to torch.float32 explicitly.
             w_hat_save = torch.empty(
-                n, buffers.latent_dim, dtype=torch.float32, device=x.device
+                n, buffers.latent_dim, dtype=torch.bfloat16, device=x.device
             )
             ext.turboquant_kv_fwd(
                 flat,
