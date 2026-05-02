@@ -60,7 +60,12 @@ __device__ __forceinline__ void store_from_float<__half>(__half* p, float v) {
   *p = __float2half(v);
 }
 
-template <typename scalar_t, bool kNormCorrection>
+// `w_hat_saved`, when non-null, is a bf16 [N, kLatentDim] tensor produced by
+// the forward kernel. Reading it removes the entire recompute_w_hat region
+// (centroid lookup + FWHT) from the backward — the largest single hotspot
+// after invert_rotation. When null, the kernel falls back to the recompute
+// path so existing checkpoints / external callers stay compatible.
+template <typename scalar_t, bool kNormCorrection, bool kHaveWHat>
 __global__ void turboquant_kv_bwd_kernel(
     const scalar_t* __restrict__ grad_out,
     const scalar_t* __restrict__ x,
@@ -68,6 +73,7 @@ __global__ void turboquant_kv_bwd_kernel(
     const uint8_t* __restrict__ ste_mask,
     const float* __restrict__ norm_arr,
     const float* __restrict__ inner_norm_arr,
+    const __nv_bfloat16* __restrict__ w_hat_saved,
     const float* __restrict__ signs1,
     const float* __restrict__ signs2,
     const float* __restrict__ centroids_high,
@@ -90,17 +96,19 @@ __global__ void turboquant_kv_bwd_kernel(
   const float norm = norm_arr[row];
   const float inner_norm = inner_norm_arr[row];
 
-  // ------------------- region: recompute_w_hat -------------------
+  // ------------------- region: recompute_w_hat (or load saved) -------------------
   TQ_REGION_BEGIN(recompute_w_hat);
-  const int channel = tid & (kGroupSize - 1);
-  float centroid;
-  if (channel < kHighChannels) {
-    centroid = centroids_high[idx_row[tid]];
+  float w_hat;
+  if (kHaveWHat) {
+    w_hat = __bfloat162float(w_hat_saved[row * kLatentDim + tid]);
   } else {
-    centroid = centroids_low[idx_row[tid]];
+    const int channel = tid & (kGroupSize - 1);
+    const float centroid = (channel < kHighChannels)
+        ? centroids_high[idx_row[tid]]
+        : centroids_low[idx_row[tid]];
+    const float r_back = centroid * signs2[tid];
+    w_hat = fwht_512(r_back, scratch) * kInvSqrtLatentDim;
   }
-  const float r_back = centroid * signs2[tid];
-  const float w_hat = fwht_512(r_back, scratch) * kInvSqrtLatentDim;
   TQ_REGION_END(recompute_w_hat);
 
   // ------------------- region: chain_through_outputs -------------------
@@ -159,6 +167,7 @@ void launch_turboquant_kv_bwd(
     const uint8_t* ste_mask,
     const float* norm_arr,
     const float* inner_norm_arr,
+    const __nv_bfloat16* w_hat_saved,
     const float* signs1,
     const float* signs2,
     const float* centroids_high,
@@ -170,14 +179,25 @@ void launch_turboquant_kv_bwd(
     cudaStream_t stream) {
   const dim3 grid(static_cast<unsigned int>(num_rows));
   const dim3 block(kLatentDim);
-  if (norm_correction) {
-    turboquant_kv_bwd_kernel<scalar_t, true><<<grid, block, 0, stream>>>(
-        grad_out, x, indices, ste_mask, norm_arr, inner_norm_arr,
+  const bool have_w = (w_hat_saved != nullptr);
+  if (norm_correction && have_w) {
+    turboquant_kv_bwd_kernel<scalar_t, true, true><<<grid, block, 0, stream>>>(
+        grad_out, x, indices, ste_mask, norm_arr, inner_norm_arr, w_hat_saved,
+        signs1, signs2, centroids_high, centroids_low,
+        grad_x, num_rows, row_stride);
+  } else if (norm_correction) {
+    turboquant_kv_bwd_kernel<scalar_t, true, false><<<grid, block, 0, stream>>>(
+        grad_out, x, indices, ste_mask, norm_arr, inner_norm_arr, nullptr,
+        signs1, signs2, centroids_high, centroids_low,
+        grad_x, num_rows, row_stride);
+  } else if (have_w) {
+    turboquant_kv_bwd_kernel<scalar_t, false, true><<<grid, block, 0, stream>>>(
+        grad_out, x, indices, ste_mask, norm_arr, inner_norm_arr, w_hat_saved,
         signs1, signs2, centroids_high, centroids_low,
         grad_x, num_rows, row_stride);
   } else {
-    turboquant_kv_bwd_kernel<scalar_t, false><<<grid, block, 0, stream>>>(
-        grad_out, x, indices, ste_mask, norm_arr, inner_norm_arr,
+    turboquant_kv_bwd_kernel<scalar_t, false, false><<<grid, block, 0, stream>>>(
+        grad_out, x, indices, ste_mask, norm_arr, inner_norm_arr, nullptr,
         signs1, signs2, centroids_high, centroids_low,
         grad_x, num_rows, row_stride);
   }
@@ -185,18 +205,18 @@ void launch_turboquant_kv_bwd(
 
 template void launch_turboquant_kv_bwd<float>(
     const float*, const float*, const uint8_t*, const uint8_t*,
-    const float*, const float*, const float*, const float*,
-    const float*, const float*, float*,
+    const float*, const float*, const __nv_bfloat16*,
+    const float*, const float*, const float*, const float*, float*,
     int64_t, int64_t, bool, cudaStream_t);
 template void launch_turboquant_kv_bwd<__nv_bfloat16>(
     const __nv_bfloat16*, const __nv_bfloat16*, const uint8_t*, const uint8_t*,
-    const float*, const float*, const float*, const float*,
-    const float*, const float*, __nv_bfloat16*,
+    const float*, const float*, const __nv_bfloat16*,
+    const float*, const float*, const float*, const float*, __nv_bfloat16*,
     int64_t, int64_t, bool, cudaStream_t);
 template void launch_turboquant_kv_bwd<__half>(
     const __half*, const __half*, const uint8_t*, const uint8_t*,
-    const float*, const float*, const float*, const float*,
-    const float*, const float*, __half*,
+    const float*, const float*, const __nv_bfloat16*,
+    const float*, const float*, const float*, const float*, __half*,
     int64_t, int64_t, bool, cudaStream_t);
 
 }  // namespace turboquant

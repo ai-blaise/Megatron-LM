@@ -55,6 +55,11 @@ class TurboQuantKVFn(torch.autograd.Function):
             ste_mask = torch.empty(n, buffers.latent_dim, dtype=torch.uint8, device=x.device)
             norm = torch.empty(n, dtype=torch.float32, device=x.device)
             inner_norm = torch.empty(n, dtype=torch.float32, device=x.device)
+            # Save w_hat in bf16 to skip the recompute_w_hat region of the
+            # backward kernel (~20% of bwd time per region-split profile).
+            w_hat_save = torch.empty(
+                n, buffers.latent_dim, dtype=torch.bfloat16, device=x.device
+            )
             ext.turboquant_kv_fwd(
                 flat,
                 out,
@@ -62,6 +67,7 @@ class TurboQuantKVFn(torch.autograd.Function):
                 ste_mask,
                 norm,
                 inner_norm,
+                w_hat_save,
                 buffers.signs1.to(x.device).float(),
                 buffers.signs2.to(x.device).float(),
                 buffers.boundaries_high.to(x.device).float(),
@@ -71,7 +77,7 @@ class TurboQuantKVFn(torch.autograd.Function):
                 buffers.norm_correction,
             )
             ctx.cuda_path = True
-            ctx.save_for_backward(flat, indices, ste_mask, norm, inner_norm)
+            ctx.save_for_backward(flat, indices, ste_mask, norm, inner_norm, w_hat_save)
         else:
             out_ref, intermediates = turboquant_forward(
                 flat, buffers, return_intermediates=True
@@ -98,7 +104,8 @@ class TurboQuantKVFn(torch.autograd.Function):
         grad_flat = grad_x_hat.reshape(-1, buffers.latent_dim).contiguous()
 
         if getattr(ctx, "cuda_path", False):
-            x_flat, indices, ste_mask, norm, inner_norm = ctx.saved_tensors
+            (x_flat, indices, ste_mask, norm, inner_norm, w_hat_saved
+             ) = ctx.saved_tensors
             ext = _try_load_cuda_ext()
             grad_x = torch.empty_like(x_flat)
             ext.turboquant_kv_bwd(
@@ -108,6 +115,7 @@ class TurboQuantKVFn(torch.autograd.Function):
                 ste_mask,
                 norm,
                 inner_norm,
+                w_hat_saved,
                 buffers.signs1.to(x_flat.device).float(),
                 buffers.signs2.to(x_flat.device).float(),
                 buffers.centroids_high.to(x_flat.device).float(),
