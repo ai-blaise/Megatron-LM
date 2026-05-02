@@ -216,11 +216,28 @@ The overlap path **requires** `use_distributed_optimizer=True` for pure-NVFP4 tr
 ### Failure containment
 
 `step_param` and `on_bucket_complete` are guarded — an exception in one bucket stashes on the scheduler and continues with subsequent buckets. The exception is re-raised on the next `handle.remove()` or `scheduler.finalize()` so the trainer always observes it before the next iteration.
+### CUDA graph capture
+
+Each wrapped `start_grad_sync` short-circuits when `is_graph_capturing()` is true: the underlying RS dispatch still runs (delegating to MCore's original method), but the event recording, stream switch, and per-param step are skipped. Capturing the optimizer step inside a graphed microbatch would be incorrect — the step is host-side training-loop state, not microbatch compute. Mirrors the same defensive check inside MCore DDP's own backward post-hook.
+
+### Synchronisation contract
+
+The per-bucket step runs on a private high-priority CUDA stream; the default stream is *not* implicitly synchronised. Two ways to surface the updates:
+
+- **`scheduler.finalize()`** — single-stream wait (`current_stream().wait_stream(opt_stream)`); subsequent default-stream ops (param reads, next forward) see the updated weights without a global device sync. Also re-raises any deferred exception. Cheap; recommended at the end of each iteration.
+- **`handle.remove()`** — full host-side `opt_stream.synchronize()` plus exception drain. Used at teardown, not per-step.
+
+Reading the optimizer's step counter (a CPU tensor) is always safe immediately after backward — it's incremented synchronously by `step_param` on the host. Only CUDA-resident tensors (params, momentum) require the stream barrier.
+
+### Re-entry safety
+
+Each bucket group carries a sentinel attribute (`_flashoptim_gr_bucket_scheduler_installed`) set on `install` and cleared on `remove`. A second `enable_gradient_release_mcore_ddp(..., overlap_grad_reduce=True)` against an already-wrapped DDP raises `RuntimeError` rather than silently nesting wrappers (which would either double-step or recurse on remove).
 
 ### Tests
 
 | File | Coverage added |
 |---|---|
 | `test_flash_adamw_gr_bucket_overlap.py` | per-bucket step ordering, grad-zero timing, missing main_grad skip, pre_step gating, exception containment, install/remove lifecycle, DistOpt accepted, on_bucket_complete ordering, orchestrator per-bucket flush partition |
+| `test_flash_adamw_gr_overlap_sweep.py` | re-entry guard (double install rejected, install-after-remove works), graph-capture passthrough, `finalize()` makes updates visible without global sync, `finalize()` surfaces deferred exceptions, exception in bucket A doesn't block bucket B, step counter matches non-overlap across multiple backwards, expert-parallel bucket groups also wrapped |
 
-Total optimizer test suite: **50 tests, all pass on B200 (~60s)**.
+Total optimizer test suite: **57 tests, all pass on B200 (~60s)**.

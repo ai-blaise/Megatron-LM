@@ -3919,6 +3919,8 @@ class _BucketStepScheduler:
 
     # ----- public API -------------------------------------------------
 
+    _SENTINEL_ATTR = "_flashoptim_gr_bucket_scheduler_installed"
+
     def install(self, ddp_module: Any) -> None:
         """Wrap every bucket group's ``start_grad_sync``."""
         bucket_groups = list(getattr(ddp_module, "bucket_groups", []))
@@ -3926,8 +3928,15 @@ class _BucketStepScheduler:
             getattr(ddp_module, "expert_parallel_bucket_groups", [])
         )
         for bg in bucket_groups:
+            if getattr(bg, self._SENTINEL_ATTR, False):
+                raise RuntimeError(
+                    "_BucketStepScheduler.install: bucket group already has "
+                    "a scheduler attached. Call handle.remove() on the prior "
+                    "enable_gradient_release_mcore_ddp() before re-enabling."
+                )
             orig = bg.start_grad_sync
             self._installed.append((bg, orig))
+            setattr(bg, self._SENTINEL_ATTR, True)
 
             def _make_wrapped(bg=bg, orig=orig):
                 def wrapped(force_all_reduce: bool = False):
@@ -3945,6 +3954,10 @@ class _BucketStepScheduler:
             self._opt_stream.synchronize()
         for bg, orig in self._installed:
             bg.start_grad_sync = orig
+            try:
+                delattr(bg, self._SENTINEL_ATTR)
+            except AttributeError:
+                pass
         self._installed.clear()
         if self._pending_exc is not None:
             exc, self._pending_exc = self._pending_exc, None
@@ -3969,11 +3982,25 @@ class _BucketStepScheduler:
         (still on the dispatch stream) and instructs the optimizer
         stream to ``wait_event`` on it before running the per-param
         step.
+
+        Skips entirely during CUDA graph capture — recording events
+        and switching streams inside a captured region would either
+        capture the optimizer step into the graph (wrong: the step
+        belongs to the host-side training loop, not the captured
+        microbatch) or fail the capture outright. MCore DDP's own
+        backward post-hook short-circuits the same way.
         """
         if not torch.cuda.is_available():
             # CPU path (only hit by tests with mock buckets) — run
             # synchronously, in dispatch order.
             self._step_bucket_group(bg)
+            return
+
+        try:
+            from ..transformer.cuda_graphs import is_graph_capturing
+        except Exception:
+            is_graph_capturing = lambda: False  # noqa: E731
+        if is_graph_capturing():
             return
 
         # Where did the RS go? When num_distributed_optimizer_instances
