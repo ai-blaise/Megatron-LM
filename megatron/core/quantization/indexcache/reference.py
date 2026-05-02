@@ -115,19 +115,23 @@ def indexcache_backward(
     clip_mask = intermediates["clip_mask"]
     eps_active = intermediates["eps_active"]
 
-    # Direct STE term: gradient passes through where the post-divide value
-    # was inside the [-fp8_max, +fp8_max] band. Rounding itself is treated
-    # as identity (standard STE).
+    # Derivation (matches the STE-detach forward used as the autograd oracle):
+    #   y_i = scale * q_fp8_i  with q_fp8_i routed via STE through the clipped
+    #   pre_clip = x/scale, so the autograd path is:
+    #       dy_i/dx_j = mask_i * delta_ij
+    #                 + dscale/dx_j * (q_fp8_i - mask_i * x_i / scale)
+    #   The first term is the direct STE; the second is the rank-1 scale-
+    #   path contribution restricted to the row's argmax-of-|x| coordinate.
     grad_direct = g * clip_mask
 
-    # Scale-path term: scale = (1 / fp8_max) * max(|x|), so its gradient lives
-    # entirely on the row's argmax-of-|x| coordinate. The rank-1 update is
-    # (sum_i g_i * q_fp8_i) * sign(x_argmax) / fp8_max placed at j=argmax.
+    scale = intermediates["scale"]  # [N]
+    scale_b = scale[:, None]
+    inner = (g * (q_fp8 - clip_mask * xf / scale_b)).sum(dim=-1)  # [N]
+
     abs_xf = xf.abs()
     argmax = abs_xf.argmax(dim=-1)
     sign_at_argmax = torch.gather(xf.sign(), -1, argmax[:, None]).squeeze(-1)
     scale_grad_factor = (sign_at_argmax * eps_active) * config.fp8_max_inv  # [N]
-    inner = (g * q_fp8).sum(dim=-1)  # [N]
     contrib = inner * scale_grad_factor  # [N]
     rank1 = torch.zeros_like(grad_direct)
     rank1.scatter_(-1, argmax[:, None], contrib[:, None])
