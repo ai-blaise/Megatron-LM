@@ -95,13 +95,48 @@ The ±1 ULP int8 differences are floor-vs-round disagreements at element
 boundaries and are below the noise floor that ECO already absorbs through
 the next step's inject.
 
+## Round 2 — algebraic identity in the var dequant path
+
+Followup tightening: when the optimizer state is quantized, the variance
+is stored as its sqrt (the FlashAdamW int8 store-time invariant). The
+inject kernel previously squared `var_sqrt` to recover `var`, then took
+sqrt again to compute the Adam denominator:
+
+```
+var       = var_sqrt * var_sqrt
+denom     = sqrt(var / bc2) + eps
+```
+
+Algebraically (with `var_sqrt ≥ 0`):
+
+```
+sqrt(var_sqrt^2 / bc2) = var_sqrt * (1 / sqrt(bc2))
+```
+
+so the kernel now computes `denom = var_sqrt * inv_sqrt_bc2 + eps`,
+where `inv_sqrt_bc2` is precomputed once host-side per call. Saves one
+square and one sqrt per element in the QUANTIZE_OPTIM_STATES branch
+(the live training path). Identity-preserving, verified by the
+correctness oracle (same bit-equivalence numbers as before the change:
+zero int8 mismatches at 262 K, 11/4 M and 33/16 M at ±1 ULP, fp32 round-
+off only on the unquantized path).
+
+Wall-clock is unchanged because the kernel is bandwidth-bound at large
+N and launch-bound at small N — neither regime is gated on the saved
+arithmetic. The change is kept for code clarity and lower per-thread
+register pressure (one fewer live fp32 between var dequant and denom).
+
 ## What stays out of scope this round
 
 The wider perf wins identified during profiling — fusing the NVFP4 cast
 with error compute, eliminating the full-tensor dequantize-then-slice in
 `distrib_optimizer._inject_nvfp4_eco_errors`, and per-tile dither — all
-require Transformer Engine to exercise end-to-end. They are flagged as
-followup work to land once TE is brought up on the dev VM. Specifically:
+require Transformer Engine to exercise end-to-end. The pip wheel for TE
+(>= 2.7.0.dev0) targets a newer cuBLAS than the CUDA 13.0 driver on the
+dev VM ships with (undefined symbol
+`cublasLtGroupedMatrixLayoutInit_internal` against `libcublasLt.so.13`),
+so a clean source build is needed before the TE-pipeline round can land.
+Specifically:
 
 - **Cast + inject fusion.** The cast kernel in
   `nvfp4_sr.cast_master_weights_to_nvfp4_2d_sr` has `pre_cast` in
