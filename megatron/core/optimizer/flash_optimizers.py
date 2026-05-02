@@ -2740,11 +2740,35 @@ def _fused_eco_inject(
     from the variance, computes error = pre_cast - post_cast (BF16),
     adds eco_scalar * denom * error to exp_avg, requantizes if needed,
     and writes back in a single Triton kernel launch.
+
+    Note on this fork's contract with ECO: model weights are never
+    dequantized to a higher master precision for the backward (no fp32
+    shadow), so the injection of ``eco_scalar * denom * (pre - post)`` here
+    is the *only* signal compensating for the missing precision. The
+    optimization in this kernel is therefore purely plumbing — autotune
+    over BLOCK_SIZE_N / num_warps / num_stages — and preserves the
+    per-step semantics of the inject (no batching, no deferral across
+    steps, no tile-level rounding shortcuts that change the per-element
+    error magnitude).
+
+    BLOCK_SIZE_N and num_warps are chosen by ``triton.autotune`` (see the
+    decorator on ``_triton_eco_inject_kernel``); the autotune cache is keyed
+    on (N, PARAM_DTYPE, QUANTIZE_OPTIM_STATES) so each unique shape pays
+    the search cost once.
     """
     N = pre_cast.numel()
     if N == 0:
         return
-    grid = functools.partial(_make_grid, N)
+
+    # Meta-aware grid: ``triton.autotune`` chooses BLOCK_SIZE_N from the
+    # config space below; the grid lambda receives that choice via ``meta``
+    # and sizes the launch as min(2*SM_count, ceil(N / BLOCK_SIZE_N)). The
+    # cap at 2*SM_count matches the ``_make_grid`` heuristic used elsewhere
+    # in this file; the floor at the needed-blocks count avoids the
+    # small-N regression that a fixed-CTA launch would otherwise produce.
+    grid = lambda meta: (
+        min(2 * _get_sm_count(), triton.cdiv(N, meta["BLOCK_SIZE_N"])),
+    )
     _triton_eco_inject_kernel[grid](
         mom,
         mom_scales_f16,
@@ -2759,10 +2783,21 @@ def _fused_eco_inject(
         GROUP_SIZE=group_size,
         PARAM_DTYPE=_TORCH_DTYPE_TO_TRITON_DTYPE[pre_cast.dtype],
         QUANTIZE_OPTIM_STATES=quantize_optim_states,
-        BLOCK_SIZE_N=1024,
     )
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_SIZE_N": bs}, num_warps=nw, num_stages=ns)
+        for bs in (256, 512, 1024, 2048, 4096)
+        for nw in (2, 4, 8)
+        for ns in (1, 2, 3)
+    ],
+    # GROUP_SIZE is constant across the live training path (always 32). Key
+    # on the dynamic shape and the two compile-time switches that change
+    # which code paths the kernel emits.
+    key=["N", "QUANTIZE_OPTIM_STATES", "PARAM_DTYPE"],
+)
 @triton.jit
 def _triton_eco_inject_kernel(
     mom_ptr: "Any",
