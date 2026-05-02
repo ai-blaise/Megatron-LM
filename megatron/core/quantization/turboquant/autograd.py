@@ -30,7 +30,7 @@ def _try_load_cuda_ext():
         from megatron.core.quantization.turboquant.kernels.build import get_ext
 
         return get_ext()
-    except Exception:  # noqa: BLE001 — the JIT build fails for many reasons
+    except (ImportError, RuntimeError):
         return None
 
 
