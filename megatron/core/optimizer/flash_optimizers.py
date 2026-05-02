@@ -2760,6 +2760,13 @@ def _fused_eco_inject(
     if N == 0:
         return
 
+    # Pre-compute 1/sqrt(bc2) host-side. The quantized state stores the
+    # variance as its sqrt; the kernel uses inv_sqrt_bc2 to evaluate the
+    # Adam denominator as var_sqrt * inv_sqrt_bc2 + eps, eliminating one
+    # square and one sqrt per element relative to the canonical
+    # sqrt(var_sqrt**2 / bc2) + eps formulation.
+    inv_sqrt_bc2 = 1.0 / math.sqrt(bc2)
+
     # Meta-aware grid: ``triton.autotune`` chooses BLOCK_SIZE_N from the
     # config space below; the grid lambda receives that choice via ``meta``
     # and sizes the launch as min(2*SM_count, ceil(N / BLOCK_SIZE_N)). The
@@ -2780,6 +2787,7 @@ def _fused_eco_inject(
         eco_scalar,
         eps,
         bc2,
+        inv_sqrt_bc2,
         GROUP_SIZE=group_size,
         PARAM_DTYPE=_TORCH_DTYPE_TO_TRITON_DTYPE[pre_cast.dtype],
         QUANTIZE_OPTIM_STATES=quantize_optim_states,
@@ -2810,6 +2818,7 @@ def _triton_eco_inject_kernel(
     eco_scalar: float,
     eps: float,
     bc2: float,
+    inv_sqrt_bc2: float,
     GROUP_SIZE: tl.constexpr,
     PARAM_DTYPE: tl.constexpr,
     QUANTIZE_OPTIM_STATES: tl.constexpr,
@@ -2856,12 +2865,18 @@ def _triton_eco_inject_kernel(
             mom_f32 = (mom_normalized * mom_scales.to(tl.float32)[:, None]).reshape(
                 (BLOCK_SIZE_N,)
             )
-            # Variance: /255, * scale, square (sqrt was applied at store time)
+            # Variance is stored AS its sqrt (the store-time invariant in
+            # FlashAdamW's int8 quantization path). The dequant chain
+            # /255 -> * scale recovers var_sqrt = sqrt(var). The Adam
+            # denominator we want is sqrt(var / bc2) + eps. With var_sqrt
+            # in hand and var = var_sqrt**2, that simplifies to
+            # var_sqrt / sqrt(bc2) + eps -- one sqrt and one square saved
+            # per element. inv_sqrt_bc2 is hoisted as a kernel-scalar so
+            # Triton lifts the host-side rsqrt out of the inner loop.
             var_transformed = var_groups / 255.0
             var_sqrt = (var_transformed * var_scales.to(tl.float32)[:, None]).reshape(
                 (BLOCK_SIZE_N,)
             )
-            var_f32 = var_sqrt * var_sqrt
         else:
             mom_f32 = tl.load(mom_ptr + absolute_offsets, mask=mask, other=0.0).to(
                 tl.float32
@@ -2879,8 +2894,13 @@ def _triton_eco_inject_kernel(
         )
         error = pre - post
 
-        # Adam denominator (bias-corrected variance)
-        denom = tl.sqrt(var_f32 / bc2) + eps
+        # Adam denominator (bias-corrected variance). The two paths differ
+        # because the quantized state stores var as its sqrt; see the
+        # var-dequant comment above.
+        if QUANTIZE_OPTIM_STATES:
+            denom = var_sqrt * inv_sqrt_bc2 + eps
+        else:
+            denom = tl.sqrt(var_f32 / bc2) + eps
 
         # Inject: m += α · denom · e
         mom_f32 = mom_f32 + eco_scalar * denom * error
