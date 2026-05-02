@@ -95,6 +95,46 @@ The ±1 ULP int8 differences are floor-vs-round disagreements at element
 boundaries and are below the noise floor that ECO already absorbs through
 the next step's inject.
 
+## Round 3 — autotune correctness fix (CRITICAL)
+
+The round-1 autotune addition (commit `7fbec44dd`'s parent chain, originally
+landed via PR #7) was missing a ``restore_value`` argument. Triton's
+``@autotune`` decorator invokes the kernel once per candidate config to
+time it, then runs the chosen config again — *without* snapshotting any
+input. Because ``_triton_eco_inject_kernel`` does an in-place RMW on the
+momentum buffer (and its int8 scales), every cache-miss inject call was
+applying the optimizer update **45 + 1 = 46 times** instead of once,
+silently corrupting the optimizer state on the first encounter of each
+unique ``(N, PARAM_DTYPE, QUANTIZE_OPTIM_STATES)`` shape.
+
+The existing correctness oracle masked the bug because it clones inputs
+per call. Round-3 added
+``tests/unit_tests/optimizer/test_flash_adamw_eco_first_call.py``: same
+prepared state called twice without cloning — the first call sweeps the
+autotune configs and the second hits the cache. Without ``restore_value``
+the two diverge wildly; with it they are bit-equal.
+
+The fix is a one-line addition to the autotune decorator
+(``restore_value=("mom_ptr", "mom_scales_f16_ptr")``) so Triton
+snapshot-and-restores those tensors around each timing run. The neighboring
+``_triton_adam_kernel`` and ``_triton_momentum_kernel`` deliberately skip
+``@triton.autotune`` entirely with the same justification (see line 1631
+of ``flash_optimizers.py``); this fix brings the inject kernel into
+compliance with that house rule.
+
+Bench post-fix on B200 (compare to round-1 numbers above):
+
+| elements | autotune-only (q) | + restore_value (q) | Δ |
+|---:|---:|---:|---:|
+|   262 144 |  45 µs |  47 µs | +4 % |
+|  4 194 304 |  46 µs |  48 µs | +4 % |
+| 16 777 216 |  50 µs |  52 µs | +4 % |
+| 67 108 864 | 189 µs | 176 µs | −7 % |
+
+Steady-state perf is preserved (the cache-hit path was already correct);
+only first-call latency for new shapes pays a one-time snapshot cost
+during the autotune sweep, then is cached forever.
+
 ## Round 2 — algebraic identity in the var dequant path
 
 Followup tightening: when the optimizer state is quantized, the variance
