@@ -125,8 +125,24 @@ Backward saves `w_hat` from forward to skip the recompute_w_hat region:
 
 Below 16K tokens kernel-launch dispatch dominates. The save-w_hat
 optimization shaves 12–14% off the backward at large token counts (151 µs
-→ 131 µs at 16K, 581 µs → 500 µs at 65K) at the cost of an extra 2 KB
-fp32/token of activation memory.
+→ 131 µs at 16K, 581 µs → 500 µs at 65K) at the cost of 1 KB bf16/token
+of activation memory.
+
+### Saved-w_hat dtype: bf16 with ECO, fp32 without
+
+`w_hat` is saved in **bf16** (1 KB/token) by default. The bf16 round-trip
+introduces ~1e-3 max abs / 1e-4 relative-norm error in `grad_x` vs the
+fp32-saved baseline — well below the gradient-noise floor that
+**FlashAdamW + ECO** (Error-Compensating Optimization, arXiv:2601.22101)
+absorbs by injecting weight-quant error into the momentum buffer each
+step. Convergence under plain AdamW (no ECO) on the target-shape
+mini-config: TurboQuant +4.79% rel vs no-quant baseline, well within the
+10% tolerance.
+
+Callers without ECO can switch back to fp32 by editing
+`autograd.py:w_hat_save` to `dtype=torch.float32` and updating the
+pybind dtype check; this is a 2-line change. A config-flag toggle is on
+the followup track.
 
 ## Running training
 
