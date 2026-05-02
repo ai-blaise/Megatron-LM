@@ -119,6 +119,17 @@ followup work to land once TE is brought up on the dev VM. Specifically:
   the published ECO recipe, which calls for per-element SR; this needs a
   variance-bound analysis before landing.
 
+## End-to-end production-path test
+
+`tests/unit_tests/optimizer/test_flash_adamw_eco_e2e.py` synthesizes a
+mini `FlashAdamW(eco=True)` instance and drives the full production call
+chain `FlashAdamW.inject_eco_error → _fused_eco_inject →
+_triton_eco_inject_kernel` for the same shape/dtype matrix as the
+correctness oracle. All six combinations pass on B200: momentum changes
+non-trivially after the inject and stays finite. This validates the
+autotuned kernel through exactly the API surface the distributed
+optimizer invokes in production, with no TE dependency.
+
 ## Footprint contract
 
 The hard constraint for this round was **no additional memory**. The
