@@ -114,36 +114,65 @@ The audit found no further missed bugs. The remaining ECO kernels are
 either (a) explicitly opted out of autotune for the same reason as Adam
 or (b) read-only on inputs.
 
-### Dither autotune candidate — NOT SHIPPED
+### Dither autotune — shipped with a size-threshold dispatch
 
-A standalone bench of `_triton_block_dither_kernel` shows similar
-autotune wins to the inject kernel:
+A standalone bench of `_triton_block_dither_kernel` showed dramatic
+autotune wins at large shards (16 M+ elements) but a 30–45 % regression
+at small shards from autotune-dispatch overhead exceeding the work.
+Rather than ship one or the other, the wrapper now dispatches between
+two kernel variants based on shard `numel`:
 
-| elements | baseline | autotuned (with `restore_value`) | Δ |
-|---:|---:|---:|---:|
-|   262 144 |  23 µs |  31 µs | +35 % |
-|  4 194 304 |  22 µs |  32 µs | +45 % |
-| 16 777 216 |  83 µs | **33 µs** | **−61 %** |
-| 67 108 864 | 316 µs | **86 µs** | **−73 %** |
+```python
+if numel < _DITHER_AUTOTUNE_THRESHOLD:    # 8 Mi elements
+    _triton_block_dither_kernel[grid](...)              # fixed BLOCK=1024
+else:
+    _triton_block_dither_kernel_autotuned[grid](...)    # autotune sweep
+```
 
-However, a direct bit-equivalence check between baseline and autotuned
-kernels at identical seed + input revealed **different realized random
-sequences** for different `BLOCK_SIZE` configs. Statistical properties
-of the per-element dither are preserved (still
-U(−DITHER_COEF, +DITHER_COEF), same mean + variance, ECO's expected-
-value contract on the SR cast unchanged), but bit-for-bit per-step
-values differ across runs that pick different autotune configs.
+This mirrors the variant-dispatch pattern already used in the
+TurboQuant forward kernel (which selects between template
+specializations at the launch site based on the per-call shape /
+flag combination).
 
-This is a Triton `tl.rand` implementation detail: the PRNG state per
-SIMD lane depends on the tensor layout, not just the absolute element
-offset. The implication for production is loss of bit-for-bit
-reproducibility across hardware revisions / Triton versions / input
-shapes that lead to different cached configs.
+End-to-end bench of the threshold-dispatched wrapper on B200:
 
-The dither autotune is documented here as a candidate for explicit
-reproducibility-vs-speed approval rather than a default-on change.
-Anyone evaluating it can lift the standalone bench from
-`/tmp/dither_bench_autotuned.py` (against `dither_bench2.py` baseline).
+| elements | path | us/call | vs. original baseline |
+|---:|---|---:|---:|
+|   262 144 | baseline (small) |  25 µs | ~same (~23 µs orig) |
+|  4 194 304 | baseline (small) |  24 µs | ~same (~22 µs orig) |
+| 16 777 216 | autotuned (large) | **33 µs** | **−60 %** (83 µs orig) |
+| 67 108 864 | autotuned (large) | **86 µs** | **−73 %** (316 µs orig) |
+
+Crossover threshold of 8 Mi elements is set conservatively at the
+midpoint of the bench-derived 4 M–16 M crossover band. In practice this
+keeps small MLA LoRA / DSA Indexer / per-expert MoE shards under
+moderate DP on the baseline path, while FFN matrices, embeddings, and
+large MoE shards take the autotuned win.
+
+#### Statistical contract preserved; bit-for-bit reproducibility caveat
+
+A direct bit-equivalence check revealed that the two variants produce
+**different realized random sequences** at identical seed + input. This
+is a Triton `tl.rand` implementation detail: the PRNG state per SIMD
+lane depends on the tensor layout, so two configs that pick different
+`BLOCK_SIZE` produce different per-element noise even when the
+absolute offset values match. What is preserved across both variants:
+
+- Per-element distribution: U(−`DITHER_COEF`, +`DITHER_COEF`)
+- Mean: 0
+- Variance: identical
+- ECO's expected-value contract on the cast result: unchanged
+- Within-run determinism: a single configuration is reproducible across
+  re-runs once the autotune cache is warm
+
+What is lost: bit-for-bit reproducibility across runs that select
+different autotune configs (e.g. different hardware revisions, Triton
+versions, or inputs that cross the 8 Mi threshold).
+
+The autotuned variant carries
+`restore_value=("master_ptr",)` so the in-place RMW on the master shard
+is correctly snapshot-and-restored around each autotune timing trial —
+same contract as the round-3 inject fix.
 
 ## Round 3 — autotune correctness fix (CRITICAL)
 
