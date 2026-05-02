@@ -2,6 +2,9 @@
 
 #include <torch/extension.h>
 
+#include <ATen/cuda/CUDAContext.h>
+
+#include <cstdint>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>

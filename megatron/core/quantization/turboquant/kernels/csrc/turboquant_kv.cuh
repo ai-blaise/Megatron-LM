@@ -8,6 +8,8 @@
 
 #pragma once
 
+#include <cstdint>
+
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
