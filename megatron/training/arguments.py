@@ -2089,6 +2089,20 @@ def _add_spinquant_args(parser):
         default=0,
         help="Base seed for per-layer sign vectors. Final seed is base*2654435761+layer_idx.",
     )
+
+    group = parser.add_argument_group(title="indexcache")
+    group.add_argument(
+        "--dsa-indexcache-quant-enabled",
+        action="store_true",
+        default=False,
+        help="Enable fp8 e4m3 fake-quant on the DSA indexer K tensor.",
+    )
+    group.add_argument(
+        "--dsa-indexcache-quant-eps",
+        type=float,
+        default=1e-4,
+        help="Epsilon clamp on per-token abs-max before scale derivation (matches SGLang).",
+    )
     return parser
 
 

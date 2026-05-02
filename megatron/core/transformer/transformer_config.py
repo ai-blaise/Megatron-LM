@@ -613,6 +613,24 @@ class TransformerConfig(ModelParallelConfig):
 
 
     ####################
+    # IndexCache fp8 fake-quant on the DSA indexer K
+    ####################
+    dsa_indexcache_quant_enabled: bool = False
+    """Enable fp8 e4m3 fake-quant on the DSA indexer K tensor.
+
+    Mirrors the SGLang inference path
+    (``optimization-playground/python/sglang/jit_kernel/csrc/nsa/fused_store_index_cache.cuh``)
+    so training under the IndexerK8 regime sees the same per-token quantization
+    noise the production checkpoint will see at inference. Composes with
+    TurboQuant (which acts on the dense MLA latent KV); the two paths share no
+    tensors."""
+
+    dsa_indexcache_quant_eps: float = 1e-4
+    """Epsilon used to clamp the per-token absolute max before computing the
+    fp8 scale. Matches the SGLang reference (1e-4)."""
+
+
+    ####################
     # MoE related
     ####################
     moe_shared_expert_intermediate_size: Optional[int] = None

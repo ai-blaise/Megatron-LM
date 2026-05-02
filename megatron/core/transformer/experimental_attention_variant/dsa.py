@@ -721,6 +721,14 @@ class DSAIndexer(MegatronModule):
 
         self.softmax_scale: float = self.index_head_dim**-0.5
 
+        self.indexcache_config = None
+        if getattr(self.config, "dsa_indexcache_quant_enabled", False):
+            from megatron.core.quantization.indexcache import build_indexcache_config
+
+            self.indexcache_config = build_indexcache_config(
+                eps=getattr(self.config, "dsa_indexcache_quant_eps", 1e-4),
+            )
+
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
         self.pg_collection = pg_collection
@@ -875,6 +883,13 @@ class DSAIndexer(MegatronModule):
         # =========================================
         q = rotate_activation(q)
         k = rotate_activation(k)
+
+        # IndexCache fp8 fake-quant on the post-rotation indexer K. K only —
+        # SGLang's reference quantizes the indexer key cache, not the query.
+        if self.indexcache_config is not None:
+            from megatron.core.quantization.indexcache import apply_indexcache_kv
+
+            k = apply_indexcache_kv(k, self.indexcache_config)
 
         # =========================================
         # Prepare weights for index scores
