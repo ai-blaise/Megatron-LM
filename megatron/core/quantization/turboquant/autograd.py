@@ -55,10 +55,14 @@ class TurboQuantKVFn(torch.autograd.Function):
             ste_mask = torch.empty(n, buffers.latent_dim, dtype=torch.uint8, device=x.device)
             norm = torch.empty(n, dtype=torch.float32, device=x.device)
             inner_norm = torch.empty(n, dtype=torch.float32, device=x.device)
-            # Save w_hat in bf16 to skip the recompute_w_hat region of the
+            # Save w_hat in fp32 to skip the recompute_w_hat region of the
             # backward kernel (~20% of bwd time per region-split profile).
+            # bf16 was tried first but the round-trip error compounded through
+            # the cross-coordinate sum reduction in chain_outputs to ~1e-3
+            # absolute (vs the 1e-6 fp32 baseline); fp32 keeps the gradient
+            # at machine-precision parity at the cost of 2 KB/token.
             w_hat_save = torch.empty(
-                n, buffers.latent_dim, dtype=torch.bfloat16, device=x.device
+                n, buffers.latent_dim, dtype=torch.float32, device=x.device
             )
             ext.turboquant_kv_fwd(
                 flat,

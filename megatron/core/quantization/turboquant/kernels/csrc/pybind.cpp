@@ -15,7 +15,7 @@ namespace turboquant {
 template <typename scalar_t>
 void launch_turboquant_kv_fwd(
     const scalar_t* x, scalar_t* out, uint8_t* indices, uint8_t* ste_mask,
-    float* norm_out, float* inner_norm_out, __nv_bfloat16* w_hat_save,
+    float* norm_out, float* inner_norm_out, float* w_hat_save,
     const float* signs1, const float* signs2,
     const float* boundaries_high, const float* boundaries_low,
     const float* centroids_high, const float* centroids_low,
@@ -27,7 +27,7 @@ void launch_turboquant_kv_bwd(
     const scalar_t* grad_out, const scalar_t* x,
     const uint8_t* indices, const uint8_t* ste_mask,
     const float* norm_arr, const float* inner_norm_arr,
-    const __nv_bfloat16* w_hat_saved,
+    const float* w_hat_saved,
     const float* signs1, const float* signs2,
     const float* centroids_high, const float* centroids_low,
     scalar_t* grad_x, int64_t num_rows, int64_t row_stride,
@@ -42,18 +42,18 @@ namespace {
 #define TQ_CHECK_CONTIG(t) TORCH_CHECK((t).is_contiguous(), #t " must be contiguous")
 #define TQ_CHECK_DTYPE(t, dt) TORCH_CHECK((t).scalar_type() == (dt), #t " has wrong dtype")
 
-__nv_bfloat16* maybe_w_hat_ptr(c10::optional<torch::Tensor> w_hat) {
+float* maybe_w_hat_ptr(c10::optional<torch::Tensor> w_hat) {
   if (!w_hat.has_value() || !w_hat->defined()) return nullptr;
   TQ_CHECK_CUDA((*w_hat));
-  TQ_CHECK_DTYPE((*w_hat), torch::kBFloat16);
-  return reinterpret_cast<__nv_bfloat16*>(w_hat->data_ptr());
+  TQ_CHECK_DTYPE((*w_hat), torch::kFloat32);
+  return w_hat->data_ptr<float>();
 }
 
-const __nv_bfloat16* maybe_w_hat_const(c10::optional<torch::Tensor> w_hat) {
+const float* maybe_w_hat_const(c10::optional<torch::Tensor> w_hat) {
   if (!w_hat.has_value() || !w_hat->defined()) return nullptr;
   TQ_CHECK_CUDA((*w_hat));
-  TQ_CHECK_DTYPE((*w_hat), torch::kBFloat16);
-  return reinterpret_cast<const __nv_bfloat16*>(w_hat->data_ptr());
+  TQ_CHECK_DTYPE((*w_hat), torch::kFloat32);
+  return w_hat->data_ptr<float>();
 }
 
 void turboquant_kv_fwd(
@@ -78,7 +78,7 @@ void turboquant_kv_fwd(
   TQ_CHECK_DTYPE(norm_out, torch::kFloat32);
   TQ_CHECK_DTYPE(inner_norm_out, torch::kFloat32);
 
-  __nv_bfloat16* w_hat_ptr = maybe_w_hat_ptr(w_hat_save);
+  float* w_hat_ptr = maybe_w_hat_ptr(w_hat_save);
 
   const int64_t num_rows = x.size(0);
   const int64_t row_stride = x.size(1);
@@ -137,7 +137,7 @@ void turboquant_kv_bwd(
   TORCH_CHECK(grad_out.sizes() == x.sizes(), "grad_out shape mismatch");
   TORCH_CHECK(grad_x.sizes() == x.sizes(), "grad_x shape mismatch");
 
-  const __nv_bfloat16* w_hat_ptr = maybe_w_hat_const(w_hat_saved);
+  const float* w_hat_ptr = maybe_w_hat_const(w_hat_saved);
 
   const int64_t num_rows = x.size(0);
   const int64_t row_stride = x.size(1);
