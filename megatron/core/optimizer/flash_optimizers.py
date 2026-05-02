@@ -2805,6 +2805,16 @@ def _fused_eco_inject(
     # on the dynamic shape and the two compile-time switches that change
     # which code paths the kernel emits.
     key=["N", "QUANTIZE_OPTIM_STATES", "PARAM_DTYPE"],
+    # The kernel does an in-place RMW on the momentum buffer (and its
+    # scales). Without ``restore_value`` Triton would invoke the kernel
+    # once per config during the autotune sweep, applying the inject
+    # update once per config and corrupting state on the first call for
+    # each unique (N, PARAM_DTYPE, QUANTIZE_OPTIM_STATES) shape (45
+    # configs × 1 extra inject = 45 spurious updates). ``restore_value``
+    # makes Triton snapshot these tensors before each timing run and
+    # restore them after, so the state observed by training is exactly
+    # one inject's worth of update — matching the non-autotuned path.
+    restore_value=("mom_ptr", "mom_scales_f16_ptr"),
 )
 @triton.jit
 def _triton_eco_inject_kernel(
