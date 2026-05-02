@@ -112,18 +112,21 @@ seed; replication is verified bit-exact by
 
 ## Benchmarks (NVIDIA B200)
 
-Latent dim 512, fwd + bwd (per-iter, microseconds; 200 iters with 20-iter warmup):
+Latent dim 512, fwd + bwd (per-iter, microseconds; 200 iters with 20-iter warmup).
+Backward saves `w_hat` from forward to skip the recompute_w_hat region:
 
 | tokens | dtype | fwd | bwd | fwd+bwd | tokens/sec (fwd+bwd) |
 |---|---|---|---|---|---|
-| 256   | bf16 |  36 us | 156 us | 192 us |  1.3 M |
-| 1024  | bf16 |  36 us | 158 us | 193 us |  5.3 M |
-| 4096  | bf16 |  36 us | 159 us | 195 us | 21.0 M |
-| 16384 | bf16 |  96 us | 149 us | 245 us | 66.8 M |
-| 65536 | bf16 | 384 us | 580 us | 964 us | 68.0 M |
+| 256   | bf16 |  38 us | 156 us | 194 us |  1.3 M |
+| 1024  | bf16 |  38 us | 158 us | 195 us |  5.3 M |
+| 4096  | bf16 |  38 us | 159 us | 197 us | 20.8 M |
+| 16384 | bf16 |  99 us | 131 us | 231 us | 71.1 M |
+| 65536 | bf16 | 391 us | 500 us | 891 us | 73.6 M |
 
-Below 16K tokens, kernel-launch dispatch dominates. Backward is
-1.5–4× the forward (3 FWHT calls + 2 block-reduces).
+Below 16K tokens kernel-launch dispatch dominates. The save-w_hat
+optimization shaves 12–14% off the backward at large token counts (151 µs
+→ 131 µs at 16K, 581 µs → 500 µs at 65K) at the cost of an extra 2 KB
+fp32/token of activation memory.
 
 ## Running training
 
