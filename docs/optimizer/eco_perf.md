@@ -95,6 +95,56 @@ The ±1 ULP int8 differences are floor-vs-round disagreements at element
 boundaries and are below the noise floor that ECO already absorbs through
 the next step's inject.
 
+## Round 4 — correctness sweep + dither autotune candidate (NOT SHIPPED)
+
+This round was about defense-in-depth: an exhaustive audit of every
+`@triton.autotune` decorator in the ECO path to confirm the round-3
+state-corruption fix was the *only* missed bug. Audit summary:
+
+| Kernel | Autotuned today | Risk | Status |
+|---|---|---|---|
+| `_triton_eco_inject_kernel` | yes | in-place RMW on momentum | ✅ has `restore_value` (round-3 fix) |
+| `_triton_dequantize_kernel` | yes | pure-functional (separate input/output) | ✅ safe — output is deterministic |
+| `_triton_quantize_kernel` | yes | pure-functional | ✅ safe |
+| `_triton_adam_kernel` | **no** (deliberately) | in-place RMW on param/m₁/m₂/ECC | ✅ safe — autotune skipped per the line-1631 comment |
+| `_triton_momentum_kernel` | **no** (deliberately) | same as Adam | ✅ safe |
+| `_triton_block_dither_kernel` (`nvfp4_sr.py`) | **no** today | in-place RMW on master | ✅ safe today; see candidate below |
+
+The audit found no further missed bugs. The remaining ECO kernels are
+either (a) explicitly opted out of autotune for the same reason as Adam
+or (b) read-only on inputs.
+
+### Dither autotune candidate — NOT SHIPPED
+
+A standalone bench of `_triton_block_dither_kernel` shows similar
+autotune wins to the inject kernel:
+
+| elements | baseline | autotuned (with `restore_value`) | Δ |
+|---:|---:|---:|---:|
+|   262 144 |  23 µs |  31 µs | +35 % |
+|  4 194 304 |  22 µs |  32 µs | +45 % |
+| 16 777 216 |  83 µs | **33 µs** | **−61 %** |
+| 67 108 864 | 316 µs | **86 µs** | **−73 %** |
+
+However, a direct bit-equivalence check between baseline and autotuned
+kernels at identical seed + input revealed **different realized random
+sequences** for different `BLOCK_SIZE` configs. Statistical properties
+of the per-element dither are preserved (still
+U(−DITHER_COEF, +DITHER_COEF), same mean + variance, ECO's expected-
+value contract on the SR cast unchanged), but bit-for-bit per-step
+values differ across runs that pick different autotune configs.
+
+This is a Triton `tl.rand` implementation detail: the PRNG state per
+SIMD lane depends on the tensor layout, not just the absolute element
+offset. The implication for production is loss of bit-for-bit
+reproducibility across hardware revisions / Triton versions / input
+shapes that lead to different cached configs.
+
+The dither autotune is documented here as a candidate for explicit
+reproducibility-vs-speed approval rather than a default-on change.
+Anyone evaluating it can lift the standalone bench from
+`/tmp/dither_bench_autotuned.py` (against `dither_bench2.py` baseline).
+
 ## Round 3 — autotune correctness fix (CRITICAL)
 
 The round-1 autotune addition (commit `7fbec44dd`'s parent chain, originally
