@@ -3780,6 +3780,34 @@ class NVFP4EcoGradientReleaseOrchestrator:
         if self._pending:
             self._flush()
 
+    def flush_bucket(self, bucket: Any) -> None:
+        """Flush only the pending entries whose param is in *bucket*.
+
+        Used as the ``on_bucket_complete`` callback for the bucket
+        scheduler so the TE cast + ECO inject runs per-bucket on the
+        optimizer stream, in lock-step with the bucket's grad-zero.
+        Cross-rank amax all-reduce happens once per bucket (small
+        float scalar reduction) — the price of overlap.
+        """
+        if not self._pending:
+            return
+        ids = {id(p) for p in getattr(bucket, "params_list", [])}
+        kept = []
+        bucket_pending = []
+        for entry in self._pending:
+            if id(entry[0]) in ids:
+                bucket_pending.append(entry)
+            else:
+                kept.append(entry)
+        self._pending = kept
+        if bucket_pending:
+            saved = self._pending
+            self._pending = bucket_pending
+            try:
+                self._flush()
+            finally:
+                self._pending = saved
+
     def _flush(self) -> None:
         from ..fp4_utils import dequantize_fp4_tensor
 
@@ -3820,41 +3848,266 @@ class MCoreDDPGradientReleaseHandle:
         self._optimizer._gradient_release = False
 
 
+class _BucketStepScheduler:
+    """Wraps each MCore DDP bucket-group's ``start_grad_sync`` to chain
+    a per-bucket optimizer step on the reduce-scatter completion.
+
+    Memory model:
+
+      * Backward populates ``param.main_grad`` per parameter.
+      * MCore DDP's ``_make_backward_post_hook`` calls
+        ``register_grad_ready`` once a param's local grad has been
+        moved into ``main_grad``; when all params in a bucket group
+        signal ready, ``start_grad_sync`` dispatches the async RS.
+      * Without this scheduler, ``param.main_grad`` for every bucket
+        stays live until ``optimizer.step()`` consumes them — peak
+        usage = full grad buffer.
+      * With this scheduler, each bucket's RS is followed (on a
+        dedicated optimizer stream) by ``step_param`` over the
+        bucket's params and an in-place zero of ``bucket.grad_data``.
+        Peak grad-buffer memory drops to one bucket's worth in
+        steady state.
+
+    Stream choreography (NCCL, ``overlap_grad_reduce=True``):
+
+        default stream:   compute ── grad ─ register_grad_ready ─┐
+                                                                 │
+        nccl stream:                ─── RS ───────► (event)      │
+                                                                 │
+        opt stream:                          (wait_event)── step ── zero
+                                                                 │
+        next-iter sync:    finalize ◄──── opt stream sync ───────┘
+
+    The optimizer stream is private (``high_priority=True``); the
+    handle's ``remove()`` synchronises on it before unwrapping.
+
+    Failure containment: each bucket-step is guarded — if
+    ``step_param`` raises, the wrapper still records a CUDA event so
+    subsequent buckets aren't blocked on a never-completing future.
+    The exception is re-raised on the calling thread the next time
+    the scheduler is touched (via ``finalize()`` or ``remove()``).
+    """
+
+    def __init__(
+        self,
+        *,
+        optimizer: "FlashOptimizer",
+        param_to_group: dict[int, dict[str, Any]],
+        pre_step: Optional[Callable[[torch.Tensor, dict[str, Any]], bool]],
+        post_step: Optional[Callable[[torch.Tensor, dict[str, Any]], None]],
+        optimizer_stream: Optional[Any],
+        zero_grad_after_step: bool,
+        on_bucket_complete: Optional[Callable[[Any], None]] = None,
+    ) -> None:
+        self._optimizer = optimizer
+        self._param_to_group = param_to_group
+        self._pre_step = pre_step
+        self._post_step = post_step
+        self._zero_grad_after_step = zero_grad_after_step
+        # Fired after all params in a bucket have been stepped, before
+        # grad_data is zeroed. The pure-NVFP4 + ECO path wires this to
+        # NVFP4EcoGradientReleaseOrchestrator.flush_bucket(...) so the
+        # TE cast + ECO inject runs per-bucket (one cross-rank amax
+        # all-reduce per bucket — small float scalar reduction, cheaper
+        # than losing the overlap by deferring to the end of backward).
+        self._on_bucket_complete = on_bucket_complete
+        if optimizer_stream is None and torch.cuda.is_available():
+            optimizer_stream = torch.cuda.Stream(priority=-1)
+        self._opt_stream = optimizer_stream
+        self._installed: list[tuple[Any, Callable]] = []
+        self._pending_exc: Optional[BaseException] = None
+
+    # ----- public API -------------------------------------------------
+
+    def install(self, ddp_module: Any) -> None:
+        """Wrap every bucket group's ``start_grad_sync``."""
+        bucket_groups = list(getattr(ddp_module, "bucket_groups", []))
+        bucket_groups += list(
+            getattr(ddp_module, "expert_parallel_bucket_groups", [])
+        )
+        for bg in bucket_groups:
+            orig = bg.start_grad_sync
+            self._installed.append((bg, orig))
+
+            def _make_wrapped(bg=bg, orig=orig):
+                def wrapped(force_all_reduce: bool = False):
+                    orig(force_all_reduce=force_all_reduce)
+                    self._on_grad_sync_dispatched(bg)
+                return wrapped
+
+            bg.start_grad_sync = _make_wrapped()
+
+    def remove(self) -> None:
+        """Restore original ``start_grad_sync`` and drain pending work."""
+        # Drain on the optimizer stream so the consumer sees a quiescent
+        # state before the wrappers vanish.
+        if self._opt_stream is not None and torch.cuda.is_available():
+            self._opt_stream.synchronize()
+        for bg, orig in self._installed:
+            bg.start_grad_sync = orig
+        self._installed.clear()
+        if self._pending_exc is not None:
+            exc, self._pending_exc = self._pending_exc, None
+            raise exc
+
+    def finalize(self) -> None:
+        """Synchronise the optimizer stream and surface any deferred
+        exception. Trainers can call this before ``optimizer.zero_grad``
+        or before reading optimizer state."""
+        if self._opt_stream is not None and torch.cuda.is_available():
+            torch.cuda.current_stream().wait_stream(self._opt_stream)
+        if self._pending_exc is not None:
+            exc, self._pending_exc = self._pending_exc, None
+            raise exc
+
+    # ----- internals --------------------------------------------------
+
+    def _on_grad_sync_dispatched(self, bg: Any) -> None:
+        """Invoked synchronously after the bucket group's RS dispatch.
+
+        Records a CUDA event right after the RS kernel was enqueued
+        (still on the dispatch stream) and instructs the optimizer
+        stream to ``wait_event`` on it before running the per-param
+        step.
+        """
+        if not torch.cuda.is_available():
+            # CPU path (only hit by tests with mock buckets) — run
+            # synchronously, in dispatch order.
+            self._step_bucket_group(bg)
+            return
+
+        # Where did the RS go? When num_distributed_optimizer_instances
+        # > 1, MCore puts it on bg.communication_stream; otherwise
+        # async_op=True keeps it on the default stream.
+        dispatch_stream = (
+            getattr(bg, "communication_stream", None)
+            or torch.cuda.current_stream()
+        )
+        rs_done = torch.cuda.Event()
+        rs_done.record(dispatch_stream)
+
+        # Run step + grad-zero on the optimizer stream, gated on the
+        # event so it cannot start before the RS data is visible.
+        with torch.cuda.stream(self._opt_stream):
+            self._opt_stream.wait_event(rs_done)
+            self._step_bucket_group(bg)
+
+    def _step_bucket_group(self, bg: Any) -> None:
+        opt = self._optimizer
+        for bucket in getattr(bg, "buckets", []):
+            for p in getattr(bucket, "params_list", []):
+                if id(p) not in self._param_to_group:
+                    continue
+                group = self._param_to_group[id(p)]
+                main_grad = getattr(p, "main_grad", None)
+                if main_grad is None:
+                    continue
+                if self._pre_step is not None and not self._pre_step(p, group):
+                    continue
+                saved = getattr(p, "decoupled_grad", None)
+                p.decoupled_grad = main_grad
+                try:
+                    opt.step_param(p, group)
+                    if self._post_step is not None:
+                        self._post_step(p, group)
+                except BaseException as exc:
+                    # Stash + continue so a single param failure doesn't
+                    # block the rest of the bucket. Surfaces on the next
+                    # finalize() / remove().
+                    if self._pending_exc is None:
+                        self._pending_exc = exc
+                finally:
+                    if saved is None:
+                        if hasattr(p, "decoupled_grad"):
+                            delattr(p, "decoupled_grad")
+                    else:
+                        p.decoupled_grad = saved
+            # All NVFP4 params in this bucket now have their transient
+            # bf16/fp32 master shard staged on _fa_updated_shard. Fire
+            # the per-bucket completion hook so the NVFP4+ECO
+            # orchestrator can run TE cast + ECO inject for this bucket
+            # before its grad buffer is zeroed.
+            if self._on_bucket_complete is not None:
+                try:
+                    self._on_bucket_complete(bucket)
+                except BaseException as exc:
+                    if self._pending_exc is None:
+                        self._pending_exc = exc
+            if self._zero_grad_after_step:
+                # Free the bucket's grad buffer for the next iteration.
+                # Safe under MCore DDP: it accumulates into grad_data
+                # via .add_() each backward, starting from zero — so
+                # zeroing here matches the semantics the trainer would
+                # otherwise invoke via ddp_module.zero_grad_buffer().
+                gd = getattr(bucket, "grad_data", None)
+                if gd is not None:
+                    gd.zero_()
+
+
 def enable_gradient_release_mcore_ddp(
     ddp_module: Any,
     optimizer: "FlashOptimizer",
     *,
     pre_step: Optional[Callable[[torch.Tensor, dict[str, Any]], bool]] = None,
     post_step: Optional[Callable[[torch.Tensor, dict[str, Any]], None]] = None,
+    overlap_grad_reduce: bool = False,
+    optimizer_stream: Optional[Any] = None,
+    zero_grad_after_step: bool = True,
+    on_bucket_complete: Optional[Callable[[Any], None]] = None,
 ) -> MCoreDDPGradientReleaseHandle:
     """Gradient release wired to Megatron-Core DDP buckets.
 
-    Unlike :func:`enable_gradient_release`, this routes the per-parameter
-    step through Megatron's bucket reduce-scatter rather than directly
-    off ``register_post_accumulate_grad_hook``. The post-accumulate hook
-    only signals that the *local* gradient is ready; the all-reduced
-    ``param.main_grad`` becomes valid only after the bucket's
-    reduce-scatter completes. We therefore install a per-parameter hook
-    that runs after Megatron's own ``_make_backward_post_hook`` (which
-    moves grad → main_grad and signals bucket readiness), and stage the
-    optimizer step on a per-bucket completion callback installed on
-    ``param_and_grad_buffer`` if available.
+    Two execution modes:
 
-    For the common single-rank / no-overlap case the per-param hook runs
-    ``step_param`` immediately on ``param.main_grad`` and is bit-equivalent
-    to a batched ``optimizer.step()``.
+    * **Default (overlap_grad_reduce=False)** — installs a per-parameter
+      ``register_post_accumulate_grad_hook`` that fires *after* Megatron's
+      own ``_make_backward_post_hook`` (the one that moves grad →
+      main_grad), reads ``param.main_grad``, and runs ``step_param``.
+      Bit-equivalent to a batched ``optimizer.step()`` and safe under
+      single-rank or any config where ``ddp_config.overlap_grad_reduce``
+      is False (the bucket reduce-scatter completes synchronously in
+      ``finish_grad_sync`` before the trainer would call ``step()``
+      anyway).
 
-    The full multi-rank path with bucket-overlap requires the bucket
-    sync to land before stepping; until that integration is wired in the
-    ``param_and_grad_buffer``, callers running with overlapped reduce
-    must call ``optimizer.step()`` themselves after ``finish_grad_sync()``.
-    This handle still warns rather than silently misbehaving.
+    * **overlap_grad_reduce=True** — installs a per-bucket scheduler
+      that wraps each :class:`_ParamAndGradBucketGroup.start_grad_sync`.
+      As soon as a bucket's async reduce-scatter dispatches, the
+      scheduler enqueues the per-parameter Adam step on a dedicated
+      *optimizer stream* that ``wait_event`` s on the RS completion.
+      Optionally zeroes ``bucket.grad_data`` after the step so the
+      bucket's grad memory is reclaimed for the next iteration before
+      backward finishes. This is the **memory-pressure path**: peak
+      grad-buffer + optimizer-transient memory drops from "full model"
+      to "one bucket worth".
+
+    Constraints on the overlap path:
+
+    * Plain MCore DDP only. ``use_distributed_optimizer=True`` requires
+      a shard-mapping cooperation that the DistributedOptimizer must
+      provide (its main_params live on a separate buffer than the model
+      params). Detected and rejected with a clear error.
+    * The optimizer step runs on a separate stream; correctness depends
+      on autograd's default-stream RS dispatch being externally
+      synchronisable via ``stream.wait_event(event_recorded_after_RS)``
+      (true for NCCL Work handles in PyTorch >= 2.1).
+    * The bucket's first-batch lazy initialisation
+      (``golden_per_param_grad_ready_counts``) is preserved — the wrap
+      runs *after* the original ``start_grad_sync``.
 
     Args:
         ddp_module: The Megatron-Core ``DistributedDataParallel`` wrapper.
         optimizer: A :class:`FlashOptimizer` owning the underlying params.
         pre_step / post_step: Same semantics as
             :func:`enable_gradient_release`.
+        overlap_grad_reduce: When True, install the bucket scheduler.
+        optimizer_stream: CUDA stream to run the per-bucket step on. If
+            None, a private high-priority stream is created.
+        zero_grad_after_step: When True (default), zeroes
+            ``bucket.grad_data`` immediately after the bucket's step
+            completes. Reclaims grad memory for the next iteration; safe
+            because MCore DDP recomputes the grad buffer per backward.
+            Set False if a downstream consumer (e.g. grad-norm logger)
+            still needs the post-RS grad after the step.
     """
     from megatron.core.distributed.distributed_data_parallel import (
         DistributedDataParallel as MCoreDDP,
@@ -3871,6 +4124,29 @@ def enable_gradient_release_mcore_ddp(
         id(p): g for g in optimizer.param_groups for p in g["params"]
     }
     inner = ddp_module.module if hasattr(ddp_module, "module") else ddp_module
+
+    if overlap_grad_reduce:
+        # NOTE: pure-NVFP4 training (this fork's target) requires
+        # use_distributed_optimizer=True to populate _fa_shard_offset
+        # on each NVFP4 param, so the scheduler explicitly supports
+        # DistOpt rather than rejecting it. The transient bf16/fp32
+        # master shard born inside _step_nvfp4_transient lives entirely
+        # inside step_param — there is no persistent main_param buffer
+        # to shard-map externally.
+        scheduler = _BucketStepScheduler(
+            optimizer=optimizer,
+            param_to_group=param_to_group,
+            pre_step=pre_step,
+            post_step=post_step,
+            optimizer_stream=optimizer_stream,
+            zero_grad_after_step=zero_grad_after_step,
+            on_bucket_complete=on_bucket_complete,
+        )
+        scheduler.install(ddp_module)
+        optimizer._gradient_release = True
+        return MCoreDDPGradientReleaseHandle(
+            _hooks=[scheduler], _optimizer=optimizer, _ddp_module=ddp_module
+        )
 
     for p in inner.parameters():
         if not p.requires_grad or id(p) not in param_to_group:

@@ -156,3 +156,71 @@ flight.
 | `test_flash_adamw_eco_gr_alignment.py` | Target-model shapes, TP-shard equivalence, no-extra-state, bf16-param/fp32-main_grad parity |
 
 Run: `python -m unittest discover tests/unit_tests/optimizer/`.
+
+## Bucket-completion overlap (memory-pressure mode)
+
+For pure-NVFP4 + ECO training under MCore DDP, `enable_gradient_release_mcore_ddp(..., overlap_grad_reduce=True)` switches from per-parameter post-accumulate hooks to a per-bucket scheduler. The scheduler wraps each `_ParamAndGradBucketGroup.start_grad_sync` so that, immediately after the bucket's reduce-scatter is dispatched, the per-parameter Adam step runs on a dedicated optimizer stream gated on the RS completion event.
+
+```python
+from megatron.core.optimizer.flash_optimizers import (
+    enable_gradient_release_mcore_ddp,
+    NVFP4EcoGradientReleaseOrchestrator,
+)
+from megatron.core.optimizer.nvfp4_sr import cast_master_weights_to_nvfp4_2d_sr
+
+orch = NVFP4EcoGradientReleaseOrchestrator(
+    optimizer=optimizer,
+    cast_fn=cast_master_weights_to_nvfp4_2d_sr,
+    data_parallel_group=data_parallel_group,
+    expected_nvfp4_params=10**9,  # large; per-bucket flush drains
+)
+
+handle = enable_gradient_release_mcore_ddp(
+    ddp_module, optimizer,
+    overlap_grad_reduce=True,
+    on_bucket_complete=orch.flush_bucket,   # per-bucket TE cast + ECO inject
+    zero_grad_after_step=True,              # frees grad_data immediately
+)
+```
+
+### Pipeline
+
+```
+default stream :   compute ── grad ── register_grad_ready ─┐
+                                                           │
+nccl stream    :              ─── reduce-scatter ──► event │
+                                                           │
+opt stream     :                       wait_event ── step_param(*) ── orch.flush_bucket(b)
+                                                                          (TE cast + ECO inject)
+                                                                          ── grad_data.zero_()
+```
+
+### Pure-NVFP4 invariant — no master weights
+
+The transient bf16/fp32 master shard inside `_step_nvfp4_transient` is the **only** higher-precision view of the weights, and it lives strictly inside the per-parameter step. Under bucket overlap:
+
+- Each parameter's step creates a transient master, runs Adam, stashes it on `p._fa_updated_shard`.
+- `on_bucket_complete` is called as soon as all params in the bucket have been stepped. The orchestrator's `flush_bucket` runs the TE cast (which writes back to the persistent NVFP4 model param) and the ECO inject (which updates momentum), then deletes `p._fa_updated_shard`.
+- The bucket's `grad_data` slice is zeroed and reclaimed for the next iteration.
+
+At any instant the only persistent state is: NVFP4 model params + bf16-quantized exp_avg/exp_avg_sq + step counter. Peak transient memory in flight is *one bucket worth* of master shards, instead of *the whole model* under the batched path.
+
+### Cross-rank determinism
+
+Under overlap, the TE cast's amax all-reduce runs once per bucket instead of once per backward. The all-reduce is on a small float scalar per block, so the cost increase is negligible and overlaps with the next bucket's RS. Per-bucket determinism is preserved bit-equivalently with the batched cast (validated by `test_two_bucket_parity`).
+
+### use_distributed_optimizer
+
+The overlap path **requires** `use_distributed_optimizer=True` for pure-NVFP4 training, because DistOpt is what populates `_fa_shard_offset` on each NVFP4 param (the slot the per-param transient slices into). The scheduler explicitly accepts DistOpt — there is no shard-mapping conflict because no persistent main_param buffer exists for NVFP4 params.
+
+### Failure containment
+
+`step_param` and `on_bucket_complete` are guarded — an exception in one bucket stashes on the scheduler and continues with subsequent buckets. The exception is re-raised on the next `handle.remove()` or `scheduler.finalize()` so the trainer always observes it before the next iteration.
+
+### Tests
+
+| File | Coverage added |
+|---|---|
+| `test_flash_adamw_gr_bucket_overlap.py` | per-bucket step ordering, grad-zero timing, missing main_grad skip, pre_step gating, exception containment, install/remove lifecycle, DistOpt accepted, on_bucket_complete ordering, orchestrator per-bucket flush partition |
+
+Total optimizer test suite: **50 tests, all pass on B200 (~60s)**.
