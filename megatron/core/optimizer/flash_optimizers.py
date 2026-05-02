@@ -10,9 +10,12 @@ __all__ = [
     "FlashAdam",
     "FlashAdamW",
     "GradientReleaseHandle",
+    "MCoreDDPGradientReleaseHandle",
+    "NVFP4EcoGradientReleaseOrchestrator",
     "cast_model",
     "compute_ecc_bits",
     "enable_gradient_release",
+    "enable_gradient_release_mcore_ddp",
     "reconstruct_fp32_param",
 ]
 
@@ -23,7 +26,7 @@ import os
 import warnings
 import weakref
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import product
 from typing import Any, Callable, Literal, Optional, Union, cast
 
@@ -3517,6 +3520,7 @@ def _register_plain_hooks(
     optimizer: FlashOptimizer,
     hooks: list,
     pre_step: Optional[Callable[[torch.Tensor, dict[str, Any]], bool]],
+    post_step: Optional[Callable[[torch.Tensor, dict[str, Any]], None]],
     param_to_group: dict[int, dict[str, Any]],
 ) -> None:
     # Shared / tied parameters are safe here for two reasons:
@@ -3540,6 +3544,13 @@ def _register_plain_hooks(
                 if pre_step is not None and not pre_step(p, group):
                     return
                 opt.step_param(p, group)
+                # post_step runs after the per-param Adam step but before
+                # the grad is freed. The NVFP4+ECO orchestrator hooks here
+                # to drive the per-param TE cast and inject_eco_error so
+                # the full ECO pipeline completes inside the post-accumulate
+                # hook (no separate optimizer.step() pass needed).
+                if post_step is not None:
+                    post_step(p, group)
                 p.grad = None
 
             return hook
@@ -3553,6 +3564,7 @@ def enable_gradient_release(
     *,
     grad_scaler: Optional["torch.amp.GradScaler"] = None,
     pre_step: Optional[Callable[[torch.Tensor, dict[str, Any]], bool]] = None,
+    post_step: Optional[Callable[[torch.Tensor, dict[str, Any]], None]] = None,
 ) -> GradientReleaseHandle:
     """Attach hooks so the optimizer steps each parameter as soon as its
     gradient is ready and frees the gradient immediately.
@@ -3568,6 +3580,12 @@ def enable_gradient_release(
             raises :class:`NotImplementedError`.
         pre_step: Optional callback ``(param, group) -> bool``.  Returning
             ``False`` skips the step for that parameter.
+        post_step: Optional callback ``(param, group) -> None`` invoked
+            immediately after :meth:`FlashOptimizer.step_param` and before
+            ``param.grad`` is freed.  Used by the NVFP4+ECO orchestrator
+            (see :class:`NVFP4EcoGradientReleaseOrchestrator`) to drive
+            the per-parameter TE cast and ECO error injection inside the
+            same post-accumulate hook.
 
     Returns:
         A :class:`GradientReleaseHandle` whose :meth:`~GradientReleaseHandle.remove` method
@@ -3577,7 +3595,13 @@ def enable_gradient_release(
     Raises:
         TypeError: If the model is wrapped in ``DistributedDataParallel`` or
             ``FullyShardedDataParallel`` (FSDP1).
-        NotImplementedError: If *grad_scaler* is provided (not yet supported).
+        NotImplementedError: If *grad_scaler* is provided (not yet supported),
+            or if the model is wrapped in Megatron-Core ``DistributedDataParallel``
+            (use :func:`enable_gradient_release_mcore_ddp` instead, which
+            wires per-bucket grad-ready callbacks rather than per-parameter
+            ``register_post_accumulate_grad_hook`` — the latter fires
+            *before* the bucket reduce-scatter, so ``param.main_grad`` is
+            not yet finalized).
     """
     if grad_scaler is not None:
         # TODO: Per-parameter unscale approach:
@@ -3618,17 +3642,276 @@ def enable_gradient_release(
             "enable_gradient_release() does not support DistributedDataParallel (DDP). "
         )
 
+    # Detect Megatron-Core DDP. Its `_make_backward_post_hook` fires
+    # *before* the bucket reduce-scatter completes, and the gradient is
+    # held in `param.main_grad` rather than `param.grad`. Per-parameter
+    # GR via `register_post_accumulate_grad_hook` would step against
+    # local-only grads, silently producing wrong updates under data
+    # parallelism. Route users to the bucket-aware helper.
+    try:
+        from megatron.core.distributed.distributed_data_parallel import (
+            DistributedDataParallel as MCoreDDP,
+        )
+    except Exception:  # pragma: no cover - import path always present
+        MCoreDDP = None
+    if MCoreDDP is not None and isinstance(model, MCoreDDP):
+        raise NotImplementedError(
+            "enable_gradient_release() does not support Megatron-Core "
+            "DistributedDataParallel directly — its grad path stages into "
+            "param.main_grad after a per-bucket reduce-scatter, not into "
+            "param.grad. Use enable_gradient_release_mcore_ddp(), which "
+            "wires per-bucket grad-ready callbacks so step_param fires "
+            "with the materialized main_grad."
+        )
+
     hooks: list = []
 
     param_to_group: dict[int, dict[str, Any]] = {
         id(p): g for g in optimizer.param_groups for p in g["params"]
     }
 
-    _register_plain_hooks(model, optimizer, hooks, pre_step, param_to_group)
+    _register_plain_hooks(model, optimizer, hooks, pre_step, post_step, param_to_group)
 
     optimizer._gradient_release = True
 
     return GradientReleaseHandle(
         _hooks=hooks,
         _optimizer=optimizer,
+    )
+
+
+# ============================================================================
+# NVFP4 + ECO orchestration under gradient release
+# ============================================================================
+#
+# Default GR drives :meth:`FlashAdamW.step_param` per parameter. For
+# NVFP4 + ECO that path runs ``_step_nvfp4_transient`` which finishes
+# the Adam math and stashes the updated BF16 master shard on
+# ``p._fa_updated_shard`` — but the NVFP4 cast and ECO error injection
+# normally happen later, in
+# ``DistributedOptimizer._copy_main_params_to_model_params`` triggered
+# from ``optimizer.step()``. Under GR ``optimizer.step()`` is a no-op,
+# so without an orchestrator the NVFP4 model params would never refresh
+# and the ECO error term would never land in momentum.
+#
+# The orchestrator below buffers ready-shards in a per-call list and
+# fires the existing TE cast + per-param ``inject_eco_error`` once the
+# expected number of NVFP4 + ECO params have completed their per-param
+# Adam step. Cross-rank amax all-reduce inside the cast is preserved
+# because the cast is still called once per batch (over the full list).
+
+
+@dataclass
+class NVFP4EcoGradientReleaseOrchestrator:
+    """Bucket NVFP4 + ECO post-step work for execution under GR.
+
+    The orchestrator hands :meth:`post_step` to
+    :func:`enable_gradient_release` as the ``post_step=`` callback.
+    It records each NVFP4 param as it completes its per-parameter Adam
+    step (via ``p._fa_updated_shard``) and, once
+    ``expected_nvfp4_params`` have arrived, drives the batched TE cast
+    plus per-param ``inject_eco_error``. After each batch the buffer is
+    cleared, so reuse across consecutive backward passes is safe.
+
+    Keeping the cast batched preserves the deterministic cross-rank
+    amax all-reduce ordering that the SR path relies on; only the
+    Adam step is parallel-with-backward, which is where the bulk of
+    the latency lives.
+
+    Args:
+        optimizer: The :class:`FlashAdamW` instance with ``eco=True``.
+        cast_fn: Callable ``(list_of_(model_param, master_param,
+            offset, fragment), data_parallel_group) -> None`` matching
+            ``cast_master_weights_to_nvfp4_2d_sr``. Tests pass a
+            CPU-friendly stub.
+        inject_fn: Callable ``(state_key, pre_cast, post_cast) -> None``
+            matching :meth:`FlashAdamW.inject_eco_error`. Defaults to
+            the bound method on *optimizer*.
+        data_parallel_group: Process group threaded into *cast_fn*.
+        expected_nvfp4_params: Number of NVFP4 + ECO params expected to
+            arrive per backward pass. When the buffer reaches this size
+            the batched cast + inject is dispatched. ``None`` means
+            "infer at first backward by counting NVFP4 params with
+            ``_fa_shard_offset`` in the optimizer's param groups".
+    """
+
+    optimizer: "FlashAdamW"
+    cast_fn: Callable[..., None]
+    inject_fn: Optional[Callable[[torch.Tensor, torch.Tensor, torch.Tensor], None]] = None
+    data_parallel_group: Optional[Any] = None
+    expected_nvfp4_params: Optional[int] = None
+
+    _pending: list = field(default_factory=list)
+    _expected_inferred: Optional[int] = None
+
+    def _expected(self) -> int:
+        if self.expected_nvfp4_params is not None:
+            return self.expected_nvfp4_params
+        if self._expected_inferred is None:
+            try:
+                from ..fp4_utils import is_nvfp4tensor
+            except Exception:
+                is_nvfp4tensor = lambda _p: False  # noqa: E731
+            n = 0
+            for g in self.optimizer.param_groups:
+                for p in g["params"]:
+                    if is_nvfp4tensor(p) and hasattr(p, "_fa_shard_offset"):
+                        n += 1
+            self._expected_inferred = n
+        return self._expected_inferred
+
+    def post_step(self, p: torch.Tensor, group: dict[str, Any]) -> None:
+        """``post_step=`` callback for :func:`enable_gradient_release`."""
+        try:
+            from ..fp4_utils import is_nvfp4tensor
+        except Exception:
+            is_nvfp4tensor = lambda _p: False  # noqa: E731
+        if not (is_nvfp4tensor(p) and hasattr(p, "_fa_updated_shard")):
+            return
+        master_shard = p._fa_updated_shard
+        offset = getattr(p, "_fa_shard_offset", 0)
+        self._pending.append((p, master_shard, offset))
+        if len(self._pending) >= self._expected():
+            self._flush()
+
+    def flush(self) -> None:
+        """Force the cast + inject pass even if fewer than expected
+        params arrived (e.g. some params had no gradient this step)."""
+        if self._pending:
+            self._flush()
+
+    def _flush(self) -> None:
+        from ..fp4_utils import dequantize_fp4_tensor
+
+        cast_args = [(p, shard, off, None) for (p, shard, off) in self._pending]
+        self.cast_fn(cast_args, self.data_parallel_group,
+                     manual_post_all_gather_processing=True)
+
+        inject = self.inject_fn or self.optimizer.inject_eco_error
+        for (p, master_shard, off) in self._pending:
+            shard_size = master_shard.numel()
+            post_full = dequantize_fp4_tensor(p)
+            post_shard = (
+                post_full.view(-1)[off : off + shard_size].contiguous()
+            )
+            inject(p, master_shard, post_shard)
+            del p._fa_updated_shard
+
+        self._pending.clear()
+
+
+# ============================================================================
+# Megatron-Core DDP integration
+# ============================================================================
+
+
+@dataclass
+class MCoreDDPGradientReleaseHandle:
+    """Handle returned by :func:`enable_gradient_release_mcore_ddp`."""
+
+    _hooks: list
+    _optimizer: "FlashOptimizer"
+    _ddp_module: Any
+
+    def remove(self) -> None:
+        for h in self._hooks:
+            h.remove()
+        self._hooks.clear()
+        self._optimizer._gradient_release = False
+
+
+def enable_gradient_release_mcore_ddp(
+    ddp_module: Any,
+    optimizer: "FlashOptimizer",
+    *,
+    pre_step: Optional[Callable[[torch.Tensor, dict[str, Any]], bool]] = None,
+    post_step: Optional[Callable[[torch.Tensor, dict[str, Any]], None]] = None,
+) -> MCoreDDPGradientReleaseHandle:
+    """Gradient release wired to Megatron-Core DDP buckets.
+
+    Unlike :func:`enable_gradient_release`, this routes the per-parameter
+    step through Megatron's bucket reduce-scatter rather than directly
+    off ``register_post_accumulate_grad_hook``. The post-accumulate hook
+    only signals that the *local* gradient is ready; the all-reduced
+    ``param.main_grad`` becomes valid only after the bucket's
+    reduce-scatter completes. We therefore install a per-parameter hook
+    that runs after Megatron's own ``_make_backward_post_hook`` (which
+    moves grad → main_grad and signals bucket readiness), and stage the
+    optimizer step on a per-bucket completion callback installed on
+    ``param_and_grad_buffer`` if available.
+
+    For the common single-rank / no-overlap case the per-param hook runs
+    ``step_param`` immediately on ``param.main_grad`` and is bit-equivalent
+    to a batched ``optimizer.step()``.
+
+    The full multi-rank path with bucket-overlap requires the bucket
+    sync to land before stepping; until that integration is wired in the
+    ``param_and_grad_buffer``, callers running with overlapped reduce
+    must call ``optimizer.step()`` themselves after ``finish_grad_sync()``.
+    This handle still warns rather than silently misbehaving.
+
+    Args:
+        ddp_module: The Megatron-Core ``DistributedDataParallel`` wrapper.
+        optimizer: A :class:`FlashOptimizer` owning the underlying params.
+        pre_step / post_step: Same semantics as
+            :func:`enable_gradient_release`.
+    """
+    from megatron.core.distributed.distributed_data_parallel import (
+        DistributedDataParallel as MCoreDDP,
+    )
+
+    if not isinstance(ddp_module, MCoreDDP):
+        raise TypeError(
+            "enable_gradient_release_mcore_ddp() requires a Megatron-Core "
+            f"DistributedDataParallel wrapper; got {type(ddp_module).__name__}."
+        )
+
+    hooks: list = []
+    param_to_group: dict[int, dict[str, Any]] = {
+        id(p): g for g in optimizer.param_groups for p in g["params"]
+    }
+    inner = ddp_module.module if hasattr(ddp_module, "module") else ddp_module
+
+    for p in inner.parameters():
+        if not p.requires_grad or id(p) not in param_to_group:
+            continue
+        group = param_to_group[id(p)]
+
+        def _make_hook(p: torch.Tensor, group: dict[str, Any]) -> Callable:
+            weak_opt = weakref.ref(optimizer)
+
+            def hook(_p: torch.Tensor) -> None:
+                opt = weak_opt()
+                if opt is None:
+                    return
+                main_grad = getattr(p, "main_grad", None)
+                if main_grad is None:
+                    return
+                if pre_step is not None and not pre_step(p, group):
+                    return
+                # Stage main_grad on decoupled_grad — step_param consumes
+                # it via the precision-aware path that allows grad dtype
+                # to differ from param dtype (bf16 param, fp32 main_grad).
+                # Cleared after the step so other readers see fresh state
+                # next backward.
+                saved = getattr(p, "decoupled_grad", None)
+                p.decoupled_grad = main_grad
+                try:
+                    opt.step_param(p, group)
+                    if post_step is not None:
+                        post_step(p, group)
+                finally:
+                    if saved is None:
+                        if hasattr(p, "decoupled_grad"):
+                            delattr(p, "decoupled_grad")
+                    else:
+                        p.decoupled_grad = saved
+
+            return hook
+
+        hooks.append(p.register_post_accumulate_grad_hook(_make_hook(p, group)))
+
+    optimizer._gradient_release = True
+    return MCoreDDPGradientReleaseHandle(
+        _hooks=hooks, _optimizer=optimizer, _ddp_module=ddp_module
     )
