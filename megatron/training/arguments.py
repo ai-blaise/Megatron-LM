@@ -2068,6 +2068,27 @@ def _add_spinquant_args(parser):
         default=False,
         help="Fuse SpinQuant R1/R2 rotations into QKV/O and MLP weights before training.",
     )
+
+    group = parser.add_argument_group(title="turboquant")
+    group.add_argument(
+        "--turboquant-kv-enabled",
+        action="store_true",
+        default=False,
+        help="Enable 2.5-bit TurboQuant fake-quant on the MLA latent KV during training.",
+    )
+    group.add_argument(
+        "--turboquant-kv-preset",
+        type=str,
+        default="latent_2p5bit_nc",
+        choices=["latent_2p5bit_nc", "latent_4bit_nc", "latent_k3_nc", "latent_k8"],
+        help="TurboQuant quantizer preset.",
+    )
+    group.add_argument(
+        "--turboquant-kv-seed",
+        type=int,
+        default=0,
+        help="Base seed for per-layer sign vectors. Final seed is base*2654435761+layer_idx.",
+    )
     return parser
 
 

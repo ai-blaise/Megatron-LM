@@ -594,6 +594,25 @@ class TransformerConfig(ModelParallelConfig):
 
 
     ####################
+    # TurboQuant dense MLA-latent KV
+    ####################
+    turboquant_kv_enabled: bool = False
+    """Enable 2.5-bit TurboQuant fake-quant on the MLA latent KV during training.
+
+    The op is per-token-local on the post-projection latent (kv_lora_rank
+    dimension) and is safe under TP/SP/CP/EP. RoPE features pass through
+    unchanged. Frozen buffers are seeded deterministically from
+    (turboquant_kv_seed, layer_idx) so every rank constructs identical
+    quantizer state without collective communication."""
+
+    turboquant_kv_preset: str = "latent_2p5bit_nc"
+    """Quantizer preset. One of latent_2p5bit_nc | latent_4bit_nc | latent_k3_nc | latent_k8."""
+
+    turboquant_kv_seed: int = 0
+    """Base seed for the per-layer sign vectors."""
+
+
+    ####################
     # MoE related
     ####################
     moe_shared_expert_intermediate_size: Optional[int] = None

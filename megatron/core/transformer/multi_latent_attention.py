@@ -542,6 +542,53 @@ class MLASelfAttention(MultiLatentAttention):
             eps=self.config.layernorm_epsilon,
         )
 
+        self.turboquant_kv_buffers = None
+        if getattr(self.config, "turboquant_kv_enabled", False):
+            from megatron.core.quantization.turboquant import build_turboquant_buffers
+
+            buffers = build_turboquant_buffers(
+                latent_dim=self.config.kv_lora_rank,
+                preset=getattr(self.config, "turboquant_kv_preset", "latent_2p5bit_nc"),
+                seed=getattr(self.config, "turboquant_kv_seed", 0),
+                layer_idx=layer_number,
+                device="cpu",
+                dtype=torch.float32,
+            )
+            self.register_buffer("_turboquant_signs1", buffers.signs1, persistent=False)
+            self.register_buffer("_turboquant_signs2", buffers.signs2, persistent=False)
+            self.register_buffer(
+                "_turboquant_boundaries_high", buffers.boundaries_high, persistent=False
+            )
+            self.register_buffer(
+                "_turboquant_boundaries_low", buffers.boundaries_low, persistent=False
+            )
+            self.register_buffer(
+                "_turboquant_centroids_high", buffers.centroids_high, persistent=False
+            )
+            self.register_buffer(
+                "_turboquant_centroids_low", buffers.centroids_low, persistent=False
+            )
+            self.turboquant_kv_buffers = buffers
+
+    def _refresh_turboquant_buffers_device(self) -> None:
+        """Sync the cached buffer dataclass with the registered tensors."""
+
+        if self.turboquant_kv_buffers is None:
+            return
+        from megatron.core.quantization.turboquant import TurboQuantBuffers
+
+        self.turboquant_kv_buffers = TurboQuantBuffers(
+            latent_dim=self.turboquant_kv_buffers.latent_dim,
+            bits=self.turboquant_kv_buffers.bits,
+            norm_correction=self.turboquant_kv_buffers.norm_correction,
+            signs1=self._turboquant_signs1,
+            signs2=self._turboquant_signs2,
+            boundaries_high=self._turboquant_boundaries_high,
+            boundaries_low=self._turboquant_boundaries_low,
+            centroids_high=self._turboquant_centroids_high,
+            centroids_low=self._turboquant_centroids_low,
+        )
+
     def get_query_key_value_tensors(
         self,
         hidden_states,
@@ -683,6 +730,12 @@ class MLASelfAttention(MultiLatentAttention):
             q_compressed = apply_module(self.q_layernorm)(q_compressed)
 
         kv_compressed = apply_module(self.kv_layernorm)(kv_compressed)
+
+        if self.turboquant_kv_buffers is not None:
+            from megatron.core.quantization.turboquant import apply_turboquant_kv
+
+            self._refresh_turboquant_buffers_device()
+            kv_compressed = apply_turboquant_kv(kv_compressed, self.turboquant_kv_buffers)
 
         # =========================================
         # QKV up projection and RoPE apply
