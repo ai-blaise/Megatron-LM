@@ -2759,7 +2759,17 @@ def _fused_eco_inject(
     N = pre_cast.numel()
     if N == 0:
         return
-    _triton_eco_inject_kernel[(_ECO_INJECT_NUM_BLOCKS,)](
+
+    # Meta-aware grid: ``triton.autotune`` chooses BLOCK_SIZE_N from the
+    # config space below; the grid lambda receives that choice via ``meta``
+    # and sizes the launch as min(2*SM_count, ceil(N / BLOCK_SIZE_N)). The
+    # cap at 2*SM_count matches the ``_make_grid`` heuristic used elsewhere
+    # in this file; the floor at the needed-blocks count avoids the
+    # small-N regression that a fixed-CTA launch would otherwise produce.
+    grid = lambda meta: (
+        min(2 * _get_sm_count(), triton.cdiv(N, meta["BLOCK_SIZE_N"])),
+    )
+    _triton_eco_inject_kernel[grid](
         mom,
         mom_scales_f16,
         var,
@@ -2774,13 +2784,6 @@ def _fused_eco_inject(
         PARAM_DTYPE=_TORCH_DTYPE_TO_TRITON_DTYPE[pre_cast.dtype],
         QUANTIZE_OPTIM_STATES=quantize_optim_states,
     )
-
-
-# Number of CTAs to launch for the autotuned eco_inject kernel. Matches the
-# 2-blocks-per-SM heuristic used elsewhere (_make_grid). Triton autotune
-# selects BLOCK_SIZE_N within the kernel; the grid sizing is fixed at the
-# launch site so autotune can vary BLOCK_SIZE_N freely without coupling.
-_ECO_INJECT_NUM_BLOCKS = max(1, 2 * 132)  # B200: 132 SMs; safe over-launch
 
 
 @triton.autotune(
