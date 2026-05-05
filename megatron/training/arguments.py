@@ -2939,6 +2939,14 @@ def _add_regularization_args(parser):
         help="FlashAdamW: enable Error-Compensating Optimization (ECO). "
         "Reserved for future Mode B integration.",
     )
+    group.add_argument(
+        "--flash-adamw-compress-state-dict",
+        action="store_true",
+        default=False,
+        help="FlashAdamW: save quantized optimizer-state values and scales instead of "
+        "materializing bf16 optimizer-state tensors. Requires the same optimizer-state "
+        "sharding when resuming.",
+    )
 
     group.add_argument(
         "--no-weight-decay-cond-type",

@@ -294,6 +294,11 @@ class OptimizerConfig:
     by injecting quantization error back into the momentum buffer. Reserved for future Mode B
     integration where FlashAdamW operates on bf16 param shards directly."""
 
+    flash_adamw_compress_state_dict: bool = False
+    """If true, checkpoint FlashAdamW quantized optimizer states as their int8 values and
+    fp16 scales instead of materializing bf16 state tensors. This reduces checkpoint peak memory,
+    but compressed state dicts must be resumed with the same optimizer-state sharding."""
+
     #######################
     # Distributed optimizer
     #######################
@@ -458,6 +463,9 @@ class OptimizerConfig:
                 '--offload-optimizer-states is not supported with --optimizer flash_adamw '
                 '(OptimizerStateOffloader requires TE FusedAdam)'
             )
+            assert (
+                self.flash_adamw_quantize or not self.flash_adamw_compress_state_dict
+            ), '--flash-adamw-compress-state-dict requires quantized FlashAdamW states'
 
 
 # Backward-compatible aliases (deprecated; use OptimizerConfig directly).

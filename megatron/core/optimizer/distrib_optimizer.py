@@ -105,6 +105,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
     See __init__() below for argument details.
     """
 
+    _FLASH_ADAMW_STATE_QUANT_GROUP_SIZE = 32
+
     # enumerates fully reshardable optimizer formats (as opposed to formats
     # which depend on the internal optimizer buffers structure)
     checkpoint_fully_reshardable_formats: set[str] = {
@@ -112,6 +114,58 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         "fully_sharded_model_space",
         "fsdp_dtensor",
     }
+
+    def _flash_adamw_should_compress_state_dict(self) -> bool:
+        return self.config.optimizer == 'flash_adamw' and getattr(
+            self.config, 'flash_adamw_compress_state_dict', False
+        )
+
+    def _flash_adamw_compressed_empty_state(self, numel: int) -> dict[str, torch.Tensor]:
+        """Allocate placeholder compressed FlashAdamW state for checkpoint load.
+
+        DistributedOptimizer needs the inner optimizer state structure before it can load the
+        per-parameter distributed state. Using compressed placeholders avoids allocating full
+        fp32/bf16 moment shards just to overwrite them immediately afterward.
+        """
+        scales_numel = (
+            numel + self._FLASH_ADAMW_STATE_QUANT_GROUP_SIZE - 1
+        ) // self._FLASH_ADAMW_STATE_QUANT_GROUP_SIZE
+        device = torch.cuda.current_device()
+        return {
+            "exp_avg::quantized": torch.zeros(
+                (numel,), dtype=torch.int8, device=device
+            ),
+            "exp_avg::scales": torch.zeros(
+                (scales_numel,), dtype=torch.float16, device=device
+            ),
+            "exp_avg_sq::quantized": torch.zeros(
+                (numel,), dtype=torch.uint8, device=device
+            ),
+            "exp_avg_sq::scales": torch.zeros(
+                (scales_numel,), dtype=torch.float16, device=device
+            ),
+        }
+
+    @staticmethod
+    def _is_flash_adamw_quantized_scale_key(key: str) -> bool:
+        return key.endswith("::scales")
+
+    def _flash_adamw_maybe_move_state_to_param_device(
+        self, tensors: dict[str, Any], state_name: str, device: torch.device
+    ) -> dict[str, Any]:
+        state_keys = {
+            k: v
+            for k, v in tensors.items()
+            if k == state_name or k.startswith(f"{state_name}::")
+        }
+        return {
+            k: (
+                v.to(device=device)
+                if isinstance(v, torch.Tensor) and v.device != device
+                else v
+            )
+            for k, v in state_keys.items()
+        }
 
     @classmethod
     def _build_model_gbuf_param_range_map(
@@ -722,7 +776,19 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         state_dict = {}
 
         # Extract 'step', for non-Apex/TE support.
-        if not HAVE_APEX_OR_TE:
+        if self.config.optimizer == 'flash_adamw':
+            steps = list(
+                set(
+                    [
+                        int(s["step"].item())
+                        for s in inner_state_dict["state"].values()
+                        if "step" in s
+                    ]
+                )
+            )
+            assert len(steps) <= 1, f"steps: {steps}"
+            step = steps[0] if len(steps) == 1 else None
+        elif not HAVE_APEX_OR_TE:
             steps = list(
                 set([s["step"].item() for s in inner_state_dict["state"].values()])
             )
@@ -767,6 +833,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 USING_TE_OPTIMIZER
                 or USING_APEX_OPTIMIZER
                 or isinstance(self.optimizer, HybridDeviceOptimizer)
+                or self.config.optimizer == 'flash_adamw'
             ) and step is not None:
                 # TE FusedAdam will not accumulate step for empty param groups, so we need to
                 # align the step across param groups.
@@ -892,10 +959,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                             # For precision_aware_optimizer, the empty tensors should also be
                             #  initialized with the correct dtype.
-                            tensors = {
-                                "exp_avg": init_shard(self.config.exp_avg_dtype),
-                                "exp_avg_sq": init_shard(self.config.exp_avg_sq_dtype),
-                            }
+                            if self._flash_adamw_should_compress_state_dict():
+                                tensors = self._flash_adamw_compressed_empty_state(numel)
+                            else:
+                                tensors = {
+                                    "exp_avg": init_shard(self.config.exp_avg_dtype),
+                                    "exp_avg_sq": init_shard(self.config.exp_avg_sq_dtype),
+                                }
                             if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
                                 if (
                                     self.config.store_param_remainders
@@ -917,7 +987,22 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             state_dict_state = inner_state_dict["state"]
 
         # Extract 'step', for non-Apex/TE support.
-        if not HAVE_APEX_OR_TE:
+        if self.config.optimizer == 'flash_adamw':
+            steps = list(
+                set(
+                    [
+                        g["step"]
+                        for g in state_dict["optimizer"]["param_groups"]
+                        if "step" in g
+                    ]
+                )
+            )
+            if len(steps) != 0:
+                assert len(steps) == 1, f"steps: {steps}"
+                step = torch.tensor(steps[0], dtype=torch.float32, device="cpu")
+                for s in state_dict_state.values():
+                    s["step"] = step.detach().clone()
+        elif not HAVE_APEX_OR_TE:
             steps = list(
                 set([g["step"] for g in state_dict["optimizer"]["param_groups"]])
             )
@@ -1037,6 +1122,14 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             for k, v in optim_state.items():
                 if isinstance(v, torch.Tensor):
                     tensors[k] = v
+                elif (
+                    self._flash_adamw_should_compress_state_dict()
+                    and hasattr(v, 'state_dict')
+                ):
+                    # FlashAdamW stores exp_avg/exp_avg_sq as _MaybeQuantizedTensor.
+                    # Preserve quantized values and fp16 scales instead of dequantizing
+                    # them into bf16/fp32 checkpoint tensors.
+                    tensors.update(v.state_dict(name=k, allow_quantized=True))
                 elif hasattr(v, 'materialize'):
                     # FlashAdamW stores exp_avg/exp_avg_sq as _MaybeQuantizedTensor.
                     # materialize() dequantizes to a plain fp32 torch.Tensor.
@@ -1082,13 +1175,36 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 main_param.copy_(tensors["param"])
             # Copy optimizer states, handling both plain tensors and
             # FlashAdamW's _MaybeQuantizedTensor (which uses set_data to re-quantize).
+            handled_tensor_keys = {"param"}
             for k, v in optim_state.items():
-                if k not in tensors:
+                if isinstance(v, torch.Tensor):
+                    if k not in tensors:
+                        continue
+                    v.copy_(tensors[k])
+                    handled_tensor_keys.add(k)
+                elif hasattr(v, 'load_state_dict') and (
+                    k in tensors
+                    or any(tensor_key.startswith(f"{k}::") for tensor_key in tensors)
+                ):
+                    state_tensors = self._flash_adamw_maybe_move_state_to_param_device(
+                        tensors, k, main_param.device
+                    )
+                    v.load_state_dict(state_tensors, k)
+                    handled_tensor_keys.update(state_tensors.keys())
+                elif k in tensors and hasattr(v, 'set_data'):
+                    v.set_data(tensors[k])
+                    handled_tensor_keys.add(k)
+            for k, v in tensors.items():
+                if k in handled_tensor_keys or k.startswith("param::"):
+                    continue
+                if k == "step" or "::" in k:
                     continue
                 if isinstance(v, torch.Tensor):
-                    v.copy_(tensors[k])
-                elif hasattr(v, 'set_data'):
-                    v.set_data(tensors[k])
+                    optim_state[k] = (
+                        v.to(device=main_param.device)
+                        if v.device != main_param.device
+                        else v
+                    )
 
     def get_parameter_state_dp_reshardable(self):
         """Get internal representation of parameter state without any copies and modifications.
@@ -1398,6 +1514,16 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         else:
             sharding_type = (metadata or {}).get(
                 "distrib_optim_sharding_type", "fully_sharded_model_space"
+            )
+
+        if (
+            self._flash_adamw_should_compress_state_dict()
+            and sharding_type != "dp_reshardable"
+        ):
+            raise NotImplementedError(
+                "Compressed FlashAdamW optimizer checkpointing currently supports only "
+                "'dp_reshardable' distributed optimizer state. Resume with the same "
+                "optimizer-state sharding, or disable --flash-adamw-compress-state-dict."
             )
 
         # Handle FSDP DistributedOptimizer States
@@ -1833,6 +1959,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                                 )
                                 for k, v in bucket_state[i].items()
                                 if isinstance(v, torch.Tensor)
+                                and not self._is_flash_adamw_quantized_scale_key(k)
                             }
                             all_pad_tensors[i + 1] = {
                                 **pad_tensors,
@@ -1865,6 +1992,25 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                                 # The optimizer state of STEP is a 0-dim tensor and is handled
                                 # separately via param_groups, not as part of the gradient buffer.
                                 tensors[key] = LocalNonpersistentObject(tensors[key])
+                                continue
+                            if self._is_flash_adamw_quantized_scale_key(key):
+                                tensors[key] = ShardedTensor(
+                                    f"{sharded_bucket_key}.param_idx_{bucket_params_idx}.{key}",
+                                    tensors[key],
+                                    tensors[key].dtype,
+                                    tensors[key].shape,
+                                    (data_parallel_world_size, *tensors[key].shape),
+                                    (data_parallel_rank, *([0] * tensors[key].dim())),
+                                    axis_fragmentations=None,
+                                    flattened_range=None,
+                                    allow_shape_mismatch=False,
+                                    replica_id=(
+                                        self.distributed_optimizer_instance_id,
+                                        0,
+                                        0,
+                                    ),
+                                    prepend_axis_num=1,
+                                )
                                 continue
                             assert tensors[key].shape == (
                                 gbuf_local_end - gbuf_local_start,

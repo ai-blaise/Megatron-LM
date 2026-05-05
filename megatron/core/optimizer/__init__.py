@@ -425,6 +425,7 @@ def _get_megatron_optimizer_based_on_param_groups(
                 eps=config.adam_eps,
                 weight_decay=config.weight_decay,
                 quantize=config.flash_adamw_quantize,
+                compress_state_dict=config.flash_adamw_compress_state_dict,
                 master_weight_bits=master_bits,
                 fused=config.flash_adamw_fused,
                 eco=config.flash_adamw_eco,

@@ -204,6 +204,7 @@ class _MaybeQuantizedTensor:
             self.set_data(d[name])
             return
 
+        self._data = None
         target_dtype = torch.int8 if self._signed else torch.uint8
         self._quantized = d[_MaybeQuantizedTensor._quantized_vals_key(name)].to(
             dtype=target_dtype

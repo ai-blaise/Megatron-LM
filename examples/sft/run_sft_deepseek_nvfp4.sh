@@ -280,6 +280,9 @@ TRAINING_ARGS=(
 if [[ "${GRAD_REDUCE_IN_BF16:-1}" == "1" ]]; then
     TRAINING_ARGS+=(--grad-reduce-in-bf16)
 fi
+if [[ "${FLASH_ADAMW_COMPRESS_STATE_DICT:-1}" == "1" ]]; then
+    TRAINING_ARGS+=(--flash-adamw-compress-state-dict)
+fi
 
 RECOMPUTE_ARGS=()
 if [[ "${RECOMPUTE:-1}" == "1" ]]; then
@@ -385,7 +388,7 @@ if [[ "${DISABLE_SAVE:-0}" != "1" ]]; then
         --save "$SAVE_CKPT"
     )
 fi
-if [[ "${NO_SAVE_OPTIM:-1}" == "1" ]]; then
+if [[ "${NO_SAVE_OPTIM:-0}" == "1" ]]; then
     CKPT_ARGS+=(--no-save-optim)
 fi
 if [[ "${NO_SAVE_RNG:-0}" == "1" ]]; then
