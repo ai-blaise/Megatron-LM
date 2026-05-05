@@ -27,3 +27,4 @@ docs/apidocs
 .claude
 .codex
 snapshots/*
+megatron/core/datasets/helpers_cpp

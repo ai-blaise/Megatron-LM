@@ -2127,6 +2127,16 @@ def training_log(
                 "mem-max-allocated-bytes", mem_stats["allocated_bytes.all.peak"], iteration
             )
             writer.add_scalar("mem-allocated-count", mem_stats["allocation.all.current"], iteration)
+            if wandb_writer:
+                wandb_writer.log(
+                    {
+                        "mem-reserved-bytes": mem_stats["reserved_bytes.all.current"],
+                        "mem-allocated-bytes": mem_stats["allocated_bytes.all.current"],
+                        "mem-max-allocated-bytes": mem_stats["allocated_bytes.all.peak"],
+                        "mem-allocated-count": mem_stats["allocation.all.current"],
+                    },
+                    iteration,
+                )
         if args.log_max_attention_logit:
             writer.add_scalar('max_attention_logit', max_attention_logit, iteration)
             if wandb_writer:

@@ -1,20 +1,47 @@
 #!/bin/bash
-#SBATCH --job-name=prep_swe_rebench
+# Prepare BlaiseAI DeepSeek-V3.2 SFT JSONL for Megatron SFTDataset.
+
+#SBATCH --job-name=prep_blaise_sft
 #SBATCH --nodes=1
-#SBATCH --gpus-per-node=1
+#SBATCH --ntasks=1
 
-set -e
+set -euo pipefail
 
-MEGATRON_DIR=/home/divij/Megatron-LM
-OUTPUT_DIR=/path/to/3fs/swe_rebench_v2_data
-TOKENIZER_MODEL=deepseek-ai/DeepSeek-V3.2
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MEGATRON_DIR="${MEGATRON_DIR:-"${SCRIPT_DIR}/../.."}"
+cd "$MEGATRON_DIR"
 
-mkdir -p ${OUTPUT_DIR}
+DATASET_ID="${DATASET_ID:-BlaiseAI/blaise-sft-training-mix}"
+DATASET_CONFIG="${DATASET_CONFIG:-nemotron-full-family}"
+DATA_FILES="${DATA_FILES:-}"
+SPLIT="${SPLIT:-train}"
+OUTPUT_DIR="${OUTPUT_DIR:-"$HOME/data/sft/blaise-sft-training-mix"}"
 
-cd ${MEGATRON_DIR}
-python tools/prepare_swe_rebench_sft.py \
-    --dataset nebius/SWE-rebench-V2 \
-    --split train \
-    --output-dir ${OUTPUT_DIR} \
-    --tokenizer-model ${TOKENIZER_MODEL} \
-    --system-prompt "You are an expert software engineer. Read the repository context and issue, then produce the smallest correct patch that resolves the problem."
+if [[ -n "$DATA_FILES" ]]; then
+    default_name="$(basename "$DATA_FILES" .parquet)"
+else
+    default_name="$DATASET_CONFIG"
+fi
+OUTPUT_FILE="${OUTPUT_FILE:-"$OUTPUT_DIR/${default_name}.jsonl"}"
+
+ARGS=(
+    --dataset "$DATASET_ID"
+    --split "$SPLIT"
+    --output "$OUTPUT_FILE"
+)
+
+if [[ -n "$DATA_FILES" ]]; then
+    ARGS+=(--data-files "$DATA_FILES")
+else
+    ARGS+=(--config "$DATASET_CONFIG")
+fi
+
+if [[ -n "${MAX_SAMPLES:-}" ]]; then
+    ARGS+=(--max-samples "$MAX_SAMPLES")
+fi
+
+if [[ "${STREAMING:-0}" == "1" ]]; then
+    ARGS+=(--streaming)
+fi
+
+uv run --no-sync python tools/prepare_blaise_sft.py "${ARGS[@]}"

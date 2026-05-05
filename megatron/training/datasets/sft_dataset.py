@@ -4,6 +4,7 @@ import atexit, json
 from collections import Counter
 import json
 import math
+import os
 from typing import Any, Dict, Optional, List, Union
 
 import numpy as np
@@ -37,19 +38,64 @@ class SFTLowLevelDataset:
     """
 
     def __init__(self, dataset_path: str) -> None:
-        try:
-            from datasets import load_dataset
-        except ImportError:
-            raise ImportError(
-                "SFTDataset currently requires datasets library to be installed"
-            )
-        self.dataset = load_dataset(data_files=dataset_path, split="all")
+        self.dataset_path = dataset_path
+        self._file = None
+        if os.path.isfile(dataset_path):
+            self.dataset = None
+            self.offsets = self._load_or_build_offsets(dataset_path)
+        else:
+            try:
+                from datasets import load_dataset
+            except ImportError:
+                raise ImportError(
+                    "SFTDataset currently requires datasets library to be installed"
+                )
+            self.dataset = load_dataset(dataset_path, split="train")
+            self.offsets = None
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_file"] = None
+        return state
+
+    def _load_or_build_offsets(self, dataset_path: str) -> np.ndarray:
+        offsets_path = f"{dataset_path}.offsets.npy"
+        if os.path.exists(offsets_path):
+            return np.load(offsets_path, mmap_mode="r")
+
+        offsets = []
+        with open(dataset_path, "rb") as dataset_file:
+            while True:
+                offset = dataset_file.tell()
+                line = dataset_file.readline()
+                if not line:
+                    break
+                if line.strip():
+                    offsets.append(offset)
+
+        tmp_path = f"{offsets_path}.{os.getpid()}.tmp.npy"
+        np.save(tmp_path, np.asarray(offsets, dtype=np.int64))
+        os.replace(tmp_path, offsets_path)
+        return np.load(offsets_path, mmap_mode="r")
+
+    def _get_file(self):
+        if self._file is None:
+            self._file = open(self.dataset_path, "rb")
+            atexit.register(self._file.close)
+        return self._file
 
     def __len__(self) -> int:
+        if self.offsets is not None:
+            return len(self.offsets)
         return len(self.dataset)
 
     def __getitem__(self, idx: int) -> list:
-        item = self.dataset[idx]
+        if self.offsets is not None:
+            dataset_file = self._get_file()
+            dataset_file.seek(int(self.offsets[idx]))
+            item = json.loads(dataset_file.readline())
+        else:
+            item = self.dataset[idx]
         return item.get("messages", item.get("conversations"))
 
 

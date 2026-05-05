@@ -2425,6 +2425,11 @@ def _add_network_size_args(parser):
         "spinquant_v_groupsize",
         "spinquant_kv_sym",
         "spinquant_fuse_weights",
+        "turboquant_kv_enabled",
+        "turboquant_kv_preset",
+        "turboquant_kv_seed",
+        "dsa_indexcache_quant_enabled",
+        "dsa_indexcache_quant_eps",
     ]
     transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
     transformer_group = transformer_factory.build_group(

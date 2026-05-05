@@ -1,85 +1,161 @@
 #!/bin/bash
-# Multi GPU DeepSeek-V3.2 MoE + NVFP4 + SFT + finetune
-# SLURM with srun
+# DeepSeek-V3.2 REAP NVFP4 W4A4KV4 SFT on 16x B200.
+#
+# This script expects --load to point at a Megatron torch_dist checkpoint. The
+# BlaiseAI Hugging Face checkpoint still needs conversion before training.
 
-#SBATCH --job-name=deepseek_nvfp4_sft
-#SBATCH --nodes=${NNODES:-1}
+#SBATCH --job-name=deepseek_v32_reap_sft
+#SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=8
 
-set -e
+set -euo pipefail
 
 # ======================
 # Environment
 # ======================
-export CUDA_DEVICE_MAX_CONNECTIONS=1
-export NCCL_NET=TCP
-export NCCL_SOCKET_IFNAME=eth0
-export NCCL_IB_DISABLE=1
-export NCCL_TIMEOUT=3600
-export OMP_NUM_THREADS=1
-export TOKENIZERS_PARALLELISM=False
+export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
+export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-0}"
+export NCCL_TIMEOUT="${NCCL_TIMEOUT:-3600}"
+export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export MEGATRON_DSA_TRITON="${MEGATRON_DSA_TRITON:-1}"
+export MEGATRON_DSA_STREAMING_INDEXER_TOPK="${MEGATRON_DSA_STREAMING_INDEXER_TOPK:-1}"
+export MEGATRON_DSA_INDEXER_KEY_BLOCK_SIZE="${MEGATRON_DSA_INDEXER_KEY_BLOCK_SIZE:-2048}"
+export MEGATRON_FLASH_ADAMW_NVFP4_IMMEDIATE_CAST="${MEGATRON_FLASH_ADAMW_NVFP4_IMMEDIATE_CAST:-1}"
 
 # ======================
-# Path Setup
+# Path setup
 # ======================
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MEGATRON_DIR="${SCRIPT_DIR}/../.."
-cd ${MEGATRON_DIR}
+MEGATRON_DIR="${MEGATRON_DIR:-"${SCRIPT_DIR}/../.."}"
+cd "$MEGATRON_DIR"
 
-CHECKPOINT_PATH=${1:-"$HOME/checkpoints/sft_deepseek_nvfp4"}
-TENSORBOARD_LOGS_PATH=${2:-"$HOME/tensorboard_logs/sft_deepseek_nvfp4"}
+if [[ -z "${CUDA_HOME:-}" && -x "$MEGATRON_DIR/.venv/lib/python3.12/site-packages/nvidia/cu13/bin/nvcc" ]]; then
+    export CUDA_HOME="$MEGATRON_DIR/.venv/lib/python3.12/site-packages/nvidia/cu13"
+fi
+if [[ -n "${CUDA_HOME:-}" ]]; then
+    export CUDA_PATH="${CUDA_PATH:-$CUDA_HOME}"
+    export PATH="$CUDA_HOME/bin:$PATH"
+    export LD_LIBRARY_PATH="$CUDA_HOME/lib64:$CUDA_HOME/lib:${LD_LIBRARY_PATH:-}"
+fi
+if [[ -z "${CC:-}" && -x /usr/bin/gcc ]]; then
+    export CC=/usr/bin/gcc
+fi
+if [[ -z "${CXX:-}" && -x /usr/bin/g++ ]]; then
+    export CXX=/usr/bin/g++
+fi
 
-mkdir -p "$(dirname "$CHECKPOINT_PATH")"
-mkdir -p "$TENSORBOARD_LOGS_PATH"
+MODEL_ID="${MODEL_ID:-BlaiseAI/DeepSeek-V3.2-REAP-345B-NVFP4-W4A4KV4-IndexerK8-FP8-GatedNorm-G1}"
+TOKENIZER_MODEL="${TOKENIZER_MODEL:-$MODEL_ID}"
+
+LOAD_CKPT="${LOAD_CKPT:-"$HOME/checkpoints/deepseek_v32_reap_megatron"}"
+SAVE_CKPT="${SAVE_CKPT:-"$HOME/checkpoints/sft_deepseek_v32_reap_nvfp4"}"
+DATA_PATH="${DATA_PATH:-"$HOME/data/sft/blaise-sft-training-mix/nemotron-full-family.jsonl"}"
+TENSORBOARD_LOGS_PATH="${TENSORBOARD_LOGS_PATH:-"$HOME/tensorboard_logs/sft_deepseek_v32_reap_nvfp4"}"
+
+mkdir -p "$SAVE_CKPT" "$TENSORBOARD_LOGS_PATH"
 
 # ======================
-# Distributed Setup
+# Distributed setup
 # ======================
-GPUS_PER_NODE=${GPUS_PER_NODE:-8}
-NNODES=${SLURM_NNODES:-1}
-NODE_RANK=${SLURM_NODEID:-0}
-MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST 2>/dev/null | head -1)
-MASTER_ADDR=${MASTER_ADDR:-localhost}
-MASTER_PORT=${MASTER_PORT:-29500}
+GPUS_PER_NODE="${GPUS_PER_NODE:-8}"
+NNODES="${SLURM_NNODES:-${NNODES:-2}}"
+NODE_RANK="${SLURM_NODEID:-${NODE_RANK:-0}}"
+MASTER_ADDR="${MASTER_ADDR:-}"
+if [[ -z "$MASTER_ADDR" && -n "${SLURM_JOB_NODELIST:-}" ]]; then
+    MASTER_ADDR="$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -1)"
+fi
+MASTER_ADDR="${MASTER_ADDR:-localhost}"
+MASTER_PORT="${MASTER_PORT:-29500}"
 
 DISTRIBUTED_ARGS=(
-    --nproc_per_node $GPUS_PER_NODE
-    --nnodes $NNODES
-    --node_rank $NODE_RANK
-    --master_addr $MASTER_ADDR
-    --master_port $MASTER_PORT
+    --nproc_per_node "$GPUS_PER_NODE"
+    --nnodes "$NNODES"
+    --node_rank "$NODE_RANK"
+    --master_addr "$MASTER_ADDR"
+    --master_port "$MASTER_PORT"
 )
 
 # ======================
-# Model Args (DeepSeek-V3.2 MoE)
+# Parallelism
 # ======================
+# Current DSA implementation asserts context_parallel_size == 1.
+# For 16 GPUs, TP=4 * PP=2 leaves DP=2 while preserving pipeline parallelism.
+TP="${TP:-4}"
+PP="${PP:-2}"
+CP="${CP:-1}"
+EP="${EP:-4}"
+ETP="${ETP:-1}"
+if [[ -z "${DECODER_FIRST_PIPELINE_NUM_LAYERS:-}" ]]; then
+    if [[ "$PP" -eq 4 ]]; then
+        DECODER_FIRST_PIPELINE_NUM_LAYERS=16
+    else
+        DECODER_FIRST_PIPELINE_NUM_LAYERS=31
+    fi
+fi
+
+MODEL_PARALLEL_ARGS=(
+    --tensor-model-parallel-size "$TP"
+    --pipeline-model-parallel-size "$PP"
+    --context-parallel-size "$CP"
+    --expert-model-parallel-size "$EP"
+    --expert-tensor-parallel-size "$ETP"
+    --sequence-parallel
+)
+
+if [[ "$PP" -gt 1 && -n "$DECODER_FIRST_PIPELINE_NUM_LAYERS" ]]; then
+    MODEL_PARALLEL_ARGS+=(--decoder-first-pipeline-num-layers "$DECODER_FIRST_PIPELINE_NUM_LAYERS")
+fi
+if [[ "$PP" -gt 1 && -n "${DECODER_LAST_PIPELINE_NUM_LAYERS:-}" ]]; then
+    MODEL_PARALLEL_ARGS+=(--decoder-last-pipeline-num-layers "$DECODER_LAST_PIPELINE_NUM_LAYERS")
+fi
+
+# ======================
+# Model args
+# ======================
+SEQ_LENGTH="${SEQ_LENGTH:-32768}"
+MOE_LAYER_FREQ="${MOE_LAYER_FREQ:-([0]*3+[1]*58)}"
+
 MODEL_ARGS=(
     --use-mcore-models
+    --transformer-impl transformer_engine
     --num-layers 61
     --hidden-size 7168
     --ffn-hidden-size 18432
     --num-attention-heads 128
     --kv-channels 128
-    --seq-length 4096
+    --seq-length "$SEQ_LENGTH"
     --max-position-embeddings 163840
     --position-embedding-type rope
-    --rotary-base 1000000
+    --rope-type yarn
+    --rotary-base 10000
     --rotary-percent 1.0
+    --rotary-scaling-factor 40
+    --mscale 1.0
+    --mscale-all-dim 1.0
+    --no-rope-fusion
     --attention-dropout 0.0
     --hidden-dropout 0.0
     --swiglu
     --normalization RMSNorm
-    --init-method-std 0.0134
+    --norm-epsilon 1e-6
+    --init-method-std 0.02
     --attention-backend fused
-    --apply-layernorm-1p
+    --attention-softmax-in-fp32
+    --qk-layernorm
+    --attention-output-gate
+    --gated-norm
+    --gated-norm-rank 16
     --untie-embeddings-and-output-weights
     --disable-bias-linear
+    --bf16
 )
 
 # ======================
-# MLA Args (Multi-Latent Attention) — REQUIRED for DSA
-# DSA builds ON TOP of MLA, not a replacement
+# MLA + DSA
 # ======================
 MLA_ARGS=(
     --multi-latent-attention
@@ -90,76 +166,48 @@ MLA_ARGS=(
     --v-head-dim 128
 )
 
-# ======================
-# DSA Args (DeepSeek Sparse Attention) — DeepSeek-V3.2 specific
-# Source: DeepSeek-V3.2-Exp GitHub + tests/functional_tests/test_cases/gpt/gpt3_mcore_te_tp2_pp2_dsa/model_config.yaml
-# ======================
 DSA_ARGS=(
     --experimental-attention-variant dsa
     --dsa-indexer-n-heads 64
     --dsa-indexer-head-dim 128
-    --dsa-indexer-topk 2048
-    --dsa-indexer-loss-coeff 0.01
+    --dsa-indexer-topk "${DSA_INDEXER_TOPK:-2048}"
+    --dsa-indexer-loss-coeff "${DSA_INDEXER_LOSS_COEFF:-0.0}"
 )
 
 # ======================
-# MoE Args
+# MoE
 # ======================
-MODEL_ARGS+=(
+MOE_ARGS=(
     --num-experts 128
-    --moe-router-topk 8
-    --moe-layer-freq $(python3 -c "print('[' + ','.join(['0']*3 + ['1']*58) + ']')")
+    --moe-layer-freq "$MOE_LAYER_FREQ"
     --moe-ffn-hidden-size 2048
+    --moe-shared-expert-intermediate-size 2048
+    --moe-router-load-balancing-type seq_aux_loss
+    --moe-router-topk 8
+    --moe-router-topk-scaling-factor 2.5
     --moe-router-num-groups 8
     --moe-router-group-topk 4
     --moe-router-pre-softmax
     --moe-router-score-function sigmoid
     --moe-router-enable-expert-bias
     --moe-router-bias-update-rate 1e-3
+    --moe-router-dtype fp32
     --moe-aux-loss-coeff 1e-4
-    --moe-shared-expert-intermediate-size 2048
     --moe-token-dispatcher-type alltoall
 )
 
-# ======================
-# Training Args
-# ======================
-TRAINING_ARGS=(
-    --micro-batch-size 1
-    --global-batch-size 32
-    --train-samples 32000000
-    --lr-decay-samples 31968645
-    --lr-warmup-samples 31348
-    --lr 5.0e-6
-    --min-lr 1.0e-7
-    --lr-decay-style cosine
-    --clip-grad 1.0
-    --weight-decay 0.0
-    --adam-beta1 0.9
-    --adam-beta2 0.95
-    --init-method-std 0.010
-    --log-interval 10
-)
+if [[ "${MOE_GROUPED_GEMM:-1}" == "1" ]]; then
+    MOE_ARGS+=(--moe-grouped-gemm)
+fi
+if [[ "${MOE_PERMUTE_FUSION:-1}" == "1" ]]; then
+    MOE_ARGS+=(--moe-permute-fusion)
+fi
+if [[ "${MOE_PER_LAYER_LOGGING:-1}" == "1" ]]; then
+    MOE_ARGS+=(--moe-per-layer-logging)
+fi
 
 # ======================
-# Parallelism
-# ======================
-TP=8
-EP=1
-PP=1
-CP=1
-
-MODEL_PARALLEL_ARGS=(
-    --tensor-model-parallel-size $TP
-    --expert-tensor-parallel-size 1
-    --expert-model-parallel-size $EP
-    --pipeline-model-parallel-size $PP
-    --context-parallel-size $CP
-    --sequence-parallel
-)
-
-# ======================
-# NVFP4 + Precision-Aware
+# NVFP4, SpinQuant, TurboQuant, IndexCache
 # ======================
 DTYPE_ARGS=(
     --fp4-format e2m1
@@ -167,103 +215,215 @@ DTYPE_ARGS=(
     --fp4-param-gather
 )
 
-PRECISION_AWARE_ARGS=(
-    --use-precision-aware-optimizer
-    --exp-avg-dtype bf16
-    --exp-avg-sq-dtype bf16
-)
+SPINQUANT_ARGS=()
+if [[ "${SPINQUANT:-1}" == "1" ]]; then
+    SPINQUANT_ARGS+=(
+        --spinquant
+        --spinquant-mode "${SPINQUANT_MODE:-random}"
+        --spinquant-w-bits 4
+        --spinquant-a-bits 4
+        --spinquant-k-bits 4
+        --spinquant-v-bits 4
+    )
+    if [[ "${SPINQUANT_FUSE_WEIGHTS:-0}" == "1" ]]; then
+        SPINQUANT_ARGS+=(--spinquant-fuse-weights)
+    fi
+    if [[ -n "${SPINQUANT_ROTATION_PATH:-}" ]]; then
+        SPINQUANT_ARGS+=(--spinquant-rotation-path "$SPINQUANT_ROTATION_PATH")
+    fi
+fi
+
+TURBOQUANT_ARGS=()
+if [[ "${TURBOQUANT:-1}" == "1" ]]; then
+    TURBOQUANT_ARGS+=(
+        --turboquant-kv-enabled
+        --turboquant-kv-preset "${TURBOQUANT_KV_PRESET:-latent_2p5bit_nc}"
+        --turboquant-kv-seed "${TURBOQUANT_KV_SEED:-0}"
+    )
+fi
+
+INDEXCACHE_ARGS=()
+if [[ "${INDEXCACHE:-1}" == "1" ]]; then
+    INDEXCACHE_ARGS+=(
+        --dsa-indexcache-quant-enabled
+        --dsa-indexcache-quant-eps "${DSA_INDEXCACHE_QUANT_EPS:-1e-4}"
+    )
+fi
 
 # ======================
-# Optimizer
+# Training
 # ======================
-TRAINING_ARGS+=(
+TRAINING_ARGS=(
+    --micro-batch-size "${MICRO_BATCH_SIZE:-1}"
+    --global-batch-size "${GLOBAL_BATCH_SIZE:-16}"
+    --train-samples "${TRAIN_SAMPLES:-32000000}"
+    --lr-decay-samples "${LR_DECAY_SAMPLES:-31968645}"
+    --lr-warmup-samples "${LR_WARMUP_SAMPLES:-31348}"
+    --lr "${LR:-5.0e-6}"
+    --min-lr "${MIN_LR:-1.0e-7}"
+    --lr-decay-style cosine
+    --clip-grad "${CLIP_GRAD:-1.0}"
+    --weight-decay "${WEIGHT_DECAY:-0.0}"
+    --adam-beta1 "${ADAM_BETA1:-0.9}"
+    --adam-beta2 "${ADAM_BETA2:-0.95}"
+    --log-interval "${LOG_INTERVAL:-10}"
+    --empty-unused-memory-level "${EMPTY_UNUSED_MEMORY_LEVEL:-1}"
+    --rerun-mode "${RERUN_MODE:-disabled}"
+    --optimizer flash_adamw
+    --flash-adamw-eco
     --use-distributed-optimizer
+    --overlap-grad-reduce
+    --overlap-param-gather
     --no-gradient-accumulation-fusion
-    --reset-position-ids
-    --reset-attention-mask
-    --eod-mask-loss
 )
 
+if [[ "${GRAD_REDUCE_IN_BF16:-1}" == "1" ]]; then
+    TRAINING_ARGS+=(--grad-reduce-in-bf16)
+fi
+
+RECOMPUTE_ARGS=()
+if [[ "${RECOMPUTE:-1}" == "1" ]]; then
+    RECOMPUTE_ARGS+=(
+        --recompute-granularity "${RECOMPUTE_GRANULARITY:-full}"
+        --recompute-method "${RECOMPUTE_METHOD:-uniform}"
+        --recompute-num-layers "${RECOMPUTE_NUM_LAYERS:-1}"
+    )
+fi
+
 # ======================
-# SFT + finetune
+# SFT + tokenizer
 # ======================
 SFT_ARGS=(
     --sft
     --finetune
-    --sft-tokenizer-prompt-format nemotron-h-aligned
+    --sft-tokenizer-prompt-format deepseek-v3.2
 )
-
-# ======================
-# Tokenizer
-# ======================
-TOKENIZER_MODEL=${3:-"deepseek-ai/DeepSeek-V3.2"}
 
 TOKENIZER_ARGS=(
-    --tokenizer-type HuggingFaceTokenizer
-    --tokenizer-model $TOKENIZER_MODEL
+    --tokenizer-type SFTTokenizer
+    --tokenizer-model "$TOKENIZER_MODEL"
+    --padded-vocab-size 129280
 )
 
 # ======================
-# Data (Real)
+# Data
 # ======================
-DATA_PATH=${HOME}/data/sft/swe_rebench_v2_data
-
 DATA_ARGS=(
-    --data-path $DATA_PATH
+    --data-path "$DATA_PATH"
     --split 100,0,0
     --no-create-attention-mask-in-dataloader
     --no-mmap-bin-files
-    --num-workers 1
-    --vocab-size 128256
+    --num-workers "${NUM_WORKERS:-1}"
 )
 
 # ======================
-# TensorBoard + Profiling
+# Logging, profiling, checkpointing
 # ======================
 TENSORBOARD_ARGS=(
     --tensorboard-dir "$TENSORBOARD_LOGS_PATH"
     --log-throughput
     --log-memory-to-tensorboard
-    --log-l2-norm-grad-to-tensorboard
-    --tensorboard-log-interval 10
+    --log-world-size-to-tensorboard
+    --tensorboard-log-interval "${TENSORBOARD_LOG_INTERVAL:-10}"
 )
 
-PROFILING_ARGS=(
-    --profile
-    --profile-step-start 4
-    --profile-step-end 6
-)
+if [[ "${LOG_TIMERS_TO_TENSORBOARD:-1}" == "1" ]]; then
+    TENSORBOARD_ARGS+=(
+        --log-timers-to-tensorboard
+        --timing-log-level "${TIMING_LOG_LEVEL:-1}"
+        --timing-log-option "${TIMING_LOG_OPTION:-minmax}"
+    )
+fi
+if [[ -n "${LOG_MEMORY_INTERVAL:-}" ]]; then
+    TENSORBOARD_ARGS+=(--log-memory-interval "$LOG_MEMORY_INTERVAL")
+fi
+if [[ "${LOG_PARAMS_NORM:-0}" == "1" ]]; then
+    TENSORBOARD_ARGS+=(--log-params-norm)
+fi
+if [[ "${LOG_NUM_ZEROS_IN_GRAD:-0}" == "1" ]]; then
+    TENSORBOARD_ARGS+=(--log-num-zeros-in-grad)
+fi
+if [[ "${LOG_MAX_ATTENTION_LOGIT:-0}" == "1" ]]; then
+    TENSORBOARD_ARGS+=(--log-max-attention-logit)
+fi
+if [[ "${LOG_ENERGY:-0}" == "1" ]]; then
+    TENSORBOARD_ARGS+=(--log-energy)
+fi
 
-# ======================
-# Checkpointing
-# ======================
+WANDB_ARGS=()
+if [[ -n "${WANDB_PROJECT:-}" ]]; then
+    WANDB_ARGS+=(
+        --wandb-project "$WANDB_PROJECT"
+        --wandb-exp-name "${WANDB_EXP_NAME:-sft_deepseek_v32_reap_nvfp4}"
+        --wandb-save-dir "${WANDB_SAVE_DIR:-"$SAVE_CKPT/wandb"}"
+    )
+    if [[ -n "${WANDB_ENTITY:-}" ]]; then
+        WANDB_ARGS+=(--wandb-entity "$WANDB_ENTITY")
+    fi
+fi
+
+PROFILING_ARGS=()
+if [[ "${ENABLE_PROFILING:-0}" == "1" ]]; then
+    PROFILING_ARGS+=(
+        --profile
+        --profile-step-start "${PROFILE_STEP_START:-4}"
+        --profile-step-end "${PROFILE_STEP_END:-6}"
+    )
+fi
+
 CKPT_ARGS=(
-    --save-interval 500
-    --eval-interval 100
-    --eval-iters 10
-    --save "$CHECKPOINT_PATH"
-    --load "$CHECKPOINT_PATH"
-    --distributed-timeout-minutes 60
+    --eval-interval "${EVAL_INTERVAL:-100}"
+    --eval-iters "${EVAL_ITERS:-10}"
+    --load "$LOAD_CKPT"
+    --distributed-timeout-minutes "${DISTRIBUTED_TIMEOUT_MINUTES:-60}"
     --ckpt-format torch_dist
     --auto-detect-ckpt-format
 )
+if [[ "${DISABLE_SAVE:-0}" != "1" ]]; then
+    CKPT_ARGS+=(
+        --save-interval "${SAVE_INTERVAL:-500}"
+        --save "$SAVE_CKPT"
+    )
+fi
+if [[ "${NO_SAVE_OPTIM:-1}" == "1" ]]; then
+    CKPT_ARGS+=(--no-save-optim)
+fi
+if [[ "${NO_SAVE_RNG:-0}" == "1" ]]; then
+    CKPT_ARGS+=(--no-save-rng)
+fi
 
-# ======================
-# LAUNCH (SLURM + torchrun)
-# ======================
-srun --mpi=pmix -l \
-    torchrun ${DISTRIBUTED_ARGS[@]} \
-        pretrain_gpt.py \
-        ${MODEL_ARGS[@]} \
-        ${MLA_ARGS[@]} \
-        ${DSA_ARGS[@]} \
-        ${MODEL_PARALLEL_ARGS[@]} \
-        ${TRAINING_ARGS[@]} \
-        ${DTYPE_ARGS[@]} \
-        ${PRECISION_AWARE_ARGS[@]} \
-        ${SFT_ARGS[@]} \
-        ${TOKENIZER_ARGS[@]} \
-        ${DATA_ARGS[@]} \
-        ${TENSORBOARD_ARGS[@]} \
-        ${PROFILING_ARGS[@]} \
-        ${CKPT_ARGS[@]}
+CMD=(
+    uv run --no-sync torchrun
+    "${DISTRIBUTED_ARGS[@]}"
+    pretrain_gpt.py
+    "${MODEL_ARGS[@]}"
+    "${MLA_ARGS[@]}"
+    "${DSA_ARGS[@]}"
+    "${MOE_ARGS[@]}"
+    "${MODEL_PARALLEL_ARGS[@]}"
+    "${TRAINING_ARGS[@]}"
+    "${RECOMPUTE_ARGS[@]}"
+    "${DTYPE_ARGS[@]}"
+    "${SPINQUANT_ARGS[@]}"
+    "${TURBOQUANT_ARGS[@]}"
+    "${INDEXCACHE_ARGS[@]}"
+    "${SFT_ARGS[@]}"
+    "${TOKENIZER_ARGS[@]}"
+    "${DATA_ARGS[@]}"
+    "${TENSORBOARD_ARGS[@]}"
+    "${WANDB_ARGS[@]}"
+    "${PROFILING_ARGS[@]}"
+    "${CKPT_ARGS[@]}"
+)
+
+if [[ "${DRY_RUN:-0}" == "1" ]]; then
+    printf '%q ' "${CMD[@]}"
+    printf '\n'
+    exit 0
+fi
+
+if [[ -n "${SLURM_JOB_ID:-}" && "${USE_SRUN:-1}" == "1" ]]; then
+    srun --mpi=pmix -l "${CMD[@]}"
+else
+    "${CMD[@]}"
+fi

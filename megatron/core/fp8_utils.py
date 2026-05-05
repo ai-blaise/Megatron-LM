@@ -228,6 +228,16 @@ if HAVE_TE and is_te_min_version("2.2"):
     ) -> None:
         from transformer_engine.pytorch.tensor.utils import replace_raw_data
 
+        if type(fp8_tensor).__name__ == "NVFP4Tensor" and hasattr(fp8_tensor, "_rowwise_data"):
+            old_raw_data = fp8_tensor._rowwise_data
+            assert old_raw_data is not None, "NVFP4 tensor has no rowwise raw data to remap"
+            assert old_raw_data.dtype == new_raw_data.dtype, "The data types of raw data don't match"
+            assert old_raw_data.shape == new_raw_data.shape, "The shapes of raw data don't match"
+            new_raw_data.detach().copy_(old_raw_data)
+            fp8_tensor._rowwise_data = new_raw_data
+            del old_raw_data
+            return
+
         replace_raw_data(fp8_tensor, new_raw_data)
 
     def _quantize_param_shard_impl(
@@ -503,7 +513,10 @@ def post_all_gather_processing(model_params):
     - blockwise: create column-wise storage.
     """
     if te_post_all_gather_processing is not None:
-        te_post_all_gather_processing(model_params)
+        model_params = model_params if isinstance(model_params, list) else [model_params]
+        model_params = [p for p in model_params if type(p).__name__ != "NVFP4Tensor"]
+        if len(model_params) > 0:
+            te_post_all_gather_processing(model_params)
     else:
         # If the TE version is old and does not have post_all_gather_processing function, this is
         # a no-op, and the transpose/columnwise data will be created in the next forward pass.

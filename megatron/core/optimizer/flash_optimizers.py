@@ -2175,6 +2175,51 @@ class FlashAdam(FlashOptimizer):
             eco_scalar=0.0,
         )
 
+        # For very large NVFP4 models the default distributed-optimizer handoff
+        # retains every updated shard until all params have stepped, which can
+        # dominate peak memory. When the DP group is available, immediately cast
+        # this shard back into the NVFP4 model tensor and inject ECO before the
+        # next parameter step.
+        immediate_cast = os.getenv(
+            "MEGATRON_FLASH_ADAMW_NVFP4_IMMEDIATE_CAST", "0"
+        ).lower() in ("1", "true", "yes")
+        data_parallel_group = getattr(p, "_fa_data_parallel_group", None)
+        if immediate_cast and data_parallel_group is not None:
+            dp_world_size = torch.distributed.get_world_size(data_parallel_group)
+            use_te_full_quantize_dp1 = os.getenv(
+                "MEGATRON_FLASH_ADAMW_NVFP4_TE_FULL_QUANTIZE_DP1", "1"
+            ).lower() in ("1", "true", "yes")
+            full_local_param = shard_offset == 0 and shard_size == p.numel()
+            if use_te_full_quantize_dp1 and dp_world_size == 1 and full_local_param:
+                # With DP=1 the transient "shard" is the full local tensor.
+                # Use TE's native in-place quantizer so both rowwise and
+                # columnwise NVFP4 storage stay consistent for the next GEMM.
+                p.quantize_(bf16_shard.view(tuple(p.shape)))
+                if self._eco:
+                    post_full = dequantize_fp4_tensor(p)
+                    post_shard = post_full.view(-1)[
+                        shard_offset : shard_offset + shard_size
+                    ].contiguous()
+                    self.inject_eco_error(p, bf16_shard, post_shard)
+                    del post_shard, post_full
+                return
+
+            from .nvfp4_sr import cast_master_weights_to_nvfp4_2d_sr
+
+            cast_master_weights_to_nvfp4_2d_sr(
+                [(p, bf16_shard, shard_offset, None)],
+                data_parallel_group,
+                manual_post_all_gather_processing=True,
+            )
+            if self._eco:
+                post_full = dequantize_fp4_tensor(p)
+                post_shard = post_full.view(-1)[
+                    shard_offset : shard_offset + shard_size
+                ].contiguous()
+                self.inject_eco_error(p, bf16_shard, post_shard)
+                del post_shard, post_full
+            return
+
         # Stash for distrib_optimizer to pick up for TE cast + ECO inject.
         p._fa_updated_shard = bf16_shard
 

@@ -326,6 +326,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         param_gbuf_map: Dict[torch.nn.Parameter, Tuple],
         opt_group_ranges: List,
         config: OptimizerConfig,
+        data_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         """
         Create main parameter groups needed for the optimizer step.
@@ -379,10 +380,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     "torch.cuda.BFloat16Tensor",
                 ]:
                     # Generate sharded model param.
-                    if (
-                        is_float8tensor(model_param) or is_nvfp4tensor(model_param)
-                    ) and config.fp8_recipe != "delayed":
-                        # MXFP8Tensor and BlockwiseQTensor don't support view(-1)
+                    if is_nvfp4tensor(model_param) or (
+                        is_float8tensor(model_param) and config.fp8_recipe != "delayed"
+                    ):
+                        # NVFP4/MXFP8/BlockwiseQTensor don't support view(-1).
                         shard_model_param = None
                     else:
                         shard_model_param = model_param.detach().view(-1)[
@@ -414,6 +415,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         shard_main_param = None
                         model_param._fa_shard_offset = param_range.start
                         model_param._fa_shard_size = param_range.size
+                        model_param._fa_data_parallel_group = data_parallel_group
                     else:
                         # Create FP32 (or BF16 for FlashAdamW ECC) main param shards.
                         if is_nvfp4tensor(model_param):
@@ -661,7 +663,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self.shard_fp32_groups,
             self.shard_fp32_from_float16_groups,
         ) = self._build_model_and_main_param_groups(
-            self.gbuf_ranges, self.model_param_gbuf_map, self.opt_group_ranges, config
+            self.gbuf_ranges,
+            self.model_param_gbuf_map,
+            self.opt_group_ranges,
+            config,
+            self.data_parallel_group,
         )
 
         if isinstance(self.optimizer, HybridDeviceOptimizer):
@@ -2825,9 +2831,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 fp8_model_params, fp8_main_params, fp8_offsets
             ):
                 if is_nvfp4tensor(model_p):
+                    if main_p is None:
+                        continue
                     # (model_weight, master_weight, start_offset, fragment)
                     nvfp4_sr_params.append((model_p, main_p, off, None))
                 else:
+                    if main_p is None:
+                        continue
                     other_model.append(model_p)
                     other_main.append(main_p)
                     other_off.append(off)

@@ -468,8 +468,12 @@ def _get_dense_mlp_module_spec(
 
     from megatron.core.models.gpt.gpt_layer_specs import get_mlp_module_spec_for_backend
 
-    mlp_spec = get_mlp_module_spec_for_backend(backend=backend, num_experts=None)
-    mlp_spec.metainfo["fuse_pre_mlp_layernorm"] = backend.fuse_layernorm_and_linear()
+    mlp_spec = get_mlp_module_spec_for_backend(
+        backend=backend, num_experts=None, gated_norm=config.gated_norm
+    )
+    mlp_spec.metainfo["fuse_pre_mlp_layernorm"] = (
+        backend.fuse_layernorm_and_linear() and not config.gated_norm
+    )
 
     return mlp_spec
 

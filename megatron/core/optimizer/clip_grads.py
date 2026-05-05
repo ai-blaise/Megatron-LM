@@ -105,17 +105,20 @@ def get_grad_norm_fp32(
             # Multi-tensor applier takes a function and a list of list
             # and performs the operation on that list all in one kernel.
             if grads_for_norm:
-                grad_norm, _ = multi_tensor_applier(
-                    l2_norm_impl,
-                    dummy_overflow_buf,
-                    [grads_for_norm],
-                    False,  # no per-parameter norm
-                )
+                total_norm = torch.zeros(1, dtype=torch.float, device='cuda')
+                grads_by_dtype = {}
+                for grad in grads_for_norm:
+                    grads_by_dtype.setdefault(grad.dtype, []).append(grad)
+                for dtype_grads_for_norm in grads_by_dtype.values():
+                    grad_norm, _ = multi_tensor_applier(
+                        l2_norm_impl,
+                        dummy_overflow_buf,
+                        [dtype_grads_for_norm],
+                        False,  # no per-parameter norm
+                    )
+                    total_norm += grad_norm.float() ** norm_type
             else:
-                grad_norm = torch.zeros(1, dtype=torch.float, device='cuda')
-            # Since we will be summing across data parallel groups,
-            # we need the pow(norm-type).
-            total_norm = grad_norm**norm_type
+                total_norm = torch.zeros(1, dtype=torch.float, device='cuda')
 
         else:
             for grad in grads_for_norm:

@@ -185,6 +185,7 @@ class _ParamAndGradBucketGroup:
         # are *ready*, as marked by the backward hook.
         # The set of keys in per_param_grad_ready_counts should be equal to `params`.
         self.golden_per_param_grad_ready_counts = {}
+        self.has_sparse_grad_ready_params = False
         self.per_param_grad_ready_counts = {}
         self.is_last_microbatch = True
         self.is_first_batch = True
@@ -207,9 +208,13 @@ class _ParamAndGradBucketGroup:
         Reset metadata in bucket group in preparation for the next iteration of training.
         """
         if self.is_first_batch and len(self.per_param_grad_ready_counts) > 0:
-            # Record golden per_param_grad_ready_counts.
-            assert len(self.per_param_grad_ready_counts) == len(self.params)
+            # Record golden per_param_grad_ready_counts. Sparse MoE routing may
+            # leave some expert params unused in a microbatch; those params keep
+            # zero grad buffer entries and are reduced by finish_grad_sync().
             self.golden_per_param_grad_ready_counts = self.per_param_grad_ready_counts
+            self.has_sparse_grad_ready_params = len(self.per_param_grad_ready_counts) < len(
+                self.params
+            )
             self.is_first_batch = False
         self.per_param_grad_ready_counts = {}
         self.is_last_microbatch = True
@@ -553,6 +558,11 @@ class _ParamAndGradBucketGroup:
         if self.ddp_config.num_distributed_optimizer_instances > 1:
             torch.cuda.default_stream().wait_stream(self.communication_stream)
             return
+        if self.grad_reduce_handle is None:
+            # Sparse MoE routing can make the ready-param set differ from the
+            # first-batch "golden" set. Fall back to dispatching the full bucket
+            # at finish time; unused params have zeroed grad-buffer slices.
+            self.start_grad_sync(force_all_reduce=force_all_reduce)
         assert self.grad_reduce_handle is not None, (
             f"Communication call has not been issued for this bucket "
             f"({len(self.per_param_grad_ready_counts)}/{len(self.params)} "
@@ -579,8 +589,11 @@ class _ParamAndGradBucketGroup:
             if param not in self.per_param_grad_ready_counts:
                 self.per_param_grad_ready_counts[param] = 0
             self.per_param_grad_ready_counts[param] += 1
-            # If all params in bucket group have grads available, issue communication call.
-            if not self.is_first_batch:
+            # If all params in a dense bucket group have grads available, issue
+            # communication early. Sparse MoE buckets reduce at finish time so
+            # dynamic expert routing cannot dispatch a bucket before all used
+            # expert grads for the current microbatch have arrived.
+            if not self.is_first_batch and not self.has_sparse_grad_ready_params:
                 if (
                     self.per_param_grad_ready_counts
                     == self.golden_per_param_grad_ready_counts

@@ -2176,6 +2176,23 @@ def get_thd_batch_on_this_cp_rank(
     sequence dimension into multiple chunks, which are parallelized
     across GPUs in a context parallel group.
     """
+    def _normalize_cu_seqlens(name: str, value: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        if value is None:
+            return None
+        if value.dim() == 2:
+            if value.size(0) != 1:
+                raise ValueError(
+                    f"{name} has shape {tuple(value.shape)}; THD packed SFT currently "
+                    "expects micro-batch-size 1."
+                )
+            value = value[0]
+        if value.dim() != 1:
+            raise ValueError(f"{name} must be 1D after collation, got shape {tuple(value.shape)}")
+        return value.contiguous()
+
+    cu_seqlens = _normalize_cu_seqlens("cu_seqlens", cu_seqlens)
+    cu_seqlens_padded = _normalize_cu_seqlens("cu_seqlens_padded", cu_seqlens_padded)
+
     packed_seq_params = PackedSeqParams(
         qkv_format="thd",
         cu_seqlens_q=cu_seqlens,

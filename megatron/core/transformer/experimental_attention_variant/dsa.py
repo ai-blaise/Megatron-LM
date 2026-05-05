@@ -2,6 +2,7 @@
 
 import copy
 import math
+import os
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
 
@@ -20,11 +21,34 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.experimental_attention_variant.dsa_triton import (
+    is_sparse_dsa_triton_supported,
+    sparse_dsa_attention_triton,
+)
 
 try:
     from fast_hadamard_transform import hadamard_transform
 except ImportError:
     hadamard_transform = None
+
+
+_DSA_STREAMING_INDEXER_TOPK_ENV = "MEGATRON_DSA_STREAMING_INDEXER_TOPK"
+_DSA_INDEXER_KEY_BLOCK_SIZE_ENV = "MEGATRON_DSA_INDEXER_KEY_BLOCK_SIZE"
+
+
+def _env_flag_enabled(name: str, default: str = "1") -> bool:
+    raw = os.getenv(name, default).strip().lower()
+    return raw not in {"0", "false", "off", "no"}
+
+
+def _dsa_indexer_key_block_size(topk: int) -> int:
+    raw = os.getenv(_DSA_INDEXER_KEY_BLOCK_SIZE_ENV)
+    if raw:
+        value = int(raw)
+        if value <= 0:
+            raise ValueError(f"{_DSA_INDEXER_KEY_BLOCK_SIZE_ENV} must be positive, got {value}")
+        return value
+    return max(2048, min(4096, max(1, topk)))
 
 
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
@@ -297,13 +321,13 @@ def _compute_index_scores(q: torch.Tensor, weights: torch.Tensor, k: torch.Tenso
     #   -> [seqlen_q, batch, index_n_heads, seqlen_k]
     index_scores = torch.einsum('sbhd,tbd->sbht', q.float(), k.float())
 
-    # Apply ReLU activation.
-    index_scores = torch.relu(index_scores)
+    # Apply ReLU activation in-place to avoid carrying another full [S, B, H, S] tensor.
+    index_scores = torch.relu_(index_scores)
 
     # Weight each head by attention weights.
     # [seqlen_q, batch, index_n_heads, seqlen_k] * [seqlen_q, batch, index_n_heads, 1]
     #   -> [seqlen_q, batch, index_n_heads, seqlen_k]
-    index_scores = index_scores * weights.unsqueeze(-1)
+    index_scores.mul_(weights.unsqueeze(-1))
 
     # Sum across attention heads.
     # [seqlen_q, batch, index_n_heads, seqlen_k] -> [seqlen_q, batch, seqlen_k]
@@ -726,7 +750,7 @@ class DSAIndexer(MegatronModule):
             from megatron.core.quantization.indexcache import build_indexcache_config
 
             self.indexcache_config = build_indexcache_config(
-                eps=getattr(self.config, "dsa_indexcache_quant_eps", 1e-4),
+                eps=getattr(self.config, "dsa_indexcache_quant_eps", 1e-4)
             )
 
         if pg_collection is None:
@@ -1010,6 +1034,269 @@ def unfused_dsa_fn(query, key, value, topk_indices, softmax_scale):
     return output
 
 
+def _apply_dsa_score_mask(
+    scores: torch.Tensor,
+    mask: Optional[torch.Tensor],
+    q_start: int,
+    q_end: int,
+    sk: int,
+    is_causal: bool,
+) -> torch.Tensor:
+    if is_causal:
+        q_pos = torch.arange(q_start, q_end, device=scores.device).unsqueeze(-1)
+        k_pos = torch.arange(sk, device=scores.device).unsqueeze(0)
+        return scores.masked_fill(k_pos > q_pos, float("-inf"))
+    if mask is None:
+        return scores
+    if mask.dim() == 2:
+        return scores + mask[q_start:q_end, :].unsqueeze(0)
+    if mask.dim() == 3:
+        mask_slice = mask[:, q_start:q_end, :]
+        if scores.dim() == 4:
+            mask_slice = mask_slice.unsqueeze(1)
+        return scores + mask_slice
+    raise ValueError(f"DSA mask must be 2D or 3D, got shape {tuple(mask.shape)}")
+
+
+def _streaming_qk_topk(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    k: torch.Tensor,
+    topk: int,
+    mask: Optional[torch.Tensor],
+    q_start: int,
+    q_end: int,
+    sk: int,
+    is_causal: bool,
+) -> torch.Tensor:
+    """Compute exact DSA indexer top-k without materializing all per-head scores."""
+
+    topk_k = min(topk, sk)
+    key_block_size = _dsa_indexer_key_block_size(topk_k)
+    running_scores = None
+    running_indices = None
+
+    for key_start in range(0, sk, key_block_size):
+        key_end = min(key_start + key_block_size, sk)
+        key_block = k[key_start:key_end]
+
+        block_scores = torch.einsum("sbhd,tbd->sbht", q.float(), key_block.float())
+        block_scores = torch.relu_(block_scores)
+        block_scores.mul_(weights.unsqueeze(-1))
+        block_scores = block_scores.sum(dim=2).transpose(0, 1)
+
+        if is_causal:
+            q_pos = torch.arange(q_start, q_end, device=block_scores.device).view(1, -1, 1)
+            k_pos = torch.arange(key_start, key_end, device=block_scores.device).view(1, 1, -1)
+            block_scores = block_scores.masked_fill(k_pos > q_pos, float("-inf"))
+        elif mask is not None:
+            if mask.dim() == 2:
+                block_scores = block_scores + mask[q_start:q_end, key_start:key_end].unsqueeze(0)
+            elif mask.dim() == 3:
+                block_scores = block_scores + mask[:, q_start:q_end, key_start:key_end]
+            else:
+                raise ValueError(f"DSA mask must be 2D or 3D, got shape {tuple(mask.shape)}")
+
+        block_topk = min(topk_k, key_end - key_start)
+        block_scores, block_indices = block_scores.topk(block_topk, dim=-1)
+        block_indices = block_indices + key_start
+
+        if running_scores is None:
+            running_scores = block_scores
+            running_indices = block_indices
+        else:
+            candidate_scores = torch.cat((running_scores, block_scores), dim=-1)
+            candidate_indices = torch.cat((running_indices, block_indices), dim=-1)
+            keep_k = min(topk_k, candidate_scores.size(-1))
+            running_scores, selected = candidate_scores.topk(keep_k, dim=-1)
+            running_indices = candidate_indices.gather(-1, selected)
+
+    return running_indices
+
+
+def _sparse_dsa_attention_chunk(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    topk_indices: torch.Tensor,
+    softmax_scale: float,
+    mask: Optional[torch.Tensor],
+    q_start: int,
+    is_causal: bool,
+) -> torch.Tensor:
+    q_len, bsz, num_heads, head_dim = query.size()
+    value_head_dim = value.size(3)
+    topk_k = topk_indices.size(-1)
+    topk_block_size = 64
+    batch_outputs = []
+
+    for batch_idx in range(bsz):
+        selected_positions = topk_indices[batch_idx]
+        query_batch = query[:, batch_idx]
+        key_batch = key[:, batch_idx]
+        score_blocks = []
+        for topk_start in range(0, topk_k, topk_block_size):
+            topk_end = min(topk_start + topk_block_size, topk_k)
+            block_positions = selected_positions[:, topk_start:topk_end]
+            block_index = block_positions.reshape(-1)
+            key_block = key_batch.index_select(0, block_index)
+            key_block = key_block.view(q_len, topk_end - topk_start, num_heads, head_dim)
+            score_blocks.append(
+                torch.einsum("qhd,qkhd->qkh", query_batch.float(), key_block.float())
+            )
+        attention_scores = torch.cat(score_blocks, dim=1) * softmax_scale
+
+        if is_causal:
+            q_pos = torch.arange(q_start, q_start + q_len, device=query.device).unsqueeze(1)
+            invalid = selected_positions > q_pos
+            attention_scores = attention_scores.masked_fill(invalid.unsqueeze(-1), float("-inf"))
+        elif mask is not None:
+            if mask.dim() == 2:
+                selected_mask = mask[q_start : q_start + q_len, :].gather(1, selected_positions)
+            elif mask.dim() == 3:
+                selected_mask = mask[batch_idx, q_start : q_start + q_len, :].gather(
+                    1, selected_positions
+                )
+            else:
+                raise ValueError(f"DSA mask must be 2D or 3D, got shape {tuple(mask.shape)}")
+            attention_scores = attention_scores + selected_mask.unsqueeze(-1)
+
+        attention_probs = torch.softmax(attention_scores, dim=1, dtype=torch.float32).to(
+            value.dtype
+        )
+        del attention_scores
+
+        value_batch = value[:, batch_idx]
+        output_batch = None
+        for topk_start in range(0, topk_k, topk_block_size):
+            topk_end = min(topk_start + topk_block_size, topk_k)
+            block_positions = selected_positions[:, topk_start:topk_end]
+            block_index = block_positions.reshape(-1)
+            selected_value = value_batch.index_select(0, block_index)
+            selected_value = selected_value.view(
+                q_len, topk_end - topk_start, num_heads, value_head_dim
+            )
+            block_output = torch.einsum(
+                "qkh,qkhd->qhd", attention_probs[:, topk_start:topk_end, :], selected_value
+            )
+            output_batch = block_output if output_batch is None else output_batch + block_output
+        del attention_probs
+        batch_outputs.append(output_batch)
+
+    output = torch.stack(batch_outputs, dim=1)
+    return output.reshape(q_len, bsz, num_heads * value_head_dim)
+
+
+def chunked_dsa_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    weights: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    softmax_scale: float,
+    topk: int,
+    mask: Optional[torch.Tensor],
+    is_causal: bool,
+    loss_coeff: float,
+    sparse_loss: bool,
+    pg_collection: ProcessGroupCollection,
+    chunk_size: int,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    sq, bsz, num_heads, head_dim = query.size()
+    sk = key.size(0)
+    outputs = []
+    topk_chunks = []
+    use_triton_attention = None
+    use_streaming_indexer_topk = loss_coeff <= 0 and _env_flag_enabled(
+        _DSA_STREAMING_INDEXER_TOPK_ENV, "1"
+    )
+    loss_sum = None
+    loss_count = 0
+
+    for q_start in range(0, sq, chunk_size):
+        q_end = min(q_start + chunk_size, sq)
+        q_chunk = q[q_start:q_end]
+        weights_chunk = weights[q_start:q_end]
+        query_chunk = query[q_start:q_end]
+
+        if use_streaming_indexer_topk:
+            index_scores = None
+            topk_indices = _streaming_qk_topk(
+                q_chunk, weights_chunk, k, topk, mask, q_start, q_end, sk, is_causal
+            )
+        else:
+            index_scores = _compute_index_scores(q_chunk, weights_chunk, k)
+            index_scores = _apply_dsa_score_mask(index_scores, mask, q_start, q_end, sk, is_causal)
+            topk_k = min(topk, sk)
+            topk_indices = index_scores.topk(topk_k, dim=-1)[1]
+
+        if use_triton_attention is None:
+            use_triton_attention = is_sparse_dsa_triton_supported(
+                query_chunk, key, value, topk_indices, mask, is_causal
+            )
+
+        if loss_coeff > 0:
+            loss_index_scores = index_scores
+            attention_query = query_chunk.permute(1, 2, 0, 3).reshape(
+                bsz * num_heads, q_end - q_start, head_dim
+            )
+            attention_key = key.permute(1, 2, 3, 0).reshape(bsz * num_heads, head_dim, sk)
+            attention_scores = torch.bmm(attention_query.float(), attention_key.float())
+            attention_scores = attention_scores.reshape(bsz, num_heads, q_end - q_start, sk)
+            attention_scores = attention_scores * softmax_scale
+            attention_scores = _apply_dsa_score_mask(
+                attention_scores, mask, q_start, q_end, sk, is_causal
+            )
+
+            if sparse_loss:
+                index_mask = torch.full_like(loss_index_scores, float("-inf"))
+                index_mask.scatter_(-1, topk_indices, 0)
+                loss_index_scores = loss_index_scores + index_mask
+                attention_scores = attention_scores + index_mask.unsqueeze(1)
+
+            attention_probs = torch.softmax(attention_scores, dim=-1, dtype=torch.float32)
+            index_probs = torch.softmax(loss_index_scores, dim=-1, dtype=torch.float32)
+
+            attention_probs = attention_probs.sum(dim=1)
+            if pg_collection.tp.size() > 1:
+                torch.distributed.all_reduce(attention_probs.contiguous(), group=pg_collection.tp)
+            attention_probs = attention_probs / attention_probs.sum(dim=-1, keepdim=True)
+
+            kl = attention_probs * (
+                torch.log(attention_probs + 1e-10) - torch.log(index_probs + 1e-10)
+            )
+            chunk_loss_sum = kl.sum(dim=-1).sum()
+            loss_sum = chunk_loss_sum if loss_sum is None else loss_sum + chunk_loss_sum
+            loss_count += bsz * (q_end - q_start)
+        elif index_scores is not None:
+            del index_scores
+
+        if use_triton_attention:
+            topk_chunks.append(topk_indices.to(torch.int32))
+        else:
+            outputs.append(
+                _sparse_dsa_attention_chunk(
+                    query_chunk, key, value, topk_indices, softmax_scale, mask, q_start, is_causal
+                )
+            )
+
+    if use_triton_attention:
+        # Keep top-k generation chunked to bound the indexer score tensor, then run
+        # the selected-token attention as one autograd op so K/V gradients are
+        # accumulated once per layer instead of once per query chunk.
+        topk_indices = torch.cat(topk_chunks, dim=1)
+        topk_chunks.clear()
+        output = sparse_dsa_attention_triton(query, key, value, topk_indices, softmax_scale, 0)
+    else:
+        output = torch.cat(outputs, dim=0)
+
+    indexer_loss = None
+    if loss_sum is not None:
+        indexer_loss = loss_sum * (loss_coeff / loss_count)
+    return output, indexer_loss
+
+
 class DSAttention(MegatronModule):
     """
     This module implements sparse attention mechanism using an DSA Indexer to compute top-k
@@ -1076,6 +1363,59 @@ class DSAttention(MegatronModule):
         Returns:
             output: Output tensor [sq, b, hidden_size]
         """
+        if packed_seq_params is not None and packed_seq_params.qkv_format == "thd":
+            cu_seqlens = (
+                packed_seq_params.cu_seqlens_q_padded
+                if packed_seq_params.cu_seqlens_q_padded is not None
+                else packed_seq_params.cu_seqlens_q
+            )
+            if cu_seqlens is None:
+                raise ValueError("DSAttention THD path requires cu_seqlens")
+            if cu_seqlens.dim() == 2:
+                if cu_seqlens.size(0) != 1:
+                    raise ValueError(
+                        f"DSAttention THD path expects micro-batch-size 1, got "
+                        f"cu_seqlens shape {tuple(cu_seqlens.shape)}"
+                    )
+                cu_seqlens = cu_seqlens[0]
+            if cu_seqlens.dim() != 1:
+                raise ValueError(f"cu_seqlens must be 1D, got shape {tuple(cu_seqlens.shape)}")
+
+            if query.dim() == 4:
+                if query.size(1) != 1 or key.size(1) != 1 or value.size(1) != 1:
+                    raise ValueError("DSAttention THD path only supports a dummy batch dimension")
+                query = query.squeeze(1)
+                key = key.squeeze(1)
+                value = value.squeeze(1)
+
+            if query.dim() != 3 or key.dim() != 3 or value.dim() != 3:
+                raise ValueError(
+                    "DSAttention THD path expects query/key/value as [tokens, heads, dim]"
+                )
+
+            outputs = []
+            offsets = cu_seqlens.detach().cpu().tolist()
+            for start, end in zip(offsets[:-1], offsets[1:]):
+                if end <= start:
+                    continue
+                outputs.append(
+                    self.forward(
+                        query[start:end].unsqueeze(1),
+                        key[start:end].unsqueeze(1),
+                        value[start:end].unsqueeze(1),
+                        attention_mask,
+                        x[start:end],
+                        qr[start:end],
+                        attn_mask_type=attn_mask_type,
+                        attention_bias=attention_bias,
+                        packed_seq_params=None,
+                    )
+                )
+
+            if not outputs:
+                return query.new_empty((0, 1, value.size(1) * value.size(2)))
+            return torch.cat(outputs, dim=0)
+
         sq, b, np, hn = query.size()
         skv = key.size(0)
         hnv = value.size(3)
@@ -1084,16 +1424,12 @@ class DSAttention(MegatronModule):
         x = x.detach()
         qr = qr.detach()
 
+        is_causal = False
         # Get a FP32 mask with -inf for masked positions.
         if attn_mask_type is not None:
             assert attn_mask_type == AttnMaskType.causal, 'Only causal mask is supported for now'
-            # Generate upper triangular mask with -inf above diagonal, 0 elsewhere
-            # torch.triu with diagonal=1 creates upper triangular matrix (excluding main diagonal)
-            # float_mask [sq, skv]
-            float_mask = torch.triu(
-                torch.full((sq, skv), float('-inf'), dtype=torch.float32, device=x.device),
-                diagonal=1,
-            )
+            is_causal = True
+            float_mask = None
         else:
             assert attention_mask.shape == (b, 1, sq, skv), 'attention_mask shape mismatch'
             # [b, 1, sq, skv] -> [b, sq, skv]
@@ -1103,55 +1439,29 @@ class DSAttention(MegatronModule):
                 mask, float('-inf')
             )
 
-        if self.training and torch.is_grad_enabled():
-            # ===================================
-            # Prepare inputs for indexer loss
-            # ===================================
-            q, k, weights = self.indexer.forward_before_topk(x, qr, packed_seq_params)
-            indexer_loss_coeff = getattr(self.config, 'dsa_indexer_loss_coeff', 0.0)
-
-            # ===================================
-            # Attach indexer topk and loss
-            # ===================================
-            # Compute KL divergence loss between indexer scores and true attention scores
-            topk_indices, indexer_loss = FusedDSAIndexerLoss.apply(
-                q,
-                weights,
-                k,
-                query.detach(),
-                key.detach(),
-                self.softmax_scale,
-                self.indexer.index_topk,
-                indexer_loss_coeff,
-                float_mask,
-                getattr(self.config, "dsa_indexer_use_sparse_loss", False),
-                self.indexer.pg_collection,
+        q, k, weights = self.indexer.forward_before_topk(x, qr, packed_seq_params)
+        indexer_loss_coeff = getattr(self.config, 'dsa_indexer_loss_coeff', 0.0)
+        chunk_size = int(getattr(self.config, "dsa_chunk_size", 128))
+        output, indexer_loss = chunked_dsa_forward(
+            q,
+            k,
+            weights,
+            query,
+            key,
+            value,
+            self.softmax_scale,
+            self.indexer.index_topk,
+            float_mask,
+            is_causal,
+            indexer_loss_coeff if self.training and torch.is_grad_enabled() else 0.0,
+            getattr(self.config, "dsa_indexer_use_sparse_loss", False),
+            self.indexer.pg_collection,
+            chunk_size,
+        )
+        if indexer_loss is not None:
+            DSAIndexerLossLoggingHelper.save_loss_to_tracker(
+                loss=indexer_loss, layer_number=self.layer_number, num_layers=self.config.num_layers
             )
-            # Save indexer loss for logging and explicit auxiliary loss composition.
-            if indexer_loss_coeff > 0:
-                DSAIndexerLossLoggingHelper.save_loss_to_tracker(
-                    loss=indexer_loss,
-                    layer_number=self.layer_number,
-                    num_layers=self.config.num_layers,
-                )
-                DSAIndexerAuxLossState.add(indexer_loss)
-
-            # ===================================
-            # Run sparse attention kernel
-            # ===================================
-            output = unfused_dsa_fn(query, key, value, topk_indices, self.softmax_scale)
-
-        else:
-            # ===================================
-            # Get index scores and top-k indices
-            # ===================================
-            _, topk_indices = self.indexer.forward_with_scores(
-                x, qr, mask=float_mask, packed_seq_params=packed_seq_params
-            )
-
-            # ===================================
-            # Run sparse attention kernel
-            # ===================================
-            output = unfused_dsa_fn(query, key, value, topk_indices, self.softmax_scale)
+            DSAIndexerAuxLossState.add(indexer_loss)
 
         return output

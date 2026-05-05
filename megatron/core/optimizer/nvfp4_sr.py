@@ -18,6 +18,7 @@ error ``theta - q_sr(theta)`` rather than including the sampled dither in the
 error term.
 """
 
+import os
 from typing import List, Optional, Tuple, Any
 
 import torch
@@ -161,6 +162,298 @@ def _triton_block_dither_kernel_autotuned(
 _DITHER_AUTOTUNE_THRESHOLD = 8 * 1024 * 1024  # 8 Mi elements
 
 
+@triton.jit
+def _triton_nvfp4_partial_amax_kernel(
+    master_ptr,
+    amax_ptr,
+    numel: int,
+    shard_start_offset: int,
+    full_h: int,
+    full_w: int,
+    tile_w: int,
+    BLOCK_ELEMS: tl.constexpr,
+):
+    """Compute one 16x16-block amax for the local shard."""
+    tile_r = tl.program_id(0)
+    tile_c = tl.program_id(1)
+    offs = tl.arange(0, BLOCK_ELEMS)
+    rows = tile_r * 16 + offs // 16
+    cols = tile_c * 16 + offs % 16
+    flat = rows * full_w + cols
+    local = flat - shard_start_offset
+    mask = (
+        (rows < full_h)
+        & (cols < full_w)
+        & (local >= 0)
+        & (local < numel)
+    )
+    vals = tl.load(master_ptr + local, mask=mask, other=0.0).to(tl.float32)
+    max_abs = tl.max(tl.abs(vals), axis=0)
+    tl.store(amax_ptr + tile_r * tile_w + tile_c, max_abs)
+
+
+@triton.jit
+def _triton_nvfp4_partial_cast_kernel(
+    master_ptr,
+    out_ptr,
+    scale_ptr,
+    global_scale_ptr,
+    num_bytes: int,
+    master_numel: int,
+    shard_start_offset: int,
+    full_h: int,
+    full_w: int,
+    tile_w: int,
+    byte_start: int,
+    BLOCK_BYTES: tl.constexpr,
+):
+    """Pack a shard of FP32 master data into rowwise NVFP4 bytes."""
+    offs = tl.program_id(0) * BLOCK_BYTES + tl.arange(0, BLOCK_BYTES)
+    byte_mask = offs < num_bytes
+    logical_byte = byte_start + offs
+    flat0 = logical_byte * 2
+    flat1 = flat0 + 1
+
+    local0 = flat0 - shard_start_offset
+    local1 = flat1 - shard_start_offset
+    valid0 = byte_mask & (local0 >= 0) & (local0 < master_numel) & (flat0 < full_h * full_w)
+    valid1 = byte_mask & (local1 >= 0) & (local1 < master_numel) & (flat1 < full_h * full_w)
+
+    global_scale = tl.load(global_scale_ptr).to(tl.float32)
+
+    row0 = flat0 // full_w
+    col0 = flat0 - row0 * full_w
+    scale_off0 = (row0 // 16) * tile_w + (col0 // 16)
+    block_scale0 = tl.load(scale_ptr + scale_off0, mask=valid0, other=1.0).to(tl.float32)
+    enc0 = tl.where(block_scale0 > 0.0, global_scale / block_scale0, 1.0)
+    x0 = tl.load(master_ptr + local0, mask=valid0, other=0.0).to(tl.float32) * enc0
+    x0 = tl.minimum(tl.maximum(x0, -6.0), 6.0)
+
+    row1 = flat1 // full_w
+    col1 = flat1 - row1 * full_w
+    scale_off1 = (row1 // 16) * tile_w + (col1 // 16)
+    block_scale1 = tl.load(scale_ptr + scale_off1, mask=valid1, other=1.0).to(tl.float32)
+    enc1 = tl.where(block_scale1 > 0.0, global_scale / block_scale1, 1.0)
+    x1 = tl.load(master_ptr + local1, mask=valid1, other=0.0).to(tl.float32) * enc1
+    x1 = tl.minimum(tl.maximum(x1, -6.0), 6.0)
+
+    ax0 = tl.abs(x0)
+    pos0 = tl.where(
+        ax0 <= 0.25,
+        0,
+        tl.where(
+            ax0 < 0.75,
+            1,
+            tl.where(
+                ax0 <= 1.25,
+                2,
+                tl.where(
+                    ax0 < 1.75,
+                    3,
+                    tl.where(
+                        ax0 <= 2.5,
+                        4,
+                        tl.where(ax0 < 3.5, 5, tl.where(ax0 <= 5.0, 6, 7)),
+                    ),
+                ),
+            ),
+        ),
+    )
+    neg0 = tl.where(
+        ax0 <= 0.25,
+        8,
+        tl.where(
+            ax0 < 0.75,
+            9,
+            tl.where(
+                ax0 <= 1.25,
+                10,
+                tl.where(
+                    ax0 < 1.75,
+                    11,
+                    tl.where(
+                        ax0 <= 2.5,
+                        12,
+                        tl.where(ax0 < 3.5, 13, tl.where(ax0 <= 5.0, 14, 15)),
+                    ),
+                ),
+            ),
+        ),
+    )
+    code0 = tl.where(x0 < 0.0, neg0, pos0).to(tl.int32)
+
+    ax1 = tl.abs(x1)
+    pos1 = tl.where(
+        ax1 <= 0.25,
+        0,
+        tl.where(
+            ax1 < 0.75,
+            1,
+            tl.where(
+                ax1 <= 1.25,
+                2,
+                tl.where(
+                    ax1 < 1.75,
+                    3,
+                    tl.where(
+                        ax1 <= 2.5,
+                        4,
+                        tl.where(ax1 < 3.5, 5, tl.where(ax1 <= 5.0, 6, 7)),
+                    ),
+                ),
+            ),
+        ),
+    )
+    neg1 = tl.where(
+        ax1 <= 0.25,
+        8,
+        tl.where(
+            ax1 < 0.75,
+            9,
+            tl.where(
+                ax1 <= 1.25,
+                10,
+                tl.where(
+                    ax1 < 1.75,
+                    11,
+                    tl.where(
+                        ax1 <= 2.5,
+                        12,
+                        tl.where(ax1 < 3.5, 13, tl.where(ax1 <= 5.0, 14, 15)),
+                    ),
+                ),
+            ),
+        ),
+    )
+    code1 = tl.where(x1 < 0.0, neg1, pos1).to(tl.int32)
+
+    old = tl.load(out_ptr + offs, mask=byte_mask, other=0).to(tl.int32)
+    new = old
+    new = tl.where(valid0, (new & 0xF0) | code0, new)
+    new = tl.where(valid1, (new & 0x0F) | (code1 << 4), new)
+    tl.store(out_ptr + offs, new.to(tl.uint8), mask=byte_mask)
+
+
+def _has_te_nvfp4_sr_kernels() -> bool:
+    """Return whether the installed TE exposes the batched NVFP4 helpers."""
+    required = (
+        "nvfp4_multi_tensor_compute_partial_amax",
+        "nvfp4_compute_global_scale",
+        "nvfp4_multi_tensor_fused_scale",
+        "nvfp4_multi_tensor_2d_partial_cast",
+    )
+    return all(hasattr(tex, name) for name in required)
+
+
+def _compute_partial_amax_fallback(
+    master: torch.Tensor,
+    amax: torch.Tensor,
+    h: int,
+    w: int,
+    start_offset: int,
+) -> None:
+    """Fallback for TE's per-block partial amax helper."""
+    if master is None or master.numel() == 0:
+        return
+    grid = (amax.shape[0], amax.shape[1])
+    _triton_nvfp4_partial_amax_kernel[grid](
+        master,
+        amax,
+        master.numel(),
+        int(start_offset),
+        int(h),
+        int(w),
+        int(amax.shape[1]),
+        BLOCK_ELEMS=256,
+    )
+
+
+def _compute_global_scale_fallback(
+    global_amaxes: torch.Tensor,
+    global_scale: torch.Tensor,
+) -> None:
+    """Compute NVFP4's per-tensor encode scale."""
+    max_fp4 = 6.0
+    max_fp8_e4m3 = 448.0
+    scale = torch.where(
+        global_amaxes > 0,
+        (max_fp4 * max_fp8_e4m3) / global_amaxes,
+        torch.ones_like(global_amaxes),
+    )
+    scale = torch.minimum(scale, torch.full_like(scale, torch.finfo(torch.float32).max))
+    global_scale.copy_(scale)
+
+
+def _fused_scale_fallback(
+    block_amax: torch.Tensor,
+    global_amax: torch.Tensor,
+    per_block_scale: torch.Tensor,
+    target_scale: torch.Tensor,
+    target_amax: torch.Tensor,
+    tile_rows: int,
+    tile_cols: int,
+    rows_padded: int,
+) -> None:
+    """Fallback for TE's NVFP4 block-scale packing helper."""
+    max_fp4 = 6.0
+    max_fp8_e4m3 = 448.0
+    global_encode_scale = torch.where(
+        global_amax > 0,
+        (max_fp4 * max_fp8_e4m3) / global_amax,
+        torch.ones_like(global_amax),
+    )
+    scale = block_amax * (global_encode_scale / max_fp4)
+    scale = torch.clamp(scale, min=-max_fp8_e4m3, max=max_fp8_e4m3)
+    scale_f8 = scale.to(torch.float8_e4m3fn)
+    per_block_scale.copy_(scale_f8.float())
+
+    if target_amax is not None:
+        target_amax.copy_(global_amax)
+
+    # TE stores the 16x16 2D scale repeated once per logical row. The
+    # allocation is padded to [multiple-of-128 rows, multiple-of-4 scale cols].
+    scale_u8 = scale_f8.view(torch.uint8)
+    rows_to_fill = min(tile_rows * 16, rows_padded, target_scale.shape[0])
+    cols_to_fill = min(tile_cols, target_scale.shape[1])
+    if rows_to_fill > 0 and cols_to_fill > 0:
+        expanded = scale_u8.repeat_interleave(16, dim=0)
+        target_scale[:rows_to_fill, :cols_to_fill].copy_(
+            expanded[:rows_to_fill, :cols_to_fill]
+        )
+    if target_scale.shape[1] > cols_to_fill:
+        target_scale[:rows_to_fill, cols_to_fill:].zero_()
+
+
+def _partial_cast_fallback(
+    master: torch.Tensor,
+    out: torch.Tensor,
+    scale: torch.Tensor,
+    global_scale: torch.Tensor,
+    h: int,
+    w: int,
+    start_offset: int,
+) -> None:
+    """Fallback for TE's shard-aware NVFP4 2D partial cast helper."""
+    if master.numel() == 0 or out.numel() == 0:
+        return
+    block = 1024
+    grid = (triton.cdiv(out.numel(), block),)
+    _triton_nvfp4_partial_cast_kernel[grid](
+        master,
+        out,
+        scale,
+        global_scale,
+        out.numel(),
+        master.numel(),
+        int(start_offset),
+        int(h),
+        int(w),
+        int(scale.shape[1]),
+        int(start_offset // 2),
+        BLOCK_BYTES=block,
+    )
+
+
 def _apply_block_dither(
     master: torch.Tensor,          # 1D shard
     decode_scale: torch.Tensor,    # FP32, (tile_h, tile_w)
@@ -255,6 +548,7 @@ def cast_master_weights_to_nvfp4_2d_sr(
 
     device = params[0][0].device
     block_len = NVFP4_BLOCK_SCALING_SIZE  # 16
+    has_te_nvfp4_sr = _has_te_nvfp4_sr_kernels()
 
     # ---- Per-tensor bookkeeping (matches TE's layout) ---------------------
     cu_amax_sizes = [0]
@@ -319,15 +613,29 @@ def cast_master_weights_to_nvfp4_2d_sr(
 
     # ---- Partial amax (per-block) + global amax --------------------------
     if master_weight_list:
-        tex.nvfp4_multi_tensor_compute_partial_amax(
-            master_weight_list,
-            partial_amax_list,
-            global_amax_list,
-            h_list,
-            w_list,
-            start_offset_list,
-            block_len,
-        )
+        if has_te_nvfp4_sr:
+            tex.nvfp4_multi_tensor_compute_partial_amax(
+                master_weight_list,
+                partial_amax_list,
+                global_amax_list,
+                h_list,
+                w_list,
+                start_offset_list,
+                block_len,
+            )
+        else:
+            for master, partial_amax, global_amax, h, w, start_offset in zip(
+                master_weight_list,
+                partial_amax_list,
+                global_amax_list,
+                h_list,
+                w_list,
+                start_offset_list,
+            ):
+                _compute_partial_amax_fallback(
+                    master, partial_amax, h, w, start_offset
+                )
+                global_amax.copy_(master.abs().max().view(1))
 
     if packed_amaxes.numel() > 0:
         torch.distributed.all_reduce(
@@ -340,7 +648,10 @@ def cast_master_weights_to_nvfp4_2d_sr(
 
     # ---- Global scale (per-tensor) ---------------------------------------
     global_scale_tensor = torch.empty_like(global_amaxes)
-    tex.nvfp4_compute_global_scale(global_amaxes, global_scale_tensor)
+    if has_te_nvfp4_sr:
+        tex.nvfp4_compute_global_scale(global_amaxes, global_scale_tensor)
+    else:
+        _compute_global_scale_fallback(global_amaxes, global_scale_tensor)
     global_scale_views = [global_scale_tensor[i : i + 1] for i in range(len(params))]
 
     # ---- Per-block decode scale (FP8 target) + FP32 helper ---------------
@@ -425,20 +736,52 @@ def cast_master_weights_to_nvfp4_2d_sr(
 
     # Convert FP32 per-block decode scale → E4M3 target scale (and update target_amax).
     if fused_scale_block_amax_list:
-        tex.nvfp4_multi_tensor_fused_scale(
-            fused_scale_block_amax_list,
-            fused_scale_global_amax_list,
-            fused_scale_per_block_scale_list,
-            fused_scale_target_scale_list,
-            fused_scale_target_amax_list,
-            fused_scale_tile_rows_list,
-            fused_scale_tile_cols_list,
-            fused_scale_rows_padded_list,
-            block_len,
-        )
+        if has_te_nvfp4_sr:
+            tex.nvfp4_multi_tensor_fused_scale(
+                fused_scale_block_amax_list,
+                fused_scale_global_amax_list,
+                fused_scale_per_block_scale_list,
+                fused_scale_target_scale_list,
+                fused_scale_target_amax_list,
+                fused_scale_tile_rows_list,
+                fused_scale_tile_cols_list,
+                fused_scale_rows_padded_list,
+                block_len,
+            )
+        else:
+            for (
+                block_amax,
+                global_amax,
+                per_block_scale,
+                target_scale,
+                target_amax,
+                tile_rows,
+                tile_cols,
+                rows_padded,
+            ) in zip(
+                fused_scale_block_amax_list,
+                fused_scale_global_amax_list,
+                fused_scale_per_block_scale_list,
+                fused_scale_target_scale_list,
+                fused_scale_target_amax_list,
+                fused_scale_tile_rows_list,
+                fused_scale_tile_cols_list,
+                fused_scale_rows_padded_list,
+            ):
+                _fused_scale_fallback(
+                    block_amax,
+                    global_amax,
+                    per_block_scale,
+                    target_scale,
+                    target_amax,
+                    tile_rows,
+                    tile_cols,
+                    rows_padded,
+                )
 
     # ---- Insert stochastic-rounding dither on scratch shards and cast them.
     base_seed = _next_dither_seed()
+    dither_coef = float(os.getenv("MEGATRON_NVFP4_SR_DITHER_COEF", "0.25"))
     for i, (
         master,
         out,
@@ -474,15 +817,27 @@ def cast_master_weights_to_nvfp4_2d_sr(
             full_w=full_w,
             start_offset=offset,
             seed=(base_seed + i) & 0x7FFFFFFF,
+            dither_coef=dither_coef,
         )
-        tex.nvfp4_multi_tensor_2d_partial_cast(
-            [sr_cast_weight],
-            [out],
-            [scale],
-            [global_scale],
-            [h],
-            [full_w],
-            [offset],
-            block_len,
-        )
+        if has_te_nvfp4_sr:
+            tex.nvfp4_multi_tensor_2d_partial_cast(
+                [sr_cast_weight],
+                [out],
+                [scale],
+                [global_scale],
+                [h],
+                [full_w],
+                [offset],
+                block_len,
+            )
+        else:
+            _partial_cast_fallback(
+                sr_cast_weight,
+                out,
+                scale,
+                global_scale,
+                h,
+                full_w,
+                offset,
+            )
         del sr_cast_weight
