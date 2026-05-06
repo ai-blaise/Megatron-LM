@@ -2192,6 +2192,8 @@ def get_thd_batch_on_this_cp_rank(
 
     cu_seqlens = _normalize_cu_seqlens("cu_seqlens", cu_seqlens)
     cu_seqlens_padded = _normalize_cu_seqlens("cu_seqlens_padded", cu_seqlens_padded)
+    if cu_seqlens_padded is None:
+        cu_seqlens_padded = cu_seqlens
 
     packed_seq_params = PackedSeqParams(
         qkv_format="thd",

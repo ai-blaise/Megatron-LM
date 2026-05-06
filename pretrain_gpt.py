@@ -41,6 +41,7 @@ from megatron.training import (
 )
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank, get_mtp_ranks
+from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerAuxLossState
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.training.utils import (
@@ -138,6 +139,15 @@ def loss_func(
 
         num_tokens = loss_mask.sum().clone().detach().to(torch.int)
         report = {'lm loss': torch.cat([loss.clone().detach().view(1), num_tokens.view(1)])}
+
+        dsa_indexer_loss = DSAIndexerAuxLossState.total()
+        DSAIndexerAuxLossState.clear()
+        if dsa_indexer_loss is not None:
+            loss = loss + dsa_indexer_loss
+            report["dsa indexer loss"] = torch.cat(
+                [dsa_indexer_loss.clone().detach().view(1), num_tokens.view(1)]
+            )
+            report["total loss"] = torch.cat([loss.clone().detach().view(1), num_tokens.view(1)])
 
     # Check individual rank losses are not NaN prior to DP all-reduce.
     rerun_state_machine = get_rerun_state_machine()

@@ -51,6 +51,92 @@ def _dsa_indexer_key_block_size(topk: int) -> int:
     return max(2048, min(4096, max(1, topk)))
 
 
+def _dsa_process_group_size(group: Optional[torch.distributed.ProcessGroup]) -> int:
+    return group.size() if group is not None else 1
+
+
+def _dsa_process_group_rank(group: Optional[torch.distributed.ProcessGroup]) -> int:
+    return group.rank() if group is not None else 0
+
+
+def _dsa_cp_position_ids_for_rank(
+    local_seq_len: int, cp_size: int, cp_rank: int, device: torch.device
+) -> torch.Tensor:
+    """Return absolute sequence positions for one CP rank's zigzag-local tokens."""
+
+    if cp_size <= 1:
+        return torch.arange(local_seq_len, device=device, dtype=torch.long)
+    if local_seq_len % 2 != 0:
+        raise ValueError(
+            f"DSA CP position mapping expects an even local sequence length, got {local_seq_len}"
+        )
+
+    chunk_len = local_seq_len // 2
+    first = torch.arange(
+        cp_rank * chunk_len, (cp_rank + 1) * chunk_len, device=device, dtype=torch.long
+    )
+    second_chunk = 2 * cp_size - cp_rank - 1
+    second = torch.arange(
+        second_chunk * chunk_len,
+        (second_chunk + 1) * chunk_len,
+        device=device,
+        dtype=torch.long,
+    )
+    return torch.cat((first, second), dim=0)
+
+
+def _dsa_cp_local_position_ids(
+    local_seq_len: int, cp_group: Optional[torch.distributed.ProcessGroup], device: torch.device
+) -> torch.Tensor:
+    return _dsa_cp_position_ids_for_rank(
+        local_seq_len,
+        _dsa_process_group_size(cp_group),
+        _dsa_process_group_rank(cp_group),
+        device,
+    )
+
+
+def _dsa_cp_gathered_position_ids(
+    local_seq_len: int, cp_group: Optional[torch.distributed.ProcessGroup], device: torch.device
+) -> torch.Tensor:
+    cp_size = _dsa_process_group_size(cp_group)
+    if cp_size <= 1:
+        return torch.arange(local_seq_len, device=device, dtype=torch.long)
+    return torch.cat(
+        [
+            _dsa_cp_position_ids_for_rank(local_seq_len, cp_size, cp_rank, device)
+            for cp_rank in range(cp_size)
+        ],
+        dim=0,
+    )
+
+
+def _dsa_thd_local_sequence_offsets(
+    cu_seqlens: torch.Tensor,
+    cp_group: Optional[torch.distributed.ProcessGroup],
+) -> list[tuple[int, int]]:
+    """Return local packed-THD offsets for each sequence on this CP rank."""
+
+    cp_size = _dsa_process_group_size(cp_group)
+    offsets = cu_seqlens.detach().cpu().tolist()
+    local_offsets = []
+    local_cursor = 0
+    for start, end in zip(offsets[:-1], offsets[1:]):
+        seq_len = int(end) - int(start)
+        if seq_len <= 0:
+            local_offsets.append((local_cursor, local_cursor))
+            continue
+        if seq_len % cp_size != 0:
+            raise ValueError(
+                f"DSA packed THD CP expects each padded sequence length to be divisible by "
+                f"context_parallel_size; got sequence length {seq_len} and CP {cp_size}"
+            )
+        local_len = seq_len // cp_size
+        local_offsets.append((local_cursor, local_cursor + local_len))
+        local_cursor += local_len
+    return local_offsets
+
+
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     """Apply Hadamard rotation activation.
     Reference:
@@ -321,13 +407,14 @@ def _compute_index_scores(q: torch.Tensor, weights: torch.Tensor, k: torch.Tenso
     #   -> [seqlen_q, batch, index_n_heads, seqlen_k]
     index_scores = torch.einsum('sbhd,tbd->sbht', q.float(), k.float())
 
-    # Apply ReLU activation in-place to avoid carrying another full [S, B, H, S] tensor.
-    index_scores = torch.relu_(index_scores)
+    # Keep this out-of-place: when the DSA KL loss is enabled, autograd needs
+    # the ReLU output version to remain stable through the weight multiply.
+    index_scores = torch.relu(index_scores)
 
     # Weight each head by attention weights.
     # [seqlen_q, batch, index_n_heads, seqlen_k] * [seqlen_q, batch, index_n_heads, 1]
     #   -> [seqlen_q, batch, index_n_heads, seqlen_k]
-    index_scores.mul_(weights.unsqueeze(-1))
+    index_scores = index_scores * weights.unsqueeze(-1)
 
     # Sum across attention heads.
     # [seqlen_q, batch, index_n_heads, seqlen_k] -> [seqlen_q, batch, seqlen_k]
@@ -1041,10 +1128,31 @@ def _apply_dsa_score_mask(
     q_end: int,
     sk: int,
     is_causal: bool,
+    query_positions: Optional[torch.Tensor] = None,
+    key_positions: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if is_causal:
-        q_pos = torch.arange(q_start, q_end, device=scores.device).unsqueeze(-1)
-        k_pos = torch.arange(sk, device=scores.device).unsqueeze(0)
+        if query_positions is not None or key_positions is not None:
+            if query_positions is None or key_positions is None:
+                raise ValueError("query_positions and key_positions must be provided together")
+            q_pos = query_positions.to(device=scores.device)
+            k_pos = key_positions.to(device=scores.device)
+            if q_pos.numel() != q_end - q_start:
+                raise ValueError(
+                    f"query_positions length {q_pos.numel()} does not match chunk length "
+                    f"{q_end - q_start}"
+                )
+            if k_pos.numel() != sk:
+                raise ValueError(f"key_positions length {k_pos.numel()} does not match sk {sk}")
+        else:
+            q_pos = torch.arange(q_start, q_end, device=scores.device)
+            k_pos = torch.arange(sk, device=scores.device)
+        if scores.dim() == 4:
+            q_pos = q_pos.view(1, 1, -1, 1)
+            k_pos = k_pos.view(1, 1, 1, -1)
+        else:
+            q_pos = q_pos.view(1, -1, 1)
+            k_pos = k_pos.view(1, 1, -1)
         return scores.masked_fill(k_pos > q_pos, float("-inf"))
     if mask is None:
         return scores
@@ -1068,6 +1176,8 @@ def _streaming_qk_topk(
     q_end: int,
     sk: int,
     is_causal: bool,
+    query_positions: Optional[torch.Tensor] = None,
+    key_positions: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Compute exact DSA indexer top-k without materializing all per-head scores."""
 
@@ -1086,8 +1196,16 @@ def _streaming_qk_topk(
         block_scores = block_scores.sum(dim=2).transpose(0, 1)
 
         if is_causal:
-            q_pos = torch.arange(q_start, q_end, device=block_scores.device).view(1, -1, 1)
-            k_pos = torch.arange(key_start, key_end, device=block_scores.device).view(1, 1, -1)
+            if query_positions is not None or key_positions is not None:
+                if query_positions is None or key_positions is None:
+                    raise ValueError("query_positions and key_positions must be provided together")
+                q_pos = query_positions.to(device=block_scores.device).view(1, -1, 1)
+                k_pos = key_positions[key_start:key_end].to(device=block_scores.device).view(
+                    1, 1, -1
+                )
+            else:
+                q_pos = torch.arange(q_start, q_end, device=block_scores.device).view(1, -1, 1)
+                k_pos = torch.arange(key_start, key_end, device=block_scores.device).view(1, 1, -1)
             block_scores = block_scores.masked_fill(k_pos > q_pos, float("-inf"))
         elif mask is not None:
             if mask.dim() == 2:
@@ -1123,6 +1241,8 @@ def _sparse_dsa_attention_chunk(
     mask: Optional[torch.Tensor],
     q_start: int,
     is_causal: bool,
+    query_positions: Optional[torch.Tensor] = None,
+    key_positions: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     q_len, bsz, num_heads, head_dim = query.size()
     value_head_dim = value.size(3)
@@ -1147,8 +1267,18 @@ def _sparse_dsa_attention_chunk(
         attention_scores = torch.cat(score_blocks, dim=1) * softmax_scale
 
         if is_causal:
-            q_pos = torch.arange(q_start, q_start + q_len, device=query.device).unsqueeze(1)
-            invalid = selected_positions > q_pos
+            if query_positions is not None or key_positions is not None:
+                if query_positions is None or key_positions is None:
+                    raise ValueError("query_positions and key_positions must be provided together")
+                q_pos = query_positions.to(device=query.device).unsqueeze(1)
+                selected_abs_positions = key_positions.to(device=query.device).index_select(
+                    0, selected_positions.reshape(-1).long()
+                )
+                selected_abs_positions = selected_abs_positions.view_as(selected_positions)
+                invalid = selected_abs_positions > q_pos
+            else:
+                q_pos = torch.arange(q_start, q_start + q_len, device=query.device).unsqueeze(1)
+                invalid = selected_positions > q_pos
             attention_scores = attention_scores.masked_fill(invalid.unsqueeze(-1), float("-inf"))
         elif mask is not None:
             if mask.dim() == 2:
@@ -1202,6 +1332,8 @@ def chunked_dsa_forward(
     sparse_loss: bool,
     pg_collection: ProcessGroupCollection,
     chunk_size: int,
+    query_positions: Optional[torch.Tensor] = None,
+    key_positions: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     sq, bsz, num_heads, head_dim = query.size()
     sk = key.size(0)
@@ -1219,34 +1351,72 @@ def chunked_dsa_forward(
         q_chunk = q[q_start:q_end]
         weights_chunk = weights[q_start:q_end]
         query_chunk = query[q_start:q_end]
+        query_positions_chunk = (
+            None if query_positions is None else query_positions[q_start:q_end]
+        )
 
         if use_streaming_indexer_topk:
             index_scores = None
             topk_indices = _streaming_qk_topk(
-                q_chunk, weights_chunk, k, topk, mask, q_start, q_end, sk, is_causal
+                q_chunk,
+                weights_chunk,
+                k,
+                topk,
+                mask,
+                q_start,
+                q_end,
+                sk,
+                is_causal,
+                query_positions=query_positions_chunk,
+                key_positions=key_positions,
             )
         else:
             index_scores = _compute_index_scores(q_chunk, weights_chunk, k)
-            index_scores = _apply_dsa_score_mask(index_scores, mask, q_start, q_end, sk, is_causal)
+            index_scores = _apply_dsa_score_mask(
+                index_scores,
+                mask,
+                q_start,
+                q_end,
+                sk,
+                is_causal,
+                query_positions=query_positions_chunk,
+                key_positions=key_positions,
+            )
             topk_k = min(topk, sk)
             topk_indices = index_scores.topk(topk_k, dim=-1)[1]
 
         if use_triton_attention is None:
             use_triton_attention = is_sparse_dsa_triton_supported(
-                query_chunk, key, value, topk_indices, mask, is_causal
+                query_chunk,
+                key,
+                value,
+                topk_indices,
+                mask,
+                is_causal,
+                query_positions=query_positions_chunk,
+                key_positions=key_positions,
             )
 
         if loss_coeff > 0:
             loss_index_scores = index_scores
-            attention_query = query_chunk.permute(1, 2, 0, 3).reshape(
+            attention_query = query_chunk.detach().permute(1, 2, 0, 3).reshape(
                 bsz * num_heads, q_end - q_start, head_dim
             )
-            attention_key = key.permute(1, 2, 3, 0).reshape(bsz * num_heads, head_dim, sk)
+            attention_key = key.detach().permute(1, 2, 3, 0).reshape(
+                bsz * num_heads, head_dim, sk
+            )
             attention_scores = torch.bmm(attention_query.float(), attention_key.float())
             attention_scores = attention_scores.reshape(bsz, num_heads, q_end - q_start, sk)
             attention_scores = attention_scores * softmax_scale
             attention_scores = _apply_dsa_score_mask(
-                attention_scores, mask, q_start, q_end, sk, is_causal
+                attention_scores,
+                mask,
+                q_start,
+                q_end,
+                sk,
+                is_causal,
+                query_positions=query_positions_chunk,
+                key_positions=key_positions,
             )
 
             if sparse_loss:
@@ -1277,7 +1447,16 @@ def chunked_dsa_forward(
         else:
             outputs.append(
                 _sparse_dsa_attention_chunk(
-                    query_chunk, key, value, topk_indices, softmax_scale, mask, q_start, is_causal
+                    query_chunk,
+                    key,
+                    value,
+                    topk_indices,
+                    softmax_scale,
+                    mask,
+                    q_start,
+                    is_causal,
+                    query_positions=query_positions_chunk,
+                    key_positions=key_positions,
                 )
             )
 
@@ -1287,7 +1466,16 @@ def chunked_dsa_forward(
         # accumulated once per layer instead of once per query chunk.
         topk_indices = torch.cat(topk_chunks, dim=1)
         topk_chunks.clear()
-        output = sparse_dsa_attention_triton(query, key, value, topk_indices, softmax_scale, 0)
+        output = sparse_dsa_attention_triton(
+            query,
+            key,
+            value,
+            topk_indices,
+            softmax_scale,
+            0,
+            query_positions=query_positions,
+            key_positions=key_positions,
+        )
     else:
         output = torch.cat(outputs, dim=0)
 
@@ -1327,6 +1515,10 @@ class DSAttention(MegatronModule):
         self.indexer = build_module(
             submodules.indexer, config=self.config, pg_collection=pg_collection
         )
+        indexer_loss_coeff = getattr(self.config, 'dsa_indexer_loss_coeff', 0.0) or 0.0
+        if indexer_loss_coeff <= 0:
+            for param in self.indexer.parameters():
+                param.requires_grad_(False)
 
         if softmax_scale is None:
             softmax_scale = 1.0 / math.sqrt(
@@ -1364,6 +1556,8 @@ class DSAttention(MegatronModule):
             output: Output tensor [sq, b, hidden_size]
         """
         if packed_seq_params is not None and packed_seq_params.qkv_format == "thd":
+            cp_group = self.indexer.pg_collection.cp
+            cp_size = _dsa_process_group_size(cp_group)
             cu_seqlens = (
                 packed_seq_params.cu_seqlens_q_padded
                 if packed_seq_params.cu_seqlens_q_padded is not None
@@ -1387,25 +1581,37 @@ class DSAttention(MegatronModule):
                 query = query.squeeze(1)
                 key = key.squeeze(1)
                 value = value.squeeze(1)
+            if x.dim() == 2:
+                x = x.unsqueeze(1)
+            if qr.dim() == 2:
+                qr = qr.unsqueeze(1)
 
             if query.dim() != 3 or key.dim() != 3 or value.dim() != 3:
                 raise ValueError(
                     "DSAttention THD path expects query/key/value as [tokens, heads, dim]"
                 )
+            if x.dim() != 3 or qr.dim() != 3:
+                raise ValueError("DSAttention THD path expects x/qr as [tokens, batch, dim]")
 
             outputs = []
-            offsets = cu_seqlens.detach().cpu().tolist()
-            for start, end in zip(offsets[:-1], offsets[1:]):
-                if end <= start:
+            if cp_size > 1:
+                local_offsets = _dsa_thd_local_sequence_offsets(cu_seqlens, cp_group)
+            else:
+                offsets = cu_seqlens.detach().cpu().tolist()
+                local_offsets = [
+                    (int(start), int(end)) for start, end in zip(offsets[:-1], offsets[1:])
+                ]
+            for local_start, local_end in local_offsets:
+                if local_end <= local_start:
                     continue
                 outputs.append(
                     self.forward(
-                        query[start:end].unsqueeze(1),
-                        key[start:end].unsqueeze(1),
-                        value[start:end].unsqueeze(1),
+                        query[local_start:local_end].unsqueeze(1),
+                        key[local_start:local_end].unsqueeze(1),
+                        value[local_start:local_end].unsqueeze(1),
                         attention_mask,
-                        x[start:end],
-                        qr[start:end],
+                        x[local_start:local_end],
+                        qr[local_start:local_end],
                         attn_mask_type=attn_mask_type,
                         attention_bias=attention_bias,
                         packed_seq_params=None,
@@ -1442,6 +1648,19 @@ class DSAttention(MegatronModule):
         q, k, weights = self.indexer.forward_before_topk(x, qr, packed_seq_params)
         indexer_loss_coeff = getattr(self.config, 'dsa_indexer_loss_coeff', 0.0)
         chunk_size = int(getattr(self.config, "dsa_chunk_size", 128))
+        query_positions = None
+        key_positions = None
+        cp_group = self.indexer.pg_collection.cp
+        cp_size = _dsa_process_group_size(cp_group)
+        if cp_size > 1:
+            if not is_causal:
+                raise NotImplementedError("DSAttention CP path currently supports causal masks only")
+            local_skv = key.size(0)
+            query_positions = _dsa_cp_local_position_ids(sq, cp_group, query.device)
+            key_positions = _dsa_cp_gathered_position_ids(local_skv, cp_group, key.device)
+            k = gather_from_sequence_parallel_region(k, group=cp_group)
+            key = gather_from_sequence_parallel_region(key, group=cp_group)
+            value = gather_from_sequence_parallel_region(value, group=cp_group)
         output, indexer_loss = chunked_dsa_forward(
             q,
             k,
@@ -1457,6 +1676,8 @@ class DSAttention(MegatronModule):
             getattr(self.config, "dsa_indexer_use_sparse_loss", False),
             self.indexer.pg_collection,
             chunk_size,
+            query_positions=query_positions,
+            key_positions=key_positions,
         )
         if indexer_loss is not None:
             DSAIndexerLossLoggingHelper.save_loss_to_tracker(

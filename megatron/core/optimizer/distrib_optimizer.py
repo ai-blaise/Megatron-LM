@@ -777,7 +777,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         # Extract 'step', for non-Apex/TE support.
         if self.config.optimizer == 'flash_adamw':
-            steps = list(
+            steps = sorted(
                 set(
                     [
                         int(s["step"].item())
@@ -786,8 +786,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     ]
                 )
             )
-            assert len(steps) <= 1, f"steps: {steps}"
-            step = steps[0] if len(steps) == 1 else None
+            # Sparse MoE and frozen/unused params can leave FlashAdamW per-param
+            # counters behind the current optimizer step. Distributed optimizer
+            # checkpoints store a single param-group step, so use the latest
+            # observed step and restore it uniformly on load.
+            step = max(steps) if steps else None
         elif not HAVE_APEX_OR_TE:
             steps = list(
                 set([s["step"].item() for s in inner_state_dict["state"].values()])

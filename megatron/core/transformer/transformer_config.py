@@ -1155,9 +1155,6 @@ class TransformerConfig(ModelParallelConfig):
                     f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=})."
                 )
         elif self.experimental_attention_variant == "dsa":
-            assert (
-                self.context_parallel_size == 1
-            ), "Currently context parallelism is not supported by DSAttention!"
             assert not self.apply_rope_fusion, "RoPE fusion is not supported for DSAttention"
 
         if self.fp8:

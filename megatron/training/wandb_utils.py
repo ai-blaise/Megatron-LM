@@ -35,7 +35,11 @@ def on_save_checkpoint_success(checkpoint_path: str, tracker_filename: str, save
         # wandb's artifact.add_reference requires absolute paths
         checkpoint_path = str(Path(checkpoint_path).resolve())
         artifact.add_reference(f"file://{checkpoint_path}", checksum=False)
-        artifact.add_file(tracker_filename)
+        tracker_path = Path(tracker_filename)
+        if not tracker_path.is_file():
+            tracker_path.parent.mkdir(parents=True, exist_ok=True)
+            tracker_path.write_text(str(iteration))
+        artifact.add_file(str(tracker_path))
         wandb_writer.run.log_artifact(artifact, aliases=[artifact_version])
         wandb_tracker_filename = _get_wandb_artifact_tracker_filename(save_dir)
         wandb_tracker_filename.write_text(f"{wandb_writer.run.entity}/{wandb_writer.run.project}")

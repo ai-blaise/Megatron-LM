@@ -13,6 +13,7 @@ from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexer,
+    DSAIndexerAuxLossState,
     DSAIndexerLossAutoScaler,
     DSAIndexerSubmodules,
     DSAttention,
@@ -315,6 +316,199 @@ class TestSparseDSATritonAttention:
 
         assert torch.allclose(streaming_scores, dense_scores, atol=0, rtol=0)
         assert torch.equal(streaming_indices.sort(dim=-1).values, dense_indices.sort(dim=-1).values)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_chunked_forward_honors_cp_zigzag_positions(self, monkeypatch):
+        torch.manual_seed(2468)
+        seqlen = 16
+        num_heads = 2
+        qk_head_dim = 128
+        value_head_dim = 128
+        index_n_heads = 4
+        index_head_dim = 128
+        topk = 8
+        chunk_size = 4
+        softmax_scale = qk_head_dim**-0.5
+
+        rank0_positions = torch.tensor(
+            [0, 1, 2, 3, 12, 13, 14, 15], device="cuda", dtype=torch.long
+        )
+        rank1_positions = torch.tensor(
+            [4, 5, 6, 7, 8, 9, 10, 11], device="cuda", dtype=torch.long
+        )
+        gathered_positions = torch.cat((rank0_positions, rank1_positions), dim=0)
+        natural_positions = torch.arange(seqlen, device="cuda", dtype=torch.long)
+
+        q_full = torch.randn(
+            seqlen, 1, index_n_heads, index_head_dim, device="cuda", dtype=torch.bfloat16
+        )
+        k_full = torch.randn(seqlen, 1, index_head_dim, device="cuda", dtype=torch.bfloat16)
+        weights_full = torch.rand(
+            seqlen, 1, index_n_heads, device="cuda", dtype=torch.bfloat16
+        )
+        query_full = torch.randn(
+            seqlen, 1, num_heads, qk_head_dim, device="cuda", dtype=torch.bfloat16
+        )
+        key_full = torch.randn(
+            seqlen, 1, num_heads, qk_head_dim, device="cuda", dtype=torch.bfloat16
+        )
+        value_full = torch.randn(
+            seqlen, 1, num_heads, value_head_dim, device="cuda", dtype=torch.bfloat16
+        )
+
+        q_local = q_full.index_select(0, rank0_positions)
+        weights_local = weights_full.index_select(0, rank0_positions)
+        query_local = query_full.index_select(0, rank0_positions)
+
+        monkeypatch.setenv("MEGATRON_DSA_TRITON", "0")
+        monkeypatch.setenv("MEGATRON_DSA_STREAMING_INDEXER_TOPK", "1")
+        monkeypatch.setenv("MEGATRON_DSA_INDEXER_KEY_BLOCK_SIZE", "5")
+        reference, _ = chunked_dsa_forward(
+            q_local,
+            k_full,
+            weights_local,
+            query_local,
+            key_full,
+            value_full,
+            softmax_scale,
+            topk,
+            mask=None,
+            is_causal=True,
+            loss_coeff=0.0,
+            sparse_loss=False,
+            pg_collection=None,
+            chunk_size=chunk_size,
+            query_positions=rank0_positions,
+            key_positions=natural_positions,
+        )
+
+        gathered, _ = chunked_dsa_forward(
+            q_local,
+            k_full.index_select(0, gathered_positions),
+            weights_local,
+            query_local,
+            key_full.index_select(0, gathered_positions),
+            value_full.index_select(0, gathered_positions),
+            softmax_scale,
+            topk,
+            mask=None,
+            is_causal=True,
+            loss_coeff=0.0,
+            sparse_loss=False,
+            pg_collection=None,
+            chunk_size=chunk_size,
+            query_positions=rank0_positions,
+            key_positions=gathered_positions,
+        )
+
+        assert torch.allclose(gathered, reference, atol=8e-2, rtol=8e-2)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_triton_path_with_cp_positions_matches_fallback_backward(self, monkeypatch):
+        torch.manual_seed(1357)
+        seqlen = 16
+        q_len = 8
+        num_heads = 2
+        qk_head_dim = 128
+        value_head_dim = 128
+        topk = 8
+        softmax_scale = qk_head_dim**-0.5
+
+        query_positions = torch.tensor(
+            [0, 1, 2, 3, 12, 13, 14, 15], device="cuda", dtype=torch.long
+        )
+        key_positions = torch.tensor(
+            [0, 1, 2, 3, 12, 13, 14, 15, 4, 5, 6, 7, 8, 9, 10, 11],
+            device="cuda",
+            dtype=torch.long,
+        )
+
+        query = torch.randn(
+            q_len,
+            1,
+            num_heads,
+            qk_head_dim,
+            device="cuda",
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        key = torch.randn(
+            seqlen,
+            1,
+            num_heads,
+            qk_head_dim,
+            device="cuda",
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        value = torch.randn(
+            seqlen,
+            1,
+            num_heads,
+            value_head_dim,
+            device="cuda",
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        index_scores = torch.randn(1, q_len, seqlen, device="cuda", dtype=torch.float32)
+        index_scores = index_scores.masked_fill(
+            key_positions.view(1, 1, -1) > query_positions.view(1, -1, 1), float("-inf")
+        )
+        topk_indices = index_scores.topk(topk, dim=-1).indices
+        grad_output = torch.randn(
+            q_len, 1, num_heads * value_head_dim, device="cuda", dtype=torch.bfloat16
+        )
+
+        monkeypatch.setenv("MEGATRON_DSA_TRITON", "0")
+        reference = _sparse_dsa_attention_chunk(
+            query,
+            key,
+            value,
+            topk_indices,
+            softmax_scale,
+            mask=None,
+            q_start=0,
+            is_causal=True,
+            query_positions=query_positions,
+            key_positions=key_positions,
+        )
+        (reference * grad_output).sum().backward()
+        reference_grads = (
+            query.grad.detach().clone(),
+            key.grad.detach().clone(),
+            value.grad.detach().clone(),
+        )
+
+        query_fused = query.detach().clone().requires_grad_(True)
+        key_fused = key.detach().clone().requires_grad_(True)
+        value_fused = value.detach().clone().requires_grad_(True)
+
+        monkeypatch.setenv("MEGATRON_DSA_TRITON", "1")
+        assert is_sparse_dsa_triton_supported(
+            query_fused,
+            key_fused,
+            value_fused,
+            topk_indices,
+            mask=None,
+            is_causal=True,
+            query_positions=query_positions,
+            key_positions=key_positions,
+        )
+        fused = sparse_dsa_attention_triton(
+            query_fused,
+            key_fused,
+            value_fused,
+            topk_indices,
+            softmax_scale,
+            query_positions=query_positions,
+            key_positions=key_positions,
+        )
+        (fused * grad_output).sum().backward()
+
+        assert torch.allclose(fused, reference, atol=8e-2, rtol=8e-2)
+        assert torch.allclose(query_fused.grad, reference_grads[0], atol=8e-2, rtol=8e-2)
+        assert torch.allclose(key_fused.grad, reference_grads[1], atol=8e-2, rtol=8e-2)
+        assert torch.allclose(value_fused.grad, reference_grads[2], atol=8e-2, rtol=8e-2)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize(
@@ -1038,6 +1232,8 @@ class TestDSAttention:
         attention_mask = torch.ones(batch_size, 1, seq_len, seq_len, dtype=torch.bool).cuda()
         attention_mask = torch.tril(attention_mask)
 
+        DSAIndexerAuxLossState.clear()
+
         # Forward pass
         output = self.sparse_attention(
             query=query,
@@ -1101,7 +1297,10 @@ class TestDSAttention:
         )
 
         # Backward pass
-        loss = output.sum()
+        indexer_loss = DSAIndexerAuxLossState.total()
+        assert indexer_loss is not None
+        DSAIndexerAuxLossState.clear()
+        loss = output.sum() + indexer_loss
         loss.backward()
 
         # Check that gradients are computed for inputs

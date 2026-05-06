@@ -290,7 +290,9 @@ class FullyShardedDataParallel(_BaseDataParallel):
             )
         else:
             if ep_group is not None:
-                expt_mesh = _get_dp_tp_mesh(expt_dp_group, expt_tp_group, ep_size=ep_group.size())
+                expt_mesh = _get_dp_tp_mesh(
+                    expt_dp_group, expt_tp_group, ep_size=ep_group.size(), ep_group=ep_group
+                )
                 expt_device_mesh = DeviceMesh.from_group(
                     [expt_dp_group, expt_tp_group],
                     device_type="cuda",
@@ -408,14 +410,38 @@ def _get_hsdp_tp_mesh(outer_fsdp_dp_group, dp_cp_group, tp_group, ep_size=1):
     return dp_tp_meshes[0]
 
 
-def _get_dp_tp_mesh(dp_cp_group, tp_group, ep_size=1):
+def _get_dp_tp_mesh(dp_cp_group, tp_group, ep_size=1, ep_group=None):
     assert HAVE_EINOPS, "einops is not installed. Please install it with `pip install einops`."
     world_size = dist.get_world_size()
 
     tp_size = dist.get_world_size(tp_group) if tp_group is not None else 1
+    mesh_size = dp_cp_group.size() * ep_size * tp_size
+    if mesh_size == world_size:
+        mesh_ranks = torch.arange(world_size)
+    elif tp_size == 1 and ep_size == 1:
+        # Pipeline parallelism means each FSDP mesh covers only this pipeline stage,
+        # not the full global world.
+        mesh_ranks = torch.tensor(dist.get_process_group_ranks(dp_cp_group), device="cpu")
+    elif tp_size == 1 and ep_group is not None:
+        # Expert FSDP meshes also exclude other pipeline stages. For EP-only expert
+        # layouts such as EP=4, ETP=1, expert DP=1, the current EP group is the
+        # complete local expert mesh before the EP dimension is stripped below.
+        ep_group_ranks = dist.get_process_group_ranks(ep_group)
+        if len(ep_group_ranks) != mesh_size:
+            raise RuntimeError(
+                "[Megatron-FSDP] Cannot derive a PP-local expert FSDP mesh for "
+                f"dp_cp={dp_cp_group.size()}, ep={ep_size}, tp={tp_size}; "
+                f"EP group has {len(ep_group_ranks)} ranks, expected {mesh_size}."
+            )
+        mesh_ranks = torch.tensor(ep_group_ranks, device="cpu")
+    else:
+        raise RuntimeError(
+            "[Megatron-FSDP] Cannot derive a PP-local FSDP mesh for "
+            f"dp_cp={dp_cp_group.size()}, ep={ep_size}, tp={tp_size}, world={world_size}."
+        )
     # TODO: Supports configurable (dp, cp, ep, tp) order.
     mesh = einops.rearrange(
-        torch.arange(world_size),
+        mesh_ranks,
         "(dp_cp ep tp) -> ep dp_cp tp",
         dp_cp=dp_cp_group.size(),
         tp=tp_size,

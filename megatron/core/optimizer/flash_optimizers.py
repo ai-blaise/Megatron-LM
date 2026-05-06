@@ -2802,8 +2802,9 @@ def _fused_eco_inject(
 
     BLOCK_SIZE_N and num_warps are chosen by ``triton.autotune`` (see the
     decorator on ``_triton_eco_inject_kernel``); the autotune cache is keyed
-    on (N, PARAM_DTYPE, QUANTIZE_OPTIM_STATES) so each unique shape pays
-    the search cost once.
+    on (N, PARAM_DTYPE_KEY, QUANTIZE_OPTIM_STATES) so each unique shape pays
+    the search cost once. PARAM_DTYPE_KEY is a string so Triton's disk
+    autotune cache can serialize it.
     """
     N = pre_cast.numel()
     if N == 0:
@@ -2839,6 +2840,7 @@ def _fused_eco_inject(
         inv_sqrt_bc2,
         GROUP_SIZE=group_size,
         PARAM_DTYPE=_TORCH_DTYPE_TO_TRITON_DTYPE[pre_cast.dtype],
+        PARAM_DTYPE_KEY=str(pre_cast.dtype),
         QUANTIZE_OPTIM_STATES=quantize_optim_states,
     )
 
@@ -2853,7 +2855,7 @@ def _fused_eco_inject(
     # GROUP_SIZE is constant across the live training path (always 32). Key
     # on the dynamic shape and the two compile-time switches that change
     # which code paths the kernel emits.
-    key=["N", "QUANTIZE_OPTIM_STATES", "PARAM_DTYPE"],
+    key=["N", "QUANTIZE_OPTIM_STATES", "PARAM_DTYPE_KEY"],
     # The kernel does an in-place RMW on the momentum buffer (and its
     # scales). Without ``restore_value`` Triton would invoke the kernel
     # once per config during the autotune sweep, applying the inject
@@ -2880,6 +2882,7 @@ def _triton_eco_inject_kernel(
     inv_sqrt_bc2: float,
     GROUP_SIZE: tl.constexpr,
     PARAM_DTYPE: tl.constexpr,
+    PARAM_DTYPE_KEY: tl.constexpr,
     QUANTIZE_OPTIM_STATES: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
 ):

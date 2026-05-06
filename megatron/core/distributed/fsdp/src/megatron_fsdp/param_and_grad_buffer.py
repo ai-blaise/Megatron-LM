@@ -32,6 +32,8 @@ import torch
 from torch.distributed import _coalescing_manager
 from torch.distributed.tensor import DTensor, Replicate, Shard
 
+from megatron.core.fp4_utils import dequantize_fp4_tensor, is_nvfp4tensor
+
 from .mixed_precision import (
     fp8_discard_transpose_cache,
     fp8_get_raw_data,
@@ -870,6 +872,7 @@ class DataParallelBuffer:
         item_index_map: Optional[Dict[int, TensorItemIndex]] = None,
         bucket_index: Optional[BucketIndex] = None,
         shard_bucket_index: Optional[ShardBucketIndex] = None,
+        use_quantized_param_storage: bool = False,
     ) -> None:
         self.ddp_config = ddp_config
         self.params = params
@@ -897,6 +900,7 @@ class DataParallelBuffer:
             temporary_bucket_allocator if temporary_bucket_allocator else TemporaryBucketAllocator()
         )
         self.is_transpose_buffer = is_transpose_buffer
+        self.use_quantized_param_storage = use_quantized_param_storage
         self.gradient_scaling_factor = gradient_scaling_factor
         self.mem_alloc_context = mem_alloc_context if mem_alloc_context else nullcontext
 
@@ -921,7 +925,7 @@ class DataParallelBuffer:
             # distributed buffer.
             (self.item_index_map, self.bucket_index, self.shard_bucket_index) = (
                 build_data_parallel_buffer_index(
-                    [to_local_if_dtensor(p).shape for p in self.params],
+                    [self._get_item_storage_shape(p) for p in self.params],
                     self.dp_rank,
                     self.dp_world_size,
                     is_data_distributed,
@@ -937,6 +941,13 @@ class DataParallelBuffer:
 
         # Count all parameters in this buffer and store their enumerated index.
         self.param_idx = {p: i for i, p in enumerate(self.params)}
+
+    def _get_item_storage_shape(self, param: torch.nn.Parameter) -> torch.Size:
+        """Return the physical storage shape used by this buffer for a parameter."""
+        local_param = to_local_if_dtensor(param)
+        if self.use_quantized_param_storage and is_float8tensor(local_param):
+            return fp8_get_raw_data(local_param, self.is_transpose_buffer).shape
+        return local_param.shape
 
     def init_data(self, data: torch.Tensor):
         """Allocate a buffer Tensor to persistently store the data for this
@@ -992,8 +1003,10 @@ class DataParallelBuffer:
             for p in self.params:
                 item_id = self.param_idx[p]
                 p = to_local_if_dtensor(p)
-                data = self.get_item_from_bucket(bucket, item_id).view(p.shape)
-                if is_float8tensor(p):
+                data = self.get_item_from_bucket(bucket, item_id).view(
+                    self._get_item_storage_shape(p)
+                )
+                if self.use_quantized_param_storage and is_float8tensor(p):
                     fp8_set_raw_data(p, data, self.is_transpose_buffer)
                 else:
                     p.data = data
@@ -1165,7 +1178,7 @@ class DataParallelBuffer:
         # When fully sharded, we need to get the slice of the item to be stored in this shard.
         # Otherwise, we can just flatten the entire item since this buffer contains
         # the entire bucket.
-        if is_float8tensor(item_data):
+        if self.use_quantized_param_storage and is_float8tensor(item_data):
             item_data = fp8_get_raw_data(item_data, self.is_transpose_buffer)
 
         if self.is_data_distributed:
@@ -2023,6 +2036,7 @@ class ParamAndGradBuffer:
                     bucket_id=group_id,
                     chunk_size_factor=group.chunk_size_factor,
                     mem_alloc_context=self.mem_alloc_context,
+                    use_quantized_param_storage=True,
                     **main_buf_extra_kwargs,
                 )
                 if should_create_transpose_weight_buffer:
@@ -2039,6 +2053,7 @@ class ParamAndGradBuffer:
                         bucket_id=group_id,
                         chunk_size_factor=group.chunk_size_factor,
                         mem_alloc_context=self.mem_alloc_context,
+                        use_quantized_param_storage=True,
                         **main_buf_extra_kwargs,
                     )
 
@@ -2110,6 +2125,7 @@ class ParamAndGradBuffer:
                         data_parallel_world_size=hsdp_buf_dp_group.size(),
                         data_parallel_rank=hsdp_buf_dp_group.rank(),
                     ),
+                    use_quantized_param_storage=True,
                 )
 
                 if group.transpose_weight_buffer is not None:
@@ -2290,33 +2306,37 @@ class ParamAndGradBuffer:
                     # Retrieve the newly allocated parameter data from the global bucket.
                     # Attach the bucket-allocated parameter data to the module parameter,
                     # to use the bucket-allocated data for autograd and NCCL.
-                    new_param_data = wbuf.get_item_from_bucket(bucket, item_id).view(p_local.shape)
-                    if tbuf:
-                        new_transpose_data = tbuf.get_item_from_bucket(
-                            transpose_bucket, item_id
-                        ).view(p_local.shape)
-                    else:
-                        new_transpose_data = None
-
                     if is_float8tensor(p_local):
                         old_param_data = fp8_get_raw_data(p_local)
+                        new_param_data = wbuf.get_item_from_bucket(bucket, item_id).view(
+                            old_param_data.shape
+                        )
                         assert old_param_data._base is None
                         new_param_data.detach().copy_(old_param_data)
                         fp8_set_raw_data(p_local, new_param_data)
                         del old_param_data
-                        if new_transpose_data is not None:
+                        if tbuf:
                             old_transpose_data = fp8_get_raw_data(p_local, True)
+                            new_transpose_data = tbuf.get_item_from_bucket(
+                                transpose_bucket, item_id
+                            ).view(old_transpose_data.shape)
                             assert old_transpose_data._base is None
                             new_transpose_data.detach().copy_(old_transpose_data)
                             fp8_set_raw_data(p_local, new_transpose_data, True)
                             del old_transpose_data
                     elif isinstance(p, DTensor):
+                        new_param_data = wbuf.get_item_from_bucket(bucket, item_id).view(
+                            p_local.shape
+                        )
                         old_param_data = p._local_tensor.data
                         p._local_tensor.data = new_param_data
                         assert old_param_data._base is None
                         p._local_tensor.data.detach().copy_(old_param_data)
                         del old_param_data
                     else:
+                        new_param_data = wbuf.get_item_from_bucket(bucket, item_id).view(
+                            p_local.shape
+                        )
                         # Detach the bucket-allocated parameter data from the computational graph
                         # before copying the old parameter data into the new parameter data
                         # to prevent backpropagation into a deleted parameter / Tensor.
@@ -2348,6 +2368,9 @@ class ParamAndGradBuffer:
                         # Nothing else needs to be done, because the main weights
                         # do not require autograd operations, only possibly sharding.
                         p_local = to_local_if_dtensor(p)
+                        if is_nvfp4tensor(p_local):
+                            mbuf.set_item(item_id, dequantize_fp4_tensor(p_local).float())
+                            continue
                         assert not is_float8tensor(p_local), (
                             self.param_to_name[p],
                             "fp8 param should use get_high_precision_init_val method.",

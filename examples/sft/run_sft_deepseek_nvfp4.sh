@@ -14,7 +14,16 @@ set -euo pipefail
 # ======================
 # Environment
 # ======================
-export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
+USE_MEGATRON_FSDP="${USE_MEGATRON_FSDP:-0}"
+if [[ "$USE_MEGATRON_FSDP" == "1" ]]; then
+    export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-8}"
+else
+    export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
+fi
+if [[ "$USE_MEGATRON_FSDP" == "1" && "$CUDA_DEVICE_MAX_CONNECTIONS" == "1" ]]; then
+    echo "USE_MEGATRON_FSDP=1 requires CUDA_DEVICE_MAX_CONNECTIONS to be unset or greater than 1" >&2
+    exit 1
+fi
 export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-0}"
 export NCCL_TIMEOUT="${NCCL_TIMEOUT:-3600}"
 export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
@@ -82,8 +91,8 @@ DISTRIBUTED_ARGS=(
 # ======================
 # Parallelism
 # ======================
-# Current DSA implementation asserts context_parallel_size == 1.
-# For 16 GPUs, TP=4 * PP=2 leaves DP=2 while preserving pipeline parallelism.
+# Default 16-GPU shape is TP=4 * PP=2 with CP=1, leaving DP=2.
+# CP can be overridden, but CP=2 with PP=2 is weight/optimizer-memory heavy for this model.
 TP="${TP:-4}"
 PP="${PP:-2}"
 CP="${CP:-1}"
@@ -103,8 +112,11 @@ MODEL_PARALLEL_ARGS=(
     --context-parallel-size "$CP"
     --expert-model-parallel-size "$EP"
     --expert-tensor-parallel-size "$ETP"
-    --sequence-parallel
 )
+
+if [[ "${SEQUENCE_PARALLEL:-auto}" == "1" || ( "${SEQUENCE_PARALLEL:-auto}" == "auto" && "$TP" -gt 1 ) ]]; then
+    MODEL_PARALLEL_ARGS+=(--sequence-parallel)
+fi
 
 if [[ "$PP" -gt 1 && -n "$DECODER_FIRST_PIPELINE_NUM_LAYERS" ]]; then
     MODEL_PARALLEL_ARGS+=(--decoder-first-pipeline-num-layers "$DECODER_FIRST_PIPELINE_NUM_LAYERS")
@@ -272,16 +284,34 @@ TRAINING_ARGS=(
     --optimizer flash_adamw
     --flash-adamw-eco
     --use-distributed-optimizer
-    --overlap-grad-reduce
-    --overlap-param-gather
     --no-gradient-accumulation-fusion
 )
 
+if [[ "${OVERLAP_GRAD_REDUCE:-1}" == "1" ]]; then
+    TRAINING_ARGS+=(--overlap-grad-reduce)
+fi
+if [[ "${OVERLAP_PARAM_GATHER:-1}" == "1" ]]; then
+    TRAINING_ARGS+=(--overlap-param-gather)
+fi
 if [[ "${GRAD_REDUCE_IN_BF16:-1}" == "1" ]]; then
     TRAINING_ARGS+=(--grad-reduce-in-bf16)
 fi
 if [[ "${FLASH_ADAMW_COMPRESS_STATE_DICT:-1}" == "1" ]]; then
     TRAINING_ARGS+=(--flash-adamw-compress-state-dict)
+fi
+
+FSDP_ARGS=()
+if [[ "$USE_MEGATRON_FSDP" == "1" ]]; then
+    FSDP_ARGS+=(
+        --use-megatron-fsdp
+        --data-parallel-sharding-strategy "${DATA_PARALLEL_SHARDING_STRATEGY:-optim_grads_params}"
+    )
+    if [[ "${FSDP_DOUBLE_BUFFER:-0}" == "1" ]]; then
+        FSDP_ARGS+=(--fsdp-double-buffer)
+    fi
+    if [[ -n "${SUGGESTED_COMMUNICATION_UNIT_SIZE:-}" ]]; then
+        FSDP_ARGS+=(--suggested-communication-unit-size "$SUGGESTED_COMMUNICATION_UNIT_SIZE")
+    fi
 fi
 
 RECOMPUTE_ARGS=()
@@ -374,12 +404,18 @@ if [[ "${ENABLE_PROFILING:-0}" == "1" ]]; then
     )
 fi
 
+if [[ "$USE_MEGATRON_FSDP" == "1" ]]; then
+    CKPT_FORMAT_VALUE="${CKPT_FORMAT:-fsdp_dtensor}"
+else
+    CKPT_FORMAT_VALUE="${CKPT_FORMAT:-torch_dist}"
+fi
+
 CKPT_ARGS=(
     --eval-interval "${EVAL_INTERVAL:-100}"
     --eval-iters "${EVAL_ITERS:-10}"
     --load "$LOAD_CKPT"
     --distributed-timeout-minutes "${DISTRIBUTED_TIMEOUT_MINUTES:-60}"
-    --ckpt-format torch_dist
+    --ckpt-format "$CKPT_FORMAT_VALUE"
     --auto-detect-ckpt-format
 )
 if [[ "${DISABLE_SAVE:-0}" != "1" ]]; then
@@ -405,6 +441,7 @@ CMD=(
     "${MOE_ARGS[@]}"
     "${MODEL_PARALLEL_ARGS[@]}"
     "${TRAINING_ARGS[@]}"
+    "${FSDP_ARGS[@]}"
     "${RECOMPUTE_ARGS[@]}"
     "${DTYPE_ARGS[@]}"
     "${SPINQUANT_ARGS[@]}"
