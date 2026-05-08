@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Optional, Tuple, Union
 
 import torch
+import torch.nn.functional as F
 
 from megatron.core import parallel_state
 from megatron.core.models.common.embeddings import (
@@ -57,6 +58,53 @@ def _dsa_process_group_size(group: Optional[torch.distributed.ProcessGroup]) -> 
 
 def _dsa_process_group_rank(group: Optional[torch.distributed.ProcessGroup]) -> int:
     return group.rank() if group is not None else 0
+
+
+def _in_te_no_grad_activation_recompute_forward() -> bool:
+    """Return True in TE's checkpoint forward phase, before backward replay."""
+
+    try:
+        from transformer_engine.pytorch.distributed import (
+            in_fp8_activation_recompute_phase,
+            is_fp8_activation_recompute_enabled,
+        )
+    except (ImportError, ModuleNotFoundError):
+        return False
+
+    return (
+        is_fp8_activation_recompute_enabled()
+        and not in_fp8_activation_recompute_phase()
+        and not torch.is_grad_enabled()
+    )
+
+
+def _torch_layer_norm_like_te(layer_norm: torch.nn.Module, x: torch.Tensor, eps: float) -> torch.Tensor:
+    """Apply a torch LayerNorm equivalent for TE LayerNorm modules."""
+
+    output_dtype = x.dtype
+    weight = getattr(layer_norm, "weight", None)
+    bias = getattr(layer_norm, "bias", None)
+    if weight is None:
+        raise AttributeError("LayerNorm fallback requires a weight parameter")
+
+    if hasattr(x, "dequantize"):
+        x = x.dequantize()
+
+    zero_centered_gamma = bool(getattr(layer_norm, "zero_centered_gamma", False))
+    if zero_centered_gamma:
+        weight = weight + 1
+    weight = weight.to(dtype=x.dtype)
+    if bias is not None:
+        bias = bias.to(dtype=x.dtype)
+
+    output = F.layer_norm(
+        x,
+        (x.size(-1),),
+        weight=weight,
+        bias=bias,
+        eps=eps,
+    )
+    return output.to(dtype=output_dtype)
 
 
 def _dsa_cp_position_ids_for_rank(
@@ -148,12 +196,13 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     Returns:
         Rotated tensor.
     """
-    assert (
-        x.dtype == torch.bfloat16
-    ), f"rotate_activation only support bf16 input, but got {x.dtype}"
+    if hasattr(x, "dequantize"):
+        x = x.dequantize()
+    if x.dtype != torch.bfloat16:
+        x = x.to(dtype=torch.bfloat16)
     assert hadamard_transform is not None, "fast_hadamard_transform is not installed."
     hidden_size = x.size(-1)
-    return hadamard_transform(x, scale=hidden_size**-0.5)
+    return hadamard_transform(x.contiguous(), scale=hidden_size**-0.5)
 
 
 class DSAIndexerLossLoggingHelper:
@@ -943,6 +992,25 @@ class DSAIndexer(MegatronModule):
         self, x: torch.Tensor, qr: torch.Tensor, packed_seq_params: Optional[PackedSeqParams] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """All computations before topk."""
+        orig_seqlen = x.size(0)
+        pad_len = 0
+        if self.config.fp4 and packed_seq_params is None:
+            # TE NVFP4 kernels require the flattened token dimension to be divisible
+            # by 16. Packed THD recursion can hand the indexer arbitrary per-sample
+            # lengths, so pad the private indexer projections and trim before use.
+            bsz = x.size(1)
+            while ((orig_seqlen + pad_len) * bsz) % 16 != 0:
+                pad_len += 1
+            if pad_len:
+                x = torch.cat(
+                    (x, x.new_zeros((pad_len, bsz, x.size(2)))),
+                    dim=0,
+                )
+                qr = torch.cat(
+                    (qr, qr.new_zeros((pad_len, bsz, qr.size(2)))),
+                    dim=0,
+                )
+
         # =========================================
         # Prepare RoPE params
         # =========================================
@@ -982,7 +1050,15 @@ class DSAIndexer(MegatronModule):
         # =========================================
         # [seqlen, batch, hidden_size] -> [seqlen, batch, index_head_dim]
         k, _ = self.linear_wk(x)
-        k = self.k_norm(k)
+        if self.config.fp4 and _in_te_no_grad_activation_recompute_forward():
+            # The StreamBP reference-style checkpoint forward runs under TE's
+            # activation-recompute no-grad phase. TE LayerNorm can assert on its
+            # saved-stat outputs in this phase for the DSA indexer, while this
+            # pass only needs numerically equivalent forward values. Backward
+            # replay still uses the normal TE path and produces parameter grads.
+            k = _torch_layer_norm_like_te(self.k_norm, k, self.config.layernorm_epsilon)
+        else:
+            k = self.k_norm(k)
         # [seqlen, batch, index_head_dim] -> [seqlen, batch, 1, index_head_dim]
         k = k.reshape(seqlen, bsz, 1, self.index_head_dim)
         k = self._apply_rope(k, rotary_pos_emb, mscale)
@@ -994,6 +1070,9 @@ class DSAIndexer(MegatronModule):
         # =========================================
         q = rotate_activation(q)
         k = rotate_activation(k)
+        if pad_len:
+            q = q[:orig_seqlen]
+            k = k[:orig_seqlen]
 
         # IndexCache fp8 fake-quant on the post-rotation indexer K. K only —
         # SGLang's reference quantizes the indexer key cache, not the query.
@@ -1007,6 +1086,8 @@ class DSAIndexer(MegatronModule):
         # =========================================
         # [seqlen, batch, hidden_size] -> [seqlen, batch, index_n_heads]
         weights, _ = self.linear_weights_proj(x)
+        if pad_len:
+            weights = weights[:orig_seqlen]
         weights = weights * (self.index_n_heads**-0.5) * self.softmax_scale
 
         return q, k, weights
@@ -1537,6 +1618,7 @@ class DSAttention(MegatronModule):
         attn_mask_type: AttnMaskType = None,
         attention_bias: torch.Tensor = None,
         packed_seq_params: PackedSeqParams = None,
+        streambp_positions: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ):
         """
         Forward pass for Sparse Attention.
@@ -1558,22 +1640,41 @@ class DSAttention(MegatronModule):
         if packed_seq_params is not None and packed_seq_params.qkv_format == "thd":
             cp_group = self.indexer.pg_collection.cp
             cp_size = _dsa_process_group_size(cp_group)
-            cu_seqlens = (
+            cu_seqlens_q = (
                 packed_seq_params.cu_seqlens_q_padded
                 if packed_seq_params.cu_seqlens_q_padded is not None
                 else packed_seq_params.cu_seqlens_q
             )
-            if cu_seqlens is None:
-                raise ValueError("DSAttention THD path requires cu_seqlens")
-            if cu_seqlens.dim() == 2:
-                if cu_seqlens.size(0) != 1:
+            cu_seqlens_kv = (
+                packed_seq_params.cu_seqlens_kv_padded
+                if packed_seq_params.cu_seqlens_kv_padded is not None
+                else packed_seq_params.cu_seqlens_kv
+            )
+            if cu_seqlens_q is None or cu_seqlens_kv is None:
+                raise ValueError("DSAttention THD path requires query and KV cu_seqlens")
+
+            def normalize_cu(cu_seqlens: torch.Tensor, name: str) -> torch.Tensor:
+                if cu_seqlens.dim() == 2:
+                    if cu_seqlens.size(0) != 1:
+                        raise ValueError(
+                            f"DSAttention THD path expects micro-batch-size 1, got "
+                            f"{name} shape {tuple(cu_seqlens.shape)}"
+                        )
+                    cu_seqlens = cu_seqlens[0]
+                if cu_seqlens.dim() != 1:
                     raise ValueError(
-                        f"DSAttention THD path expects micro-batch-size 1, got "
-                        f"cu_seqlens shape {tuple(cu_seqlens.shape)}"
+                        f"{name} must be 1D, got shape {tuple(cu_seqlens.shape)}"
                     )
-                cu_seqlens = cu_seqlens[0]
-            if cu_seqlens.dim() != 1:
-                raise ValueError(f"cu_seqlens must be 1D, got shape {tuple(cu_seqlens.shape)}")
+                return cu_seqlens
+
+            cu_seqlens_q = normalize_cu(cu_seqlens_q, "cu_seqlens_q")
+            cu_seqlens_kv = normalize_cu(cu_seqlens_kv, "cu_seqlens_kv")
+            if cu_seqlens_q.numel() != cu_seqlens_kv.numel():
+                raise ValueError(
+                    "DSAttention THD StreamBP path requires query and KV cu_seqlens "
+                    f"with the same number of sequences, got {cu_seqlens_q.numel()} and "
+                    f"{cu_seqlens_kv.numel()}"
+                )
 
             if query.dim() == 4:
                 if query.size(1) != 1 or key.size(1) != 1 or value.size(1) != 1:
@@ -1593,28 +1694,69 @@ class DSAttention(MegatronModule):
             if x.dim() != 3 or qr.dim() != 3:
                 raise ValueError("DSAttention THD path expects x/qr as [tokens, batch, dim]")
 
+            streambp_query_positions = None
+            streambp_key_positions = None
+            if streambp_positions is not None:
+                if cp_size > 1:
+                    raise ValueError("StreamBP DSA currently requires context_parallel_size == 1")
+                streambp_query_positions, streambp_key_positions = streambp_positions
+                if streambp_query_positions is None or streambp_key_positions is None:
+                    raise ValueError("StreamBP DSA requires both query and key positions")
+                streambp_query_positions = streambp_query_positions.to(
+                    device=query.device, dtype=torch.long
+                )
+                streambp_key_positions = streambp_key_positions.to(
+                    device=key.device, dtype=torch.long
+                )
+                if streambp_query_positions.numel() != query.size(0):
+                    raise ValueError(
+                        f"StreamBP DSA query position length "
+                        f"{streambp_query_positions.numel()} does not match query length "
+                        f"{query.size(0)}"
+                    )
+                if streambp_key_positions.numel() != key.size(0):
+                    raise ValueError(
+                        f"StreamBP DSA key position length {streambp_key_positions.numel()} "
+                        f"does not match key length {key.size(0)}"
+                    )
+
             outputs = []
             if cp_size > 1:
-                local_offsets = _dsa_thd_local_sequence_offsets(cu_seqlens, cp_group)
+                local_q_offsets = _dsa_thd_local_sequence_offsets(cu_seqlens_q, cp_group)
+                local_kv_offsets = _dsa_thd_local_sequence_offsets(cu_seqlens_kv, cp_group)
             else:
-                offsets = cu_seqlens.detach().cpu().tolist()
-                local_offsets = [
-                    (int(start), int(end)) for start, end in zip(offsets[:-1], offsets[1:])
+                q_offsets = cu_seqlens_q.detach().cpu().tolist()
+                kv_offsets = cu_seqlens_kv.detach().cpu().tolist()
+                local_q_offsets = [
+                    (int(start), int(end)) for start, end in zip(q_offsets[:-1], q_offsets[1:])
                 ]
-            for local_start, local_end in local_offsets:
-                if local_end <= local_start:
+                local_kv_offsets = [
+                    (int(start), int(end)) for start, end in zip(kv_offsets[:-1], kv_offsets[1:])
+                ]
+            for (q_start, q_end), (kv_start, kv_end) in zip(local_q_offsets, local_kv_offsets):
+                if q_end <= q_start:
                     continue
+                if kv_end <= kv_start:
+                    raise ValueError("DSAttention THD path received query tokens with empty KV span")
+                sequence_streambp_positions = None
+                if streambp_positions is not None:
+                    key_origin = streambp_key_positions[kv_start]
+                    sequence_streambp_positions = (
+                        streambp_query_positions[q_start:q_end] - key_origin,
+                        streambp_key_positions[kv_start:kv_end] - key_origin,
+                    )
                 outputs.append(
                     self.forward(
-                        query[local_start:local_end].unsqueeze(1),
-                        key[local_start:local_end].unsqueeze(1),
-                        value[local_start:local_end].unsqueeze(1),
+                        query[q_start:q_end].unsqueeze(1),
+                        key[kv_start:kv_end].unsqueeze(1),
+                        value[kv_start:kv_end].unsqueeze(1),
                         attention_mask,
-                        x[local_start:local_end],
-                        qr[local_start:local_end],
+                        x[kv_start:kv_end],
+                        qr[kv_start:kv_end],
                         attn_mask_type=attn_mask_type,
                         attention_bias=attention_bias,
                         packed_seq_params=None,
+                        streambp_positions=sequence_streambp_positions,
                     )
                 )
 
@@ -1646,13 +1788,34 @@ class DSAttention(MegatronModule):
             )
 
         q, k, weights = self.indexer.forward_before_topk(x, qr, packed_seq_params)
+        streambp_query_positions = None
+        streambp_key_positions = None
+        if streambp_positions is not None:
+            streambp_query_positions, streambp_key_positions = streambp_positions
+            if streambp_query_positions is None or streambp_key_positions is None:
+                raise ValueError("StreamBP DSA requires both query and key positions")
+            q_indices = streambp_query_positions.to(device=q.device, dtype=torch.long)
+            if q_indices.numel() != sq:
+                raise ValueError(
+                    f"StreamBP DSA query position length {q_indices.numel()} does not match "
+                    f"query length {sq}"
+                )
+            if streambp_key_positions.numel() != skv:
+                raise ValueError(
+                    f"StreamBP DSA key position length {streambp_key_positions.numel()} "
+                    f"does not match key length {skv}"
+                )
+            q = q.index_select(0, q_indices)
+            weights = weights.index_select(0, q_indices)
         indexer_loss_coeff = getattr(self.config, 'dsa_indexer_loss_coeff', 0.0)
         chunk_size = int(getattr(self.config, "dsa_chunk_size", 128))
-        query_positions = None
-        key_positions = None
+        query_positions = streambp_query_positions
+        key_positions = streambp_key_positions
         cp_group = self.indexer.pg_collection.cp
         cp_size = _dsa_process_group_size(cp_group)
         if cp_size > 1:
+            if streambp_positions is not None:
+                raise ValueError("StreamBP DSA currently requires context_parallel_size == 1")
             if not is_causal:
                 raise NotImplementedError("DSAttention CP path currently supports causal masks only")
             local_skv = key.size(0)

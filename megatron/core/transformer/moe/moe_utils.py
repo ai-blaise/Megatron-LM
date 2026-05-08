@@ -42,6 +42,16 @@ try:
     HAVE_TE = True
 except ImportError:
     HAVE_TE = False
+    fused_compute_score_for_moe_aux_loss = None
+    fused_moe_aux_loss = None
+    fused_permute = None
+    fused_permute_and_pad_with_probs = None
+    fused_permute_with_probs = None
+    fused_sort_chunks_by_index = None
+    fused_sort_chunks_by_index_with_probs = None
+    fused_topk_with_score_function = None
+    fused_unpermute = None
+    te_general_gemm = None
 
 
 def switch_load_balancing_loss_func(

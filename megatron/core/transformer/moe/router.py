@@ -23,6 +23,11 @@ from megatron.core.transformer.moe.moe_utils import (
     z_loss_func,
 )
 from megatron.core.transformer.moe.router_replay import RouterReplay
+from megatron.core.transformer.streambp import (
+    StreamBPMoeAuxStats,
+    current_streambp_moe_aux_capture,
+    current_streambp_moe_aux_replay,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
@@ -281,6 +286,124 @@ class TopKRouter(Router):
             if self.get_aux_loss_coeff(aux_loss_type) > 0:
                 return True
         return False
+
+    def _record_streambp_aux_stats(
+        self,
+        scores_for_aux_loss: torch.Tensor,
+        routing_map: torch.Tensor,
+        seq_length: int,
+        bsz: int,
+        with_padding_mask: bool,
+    ) -> None:
+        """Capture full-sequence router counts for chunked StreamBP replay."""
+        capture = current_streambp_moe_aux_capture()
+        if capture is None:
+            return
+
+        if self.get_aux_loss_coeff("aux_loss") > 0:
+            global_tokens_per_expert, local_num_tokens, total_num_tokens = (
+                get_tokens_per_expert_and_token_count(
+                    routing_map=routing_map,
+                    reduce_group=self.tp_cp_group,
+                    topk=self.topk,
+                    with_padding_mask=with_padding_mask,
+                )
+            )
+            capture.record(
+                self,
+                "aux_loss",
+                StreamBPMoeAuxStats(
+                    tokens_per_expert=global_tokens_per_expert.detach(),
+                    local_num_tokens=local_num_tokens,
+                    total_num_tokens=total_num_tokens,
+                    seq_length=seq_length,
+                    bsz=bsz,
+                    with_padding_mask=with_padding_mask,
+                ),
+            )
+
+        if self.get_aux_loss_coeff("seq_aux_loss") > 0:
+            seq_routing_map = routing_map.reshape(seq_length, -1)
+            global_tokens_per_expert, local_num_tokens, total_num_tokens = (
+                get_tokens_per_expert_and_token_count(
+                    routing_map=seq_routing_map,
+                    reduce_group=self.tp_cp_group,
+                    with_padding_mask=with_padding_mask,
+                    topk=self.topk * bsz,
+                )
+            )
+            capture.record(
+                self,
+                "seq_aux_loss",
+                StreamBPMoeAuxStats(
+                    tokens_per_expert=global_tokens_per_expert.detach(),
+                    local_num_tokens=local_num_tokens,
+                    total_num_tokens=total_num_tokens,
+                    seq_length=seq_length,
+                    bsz=bsz,
+                    with_padding_mask=with_padding_mask,
+                ),
+            )
+
+    def _apply_streambp_aux_losses(
+        self,
+        probs: torch.Tensor,
+        scores_for_aux_loss: torch.Tensor,
+        seq_length: int,
+        bsz: int,
+    ) -> Optional[torch.Tensor]:
+        """Apply full-sequence aux-loss statistics to one StreamBP chunk."""
+        replay = current_streambp_moe_aux_replay()
+        if replay is None or not replay.has_router(self):
+            return None
+
+        aux_stats = replay.get(self, "aux_loss")
+        if aux_stats is not None:
+            aux_loss_coeff = self.get_aux_loss_coeff("aux_loss")
+            aux_loss = switch_load_balancing_loss_func(
+                probs=scores_for_aux_loss,
+                tokens_per_expert=aux_stats.tokens_per_expert,
+                total_num_tokens=aux_stats.total_num_tokens,
+                topk=self.topk,
+                num_experts=self.config.num_moe_experts,
+                moe_aux_loss_coeff=aux_loss_coeff,
+                fused=self.config.moe_router_fusion,
+            )
+            probs = self.attach_and_log_load_balancing_loss(
+                probs,
+                aux_loss_coeff,
+                aux_loss,
+                "load_balancing_loss",
+                self.tp_cp_group,
+                valid_token_count=aux_stats.local_num_tokens,
+            )
+
+        seq_aux_stats = replay.get(self, "seq_aux_loss")
+        if seq_aux_stats is not None:
+            seq_aux_loss_coeff = self.get_aux_loss_coeff("seq_aux_loss")
+            seq_scores = scores_for_aux_loss.reshape(seq_length, -1)
+            aux_loss = (
+                switch_load_balancing_loss_func(
+                    probs=seq_scores,
+                    tokens_per_expert=seq_aux_stats.tokens_per_expert,
+                    total_num_tokens=seq_aux_stats.total_num_tokens,
+                    topk=self.topk,
+                    num_experts=self.config.num_moe_experts,
+                    moe_aux_loss_coeff=seq_aux_loss_coeff,
+                    fused=self.config.moe_router_fusion,
+                )
+                / bsz
+            )
+            probs = self.attach_and_log_load_balancing_loss(
+                probs,
+                seq_aux_loss_coeff,
+                aux_loss,
+                "seq_load_balancing_loss",
+                self.tp_cp_group,
+                valid_token_count=seq_aux_stats.local_num_tokens,
+            )
+
+        return probs
 
     def _apply_aux_loss(
         self,
@@ -635,8 +758,16 @@ class TopKRouter(Router):
                 pad_to_capacity=self.config.moe_pad_expert_input_to_capacity,
             )
 
-        # Apply each aux loss type and attach aux loss autograd function to probs
-        if self.training and torch.is_grad_enabled() and self.is_aux_loss_enabled():
+        # Apply each aux loss type and attach aux loss autograd function to probs.
+        # StreamBP captures full-sequence no-grad router statistics in the forward,
+        # then reuses those counts while replaying chunked MoE backward graphs.
+        capture_streambp_aux = current_streambp_moe_aux_capture()
+        should_compute_aux_metadata = (
+            self.training
+            and self.is_aux_loss_enabled()
+            and (torch.is_grad_enabled() or capture_streambp_aux is not None)
+        )
+        if should_compute_aux_metadata:
             # Calculate scores and routing_map for aux loss
             routing_map_for_aux_loss, scores_for_aux_loss = compute_routing_scores_for_aux_loss(
                 logits,
@@ -645,26 +776,44 @@ class TopKRouter(Router):
                 fused=self.config.moe_router_fusion,
                 padding_mask=padding_mask,
             )
-            probs = self._apply_aux_loss(
-                probs,
-                scores_for_aux_loss,
-                routing_map_for_aux_loss,
-                with_padding_mask=padding_mask is not None,
-            )
-            probs = self._apply_seq_aux_loss(
-                probs,
-                scores_for_aux_loss,
-                routing_map_for_aux_loss,
-                seq_length,
-                bsz,
-                with_padding_mask=padding_mask is not None,
-            )
-            probs = self._apply_global_aux_loss(
-                probs,
-                scores_for_aux_loss,
-                routing_map_for_aux_loss,
-                with_padding_mask=padding_mask is not None,
-            )
+            if capture_streambp_aux is not None and not torch.is_grad_enabled():
+                self._record_streambp_aux_stats(
+                    scores_for_aux_loss,
+                    routing_map_for_aux_loss,
+                    seq_length,
+                    bsz,
+                    with_padding_mask=padding_mask is not None,
+                )
+            if torch.is_grad_enabled():
+                streambp_probs = self._apply_streambp_aux_losses(
+                    probs,
+                    scores_for_aux_loss,
+                    seq_length,
+                    bsz,
+                )
+                if streambp_probs is not None:
+                    probs = streambp_probs
+                else:
+                    probs = self._apply_aux_loss(
+                        probs,
+                        scores_for_aux_loss,
+                        routing_map_for_aux_loss,
+                        with_padding_mask=padding_mask is not None,
+                    )
+                    probs = self._apply_seq_aux_loss(
+                        probs,
+                        scores_for_aux_loss,
+                        routing_map_for_aux_loss,
+                        seq_length,
+                        bsz,
+                        with_padding_mask=padding_mask is not None,
+                    )
+                    probs = self._apply_global_aux_loss(
+                        probs,
+                        scores_for_aux_loss,
+                        routing_map_for_aux_loss,
+                        with_padding_mask=padding_mask is not None,
+                    )
 
         # Optionally apply expert bias
         self._apply_expert_bias(routing_map, padding_mask=padding_mask)

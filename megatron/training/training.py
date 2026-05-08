@@ -1672,6 +1672,41 @@ def dummy_train_step(data_iterator):
             batch = get_batch_on_this_cp_rank(batch)
 
 
+def _adjust_tensor_shapes_for_sft_packed(recv_tensor_shapes, send_tensor_shapes):
+    """Keep packed SFT activations in THD layout across pipeline stages."""
+
+    def _flatten_batch_dim(tensor_shapes):
+        adjusted = []
+        for tensor_shape in tensor_shapes:
+            if tensor_shape is None:
+                adjusted.append(tensor_shape)
+                continue
+            if len(tensor_shape) != 3:
+                raise ValueError(
+                    f"SFT packed pipeline tensor shape must have rank 3, got {tensor_shape}"
+                )
+            seq_length, micro_batch_size, hidden_size = tensor_shape
+            adjusted.append((seq_length * micro_batch_size, 1, hidden_size))
+        return adjusted
+
+    return _flatten_batch_dim(recv_tensor_shapes), _flatten_batch_dim(send_tensor_shapes)
+
+
+def _compose_tensor_shapes_adjust_fns(*adjust_fns):
+    adjust_fns = [fn for fn in adjust_fns if fn is not None]
+    if not adjust_fns:
+        return None
+
+    def _adjust(recv_tensor_shapes, send_tensor_shapes):
+        for adjust_fn in adjust_fns:
+            recv_tensor_shapes, send_tensor_shapes = adjust_fn(
+                recv_tensor_shapes, send_tensor_shapes
+            )
+        return recv_tensor_shapes, send_tensor_shapes
+
+    return _adjust
+
+
 def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=None):
     """Single training step."""
     args = get_args()
@@ -1698,14 +1733,24 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
         if has_nvidia_modelopt:
             # [ModelOpt]: Pipeline-parallel Distillation stacks student and teacher tensors
-            adjust_tensor_shapes_fn = get_tensor_shapes_adjust_fn_for_distillation(
+            modelopt_adjust_tensor_shapes_fn = get_tensor_shapes_adjust_fn_for_distillation(
                 model,
                 seq_length=args.seq_length,
                 micro_batch_size=args.micro_batch_size,
                 decoder_seq_length=args.decoder_seq_length,
             )
         else:
-            adjust_tensor_shapes_fn = None
+            modelopt_adjust_tensor_shapes_fn = None
+
+        sft_packed_adjust_tensor_shapes_fn = (
+            _adjust_tensor_shapes_for_sft_packed
+            if args.sft and not args.hybrid_context_parallel and args.pipeline_model_parallel_size > 1
+            else None
+        )
+        adjust_tensor_shapes_fn = _compose_tensor_shapes_adjust_fns(
+            modelopt_adjust_tensor_shapes_fn,
+            sft_packed_adjust_tensor_shapes_fn,
+        )
 
         # For the mxfp8_param with reuse_grad_buf_for_mxfp8_param_ag and dp_ag_overlap,
         # we need to call the _copy_main_params_to_param_buffer() after the grad buffer
@@ -1821,6 +1866,10 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         optimizer_probe_reserved_before = torch.cuda.memory_reserved()
         optimizer_probe_start = time.perf_counter()
 
+    zcc_manager = getattr(optimizer, "zero_cost_checkpoint_manager", None)
+    if zcc_manager is not None:
+        zcc_manager.sync_before_step()
+
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
 
@@ -1903,6 +1952,11 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     if update_successful:
         increment = get_num_microbatches() * args.micro_batch_size * args.data_parallel_size
         opt_param_scheduler.step(increment=increment)
+        if zcc_manager is not None:
+            zcc_manager.snapshot_after_step(
+                (iteration + 1) if iteration is not None else 0,
+                opt_param_scheduler=opt_param_scheduler,
+            )
         skipped_iter = 0
     else:
         skipped_iter = 1

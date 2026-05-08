@@ -46,6 +46,46 @@ from megatron.core.utils import (
 from megatron.legacy.model.module import param_is_not_shared
 
 
+def _prepare_thd_packed_batch_for_tp_broadcast(batch):
+    """Flatten packed SFT microbatches into one THD stream.
+
+    Packed THD kernels consume a single token dimension plus cu_seqlens.  The
+    dataloader naturally collates SFT samples as [B, S], with one cu_seqlens row
+    per sample.  Combine those rows before TP broadcast so MBS>1 remains valid.
+    """
+
+    cu_seqlens = batch.get('cu_seqlens')
+    if cu_seqlens is None:
+        return batch
+
+    if cu_seqlens.dim() == 2:
+        combined = []
+        offset = cu_seqlens.new_zeros(())
+        for row in cu_seqlens:
+            row = row.contiguous()
+            if len(combined) == 0:
+                combined.append(row)
+            else:
+                combined.append(row[1:] + offset)
+            offset = offset + row[-1]
+        batch['cu_seqlens'] = torch.cat(combined).contiguous()
+    elif cu_seqlens.dim() == 1:
+        batch['cu_seqlens'] = cu_seqlens.contiguous()
+    else:
+        raise ValueError(f"cu_seqlens must be 1D or 2D, got shape {tuple(cu_seqlens.shape)}")
+
+    max_seqlen = batch.get('max_seqlen')
+    if max_seqlen is not None:
+        batch['max_seqlen'] = max_seqlen.max().to(dtype=torch.int32).view(1)
+
+    for key in ('tokens', 'labels', 'loss_mask', 'position_ids'):
+        value = batch.get(key)
+        if isinstance(value, torch.Tensor) and value.dim() == 2 and value.size(0) > 1:
+            batch[key] = value.contiguous().view(1, -1)
+
+    return batch
+
+
 def calc_params_l2_norm(model, force_create_fp32_copy=False):
     """Calculate l2 norm of parameters"""
     args = get_args()
@@ -558,6 +598,8 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
                 else data["local_cp_size"].cuda(non_blocking=True)
             ),
         }
+        if args.sft and not args.hybrid_context_parallel:
+            batch = _prepare_thd_packed_batch_for_tp_broadcast(batch)
 
         def _broadcast_cu_seqlens(cu_seqlens):
             dev = torch.cuda.current_device()
@@ -570,7 +612,6 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             else:
                 assert isinstance(cu_seqlens, torch.Tensor)
                 assert cu_seqlens.dtype == torch.int32
-                assert cu_seqlens.shape[0] == 1, "micro-batch-size must be 1 for packing"
                 buf = cu_seqlens.to(device=dev, non_blocking=True).contiguous()
             _broadcast(buf)
 
@@ -608,6 +649,8 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             seq_len = torch.tensor(0, dtype=torch.int32, device=torch.cuda.current_device())
             _broadcast(seq_len)
             shape = (seq_len.item())
+        elif args.sft:
+            shape = (1, args.micro_batch_size * args.seq_length)
         else:
             shape = (args.micro_batch_size, args.seq_length)
             
@@ -666,7 +709,7 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             if n == 0:
                 cu_seqlens = torch.empty(0, dtype=torch.int32, device=dev)
             else:
-                cu_seqlens = torch.empty((args.micro_batch_size, n), dtype=torch.int32, device=dev)
+                cu_seqlens = torch.empty(n, dtype=torch.int32, device=dev)
             _broadcast(cu_seqlens)
 
             return cu_seqlens if n > 0 else None

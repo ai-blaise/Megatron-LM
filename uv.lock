@@ -1410,6 +1410,15 @@ wheels = [
 ]
 
 [[package]]
+name = "expecttest"
+version = "0.3.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/22/0a/8868083a2b25c28811a88da6a4cb561f84feab0c9fa953c45820a3eb3a65/expecttest-0.3.0.tar.gz", hash = "sha256:6e8512fb86523ada1f94fd1b14e280f924e379064bb8a29ee399950e513eeccd", size = 7742, upload-time = "2024-12-11T15:32:15.72Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/27/fb/deeefea1ea549273817ca7bed3db2f39cc238a75a745a20e3651619f7335/expecttest-0.3.0-py3-none-any.whl", hash = "sha256:60f88103086e1754240b42175f622be83b6ffeac419434691ee5a5be819d0544", size = 8238, upload-time = "2024-12-11T15:32:13.523Z" },
+]
+
+[[package]]
 name = "fast-hadamard-transform"
 version = "1.0.4.post1"
 source = { git = "https://github.com/Dao-AILab/fast-hadamard-transform.git?rev=f134af63deb2df17e1171a9ec1ea4a7d8604d5ca#f134af63deb2df17e1171a9ec1ea4a7d8604d5ca" }
@@ -2439,6 +2448,7 @@ dependencies = [
     { name = "packaging" },
     { name = "psutil" },
     { name = "torch" },
+    { name = "torchcomms", marker = "(python_full_version == '3.12.*' and platform_machine == 'x86_64' and sys_platform == 'linux') or (python_full_version != '3.12.*' and extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (platform_machine != 'x86_64' and extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (sys_platform != 'linux' and extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
     { name = "transformers" },
     { name = "triton", marker = "sys_platform == 'linux' or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
 ]
@@ -2603,6 +2613,7 @@ requires-dist = [
     { name = "tensorstore", marker = "extra == 'lts'", specifier = "~=0.1,!=0.1.46,!=0.1.72" },
     { name = "tiktoken", marker = "extra == 'mlm'" },
     { name = "torch", specifier = ">=2.6.0" },
+    { name = "torchcomms", marker = "python_full_version == '3.12.*' and platform_machine == 'x86_64' and sys_platform == 'linux'", path = "/home/sjpat/wheelhouse/torchcomms-0.2.0-cp312-cp312-linux_x86_64.whl" },
     { name = "tqdm", marker = "extra == 'dev'" },
     { name = "tqdm", marker = "extra == 'lts'" },
     { name = "transformer-engine", extras = ["core-cu13", "pytorch"], marker = "extra == 'dev'", git = "https://github.com/NVIDIA/TransformerEngine.git?rev=c6853b65b7177ab3785c48c130166ec3f9324c46" },
@@ -6160,6 +6171,35 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/b1/e7/0b6665f533aa9e337662dc190425abc0af1fe3234088f4454c52393ded61/torch-2.11.0-cp314-cp314t-manylinux_2_28_x86_64.whl", hash = "sha256:563ed3d25542d7e7bbc5b235ccfacfeb97fb470c7fee257eae599adb8005c8a2", size = 530613405, upload-time = "2026-03-23T18:08:07.014Z" },
     { url = "https://files.pythonhosted.org/packages/cf/bf/c8d12a2c86dbfd7f40fb2f56fbf5a505ccf2d9ce131eb559dfc7c51e1a04/torch-2.11.0-cp314-cp314t-win_amd64.whl", hash = "sha256:b2a43985ff5ef6ddd923bbcf99943e5f58059805787c5c9a2622bf05ca2965b0", size = 114792991, upload-time = "2026-03-23T18:08:19.216Z" },
 ]
+
+[[package]]
+name = "torchcomms"
+version = "0.2.0"
+source = { path = "/home/sjpat/wheelhouse/torchcomms-0.2.0-cp312-cp312-linux_x86_64.whl" }
+dependencies = [
+    { name = "expecttest", marker = "(python_full_version == '3.12.*' and sys_platform == 'linux') or (python_full_version == '3.13.*' and sys_platform == 'linux' and extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts') or (python_full_version < '3.12' and extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (python_full_version >= '3.14' and extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (python_full_version == '3.13.*' and extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (sys_platform != 'linux' and extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
+    { name = "packaging", marker = "(python_full_version == '3.12.*' and sys_platform == 'linux') or (python_full_version == '3.13.*' and sys_platform == 'linux' and extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts') or (python_full_version < '3.12' and extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (python_full_version >= '3.14' and extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (python_full_version == '3.13.*' and extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (sys_platform != 'linux' and extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
+    { name = "pyyaml", marker = "(python_full_version == '3.12.*' and sys_platform == 'linux') or (python_full_version == '3.13.*' and sys_platform == 'linux' and extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts') or (python_full_version < '3.12' and extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (python_full_version >= '3.14' and extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (python_full_version == '3.13.*' and extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (sys_platform != 'linux' and extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
+    { name = "torch", marker = "(python_full_version == '3.12.*' and sys_platform == 'linux') or (python_full_version == '3.13.*' and sys_platform == 'linux' and extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts') or (python_full_version < '3.12' and extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (python_full_version >= '3.14' and extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (python_full_version == '3.13.*' and extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (sys_platform != 'linux' and extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
+]
+wheels = [
+    { filename = "torchcomms-0.2.0-cp312-cp312-linux_x86_64.whl", hash = "sha256:2f0d3db42e2adb4ad4cb91b9abbae8886574029ced36928a33059b769280e9c3" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "expecttest" },
+    { name = "lintrunner", marker = "extra == 'dev'" },
+    { name = "numpy", marker = "extra == 'dev'" },
+    { name = "packaging" },
+    { name = "parameterized", marker = "extra == 'dev'" },
+    { name = "psutil", marker = "extra == 'dev'" },
+    { name = "pydot", marker = "extra == 'dev'" },
+    { name = "pytest", marker = "extra == 'dev'" },
+    { name = "pyyaml" },
+    { name = "torch", specifier = "==2.11.0" },
+]
+provides-extras = ["dev"]
 
 [[package]]
 name = "tqdm"

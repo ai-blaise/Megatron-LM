@@ -604,6 +604,76 @@ def get_pg_rank(group=None):
     return group.rank()
 
 
+def _make_sharded_tensor_from_dtensor_chunk_metadata(
+    tensor: "DTensor",
+    key: str,
+    prepend_offsets=(),
+    replica_id=None,
+    **kwargs,
+):
+    """Create a non-regular MCore ShardedTensor from DTensor DCP chunk metadata.
+
+    Megatron-FSDP shards parameters unevenly through DTensor and attaches exact
+    DCP chunk metadata to the local tensor. The regular ``from_rank_offsets``
+    helpers infer global shape as ``local_shape * world_size``, which is wrong
+    for empty or uneven FSDP shards. Use the explicit chunk metadata instead.
+    """
+    local_tensor = tensor._local_tensor
+    create_chunk_list = getattr(local_tensor, "__create_chunk_list__", None)
+    is_megatron_fsdp_param = (
+        getattr(tensor, "__fsdp_param__", False)
+        or hasattr(tensor, "megatron_fsdp_dist_index")
+        or hasattr(tensor, "_megatron_fsdp_model")
+    )
+    if create_chunk_list is None and is_megatron_fsdp_param:
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
+            update_uneven_dtensor_chunk_metadata,
+        )
+
+        update_uneven_dtensor_chunk_metadata(tensor)
+        create_chunk_list = getattr(local_tensor, "__create_chunk_list__", None)
+
+    if create_chunk_list is None:
+        return None
+
+    chunks = create_chunk_list()
+    if len(chunks) != 1:
+        raise RuntimeError(
+            f"Expected exactly one local DTensor chunk for {key}, got {len(chunks)}"
+        )
+
+    prepend_axis_num = len(prepend_offsets)
+    chunk = chunks[0]
+    global_shape = [1] * prepend_axis_num + list(tensor.shape)
+    global_offset = [0] * prepend_axis_num + list(chunk.offsets)
+    local_shape = tuple(chunk.sizes)
+
+    for axis, axis_rank_offset, axis_fragm in prepend_offsets:
+        if axis < 0 or axis >= prepend_axis_num:
+            raise RuntimeError(
+                f"Invalid prepend offset axis {axis} for {key}; "
+                f"prepend_axis_num={prepend_axis_num}"
+            )
+        global_shape[axis] = axis_fragm
+        global_offset[axis] = axis_rank_offset
+
+    if replica_id is None:
+        replica_id = (0, 0, 0)
+
+    return ShardedTensor(
+        key=key,
+        data=local_tensor,
+        dtype=local_tensor.dtype,
+        local_shape=local_shape,
+        global_shape=tuple(global_shape),
+        global_offset=tuple(global_offset),
+        axis_fragmentations=None,
+        replica_id=replica_id,
+        prepend_axis_num=prepend_axis_num,
+        **kwargs,
+    )
+
+
 def get_pg_src_rank(group=None):
     """Calculate the global rank corresponding to the first local rank
     in the given process group.
@@ -1050,6 +1120,16 @@ def make_tp_sharded_tensor_for_checkpoint(
     new_offsets.append((tp_axis + prepend_axis_num, tp_rank, tp_size))
 
     if HAVE_DTENSOR and isinstance(tensor, DTensor):
+        sh_ten = _make_sharded_tensor_from_dtensor_chunk_metadata(
+            tensor,
+            key,
+            prepend_offsets=prepend_offsets,
+            replica_id=replica_id,
+            **kwargs,
+        )
+        if sh_ten is not None:
+            return sh_ten
+
         # TP + FSDP2 sharding
         dp_replica_id = 0
         tensor = tensor._local_tensor
@@ -1124,6 +1204,16 @@ def make_sharded_tensor_for_checkpoint(
     dp_replica_id = get_pg_rank(dp_cp_group)
 
     if HAVE_DTENSOR and isinstance(tensor, DTensor):
+        sh_ten = _make_sharded_tensor_from_dtensor_chunk_metadata(
+            tensor,
+            key,
+            prepend_offsets=prepend_offsets,
+            replica_id=replica_id,
+            **kwargs,
+        )
+        if sh_ten is not None:
+            return sh_ten
+
         # FSDP2 sharding
         dp_replica_id = 0
         tensor = get_full_tensor_if_necessary(tensor)
@@ -2180,12 +2270,16 @@ def get_thd_batch_on_this_cp_rank(
         if value is None:
             return None
         if value.dim() == 2:
-            if value.size(0) != 1:
-                raise ValueError(
-                    f"{name} has shape {tuple(value.shape)}; THD packed SFT currently "
-                    "expects micro-batch-size 1."
-                )
-            value = value[0]
+            combined = []
+            offset = value.new_zeros(())
+            for row in value:
+                row = row.contiguous()
+                if len(combined) == 0:
+                    combined.append(row)
+                else:
+                    combined.append(row[1:] + offset)
+                offset = offset + row[-1]
+            value = torch.cat(combined)
         if value.dim() != 1:
             raise ValueError(f"{name} must be 1D after collation, got shape {tuple(value.shape)}")
         return value.contiguous()
@@ -2195,14 +2289,24 @@ def get_thd_batch_on_this_cp_rank(
     if cu_seqlens_padded is None:
         cu_seqlens_padded = cu_seqlens
 
+    for key in ("tokens", "labels", "loss_mask", "position_ids"):
+        data = batch.get(key)
+        if isinstance(data, torch.Tensor) and data.dim() == 2 and data.size(0) > 1:
+            batch[key] = data.contiguous().view(1, -1)
+
+    if max_seqlen.dim() == 0:
+        max_seqlen_value = int(max_seqlen.item())
+    else:
+        max_seqlen_value = int(max_seqlen.max().item())
+
     packed_seq_params = PackedSeqParams(
         qkv_format="thd",
         cu_seqlens_q=cu_seqlens,
         cu_seqlens_kv=cu_seqlens,
         cu_seqlens_q_padded=cu_seqlens_padded,
         cu_seqlens_kv_padded=cu_seqlens_padded,
-        max_seqlen_q=int(max_seqlen[0].item()),
-        max_seqlen_kv=int(max_seqlen[0].item()),
+        max_seqlen_q=max_seqlen_value,
+        max_seqlen_kv=max_seqlen_value,
     )
 
     cp_size = (

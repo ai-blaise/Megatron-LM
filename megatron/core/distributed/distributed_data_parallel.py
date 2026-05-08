@@ -15,7 +15,11 @@ from ..transformer.transformer_config import TransformerConfig
 from ..utils import log_single_rank
 from .data_parallel_base import _BaseDataParallel
 from .distributed_data_parallel_config import DistributedDataParallelConfig
-from .param_and_grad_buffer import _ParamAndGradBuffer, partition_buckets
+from .param_and_grad_buffer import (
+    _ParamAndGradBuffer,
+    partition_buckets,
+    should_streambp_register_grad_ready,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -437,7 +441,7 @@ class DistributedDataParallel(_BaseDataParallel):
                     param.main_grad.add_(param.grad.data)
                 param.grad = None
 
-                if self.ddp_config.overlap_grad_reduce:
+                if self.ddp_config.overlap_grad_reduce and should_streambp_register_grad_ready(param):
                     self.param_to_bucket_group[param].register_grad_ready(
                         param, self.force_all_reduce
                     )

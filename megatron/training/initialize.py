@@ -15,6 +15,7 @@ from megatron.core import mpu, tensor_parallel
 from megatron.core.fusions.fused_bias_dropout import bias_dropout_add_fused_train
 from megatron.core.fusions.fused_bias_gelu import bias_gelu
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu
+from megatron.core import torchcomms_adapter
 from megatron.core.parallel_state import create_group
 from megatron.core.rerun_state_machine import (
     RerunDiagnostic,
@@ -358,7 +359,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
             init_process_group_kwargs['backend'] = 'fake'
             init_process_group_kwargs['store'] = store
 
-        torch.distributed.init_process_group(**init_process_group_kwargs)
+        torchcomms_adapter.init_process_group(args, **init_process_group_kwargs)
         inprocess_restart.maybe_force_nccl_backend_init(device_id)
 
     # Set the tensor model-parallel, pipeline model-parallel, and

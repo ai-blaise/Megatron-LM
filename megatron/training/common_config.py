@@ -71,8 +71,80 @@ class ProfilingConfig:
 class DistributedInitConfig:
     """Configuration settings for distributed training initialization."""
 
-    distributed_backend: Literal["nccl", "gloo"] = "nccl"
+    distributed_backend: Literal["nccl", "ncclx", "gloo"] = "nccl"
     """Which backend to use for distributed training."""
+
+    use_torchcomms: bool = field(
+        default_factory=lambda: os.getenv("MEGATRON_USE_TORCHCOMMS", "0").lower()
+        in ("1", "true", "yes", "on")
+    )
+    """Use TorchComms distwrap for the distributed backend."""
+
+    ncclx_mem_pool: bool = field(
+        default_factory=lambda: os.getenv("MEGATRON_NCCLX_MEM_POOL", "0").lower()
+        in ("1", "true", "yes", "on")
+    )
+    """Allocate communication buffers from the NCCLX/TorchComms CUDA allocator."""
+
+    ncclx_persist_ag: bool = field(
+        default_factory=lambda: os.getenv("MEGATRON_NCCLX_PERSIST_AG", "0").lower()
+        in ("1", "true", "yes", "on")
+    )
+    """Enable NCCLX persistent AllGather helpers where supported."""
+
+    ncclx_ft: bool = field(
+        default_factory=lambda: os.getenv("MEGATRON_NCCLX_FT", "0").lower()
+        in ("1", "true", "yes", "on")
+    )
+    """Enable NCCLX fault-tolerance hooks."""
+
+    ncclx_tp_overlap: bool = field(
+        default_factory=lambda: os.getenv("MEGATRON_NCCLX_TP_OVERLAP", "0").lower()
+        in ("1", "true", "yes", "on")
+    )
+    """Enable NCCLX tensor-parallel overlap experiments."""
+
+    ncclx_rdma: bool = field(
+        default_factory=lambda: os.getenv("MEGATRON_NCCLX_RDMA", "0").lower()
+        in ("1", "true", "yes", "on")
+    )
+    """Enable NCCLX/CTran RDMA transport defaults for RMA window features."""
+
+    ncclx_rdma_backends: str | None = field(
+        default_factory=lambda: os.getenv("MEGATRON_NCCLX_RDMA_BACKENDS") or None
+    )
+    """CTran backend list used when NCCLX RDMA is enabled, for example 'ib'."""
+
+    ncclx_rdma_profile: str | None = field(
+        default_factory=lambda: os.getenv("MEGATRON_NCCLX_RDMA_PROFILE") or None
+    )
+    """RDMA fabric profile. Use 'ib' or 'roce'."""
+
+    ncclx_roce_gid_index: str | None = field(
+        default_factory=lambda: os.getenv("MEGATRON_NCCLX_ROCE_GID_INDEX")
+        or os.getenv("MEGATRON_NCCLX_RDMA_GID_INDEX")
+        or None
+    )
+    """RoCE GID index override passed through as NCCL_IB_GID_INDEX."""
+
+    ncclx_roce_addr_family: str | None = field(
+        default_factory=lambda: os.getenv("MEGATRON_NCCLX_ROCE_ADDR_FAMILY")
+        or os.getenv("MEGATRON_NCCLX_RDMA_ADDR_FAMILY")
+        or None
+    )
+    """RoCE address family override passed through as NCCL_IB_ADDR_FAMILY."""
+
+    ncclx_ib_hca: str | None = field(
+        default_factory=lambda: os.getenv("MEGATRON_NCCLX_IB_HCA")
+        or os.getenv("MEGATRON_NCCLX_ROCE_HCA")
+        or None
+    )
+    """IB/RoCE HCA filter passed through as NCCL_IB_HCA."""
+
+    ncclx_hints_file: str | None = field(
+        default_factory=lambda: os.getenv("MEGATRON_NCCLX_HINTS_FILE") or None
+    )
+    """JSON file containing NCCLX per-collective hints."""
 
     distributed_timeout_minutes: int = 10
     """Timeout minutes for torch.distributed."""

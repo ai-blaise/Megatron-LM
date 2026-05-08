@@ -12,6 +12,8 @@ from typing import Callable, List, Optional
 import numpy as np
 import torch
 
+from megatron.core import torchcomms_adapter
+
 from .utils import GlobalMemoryBuffer, GlobalSymmetricMemoryBuffer, is_torch_min_version
 
 logger = logging.getLogger(__name__)
@@ -157,6 +159,8 @@ def get_nccl_options(pg_name, nccl_comm_cfgs):
         nccl_comm_cfgs (dict): nccl communicator configurations
     When an option (e.g., max_ctas) is not found in the config, use the NCCL default setting.
     """
+    if torchcomms_adapter.is_torchcomms_active():
+        return None
     if pg_name in nccl_comm_cfgs:
         # When fields in nccl_options.config are not specified, NCCL applies default settings.
         # The default values for Hopper GPUs are as follows:
@@ -195,6 +199,9 @@ def update_pg_timeout(
             The process group to update the timeout for.
             If None, all process groups are updated.
     """
+    if torchcomms_adapter.is_torchcomms_active():
+        logger.warning("Skipping process-group timeout update under NCCLX/TorchComms")
+        return
     if hasattr(torch.distributed.distributed_c10d, "_set_pg_timeout"):
         torch.distributed.barrier(pg)
         torch.cuda.synchronize()
@@ -240,12 +247,12 @@ def create_group(
             # So need to unset timeout here if caller doesn't set value. Otherwise there is
             # type error.
             kwargs.pop("timeout")
-    group = torch.distributed.new_group(**kwargs)
+    group = torchcomms_adapter.create_group(**kwargs)
     global _global_process_group_list
     if _global_process_group_list is None:
         # None stands for the default process group
         _global_process_group_list = [None]
-    if torch.distributed.get_rank() in ranks:
+    if ranks is None or torch.distributed.get_rank() in ranks:
         _global_process_group_list.append(group)
     return group
 

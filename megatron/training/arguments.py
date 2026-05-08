@@ -50,6 +50,18 @@ from megatron.core.quantization.utils import (
 from megatron.training.argument_utils import ArgumentGroupFactory
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.lower() in ("1", "true", "yes", "on")
+
+
+def _env_int(name: str) -> int | None:
+    value = os.getenv(name)
+    return None if value in (None, "") else int(value)
+
+
 def add_megatron_arguments(parser: argparse.ArgumentParser):
     """ "Add Megatron-LM arguments to the given parser."""
 
@@ -2430,6 +2442,20 @@ def _add_network_size_args(parser):
         "turboquant_kv_seed",
         "dsa_indexcache_quant_enabled",
         "dsa_indexcache_quant_eps",
+        "use_streambp",
+        "streambp_chunk_size",
+        "streambp_logits_chunk_size",
+        "streambp_chunk_forward",
+        "streambp_skip_moe",
+        "streambp_skip_dsa",
+        "streambp_validate",
+        "streambp_profile",
+        "streambp_profile_dir",
+        "streambp_profile_rank",
+        "streambp_profile_limit",
+        "streambp_profile_record_shapes",
+        "streambp_profile_with_stack",
+        "streambp_profile_filter",
     ]
     transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
     transformer_group = transformer_factory.build_group(
@@ -2947,6 +2973,130 @@ def _add_regularization_args(parser):
         "materializing bf16 optimizer-state tensors. Requires the same optimizer-state "
         "sharding when resuming.",
     )
+    group.add_argument(
+        "--enable-zero-cost-checkpoint",
+        action="store_true",
+        default=False,
+        help="Enable per-step optimizer-state ZCC snapshots.",
+    )
+    group.add_argument(
+        "--zcc-workers-num",
+        type=int,
+        default=1,
+        help="Number of ZCC durable dump workers per rank.",
+    )
+    group.add_argument(
+        "--zcc-flash-device",
+        type=str,
+        default="/dev/shm/megatron_zcc",
+        help="Tier-1 ZCC snapshot root.",
+    )
+    group.add_argument(
+        "--zcc-flash-stripe",
+        type=str,
+        default="",
+        help="Comma-separated additional tier-1 roots.",
+    )
+    group.add_argument(
+        "--zcc-durable-dir",
+        type=str,
+        default=None,
+        help="Tier-2 durable ZCC snapshot root.",
+    )
+    group.add_argument(
+        "--zcc-durable-interval",
+        type=int,
+        default=10,
+        help="Write durable ZCC snapshots every N optimizer steps.",
+    )
+    group.add_argument(
+        "--zcc-compress",
+        type=str,
+        default="zstd:1",
+        help="Tier-2 ZCC compression mode: none or zstd:<level>.",
+    )
+    group.add_argument(
+        "--zcc-include-rng",
+        action="store_true",
+        default=True,
+        help="Include RNG state in ZCC metadata.",
+    )
+    group.add_argument(
+        "--no-zcc-include-rng",
+        action="store_false",
+        dest="zcc_include_rng",
+        help="Do not include RNG state in ZCC metadata.",
+    )
+    group.add_argument(
+        "--zcc-include-dither",
+        action="store_true",
+        default=True,
+        help="Include the NVFP4 dither counter in ZCC metadata.",
+    )
+    group.add_argument(
+        "--no-zcc-include-dither",
+        action="store_false",
+        dest="zcc_include_dither",
+        help="Do not include the NVFP4 dither counter in ZCC metadata.",
+    )
+    group.add_argument(
+        "--zcc-bucket-hook",
+        action="store_true",
+        default=True,
+        help="Allow ZCC snapshots from bucket-completion hooks.",
+    )
+    group.add_argument(
+        "--no-zcc-bucket-hook",
+        action="store_false",
+        dest="zcc_bucket_hook",
+        help="Disable ZCC bucket-completion hooks.",
+    )
+    group.add_argument(
+        "--zcc-numa-pin",
+        action="store_true",
+        default=True,
+        help="NUMA-pin ZCC workers when topology is available.",
+    )
+    group.add_argument(
+        "--no-zcc-numa-pin",
+        action="store_false",
+        dest="zcc_numa_pin",
+        help="Disable NUMA pinning for ZCC workers.",
+    )
+    group.add_argument(
+        "--zcc-use-gds",
+        action="store_true",
+        default=False,
+        help="Use GPUDirect Storage for ZCC tier-1 when available.",
+    )
+    group.add_argument(
+        "--zcc-fault-inject",
+        action="store_true",
+        default=False,
+        help="Enable ZCC failure-injection paths for tests.",
+    )
+    group.add_argument(
+        "--zcc-recovery-mode",
+        type=str,
+        default="auto",
+        choices=["auto", "flash", "peer", "durable"],
+        help="ZCC resume source priority.",
+    )
+    group.add_argument(
+        "--zcc-extra-tensor-attrs",
+        type=str,
+        default="",
+        help=(
+            "Comma-separated parameter tensor attributes to include in ZCC snapshots "
+            "for FP8, FP4, or custom quantizer side tensors."
+        ),
+    )
+    group.add_argument(
+        "--zcc-retain-latest",
+        type=int,
+        default=1,
+        help="Number of latest ZCC step directories to retain per local root. Set 0 to keep all.",
+    )
 
     group.add_argument(
         "--no-weight-decay-cond-type",
@@ -3228,6 +3378,90 @@ def _add_training_args(parser):
         action="store_true",
         help="recompute activation to allow for training "
         "with larger models, sequences, and batch sizes.",
+    )
+    group.add_argument(
+        "--use-streambp",
+        action="store_true",
+        default=_env_flag("MEGATRON_USE_STREAMBP"),
+        help="Enable native StreamBP chunked backward recomputation for decoder layers.",
+    )
+    group.add_argument(
+        "--streambp-chunk-size",
+        type=int,
+        default=_env_int("MEGATRON_STREAMBP_CHUNK_SIZE"),
+        help="Sequence chunk size for StreamBP layer recomputation. Defaults to a sequence-length heuristic.",
+    )
+    group.add_argument(
+        "--streambp-logits-chunk-size",
+        type=int,
+        default=_env_int("MEGATRON_STREAMBP_LOGITS_CHUNK_SIZE"),
+        help="Sequence chunk size for StreamBP LM-head loss. Defaults to the layer chunk heuristic.",
+    )
+    group.add_argument(
+        "--streambp-chunk-forward",
+        action=argparse.BooleanOptionalAction,
+        default=_env_flag("MEGATRON_STREAMBP_CHUNK_FORWARD", True),
+        help="Chunk StreamBP's no-grad forward. Disable to match the public StreamBP reference.",
+    )
+    group.add_argument(
+        "--streambp-skip-moe",
+        action=argparse.BooleanOptionalAction,
+        default=_env_flag("MEGATRON_STREAMBP_SKIP_MOE"),
+        help="Skip MoE transformer layers when StreamBP is enabled.",
+    )
+    group.add_argument(
+        "--streambp-skip-dsa",
+        action=argparse.BooleanOptionalAction,
+        default=_env_flag("MEGATRON_STREAMBP_SKIP_DSA"),
+        help="Skip DSA attention layers when StreamBP is enabled.",
+    )
+    group.add_argument(
+        "--streambp-validate",
+        action="store_true",
+        default=_env_flag("MEGATRON_STREAMBP_VALIDATE"),
+        help="Enable extra StreamBP validation checks for debug and test runs.",
+    )
+    group.add_argument(
+        "--streambp-profile",
+        action="store_true",
+        default=_env_flag("MEGATRON_STREAMBP_PROFILE"),
+        help="Export targeted per-chunk StreamBP profiler traces on the selected rank.",
+    )
+    group.add_argument(
+        "--streambp-profile-dir",
+        type=str,
+        default=os.getenv("MEGATRON_STREAMBP_PROFILE_DIR"),
+        help="Directory for per-chunk StreamBP profiler traces.",
+    )
+    group.add_argument(
+        "--streambp-profile-rank",
+        type=int,
+        default=int(os.getenv("MEGATRON_STREAMBP_PROFILE_RANK", "0")),
+        help="Global rank selected for per-chunk StreamBP profiling.",
+    )
+    group.add_argument(
+        "--streambp-profile-limit",
+        type=int,
+        default=int(os.getenv("MEGATRON_STREAMBP_PROFILE_LIMIT", "4")),
+        help="Maximum number of StreamBP chunk profiler traces to export.",
+    )
+    group.add_argument(
+        "--streambp-profile-record-shapes",
+        action="store_true",
+        default=_env_flag("MEGATRON_STREAMBP_PROFILE_RECORD_SHAPES"),
+        help="Collect tensor shapes in per-chunk StreamBP profiler traces.",
+    )
+    group.add_argument(
+        "--streambp-profile-with-stack",
+        action="store_true",
+        default=_env_flag("MEGATRON_STREAMBP_PROFILE_WITH_STACK"),
+        help="Collect Python stacks in per-chunk StreamBP profiler traces.",
+    )
+    group.add_argument(
+        "--streambp-profile-filter",
+        type=str,
+        default=os.getenv("MEGATRON_STREAMBP_PROFILE_FILTER"),
+        help="Optional substring filter for per-chunk StreamBP profiler range names.",
     )
     group.add_argument(
         "--no-check-for-nan-in-loss-and-grad",

@@ -21,6 +21,7 @@ import gc
 import inspect
 import logging
 import math
+import os
 import traceback
 import warnings
 from collections import defaultdict, namedtuple
@@ -1944,7 +1945,7 @@ class ParamAndGradBuffer:
             self.main_grad_alloc = None
             self.double_buf_units = []
 
-        self.buffer_all_in_one = True
+        self.buffer_all_in_one = os.getenv("MEGATRON_FSDP_BUFFER_ALL_IN_ONE", "1") != "0"
 
         preserve_fp32_weights = self.preserve_fp32_weights
         grad_reduce_in_fp32 = self.grad_reduce_in_fp32
@@ -2016,9 +2017,15 @@ class ParamAndGradBuffer:
             )
 
             # Check if the parameter group requires a grad buffer or main weight buffer.
+            #
+            # Quantized parameters need a logical high-precision buffer even when they are
+            # frozen. Otherwise the distributed checkpoint template is built from packed
+            # model-weight storage, e.g. NVFP4's half-width raw layout, and cannot load a
+            # logical BF16 source checkpoint.
             should_create_grad_buffer_or_main_weight_buffer = (
                 not self.only_create_grad_buffer_and_main_weight_buffer_for_param_requires_grad
                 or group.requires_grad
+                or is_dtype_float8
             )
 
             # Initialize the model weight buffer from bucket parameters.
@@ -2391,7 +2398,25 @@ class ParamAndGradBuffer:
                 tbuf.free_bucket_storage()
 
         # Allocate the main_weight buffer and main_grad buffer data in one buffer.
+        if os.getenv("MEGATRON_FSDP_DEBUG_ALLOC", "0") == "1":
+            rank = torch.distributed.get_rank()
+            buffer_size_gib = {}
+            for dtype, size in buffer_size.items():
+                element_dtype = torch.uint8 if dtype == "float8" else dtype
+                element_size = torch.empty((), dtype=element_dtype).element_size()
+                buffer_size_gib[str(dtype)] = size * element_size / (1024**3)
+            print(
+                "[Megatron-FSDP][debug-alloc] "
+                f"rank={rank} buffer_all_in_one={self.buffer_all_in_one} "
+                f"buffer_gib={buffer_size_gib}",
+                flush=True,
+            )
         if self.buffer_all_in_one:
+            # Temporary model-weight buckets are freed just above, but the CUDA caching
+            # allocator can hold those large chunks as reserved memory. Release them
+            # before requesting the single contiguous grad buffer.
+            gc.collect()
+            torch.cuda.empty_cache()
             with self.mem_alloc_context():
                 self.buffer = {
                     torch.float32: torch.empty(
@@ -2579,29 +2604,115 @@ class ParamAndGradBuffer:
 
                 # Register model training and high-precision parameters as DTensor(s).
                 if mbuf:
-                    dist_param = make_fsdp_dtensor(
-                        local_tensor=mbuf.get_item(item_id, only_shard=sharded_optimizer_state),
-                        param=orig_param,
-                        dist_index=self.dist_index,
-                        is_sharded_param=sharded_optimizer_state,
-                        is_expert_param=pg.is_expert_param,
-                        run_check=True,
-                        update_uneven_dtensor_chunk_meta=True,
-                        force_sync_tp_duplicated_param=True,
-                    )
+                    local_tensor = mbuf.get_item(item_id, only_shard=sharded_optimizer_state)
+                    if os.getenv("MEGATRON_FSDP_DEBUG_DTENSOR", "0") == "1" and (
+                        os.getenv("MEGATRON_FSDP_DEBUG_DTENSOR_FILTER", "") in param_name
+                    ):
+                        p_local = to_local_if_dtensor(orig_param)
+                        item_index = mbuf.item_index_map[item_id]
+                        slice_start, slice_end = mbuf.locate_item_in_global_item(item_id)
+                        local_start, local_end = mbuf._get_item_local_index(item_id)
+                        print(
+                            "[Megatron-FSDP][debug-dtensor] "
+                            f"rank={torch.distributed.get_rank()} "
+                            f"name={param_name} expert={pg.is_expert_param} "
+                            f"param_shape={tuple(orig_param.shape)} "
+                            f"local_shape={tuple(p_local.shape)} "
+                            f"local_size={tuple(p_local.size())} "
+                            f"is_nvfp4={is_nvfp4tensor(p_local)} "
+                            f"item_shape={tuple(item_index.shape)} "
+                            f"item_size={item_index.size} "
+                            f"bucket_size={mbuf.bucket_index.size} "
+                            f"shard={mbuf.shard_bucket_index} "
+                            f"item_slice=({slice_start},{slice_end}) "
+                            f"local_index=({local_start},{local_end}) "
+                            f"dtensor_local_numel={local_tensor.numel()}",
+                            flush=True,
+                        )
+                    try:
+                        dist_param = make_fsdp_dtensor(
+                            local_tensor=local_tensor,
+                            param=orig_param,
+                            dist_index=self.dist_index,
+                            is_sharded_param=sharded_optimizer_state,
+                            is_expert_param=pg.is_expert_param,
+                            run_check=True,
+                            update_uneven_dtensor_chunk_meta=True,
+                            force_sync_tp_duplicated_param=True,
+                        )
+                    except Exception:
+                        print(
+                            "[Megatron-FSDP][debug-dtensor-failed] "
+                            f"rank={torch.distributed.get_rank()} "
+                            f"name={param_name} expert={pg.is_expert_param} "
+                            f"param_shape={tuple(orig_param.shape)} "
+                            f"local_tensor_shape={tuple(local_tensor.shape)} "
+                            f"local_tensor_numel={local_tensor.numel()}",
+                            flush=True,
+                        )
+                        raise
                     dist_main_weight[param_name] = dist_param
                 elif wbuf:
                     assert tbuf is None, "Transpose buffer should only exist when main params exist"
-                    dist_param = make_fsdp_dtensor(
-                        local_tensor=wbuf.get_item(item_id, only_shard=sharded_optimizer_state),
-                        param=orig_param,
-                        dist_index=self.dist_index,
-                        is_sharded_param=sharded_optimizer_state,
-                        is_expert_param=pg.is_expert_param,
-                        run_check=True,
-                        update_uneven_dtensor_chunk_meta=True,
-                        force_sync_tp_duplicated_param=True,
-                    )
+                    local_tensor = wbuf.get_item(item_id, only_shard=sharded_optimizer_state)
+                    dtensor_param = orig_param
+                    item_shape = wbuf.item_index_map[item_id].shape
+                    p_local = to_local_if_dtensor(orig_param)
+                    if os.getenv("MEGATRON_FSDP_DEBUG_DTENSOR", "0") == "1":
+                        local_start, local_end = wbuf._get_item_local_index(item_id)
+                        print(
+                            "[Megatron-FSDP][debug-dtensor-wbuf] "
+                            f"rank={torch.distributed.get_rank()} "
+                            f"name={param_name} expert={pg.is_expert_param} "
+                            f"param_type={type(p_local).__name__} "
+                            f"param_shape={tuple(orig_param.shape)} "
+                            f"item_shape={tuple(item_shape)} "
+                            f"is_fp8={is_float8tensor(p_local)} "
+                            f"is_nvfp4={is_nvfp4tensor(p_local)} "
+                            f"local_tensor_shape={tuple(local_tensor.shape)} "
+                            f"local_index=({local_start},{local_end})",
+                            flush=True,
+                        )
+                    if is_nvfp4tensor(p_local) and tuple(item_shape) != tuple(orig_param.shape):
+                        # Quantized model-weight buffers, notably NVFP4, store packed raw data.
+                        # The distributed placeholder must describe that physical storage.
+                        dtensor_param = torch.empty(item_shape, dtype=local_tensor.dtype, device="meta")
+                        for attr_name in [
+                            "tensor_model_parallel",
+                            "partition_dim",
+                            "partition_stride",
+                            "sequence_parallel",
+                            "shared",
+                            "is_embedding_or_output_parameter",
+                            "_mcore_tp",
+                            "_tp_duplicated",
+                            "_tp_partition_dim",
+                        ]:
+                            if hasattr(orig_param, attr_name):
+                                setattr(dtensor_param, attr_name, getattr(orig_param, attr_name))
+                    try:
+                        dist_param = make_fsdp_dtensor(
+                            local_tensor=local_tensor,
+                            param=dtensor_param,
+                            dist_index=self.dist_index,
+                            is_sharded_param=sharded_optimizer_state,
+                            is_expert_param=pg.is_expert_param,
+                            run_check=True,
+                            update_uneven_dtensor_chunk_meta=True,
+                            force_sync_tp_duplicated_param=True,
+                        )
+                    except Exception:
+                        print(
+                            "[Megatron-FSDP][debug-dtensor-failed] "
+                            f"rank={torch.distributed.get_rank()} "
+                            f"name={param_name} expert={pg.is_expert_param} "
+                            f"param_shape={tuple(orig_param.shape)} "
+                            f"dtensor_param_shape={tuple(dtensor_param.shape)} "
+                            f"local_tensor_shape={tuple(local_tensor.shape)} "
+                            f"local_tensor_numel={local_tensor.numel()}",
+                            flush=True,
+                        )
+                        raise
                     dist_main_weight[param_name] = dist_param
                 else:
                     # If neither the wbuf nor the mbuf are utilized in the case of "no_shard",
@@ -2638,7 +2749,13 @@ class ParamAndGradBuffer:
                         f"Parameter {param_name} not found in dist model weight "
                         "or dist main weight."
                     )
-                dist_param = torch.nn.Parameter(param_data)
+                dist_param = torch.nn.Parameter(
+                    param_data,
+                    requires_grad=(
+                        getattr(orig_param, "requires_grad", True)
+                        and getattr(param_data.dtype, "is_floating_point", False)
+                    ),
+                )
 
                 def set_param_attribute_closure(param, orig_param):
                     def set_param_attribute():
@@ -2654,7 +2771,11 @@ class ParamAndGradBuffer:
                             "_tp_duplicated",
                             "_tp_partition_dim",
                         ]:
-                            if hasattr(orig_param, attr_name):
+                            if attr_name == "requires_grad" and not getattr(
+                                param.dtype, "is_floating_point", False
+                            ):
+                                setattr(param, attr_name, False)
+                            elif hasattr(orig_param, attr_name):
                                 setattr(param, attr_name, getattr(orig_param, attr_name))
 
                     return set_param_attribute
@@ -2673,6 +2794,9 @@ class ParamAndGradBuffer:
                 if mbuf:
                     _start, _end = mbuf._get_item_slice_in_shard(item_id)
                     setattr(dist_param, "megatron_fsdp_slice", slice(_start, _end))
+
+                if isinstance(dist_param, DTensor):
+                    update_uneven_dtensor_chunk_metadata(dist_param)
 
                 dist_param.reset_attribute()
                 named_parameters.append((param_name, dist_param))
@@ -2764,6 +2888,8 @@ class ParamAndGradBuffer:
             "fsdp_shard_model_params": [],
         }
         expert_param_quantize_kwargs = copy.deepcopy(dense_param_quantize_kwargs)
+        dense_nvfp4_quantize_params = []
+        expert_nvfp4_quantize_params = []
         data_parallel_group = None
         expert_data_parallel_group = None
         clear_quantize_kwargs = lambda kwargs: [d.clear() for d in kwargs.values()]
@@ -2781,6 +2907,30 @@ class ParamAndGradBuffer:
 
             clear_quantize_kwargs(dense_param_quantize_kwargs)
             clear_quantize_kwargs(expert_param_quantize_kwargs)
+
+        def _nvfp4_quantize_params(dense_params, expert_params):
+            if len(dense_params) == 0 and len(expert_params) == 0:
+                return
+
+            from megatron.core.optimizer.nvfp4_sr import cast_master_weights_to_nvfp4_2d_sr
+
+            if len(dense_params) > 0:
+                cast_master_weights_to_nvfp4_2d_sr(
+                    dense_params,
+                    data_parallel_group,
+                    use_fsdp_shard_model_weights=True,
+                    manual_post_all_gather_processing=True,
+                )
+                dense_params.clear()
+
+            if len(expert_params) > 0:
+                cast_master_weights_to_nvfp4_2d_sr(
+                    expert_params,
+                    expert_data_parallel_group,
+                    use_fsdp_shard_model_weights=True,
+                    manual_post_all_gather_processing=True,
+                )
+                expert_params.clear()
 
         # Special handling of blockwise FP8
         BATCH_QUANT_MEMORY_LIMIT_BYTES = 5 * 1024**3  # 5 GB
@@ -2819,9 +2969,11 @@ class ParamAndGradBuffer:
 
             if pg.is_expert_param:
                 quantize_func_kwargs = expert_param_quantize_kwargs
+                nvfp4_quantize_params = expert_nvfp4_quantize_params
                 expert_data_parallel_group = mbuf.data_parallel_group
             else:
                 quantize_func_kwargs = dense_param_quantize_kwargs
+                nvfp4_quantize_params = dense_nvfp4_quantize_params
                 data_parallel_group = mbuf.data_parallel_group
 
             fp8_params = quantize_func_kwargs["model_params"]
@@ -2886,6 +3038,20 @@ class ParamAndGradBuffer:
                         has_blockwise_fp8_param = True
                     continue
 
+                if is_nvfp4tensor(param):
+                    if model_param.numel() == 0:
+                        nvfp4_quantize_params.append((param, None, None, None))
+                    else:
+                        nvfp4_quantize_params.append(
+                            (
+                                param,
+                                main_weight,
+                                mbuf.locate_item_in_global_item(item_id)[0],
+                                model_param,
+                            )
+                        )
+                    continue
+
                 if is_float8tensor(param):
                     fp8_params.append(param)
                     if model_param.numel() == 0:
@@ -2918,6 +3084,7 @@ class ParamAndGradBuffer:
             dense_param_quantize_kwargs, expert_param_quantize_kwargs, blockwise_fp8_param_buffers
         )
         _fp8_quantize_params(dense_param_quantize_kwargs, expert_param_quantize_kwargs)
+        _nvfp4_quantize_params(dense_nvfp4_quantize_params, expert_nvfp4_quantize_params)
 
     @torch.no_grad()
     def copy_model_weights_to_main_weights(self):

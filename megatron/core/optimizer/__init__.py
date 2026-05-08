@@ -76,6 +76,12 @@ from .optimizer_config import (
 logger = logging.getLogger(__name__)
 
 
+def _maybe_enable_zero_cost_checkpoint(optimizer, config):
+    from .zero_cost_checkpoint import install_zero_cost_checkpoint
+
+    return install_zero_cost_checkpoint(optimizer, config)
+
+
 def get_standard_config_overrides(config: OptimizerConfig) -> Dict[ParamKey, ParamGroupOverride]:
     """Get standard config overrides for the optimizer, handling decoupled LR and common wd skips.
 
@@ -187,7 +193,28 @@ def _get_param_groups(
     # Need to pick one of the param_override_tuples to use for the param group.
     param_groups = []
     # Sort keys, None first.
-    for key in sorted(params_key, key=lambda x: (x[0] is not None, x[0])):
+    def _normalize_param_group_key(key):
+        if isinstance(key, tuple) and len(key) == 2 and isinstance(key[1], bool):
+            return key
+        if isinstance(key, tuple) and len(key) > 0 and isinstance(key[-1], bool):
+            return (tuple(key[:-1]), key[-1])
+        raise ValueError(f"Unexpected optimizer param-group key: {key!r}")
+
+    def _param_group_sort_key(key):
+        param_override_tuple, is_expert_parallel = _normalize_param_group_key(key)
+        if param_override_tuple is None:
+            override_key = ()
+        else:
+            override_key = tuple((k, repr(v)) for k, v in param_override_tuple)
+        return (param_override_tuple is not None, override_key, is_expert_parallel)
+
+    normalized_params_key = []
+    for key in params_key:
+        normalized_key = _normalize_param_group_key(key)
+        if normalized_key not in normalized_params_key:
+            normalized_params_key.append(normalized_key)
+
+    for key in sorted(normalized_params_key, key=_param_group_sort_key):
         param_override_tuple, is_expert_parallel = key
         params = params_map[key] if key in params_map else []
         if param_override_tuple is None:
@@ -715,11 +742,14 @@ def get_megatron_optimizer(
     # TODO: the standard and emerging optimizer paths handle pg_collection differently;
     # unify them so both use a single pg_collection-based flow.
     if config.optimizer not in ('adam', 'sgd', 'flash_adamw'):
-        return _get_megatron_emerging_optimizer(
-            config=config,
-            model_chunks=model_chunks,
-            config_overrides=config_overrides,
-            pg_collection=pg_collection,
+        return _maybe_enable_zero_cost_checkpoint(
+            _get_megatron_emerging_optimizer(
+                config=config,
+                model_chunks=model_chunks,
+                config_overrides=config_overrides,
+                pg_collection=pg_collection,
+            ),
+            config,
         )
 
     log_single_rank(logger, logging.INFO, f'Setting up optimizer with config {config}')
@@ -788,9 +818,9 @@ def get_megatron_optimizer(
             model_chunk_offset += 1
 
         if len(optimizers) == 1:
-            return optimizers[0]
+            return _maybe_enable_zero_cost_checkpoint(optimizers[0], config)
 
-        return ChainedOptimizer(optimizers)
+        return _maybe_enable_zero_cost_checkpoint(ChainedOptimizer(optimizers), config)
 
     if dump_param_to_param_group_map is not None:
         param_to_param_group = {}
@@ -877,4 +907,4 @@ def get_megatron_optimizer(
             state_dict=param_to_param_group, checkpoint_id=dump_param_to_param_group_map
         )
 
-    return ChainedOptimizer(optimizers)
+    return _maybe_enable_zero_cost_checkpoint(ChainedOptimizer(optimizers), config)

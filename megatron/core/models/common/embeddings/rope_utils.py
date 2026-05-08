@@ -208,6 +208,16 @@ def _apply_rotary_pos_emb_thd(
     Returns:
         Tensor: Shape [t, h, d]. The input tensor after applying RoPE.
     """
+    restore_singleton_batch_dim = False
+    if t.dim() == 4:
+        if t.size(1) != 1:
+            raise ValueError(
+                "THD RoPE expects no batch dimension or a singleton batch dimension, "
+                f"got tensor shape {tuple(t.shape)}"
+            )
+        t = t.squeeze(1)
+        restore_singleton_batch_dim = True
+
     if multi_latent_attention is not None:
         warnings.warn(
             "multi_latent_attention is deprecated. Please use mla_rotary_interleaved instead.",
@@ -240,13 +250,14 @@ def _apply_rotary_pos_emb_thd(
 
         freqs_packed = torch.cat(freq_slices, dim=0)
 
-        return _apply_rotary_pos_emb_bshd(
+        output = _apply_rotary_pos_emb_bshd(
             t.unsqueeze(1),
             freqs_packed,
             rotary_interleaved=rotary_interleaved,
             mla_rotary_interleaved=mla_rotary_interleaved,
             mscale=mscale,
         ).squeeze(1)
+        return output.unsqueeze(1) if restore_singleton_batch_dim else output
     else:
         # CASE 2: Traditional mapping without offsets
         # Build packed freqs for all sequences using the standard mapping, then apply once
@@ -256,13 +267,14 @@ def _apply_rotary_pos_emb_thd(
             dim=0,
         )
 
-        return _apply_rotary_pos_emb_bshd(
+        output = _apply_rotary_pos_emb_bshd(
             t.unsqueeze(1),
             freqs_packed,
             rotary_interleaved=rotary_interleaved,
             mla_rotary_interleaved=mla_rotary_interleaved,
             mscale=mscale,
         ).squeeze(1)
+        return output.unsqueeze(1) if restore_singleton_batch_dim else output
 
 
 def apply_rotary_pos_emb(

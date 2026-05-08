@@ -16,6 +16,7 @@ import megatron.core.nccl_allocator as nccl_allocator
 from megatron.core import parallel_state
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import get_rerun_state_machine
+from megatron.core.transformer.streambp import should_streambp_register_grad_ready
 from megatron.core.utils import log_single_rank
 
 from ..fp8_utils import (

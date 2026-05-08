@@ -28,6 +28,7 @@ from megatron.core.utils import (
     get_attr_wrapped_model,
     get_model_config,
     get_model_type,
+    make_viewless_tensor,
     nvtx_range_pop,
     nvtx_range_push,
 )
@@ -442,6 +443,17 @@ def forward_step(
         cp_group_size,
         is_last_stage,
     )
+
+    if (
+        config.deallocate_pipeline_outputs
+        and isinstance(output_tensor, torch.Tensor)
+        and output_tensor._base is not None
+    ):
+        output_tensor = make_viewless_tensor(
+            inp=output_tensor,
+            requires_grad=output_tensor.requires_grad,
+            keep_graph=True,
+        )
 
     if unwrap_output_tensor:
         return output_tensor, num_tokens
