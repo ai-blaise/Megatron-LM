@@ -290,6 +290,9 @@ class TransformerConfig(ModelParallelConfig):
     """Whether to use sparse DSA indexer loss. If True, the indexer loss will be computed using the
     top-k indices."""
 
+    dsa_chunk_size: int = 128
+    """Query chunk size used by DSA's internal indexer and sparse attention path."""
+
     ####################
     # linear attention
     ####################
@@ -462,6 +465,15 @@ class TransformerConfig(ModelParallelConfig):
 
     streambp_chunk_forward: bool = True
     """If True, chunk the no-grad StreamBP forward. If False, match reference StreamBP."""
+
+    streambp_moe_chunk_forward: Optional[bool] = None
+    """Optional MoE-specific override for streambp_chunk_forward.
+
+    None inherits streambp_chunk_forward. False keeps StreamBP's backward replay chunked and
+    runs the no-grad forward with chunked attention plus one full-sequence MoE MLP. This avoids
+    multiplying MoE dispatch collectives during the no-grad forward path without forcing DSA
+    attention into a full-sequence kernel shape.
+    """
 
     streambp_skip_moe: bool = False
     """If True, do not apply StreamBP to MoE transformer layers."""
@@ -1374,6 +1386,9 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(
                 "Currently there is no support for Pipeline parallelism with CPU offloading"
             )
+
+        if self.dsa_chunk_size <= 0:
+            raise ValueError("dsa_chunk_size must be positive")
 
         if self.cpu_offloading and self.recompute_granularity is not None:
             raise ValueError(

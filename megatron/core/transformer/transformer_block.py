@@ -28,6 +28,7 @@ from megatron.core.transformer.streambp import (
     configure_streambp_profiler,
     moe_streambp_requires_full_replay,
     streambp_checkpoint_layer,
+    supports_streambp_moe_hybrid_replay,
 )
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -496,9 +497,14 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             return False, "skip_moe"
         if self.config.streambp_skip_dsa and self._layer_has_dsa_attention(layer):
             return False, "skip_dsa"
-        if is_moe_layer and moe_streambp_requires_full_replay(layer):
-            return True, "full_replay_moe"
         if is_moe_layer:
+            if moe_streambp_requires_full_replay(layer):
+                if (
+                    not self._streambp_chunk_forward_for_mode("chunked_moe")
+                    and supports_streambp_moe_hybrid_replay(layer)
+                ):
+                    return True, "chunked_moe"
+                return True, "full_replay_moe"
             return True, "chunked_moe"
         if packed_seq_params is not None:
             if self._layer_has_dsa_attention(layer):
@@ -520,10 +526,11 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         skipped_text = ", ".join(f"{key}={value}" for key, value in sorted(skipped.items()))
         if not skipped_text:
             skipped_text = "none"
+        moe_chunk_forward = self._streambp_chunk_forward_for_mode("chunked_moe")
         logger.info(
             "StreamBP layer routing summary: pp_rank=%s, layers=%s, chunked=%s, "
             "chunked_moe=%s, chunked_packed_dsa=%s, full_replay_moe=%s, "
-            "full_replay_packed_non_moe=%s, skipped={%s}",
+            "full_replay_packed_non_moe=%s, moe_chunk_forward=%s, skipped={%s}",
             pp_rank,
             len(self.layers),
             counts.get("chunked", 0),
@@ -531,8 +538,18 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             counts.get("chunked_packed_dsa", 0),
             counts.get("full_replay_moe", 0),
             counts.get("full_replay_packed_non_moe", 0),
+            moe_chunk_forward,
             skipped_text,
         )
+
+    def _streambp_chunk_forward_for_mode(self, streambp_mode: str) -> bool:
+        """Resolve StreamBP no-grad forward chunking for a routed layer mode."""
+        if (
+            streambp_mode == "chunked_moe"
+            and self.config.streambp_moe_chunk_forward is not None
+        ):
+            return self.config.streambp_moe_chunk_forward
+        return self.config.streambp_chunk_forward
 
     def _checkpointed_forward(
         self,
@@ -1015,7 +1032,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                                 layer,
                                 hidden_states,
                                 chunk_size=self.config.streambp_chunk_size,
-                                chunk_forward=self.config.streambp_chunk_forward,
+                                chunk_forward=self._streambp_chunk_forward_for_mode(streambp_mode),
                                 context_factory=make_inner_quantization_context,
                                 full_replay=streambp_mode.startswith("full_replay"),
                                 attention_mask=attention_mask,

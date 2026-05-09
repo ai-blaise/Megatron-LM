@@ -23,6 +23,8 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.experimental_attention_variant.dsa_triton import (
+    dsa_indexer_scores_triton,
+    is_dsa_indexer_scores_triton_supported,
     is_sparse_dsa_triton_supported,
     sparse_dsa_attention_triton,
 )
@@ -35,6 +37,8 @@ except ImportError:
 
 _DSA_STREAMING_INDEXER_TOPK_ENV = "MEGATRON_DSA_STREAMING_INDEXER_TOPK"
 _DSA_INDEXER_KEY_BLOCK_SIZE_ENV = "MEGATRON_DSA_INDEXER_KEY_BLOCK_SIZE"
+_DSA_SORT_TOPK_INDICES_ENV = "MEGATRON_DSA_SORT_TOPK_INDICES"
+_DSA_COMPACT_TOPK_INDICES_ENV = "MEGATRON_DSA_COMPACT_TOPK_INDICES"
 
 
 def _env_flag_enabled(name: str, default: str = "1") -> bool:
@@ -50,6 +54,18 @@ def _dsa_indexer_key_block_size(topk: int) -> int:
             raise ValueError(f"{_DSA_INDEXER_KEY_BLOCK_SIZE_ENV} must be positive, got {value}")
         return value
     return max(2048, min(4096, max(1, topk)))
+
+
+def _dsa_topk_buffer_dtype(sk: int) -> torch.dtype:
+    if _env_flag_enabled(_DSA_COMPACT_TOPK_INDICES_ENV, "0") and sk <= 32768:
+        return torch.int16
+    return torch.int32
+
+
+def _maybe_sort_dsa_topk_indices(topk_indices: torch.Tensor) -> torch.Tensor:
+    if not _env_flag_enabled(_DSA_SORT_TOPK_INDICES_ENV, "0"):
+        return topk_indices
+    return topk_indices.sort(dim=-1).values
 
 
 def _dsa_process_group_size(group: Optional[torch.distributed.ProcessGroup]) -> int:
@@ -498,7 +514,7 @@ def fused_qk_topk_naive(
     # =========================================
     topk_k = min(index_topk, seqlen)
     # [batch, seqlen, index_topk]
-    topk_indices = index_scores.topk(topk_k, dim=-1)[1]
+    topk_indices = index_scores.topk(topk_k, dim=-1, sorted=False)[1]
 
     return index_scores, topk_indices
 
@@ -1266,49 +1282,87 @@ def _streaming_qk_topk(
     key_block_size = _dsa_indexer_key_block_size(topk_k)
     running_scores = None
     running_indices = None
+    candidate_scores_buffer = None
+    candidate_indices_buffer = None
 
-    for key_start in range(0, sk, key_block_size):
-        key_end = min(key_start + key_block_size, sk)
-        key_block = k[key_start:key_end]
-
-        block_scores = torch.einsum("sbhd,tbd->sbht", q.float(), key_block.float())
-        block_scores = torch.relu_(block_scores)
-        block_scores.mul_(weights.unsqueeze(-1))
-        block_scores = block_scores.sum(dim=2).transpose(0, 1)
-
+    with torch.no_grad():
+        # The streaming path is used only when the DSA indexer loss is disabled,
+        # so top-k selection should not build or retain an autograd graph.
+        q_float = q.float()
+        k_float = k if k.dtype == torch.float32 else k.float()
+        weights_view = weights.unsqueeze(-1)
         if is_causal:
             if query_positions is not None or key_positions is not None:
                 if query_positions is None or key_positions is None:
                     raise ValueError("query_positions and key_positions must be provided together")
-                q_pos = query_positions.to(device=block_scores.device).view(1, -1, 1)
-                k_pos = key_positions[key_start:key_end].to(device=block_scores.device).view(
-                    1, 1, -1
+                q_pos = query_positions.to(device=q.device).view(1, -1, 1)
+            else:
+                q_pos = torch.arange(q_start, q_end, device=q.device).view(1, -1, 1)
+
+        for key_start in range(0, sk, key_block_size):
+            key_end = min(key_start + key_block_size, sk)
+            key_block = k_float[key_start:key_end]
+
+            block_scores = torch.einsum("sbhd,tbd->sbht", q_float, key_block)
+            block_scores = torch.relu_(block_scores)
+            block_scores.mul_(weights_view)
+            block_scores = block_scores.sum(dim=2).transpose(0, 1)
+
+            if is_causal:
+                if key_positions is not None:
+                    k_pos = key_positions[key_start:key_end].to(device=block_scores.device).view(
+                        1, 1, -1
+                    )
+                else:
+                    k_pos = torch.arange(
+                        key_start, key_end, device=block_scores.device
+                    ).view(1, 1, -1)
+                block_scores.masked_fill_(k_pos > q_pos, float("-inf"))
+            elif mask is not None:
+                if mask.dim() == 2:
+                    block_scores.add_(
+                        mask[q_start:q_end, key_start:key_end].unsqueeze(0)
+                    )
+                elif mask.dim() == 3:
+                    block_scores.add_(mask[:, q_start:q_end, key_start:key_end])
+                else:
+                    raise ValueError(f"DSA mask must be 2D or 3D, got shape {tuple(mask.shape)}")
+
+            block_topk = min(topk_k, key_end - key_start)
+            block_scores, block_indices = block_scores.topk(
+                block_topk, dim=-1, sorted=False
+            )
+            block_indices.add_(key_start)
+
+            if running_scores is None:
+                running_scores = block_scores
+                running_indices = block_indices
+            else:
+                candidate_len = running_scores.size(-1) + block_scores.size(-1)
+                if (
+                    candidate_scores_buffer is None
+                    or candidate_scores_buffer.shape[:-1] != running_scores.shape[:-1]
+                    or candidate_scores_buffer.size(-1) < candidate_len
+                ):
+                    candidate_shape = (
+                        *running_scores.shape[:-1],
+                        topk_k + min(topk_k, key_block_size),
+                    )
+                    candidate_scores_buffer = torch.empty(
+                        candidate_shape, device=running_scores.device, dtype=running_scores.dtype
+                    )
+                    candidate_indices_buffer = torch.empty(
+                        candidate_shape, device=running_indices.device, dtype=running_indices.dtype
+                    )
+                candidate_scores = candidate_scores_buffer.narrow(-1, 0, candidate_len)
+                candidate_indices = candidate_indices_buffer.narrow(-1, 0, candidate_len)
+                torch.cat((running_scores, block_scores), dim=-1, out=candidate_scores)
+                torch.cat((running_indices, block_indices), dim=-1, out=candidate_indices)
+                keep_k = min(topk_k, candidate_len)
+                running_scores, selected = candidate_scores.topk(
+                    keep_k, dim=-1, sorted=False
                 )
-            else:
-                q_pos = torch.arange(q_start, q_end, device=block_scores.device).view(1, -1, 1)
-                k_pos = torch.arange(key_start, key_end, device=block_scores.device).view(1, 1, -1)
-            block_scores = block_scores.masked_fill(k_pos > q_pos, float("-inf"))
-        elif mask is not None:
-            if mask.dim() == 2:
-                block_scores = block_scores + mask[q_start:q_end, key_start:key_end].unsqueeze(0)
-            elif mask.dim() == 3:
-                block_scores = block_scores + mask[:, q_start:q_end, key_start:key_end]
-            else:
-                raise ValueError(f"DSA mask must be 2D or 3D, got shape {tuple(mask.shape)}")
-
-        block_topk = min(topk_k, key_end - key_start)
-        block_scores, block_indices = block_scores.topk(block_topk, dim=-1)
-        block_indices = block_indices + key_start
-
-        if running_scores is None:
-            running_scores = block_scores
-            running_indices = block_indices
-        else:
-            candidate_scores = torch.cat((running_scores, block_scores), dim=-1)
-            candidate_indices = torch.cat((running_indices, block_indices), dim=-1)
-            keep_k = min(topk_k, candidate_scores.size(-1))
-            running_scores, selected = candidate_scores.topk(keep_k, dim=-1)
-            running_indices = candidate_indices.gather(-1, selected)
+                running_indices = candidate_indices.gather(-1, selected)
 
     return running_indices
 
@@ -1419,11 +1473,14 @@ def chunked_dsa_forward(
     sq, bsz, num_heads, head_dim = query.size()
     sk = key.size(0)
     outputs = []
-    topk_chunks = []
+    topk_buffer = None
     use_triton_attention = None
     use_streaming_indexer_topk = loss_coeff <= 0 and _env_flag_enabled(
         _DSA_STREAMING_INDEXER_TOPK_ENV, "1"
     )
+    index_scores_buffer = None
+    topk_values_buffer = None
+    topk_indices_buffer = None
     loss_sum = None
     loss_count = 0
 
@@ -1437,20 +1494,60 @@ def chunked_dsa_forward(
         )
 
         if use_streaming_indexer_topk:
-            index_scores = None
-            topk_indices = _streaming_qk_topk(
+            if is_dsa_indexer_scores_triton_supported(
                 q_chunk,
                 weights_chunk,
                 k,
-                topk,
                 mask,
-                q_start,
-                q_end,
-                sk,
                 is_causal,
                 query_positions=query_positions_chunk,
                 key_positions=key_positions,
-            )
+            ):
+                score_shape = (bsz, q_end - q_start, sk)
+                if index_scores_buffer is None or tuple(index_scores_buffer.shape) != score_shape:
+                    index_scores_buffer = torch.empty(
+                        score_shape, device=q.device, dtype=torch.float32
+                    )
+                index_scores = dsa_indexer_scores_triton(
+                    q_chunk,
+                    weights_chunk,
+                    k,
+                    q_start,
+                    query_positions=query_positions_chunk,
+                    key_positions=key_positions,
+                    out=index_scores_buffer,
+                )
+                topk_k = min(topk, sk)
+                topk_shape = (*score_shape[:-1], topk_k)
+                if topk_values_buffer is None or tuple(topk_values_buffer.shape) != topk_shape:
+                    topk_values_buffer = torch.empty(
+                        topk_shape, device=index_scores.device, dtype=index_scores.dtype
+                    )
+                    topk_indices_buffer = torch.empty(
+                        topk_shape, device=index_scores.device, dtype=torch.long
+                    )
+                _, topk_indices = torch.topk(
+                    index_scores,
+                    topk_k,
+                    dim=-1,
+                    sorted=False,
+                    out=(topk_values_buffer, topk_indices_buffer),
+                )
+            else:
+                index_scores = None
+                topk_indices = _streaming_qk_topk(
+                    q_chunk,
+                    weights_chunk,
+                    k,
+                    topk,
+                    mask,
+                    q_start,
+                    q_end,
+                    sk,
+                    is_causal,
+                    query_positions=query_positions_chunk,
+                    key_positions=key_positions,
+                )
         else:
             index_scores = _compute_index_scores(q_chunk, weights_chunk, k)
             index_scores = _apply_dsa_score_mask(
@@ -1464,7 +1561,7 @@ def chunked_dsa_forward(
                 key_positions=key_positions,
             )
             topk_k = min(topk, sk)
-            topk_indices = index_scores.topk(topk_k, dim=-1)[1]
+            topk_indices = index_scores.topk(topk_k, dim=-1, sorted=False)[1]
 
         if use_triton_attention is None:
             use_triton_attention = is_sparse_dsa_triton_supported(
@@ -1524,7 +1621,14 @@ def chunked_dsa_forward(
             del index_scores
 
         if use_triton_attention:
-            topk_chunks.append(topk_indices.to(torch.int32))
+            topk_indices = _maybe_sort_dsa_topk_indices(topk_indices)
+            if topk_buffer is None:
+                topk_buffer = torch.empty(
+                    (bsz, sq, topk_indices.size(-1)),
+                    device=topk_indices.device,
+                    dtype=_dsa_topk_buffer_dtype(sk),
+                )
+            topk_buffer[:, q_start:q_end, :].copy_(topk_indices)
         else:
             outputs.append(
                 _sparse_dsa_attention_chunk(
@@ -1545,13 +1649,11 @@ def chunked_dsa_forward(
         # Keep top-k generation chunked to bound the indexer score tensor, then run
         # the selected-token attention as one autograd op so K/V gradients are
         # accumulated once per layer instead of once per query chunk.
-        topk_indices = torch.cat(topk_chunks, dim=1)
-        topk_chunks.clear()
         output = sparse_dsa_attention_triton(
             query,
             key,
             value,
-            topk_indices,
+            topk_buffer,
             softmax_scale,
             0,
             query_positions=query_positions,
@@ -1808,7 +1910,7 @@ class DSAttention(MegatronModule):
             q = q.index_select(0, q_indices)
             weights = weights.index_select(0, q_indices)
         indexer_loss_coeff = getattr(self.config, 'dsa_indexer_loss_coeff', 0.0)
-        chunk_size = int(getattr(self.config, "dsa_chunk_size", 128))
+        chunk_size = int(self.config.dsa_chunk_size)
         query_positions = streambp_query_positions
         key_positions = streambp_key_positions
         cp_group = self.indexer.pg_collection.cp

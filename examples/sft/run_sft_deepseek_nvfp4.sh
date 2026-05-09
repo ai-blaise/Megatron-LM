@@ -39,8 +39,13 @@ export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export MEGATRON_DSA_TRITON="${MEGATRON_DSA_TRITON:-1}"
+export MEGATRON_DSA_TRITON_INDEXER="${MEGATRON_DSA_TRITON_INDEXER:-1}"
 export MEGATRON_DSA_STREAMING_INDEXER_TOPK="${MEGATRON_DSA_STREAMING_INDEXER_TOPK:-1}"
-export MEGATRON_DSA_INDEXER_KEY_BLOCK_SIZE="${MEGATRON_DSA_INDEXER_KEY_BLOCK_SIZE:-2048}"
+export MEGATRON_DSA_INDEXER_KEY_BLOCK_SIZE="${MEGATRON_DSA_INDEXER_KEY_BLOCK_SIZE:-4096}"
+export MEGATRON_DSA_SORT_TOPK_INDICES="${MEGATRON_DSA_SORT_TOPK_INDICES:-0}"
+export MEGATRON_DSA_COMPACT_TOPK_INDICES="${MEGATRON_DSA_COMPACT_TOPK_INDICES:-0}"
+export MEGATRON_DSA_TRITON_BF16_GRAD_ATOMICS="${MEGATRON_DSA_TRITON_BF16_GRAD_ATOMICS:-0}"
+export MEGATRON_WEIGHTED_SWIGLU_FUSER="${MEGATRON_WEIGHTED_SWIGLU_FUSER:-eager}"
 export MEGATRON_FLASH_ADAMW_NVFP4_IMMEDIATE_CAST="${MEGATRON_FLASH_ADAMW_NVFP4_IMMEDIATE_CAST:-1}"
 DISTRIBUTED_TIMEOUT_MINUTES="${DISTRIBUTED_TIMEOUT_MINUTES:-60}"
 
@@ -221,12 +226,21 @@ MLA_ARGS=(
     --v-head-dim 128
 )
 
+if [[ -z "${DSA_CHUNK_SIZE:-}" ]]; then
+    if [[ "$USE_STREAMBP" == "1" ]]; then
+        DSA_CHUNK_SIZE="${DSA_STREAMBP_CHUNK_SIZE:-4096}"
+    else
+        DSA_CHUNK_SIZE=256
+    fi
+fi
+
 DSA_ARGS=(
     --experimental-attention-variant dsa
     --dsa-indexer-n-heads 64
     --dsa-indexer-head-dim 128
     --dsa-indexer-topk "${DSA_INDEXER_TOPK:-2048}"
     --dsa-indexer-loss-coeff "${DSA_INDEXER_LOSS_COEFF:-0.0}"
+    --dsa-chunk-size "$DSA_CHUNK_SIZE"
 )
 
 # ======================
@@ -259,6 +273,15 @@ if [[ "${MOE_PERMUTE_FUSION:-1}" == "1" ]]; then
 fi
 if [[ "${MOE_PER_LAYER_LOGGING:-1}" == "1" ]]; then
     MOE_ARGS+=(--moe-per-layer-logging)
+fi
+if [[ "${MOE_ROUTER_PADDING_FOR_QUANTIZATION:-0}" == "1" ]]; then
+    MOE_ARGS+=(--moe-router-padding-for-quantization)
+fi
+if [[ -n "${MOE_EXPERT_CAPACITY_FACTOR:-}" ]]; then
+    MOE_ARGS+=(--moe-expert-capacity-factor "$MOE_EXPERT_CAPACITY_FACTOR")
+fi
+if [[ "${MOE_PAD_EXPERT_INPUT_TO_CAPACITY:-0}" == "1" ]]; then
+    MOE_ARGS+=(--moe-pad-expert-input-to-capacity)
 fi
 
 # ======================
@@ -361,6 +384,13 @@ if [[ "$USE_STREAMBP" == "1" ]]; then
             STREAMBP_ARGS+=(--streambp-chunk-forward)
         else
             STREAMBP_ARGS+=(--no-streambp-chunk-forward)
+        fi
+    fi
+    if [[ -n "${STREAMBP_MOE_CHUNK_FORWARD:-}" ]]; then
+        if [[ "$STREAMBP_MOE_CHUNK_FORWARD" == "1" ]]; then
+            STREAMBP_ARGS+=(--streambp-moe-chunk-forward)
+        else
+            STREAMBP_ARGS+=(--no-streambp-moe-chunk-forward)
         fi
     fi
     if [[ "${STREAMBP_SKIP_MOE:-0}" == "1" ]]; then
@@ -544,7 +574,7 @@ fi
 
 CKPT_ARGS=(
     --eval-interval "${EVAL_INTERVAL:-100}"
-    --eval-iters "${EVAL_ITERS:-10}"
+    --eval-iters "${EVAL_ITERS:-0}"
     --load "$LOAD_CKPT"
     --distributed-timeout-minutes "$DISTRIBUTED_TIMEOUT_MINUTES"
     --ckpt-format "$CKPT_FORMAT_VALUE"

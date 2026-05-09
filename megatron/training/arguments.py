@@ -62,6 +62,13 @@ def _env_int(name: str) -> int | None:
     return None if value in (None, "") else int(value)
 
 
+def _env_optional_flag(name: str) -> bool | None:
+    value = os.getenv(name)
+    if value in (None, ""):
+        return None
+    return value.lower() in ("1", "true", "yes", "on")
+
+
 def add_megatron_arguments(parser: argparse.ArgumentParser):
     """ "Add Megatron-LM arguments to the given parser."""
 
@@ -2446,6 +2453,7 @@ def _add_network_size_args(parser):
         "streambp_chunk_size",
         "streambp_logits_chunk_size",
         "streambp_chunk_forward",
+        "streambp_moe_chunk_forward",
         "streambp_skip_moe",
         "streambp_skip_dsa",
         "streambp_validate",
@@ -3402,6 +3410,16 @@ def _add_training_args(parser):
         action=argparse.BooleanOptionalAction,
         default=_env_flag("MEGATRON_STREAMBP_CHUNK_FORWARD", True),
         help="Chunk StreamBP's no-grad forward. Disable to match the public StreamBP reference.",
+    )
+    group.add_argument(
+        "--streambp-moe-chunk-forward",
+        action=argparse.BooleanOptionalAction,
+        default=_env_optional_flag("MEGATRON_STREAMBP_MOE_CHUNK_FORWARD"),
+        help=(
+            "Override StreamBP no-grad forward chunking for MoE layers. "
+            "Unset inherits --streambp-chunk-forward. Disabling keeps attention chunked "
+            "and runs the MoE MLP once over the full sequence."
+        ),
     )
     group.add_argument(
         "--streambp-skip-moe",

@@ -1,6 +1,8 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+from contextlib import contextmanager
 import math
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -37,6 +39,7 @@ from megatron.core.transformer.streambp import (
     slice_streambp_padding_mask,
     streambp_checkpoint_layer,
     streambp_lm_head_loss,
+    supports_streambp_moe_hybrid_replay,
 )
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
@@ -93,6 +96,50 @@ class RecordingToyCausalLayer(ToyCausalLayer):
             chunk_range=chunk_range,
             **kwargs,
         )
+
+
+class ToyMoeAttentionSplitLayer(torch.nn.Module):
+    is_moe_layer = True
+
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.tensor(2.0))
+        self.config = SimpleNamespace(
+            moe_router_load_balancing_type="seq_aux_loss",
+            moe_expert_capacity_factor=None,
+            moe_z_loss_coeff=None,
+        )
+        self.no_grad_attention_chunks = []
+        self.no_grad_mlp_shapes = []
+        self.grad_attention_chunks = []
+        self.grad_mlp_shapes = []
+
+    def _forward_attention(self, hidden_states, chunk_range=None, context=None, **_kwargs):
+        assert context is None
+        if chunk_range is None:
+            chunk = hidden_states
+        else:
+            start, end = chunk_range
+            if not torch.is_grad_enabled():
+                self.no_grad_attention_chunks.append((start, end))
+            else:
+                self.grad_attention_chunks.append((start, end))
+            chunk = hidden_states[start:end]
+        return chunk * self.weight, None
+
+    def _forward_mlp(self, hidden_states, inference_context=None, padding_mask=None):
+        del inference_context, padding_mask
+        if not torch.is_grad_enabled():
+            self.no_grad_mlp_shapes.append(tuple(hidden_states.shape))
+        else:
+            self.grad_mlp_shapes.append(tuple(hidden_states.shape))
+        return hidden_states + 1.0
+
+    def forward(self, hidden_states, context=None, chunk_range=None, **kwargs):
+        hidden_states, context = self._forward_attention(
+            hidden_states, context=context, chunk_range=chunk_range, **kwargs
+        )
+        return self._forward_mlp(hidden_states), context
 
 
 class ToyOutputLayer(torch.nn.Module):
@@ -261,6 +308,133 @@ def test_streambp_reference_style_forward_matches_full_causal_gradients():
     assert torch.allclose(streambp_input.grad, full_input.grad, atol=2e-5, rtol=2e-5)
     for full_param, streambp_param in zip(full_layer.parameters(), streambp_layer.parameters()):
         assert torch.allclose(streambp_param.grad, full_param.grad, atol=2e-5, rtol=2e-5)
+
+
+def test_streambp_moe_chunk_forward_override_inherits_global_default():
+    block = TransformerBlock.__new__(TransformerBlock)
+    block.config = SimpleNamespace(
+        streambp_chunk_forward=True,
+        streambp_moe_chunk_forward=None,
+    )
+
+    assert block._streambp_chunk_forward_for_mode("chunked_moe") is True
+    assert block._streambp_chunk_forward_for_mode("chunked") is True
+
+
+def test_streambp_moe_chunk_forward_override_only_affects_moe():
+    block = TransformerBlock.__new__(TransformerBlock)
+    block.config = SimpleNamespace(
+        streambp_chunk_forward=True,
+        streambp_moe_chunk_forward=False,
+    )
+
+    assert block._streambp_chunk_forward_for_mode("chunked_moe") is False
+    assert block._streambp_chunk_forward_for_mode("chunked_packed_dsa") is True
+
+
+def test_streambp_routes_full_replay_required_moe_to_hybrid_when_nonchunk_forward():
+    block = TransformerBlock.__new__(TransformerBlock)
+    block.training = True
+    block.config = SimpleNamespace(
+        use_streambp=True,
+        streambp_chunk_forward=True,
+        streambp_moe_chunk_forward=False,
+        streambp_skip_moe=False,
+        streambp_skip_dsa=False,
+    )
+    layer = ToyMoeAttentionSplitLayer()
+    layer.config.moe_expert_capacity_factor = 1.0
+
+    assert moe_streambp_requires_full_replay(layer)
+    assert supports_streambp_moe_hybrid_replay(layer)
+    assert block._streambp_layer_decision(
+        layer,
+        inference_context=None,
+        packed_seq_params=None,
+        mhc_manager=None,
+    ) == (True, "chunked_moe")
+
+    block.config.streambp_moe_chunk_forward = True
+    assert block._streambp_layer_decision(
+        layer,
+        inference_context=None,
+        packed_seq_params=None,
+        mhc_manager=None,
+    ) == (True, "full_replay_moe")
+
+
+def test_streambp_moe_nonchunk_forward_and_backward_chunk_attention_once_for_mlp():
+    full_layer = ToyMoeAttentionSplitLayer()
+    layer = ToyMoeAttentionSplitLayer()
+    layer.load_state_dict(full_layer.state_dict())
+    full_hidden_states = torch.randn(10, 2, 3, requires_grad=True)
+    hidden_states = full_hidden_states.detach().clone().requires_grad_(True)
+    recompute_phases = []
+
+    @contextmanager
+    def fake_te_recompute_context(*, recompute_phase):
+        recompute_phases.append(recompute_phase)
+        yield
+
+    full_output, _ = full_layer(full_hidden_states)
+    with patch(
+        "megatron.core.transformer.streambp._te_activation_recompute_context",
+        fake_te_recompute_context,
+    ):
+        output, _ = streambp_checkpoint_layer(
+            layer,
+            hidden_states,
+            chunk_size=4,
+            chunk_forward=False,
+            mhc_recompute_manager=None,
+        )
+
+        grad_output = torch.randn_like(output)
+        assert layer.no_grad_attention_chunks == [(0, 4), (4, 8), (8, 10)]
+        assert layer.no_grad_mlp_shapes == [(10, 2, 3)]
+        assert torch.allclose(output, full_output)
+        full_output.backward(grad_output)
+        output.backward(grad_output)
+
+    assert layer.grad_attention_chunks == [(0, 4), (4, 8), (8, 10)]
+    assert layer.grad_mlp_shapes == [(10, 2, 3)]
+    assert recompute_phases == [False, False, False, False, True, True, True, True]
+    assert torch.allclose(hidden_states.grad, full_hidden_states.grad)
+    assert torch.allclose(layer.weight.grad, full_layer.weight.grad)
+
+
+def test_streambp_moe_hybrid_handles_full_replay_required_modes():
+    full_layer = ToyMoeAttentionSplitLayer()
+    layer = ToyMoeAttentionSplitLayer()
+    full_layer.config.moe_expert_capacity_factor = 1.0
+    layer.config.moe_expert_capacity_factor = 1.0
+    layer.load_state_dict(full_layer.state_dict())
+    full_hidden_states = torch.randn(10, 2, 3, requires_grad=True)
+    hidden_states = full_hidden_states.detach().clone().requires_grad_(True)
+
+    assert moe_streambp_requires_full_replay(layer)
+
+    full_output, _ = full_layer(full_hidden_states)
+    output, _ = streambp_checkpoint_layer(
+        layer,
+        hidden_states,
+        chunk_size=4,
+        chunk_forward=False,
+        mhc_recompute_manager=None,
+    )
+
+    grad_output = torch.randn_like(output)
+    assert layer.no_grad_attention_chunks == [(0, 4), (4, 8), (8, 10)]
+    assert layer.no_grad_mlp_shapes == [(10, 2, 3)]
+    assert torch.allclose(output, full_output)
+
+    full_output.backward(grad_output)
+    output.backward(grad_output)
+
+    assert layer.grad_attention_chunks == [(0, 4), (4, 8), (8, 10)]
+    assert layer.grad_mlp_shapes == [(10, 2, 3)]
+    assert torch.allclose(hidden_states.grad, full_hidden_states.grad)
+    assert torch.allclose(layer.weight.grad, full_layer.weight.grad)
 
 
 def test_streambp_layer_checkpoint_tracks_param_grads_for_gradless_input():

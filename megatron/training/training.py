@@ -2966,9 +2966,7 @@ def train(
         if (args.profile 
             and (len(args.profile_ranks) == 0 or
                  torch.distributed.get_rank() in args.profile_ranks)):
-            if args.use_pytorch_profiler:
-                prof.step()
-            elif iteration == args.profile_step_start:
+            if not args.use_pytorch_profiler and iteration == args.profile_step_start:
                 torch.cuda.check_error(torch.cuda.cudart().cudaProfilerStart())
                 nsys_nvtx_context = torch.autograd.profiler.emit_nvtx(record_shapes=True)
                 nsys_nvtx_context.__enter__()
@@ -3083,6 +3081,12 @@ def train(
             forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration
         )
         ft_integration.on_training_step_end()
+        if (
+            args.profile
+            and args.use_pytorch_profiler
+            and (len(args.profile_ranks) == 0 or torch.distributed.get_rank() in args.profile_ranks)
+        ):
+            prof.step()
         if should_checkpoint:
             save_checkpoint_and_time(
                 iteration,

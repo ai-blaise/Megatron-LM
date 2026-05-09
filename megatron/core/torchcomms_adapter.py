@@ -411,12 +411,50 @@ def _patch_cached_megatron_collectives(distwrap: ModuleType) -> None:
         _ORIGINAL_MEGATRON_COLLECTIVES.setdefault(
             "dist_all_gather_func", param_and_grad_buffer.dist_all_gather_func
         )
-        param_and_grad_buffer.dist_all_gather_func = distwrap.all_gather_into_tensor
+        original_all_gather = _ORIGINAL_MEGATRON_COLLECTIVES["dist_all_gather_func"]
+
+        def all_gather_into_tensor(output_tensor, input_tensor, *args, **kwargs):
+            group = kwargs.get("group")
+            if group is None and args:
+                # torch.distributed keeps group keyword-only today, but keep this
+                # fallback so the wrapper is harmless if TorchComms mirrors a
+                # positional group signature later.
+                maybe_group = args[0]
+                if hasattr(maybe_group, "size"):
+                    group = maybe_group
+            if _use_native_cached_collective(group):
+                return original_all_gather(output_tensor, input_tensor, *args, **kwargs)
+            return distwrap.all_gather_into_tensor(output_tensor, input_tensor, *args, **kwargs)
+
+        param_and_grad_buffer.dist_all_gather_func = all_gather_into_tensor
     if hasattr(distwrap, "reduce_scatter_tensor"):
         _ORIGINAL_MEGATRON_COLLECTIVES.setdefault(
             "dist_reduce_scatter_func", param_and_grad_buffer.dist_reduce_scatter_func
         )
-        param_and_grad_buffer.dist_reduce_scatter_func = distwrap.reduce_scatter_tensor
+        original_reduce_scatter = _ORIGINAL_MEGATRON_COLLECTIVES["dist_reduce_scatter_func"]
+
+        def reduce_scatter_tensor(output_tensor, input_tensor, *args, **kwargs):
+            group = kwargs.get("group")
+            if group is None and args:
+                maybe_group = args[0]
+                if hasattr(maybe_group, "size"):
+                    group = maybe_group
+            if _use_native_cached_collective(group):
+                return original_reduce_scatter(output_tensor, input_tensor, *args, **kwargs)
+            return distwrap.reduce_scatter_tensor(output_tensor, input_tensor, *args, **kwargs)
+
+        param_and_grad_buffer.dist_reduce_scatter_func = reduce_scatter_tensor
+
+
+def _use_native_cached_collective(group: Any | None) -> bool:
+    if group is None:
+        return False
+    if any(group is native_group for native_group in _NATIVE_GROUPS):
+        return True
+    try:
+        return group.size() <= 1
+    except Exception:
+        return False
 
 
 def _restore_torch_distributed_bridge() -> None:

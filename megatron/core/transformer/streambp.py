@@ -615,6 +615,15 @@ def moe_streambp_requires_full_replay(layer: torch.nn.Module) -> bool:
     return False
 
 
+def supports_streambp_moe_hybrid_replay(layer: torch.nn.Module) -> bool:
+    """Return True when StreamBP can chunk attention but replay MoE full-sequence."""
+    return (
+        bool(getattr(layer, "is_moe_layer", False))
+        and hasattr(layer, "_forward_attention")
+        and hasattr(layer, "_forward_mlp")
+    )
+
+
 @contextmanager
 def _maybe_context(context_factory: ContextFactory) -> Iterator[None]:
     if context_factory is None:
@@ -726,6 +735,118 @@ def _reference_no_grad_forward(
         )
 
 
+def _moe_chunk_attention_full_mlp_no_grad_forward(
+    layer: torch.nn.Module,
+    hidden_states: Tensor,
+    chunks: Sequence[ChunkRange],
+    kwargs: dict[str, Any],
+    *,
+    context_factory: ContextFactory,
+) -> Tensor:
+    """Run chunked attention followed by one full-sequence MoE MLP no-grad forward.
+
+    DeepSeek-style layers can be both MoE layers and DSA-attention layers. A full
+    no-grad layer forward would also run DSA attention full-sequence, which defeats
+    the packed/chunked DSA path and can hit unsupported kernel shapes. This hybrid
+    path keeps attention chunked, then runs the MoE MLP once on the concatenated
+    post-attention states to avoid multiplying MoE dispatcher collectives in the
+    no-grad forward.
+    """
+    if not hasattr(layer, "_forward_attention") or not hasattr(layer, "_forward_mlp"):
+        return _reference_no_grad_forward(
+            layer,
+            hidden_states,
+            kwargs,
+            context_factory=context_factory,
+        )
+
+    call_kwargs = dict(kwargs)
+    # These are whole-layer wrapper hints. The regular TransformerLayer.forward
+    # strips them before entering the attention/MLP internals.
+    call_kwargs.pop("dynamic_inference_decode_only", None)
+    call_kwargs.pop("mhc_recompute_manager", None)
+    attention_outputs = []
+    with _maybe_context(context_factory):
+        for chunk_index, chunk_range in enumerate(chunks):
+            with _profile_streambp_chunk(
+                f"streambp/no_grad_forward_moe_attention_chunk/{chunk_index}"
+            ):
+                # Backward replay still recomputes this MoE layer once per chunk.
+                # TE's FP8 activation-recompute context keeps one bookkeeping entry
+                # per replayed forward, so seed that stack even though this hybrid
+                # no-grad path only chunks attention and runs the MoE MLP once.
+                with _te_activation_recompute_context(recompute_phase=False):
+                    attention_output, context = layer._forward_attention(
+                        hidden_states=hidden_states,
+                        chunk_range=chunk_range,
+                        **call_kwargs,
+                    )
+                if context is not None:
+                    raise ValueError(
+                        "StreamBP currently supports decoder-only MoE layers with context=None"
+                    )
+                attention_outputs.append(attention_output)
+
+        post_attention = torch.cat(attention_outputs, dim=0)
+        with _profile_streambp_chunk("streambp/no_grad_forward_moe_mlp_full"):
+            with _te_activation_recompute_context(recompute_phase=False):
+                return layer._forward_mlp(
+                    post_attention,
+                    call_kwargs.get("inference_context", None),
+                    padding_mask=call_kwargs.get("padding_mask", None),
+                )
+
+
+def _moe_chunk_attention_full_mlp_backward(
+    layer: torch.nn.Module,
+    hidden_states: Tensor,
+    grad_output: Tensor,
+    chunks: Sequence[ChunkRange],
+    kwargs: dict[str, Any],
+    *,
+    context_factory: ContextFactory,
+) -> None:
+    """Replay MoE backward with chunked attention and one full MoE MLP graph."""
+    call_kwargs = dict(kwargs)
+    # These are whole-layer wrapper hints. The regular TransformerLayer.forward
+    # strips them before entering the attention/MLP internals.
+    call_kwargs.pop("dynamic_inference_decode_only", None)
+    call_kwargs.pop("mhc_recompute_manager", None)
+
+    attention_outputs = []
+    chunk_size = chunks[0][1] - chunks[0][0] if chunks else hidden_states.size(0)
+
+    with _maybe_context(context_factory):
+        for chunk_range in chunks:
+            start, _ = chunk_range
+            chunk_index = start // chunk_size
+            with _profile_streambp_chunk(
+                f"streambp/backward_replay_moe_attention_chunk/{chunk_index}"
+            ):
+                with _te_activation_recompute_context(recompute_phase=True):
+                    attention_output, context = layer._forward_attention(
+                        hidden_states=hidden_states,
+                        chunk_range=chunk_range,
+                        **call_kwargs,
+                    )
+                if context is not None:
+                    raise ValueError(
+                        "StreamBP currently supports decoder-only MoE layers with context=None"
+                    )
+                attention_outputs.append(attention_output)
+
+        post_attention = torch.cat(attention_outputs, dim=0)
+        with _profile_streambp_chunk("streambp/backward_replay_moe_mlp_full"):
+            with _te_activation_recompute_context(recompute_phase=True):
+                output = layer._forward_mlp(
+                    post_attention,
+                    call_kwargs.get("inference_context", None),
+                    padding_mask=call_kwargs.get("padding_mask", None),
+                )
+
+    torch.autograd.backward(output, grad_output)
+
+
 def _full_layer_activation_checkpoint(
     layer: torch.nn.Module,
     hidden_states: Tensor,
@@ -775,9 +896,10 @@ class _StreamBPLayerCheckpoint(torch.autograd.Function):
                             context_factory=context_factory,
                         )
                     else:
-                        output = _reference_no_grad_forward(
+                        output = _moe_chunk_attention_full_mlp_no_grad_forward(
                             layer,
                             hidden_states,
+                            chunks,
                             kwargs,
                             context_factory=context_factory,
                         )
@@ -803,6 +925,31 @@ class _StreamBPLayerCheckpoint(torch.autograd.Function):
     def backward(ctx, grad_output: Tensor):
         (hidden_states,) = ctx.saved_tensors
         chunks = iter_streambp_chunks(hidden_states.size(0), ctx.chunk_size)
+
+        if (
+            getattr(ctx.layer, "is_moe_layer", False)
+            and not ctx.chunk_forward
+            and hasattr(ctx.layer, "_forward_attention")
+            and hasattr(ctx.layer, "_forward_mlp")
+        ):
+            detached_hidden_states = hidden_states.detach().requires_grad_(
+                ctx.needs_input_grad[0]
+            )
+            with (
+                torch.enable_grad(),
+                replay_streambp_moe_aux_stats(ctx.moe_aux_stats),
+            ):
+                _moe_chunk_attention_full_mlp_backward(
+                    ctx.layer,
+                    detached_hidden_states,
+                    grad_output,
+                    chunks,
+                    ctx.kwargs,
+                    context_factory=ctx.context_factory,
+                )
+            hidden_grad = detached_hidden_states.grad if ctx.needs_input_grad[0] else None
+            return hidden_grad, None, None, None, None, None, None
+
         params = _unique_trainable_parameters(ctx.layer)
         marked = mark_streambp_pending_chunks(params, len(chunks))
 
@@ -906,7 +1053,11 @@ def streambp_checkpoint_layer(
     chunks = iter_streambp_chunks(hidden_states.size(0), chunk_size)
     if len(chunks) <= 1 or not torch.is_grad_enabled():
         return _call_layer(layer, hidden_states, kwargs, context_factory=context_factory), None
-    if full_replay or moe_streambp_requires_full_replay(layer):
+    requires_full_moe = moe_streambp_requires_full_replay(layer)
+    if full_replay or (
+        requires_full_moe
+        and (chunk_forward or not supports_streambp_moe_hybrid_replay(layer))
+    ):
         output = _full_layer_activation_checkpoint(
             layer, hidden_states, kwargs, context_factory=context_factory
         )
