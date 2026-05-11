@@ -1,7 +1,18 @@
+// Fused G1 sigmoid gate: output = attn_out * sigmoid(linear_out).
+//
+// Forward path is SM100/B200 tuned (CuTe): inline-PTX `ex2.approx.ftz.f32` and
+// `rcp.approx.ftz.f32` for fast sigmoid, N-adaptive launch (BLOCK=128/GRIDX=8
+// for n < 1.5M elements; BLOCK=256/GRIDX=4 otherwise), BF16x8 vectorised
+// load/store. Ported from ai-blaise/optimization-playground
+// `sgl-kernel/csrc/attention/g1_attention_cute.cuh` (commit 9c124721c).
+//
+// Backward keeps the analytic kernel (forward-only optimisation; backward
+// gradient is unchanged).
+
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cstdint>
-#include <cmath>
+#include <algorithm>
 
 struct alignas(16) bf16x8 { __nv_bfloat162 v[4]; };
 
@@ -18,8 +29,23 @@ void store_bf16x8(__nv_bfloat16* __restrict__ p, const bf16x8& x) {
 }
 
 __device__ __forceinline__
+float ex2_ftz(float x) {
+  float y;
+  asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+  return y;
+}
+
+__device__ __forceinline__
+float rcp_ftz(float x) {
+  float y;
+  asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+  return y;
+}
+
+__device__ __forceinline__
 float fast_sigmoid(float x) {
-  return 1.f / (1.f + __expf(-x)); // NOTE: This is literally sigmoid
+  // sigmoid(x) = 1 / (1 + exp(-x)) = rcp(1 + ex2(-x * log2(e)))
+  return rcp_ftz(1.f + ex2_ftz(-x * 1.4426950408889634f));
 }
 
 __device__ __forceinline__
@@ -27,9 +53,10 @@ void compute_fwd(__nv_bfloat162 lin, __nv_bfloat162 attn,
                  __nv_bfloat162& out, __nv_bfloat162& gate) {
   float2 fl = __bfloat1622float2(lin);
   float2 fa = __bfloat1622float2(attn);
-  float2 fg = {fast_sigmoid(fl.x), fast_sigmoid(fl.y)};
-  gate = __float22bfloat162_rn(fg);
-  out = __float22bfloat162_rn({fa.x * fg.x, fa.y * fg.y});
+  float gx = fast_sigmoid(fl.x);
+  float gy = fast_sigmoid(fl.y);
+  gate = __float22bfloat162_rn(make_float2(gx, gy));
+  out  = __float22bfloat162_rn(make_float2(fa.x * gx, fa.y * gy));
 }
 
 template <int BLOCK>
@@ -41,13 +68,12 @@ g1_gate_fwd_kernel(
     __nv_bfloat16* __restrict__ gate,
     int64_t n_total
 ) {
-  const int64_t tid = int64_t(blockIdx.x) * BLOCK + threadIdx.x;
+  const int64_t n_vec8 = n_total >> 3;
+  const int64_t tid    = int64_t(blockIdx.x) * BLOCK + threadIdx.x;
   const int64_t stride = int64_t(gridDim.x) * BLOCK;
-  const int64_t n_vec8 = n_total / 8;
-  const int64_t rem_start = n_vec8 * 8;
 
   for (int64_t i = tid; i < n_vec8; i += stride) {
-    const int64_t off = i * 8;
+    const int64_t off = i << 3;
     bf16x8 lin = load_bf16x8(linear_out + off);
     bf16x8 attn = load_bf16x8(attn_out + off);
     bf16x8 o, g;
@@ -58,6 +84,7 @@ g1_gate_fwd_kernel(
     store_bf16x8(gate + off, g);
   }
 
+  const int64_t rem_start = n_vec8 << 3;
   for (int64_t i = rem_start + tid; i < n_total; i += stride) {
     float fl = __bfloat162float(linear_out[i]);
     float fa = __bfloat162float(attn_out[i]);
@@ -115,6 +142,12 @@ g1_gate_bwd_kernel(
   }
 }
 
+// N-adaptive launch threshold. Tuned on B200 (D=7168 production); switch from
+// BLOCK=128 to BLOCK=256 at ~n=1.5M elements (~N=210 tokens for D=7168).
+#ifndef G1_BLOCK128_N_THRESHOLD
+#define G1_BLOCK128_N_THRESHOLD 1500000
+#endif
+
 extern "C" void g1_gate_fwd(
     const void* linear_out,
     const void* attn_out,
@@ -125,21 +158,30 @@ extern "C" void g1_gate_fwd(
 ) {
   if (n <= 0) return;
 
-  constexpr int BLOCK = 256;
-
-  int dev, sm;
+  int dev, sm_count;
   cudaGetDevice(&dev);
-  cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, dev);
-  const int64_t total_threads = (n + 7) / 8 * 8;
-  int blocks = min(sm * 4, int((total_threads + BLOCK - 1) / BLOCK));
-  if (blocks < 1) blocks = 1;
+  cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, dev);
 
-  g1_gate_fwd_kernel<BLOCK><<<blocks, BLOCK, 0, stream>>>(
-      (const __nv_bfloat16*)linear_out,
-      (const __nv_bfloat16*)attn_out,
-      (__nv_bfloat16*)output,
-      (__nv_bfloat16*)gate,
-      n);
+  const __nv_bfloat16* lin_p  = reinterpret_cast<const __nv_bfloat16*>(linear_out);
+  const __nv_bfloat16* attn_p = reinterpret_cast<const __nv_bfloat16*>(attn_out);
+  __nv_bfloat16* out_p        = reinterpret_cast<__nv_bfloat16*>(output);
+  __nv_bfloat16* gate_p       = reinterpret_cast<__nv_bfloat16*>(gate);
+
+  if (n < G1_BLOCK128_N_THRESHOLD) {
+    constexpr int BLOCK = 128;
+    const int64_t need = (n + BLOCK * 8 - 1) / (BLOCK * 8);
+    int blocks = int(std::min<int64_t>(need, int64_t(sm_count) * 8));
+    if (blocks < 1) blocks = 1;
+    g1_gate_fwd_kernel<BLOCK><<<blocks, BLOCK, 0, stream>>>(
+        lin_p, attn_p, out_p, gate_p, n);
+  } else {
+    constexpr int BLOCK = 256;
+    const int64_t need = (n + BLOCK * 8 - 1) / (BLOCK * 8);
+    int blocks = int(std::min<int64_t>(need, int64_t(sm_count) * 4));
+    if (blocks < 1) blocks = 1;
+    g1_gate_fwd_kernel<BLOCK><<<blocks, BLOCK, 0, stream>>>(
+        lin_p, attn_p, out_p, gate_p, n);
+  }
 }
 
 extern "C" void g1_gate_bwd(
@@ -159,7 +201,7 @@ extern "C" void g1_gate_bwd(
   cudaGetDevice(&dev);
   cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, dev);
   const int64_t total_threads = (n + 7) / 8 * 8;
-  int blocks = min(sm * 4, int((total_threads + BLOCK - 1) / BLOCK));
+  int blocks = std::min(sm * 4, int((total_threads + BLOCK - 1) / BLOCK));
   if (blocks < 1) blocks = 1;
 
   g1_gate_bwd_kernel<BLOCK><<<blocks, BLOCK, 0, stream>>>(

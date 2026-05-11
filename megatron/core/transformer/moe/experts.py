@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import copy
+import gc
 import logging
+import os
 from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass
@@ -69,7 +71,6 @@ except ImportError:
     HAVE_TE = False
 
 logger = logging.getLogger(__name__)
-
 
 class GroupedMLP(MegatronModule):
     """An efficient implementation of the Experts layer using GroupedGEMM.
@@ -454,6 +455,15 @@ class GroupedMLP(MegatronModule):
 
         @torch.no_grad()
         def sh_ten_merge_fn(sub_state_dict, tp_axis: int, with_glu: bool):
+            cpu_merge = os.getenv("MEGATRON_CPU_MERGE_CKPT_FACTORIES", "1").lower() not in (
+                "0",
+                "false",
+                "no",
+            )
+
+            def maybe_cpu(tensor):
+                return tensor.cpu() if cpu_merge else tensor
+
             if tp_axis == 1:
                 # weight1
                 weight_shape = (self.config.hidden_size, -1)
@@ -463,23 +473,48 @@ class GroupedMLP(MegatronModule):
                 assert with_glu == False
             else:
                 raise ValueError("tp_axis should be 0 or 1.")
-            if isinstance(sub_state_dict, dict):
-                assert sub_state_dict['singleton_local_shards']
-                if with_glu:
-                    assert isinstance(sub_state_dict['data'], dict)
-                    sub_state_dict = torch.cat(
-                        (
-                            torch.stack(sub_state_dict['data']['w']),
-                            torch.stack(sub_state_dict['data']['v']),
-                        ),
-                        dim=-2,
-                    )
+            try:
+                if isinstance(sub_state_dict, dict):
+                    assert sub_state_dict['singleton_local_shards']
+                    if with_glu:
+                        assert isinstance(sub_state_dict['data'], dict)
+                        sub_state_dict = torch.cat(
+                            (
+                                torch.stack([maybe_cpu(t) for t in sub_state_dict['data']['w']]),
+                                torch.stack([maybe_cpu(t) for t in sub_state_dict['data']['v']]),
+                            ),
+                            dim=-2,
+                        )
+                    else:
+                        assert isinstance(sub_state_dict['data'], list)
+                        sub_state_dict = torch.stack([maybe_cpu(t) for t in sub_state_dict['data']])
                 else:
-                    assert isinstance(sub_state_dict['data'], list)
-                    sub_state_dict = torch.stack(sub_state_dict['data'])
-            else:
-                if with_glu:
-                    sub_state_dict = torch.cat(sub_state_dict, -2)
+                    if with_glu:
+                        sub_state_dict = torch.cat([maybe_cpu(t) for t in sub_state_dict], -2)
+            except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
+                logger.warning(
+                    "CUDA OutOfMemoryError encountered during expert tensors merging. "
+                    f"Retrying on CPU. (Error: {e})"
+                )
+                gc.collect()
+                torch.cuda.empty_cache()
+                if isinstance(sub_state_dict, dict):
+                    assert sub_state_dict['singleton_local_shards']
+                    if with_glu:
+                        assert isinstance(sub_state_dict['data'], dict)
+                        sub_state_dict = torch.cat(
+                            (
+                                torch.stack([t.cpu() for t in sub_state_dict['data']['w']]),
+                                torch.stack([t.cpu() for t in sub_state_dict['data']['v']]),
+                            ),
+                            dim=-2,
+                        )
+                    else:
+                        assert isinstance(sub_state_dict['data'], list)
+                        sub_state_dict = torch.stack([t.cpu() for t in sub_state_dict['data']])
+                else:
+                    if with_glu:
+                        sub_state_dict = torch.cat([t.cpu() for t in sub_state_dict], -2)
             return sub_state_dict.transpose(-1, -2).reshape(weight_shape)
 
         state_dict = self.state_dict(prefix='', keep_vars=True)

@@ -48,6 +48,10 @@ __device__ __forceinline__ void store_from_float<__half>(__half* p, float v) {
   *p = __float2half(v);
 }
 
+// Block-wide sum across kHeadDim threads, broadcasting to every thread.
+// Uses the same scratch layout (0..3 partials, 8 broadcast) as
+// block_reduce_max_128 so the trailing __syncthreads() can be elided —
+// callers invoke this once per block before any other shared-memory use.
 __device__ __forceinline__ float block_reduce_sum_128(
     float v, float* __restrict__ scratch) {
   const int tid = threadIdx.x;
@@ -64,9 +68,7 @@ __device__ __forceinline__ float block_reduce_sum_128(
     }
   }
   __syncthreads();
-  const float total = scratch[8];
-  __syncthreads();
-  return total;
+  return scratch[8];
 }
 
 template <typename scalar_t>
@@ -86,7 +88,8 @@ __global__ void indexcache_kv_bwd_kernel(
   const int tid = threadIdx.x;
   if (row >= num_rows) return;
 
-  __shared__ float reduce_scratch[kHeadDim];
+  // block_reduce_sum_128 uses scratch[0..3] + scratch[8] like the forward.
+  __shared__ float reduce_scratch[9];
 
   const float gy = load_as_float(grad_y + row * row_stride + tid);
   const float xv = load_as_float(x + row * row_stride + tid);

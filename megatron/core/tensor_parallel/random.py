@@ -930,9 +930,16 @@ class CheckpointWithoutOutput(object):
         if self.ckpt_manager is not None or is_graph_warmup():
             return
 
+        hook_storage = hook_tensor.untyped_storage() if isinstance(hook_tensor, torch.Tensor) else None
+
         # use resize to release the output tensor memory and still keep the metadata in the tensors.
         # the metadata is still needed for backward
         for output in self.outputs:
+            if (
+                hook_storage is not None
+                and output.untyped_storage().data_ptr() == hook_storage.data_ptr()
+            ):
+                continue
             output.untyped_storage().resize_(0)
 
         # register the recomputation as a backward hook, when the the gradient of the hook_tensor

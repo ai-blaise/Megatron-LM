@@ -23,7 +23,6 @@ except ImportError:
 
 ###### BIAS SWIGLU FUSION/ NO AUTOGRAD ################
 
-
 @jit_fuser
 def swiglu(y):
     """Performs SwiGLU (Swish-Gated Linear Unit) activation function.
@@ -178,7 +177,7 @@ if HAVE_TRITON:
         input_ptr,
         weights_ptr,
         output_ptr,
-        rows: tl.constexpr,
+        rows,
         hidden_size: tl.constexpr,
         input_stride_row: tl.constexpr,
         weights_stride_row: tl.constexpr,
@@ -209,7 +208,7 @@ if HAVE_TRITON:
         weights_ptr,
         grad_input_ptr,
         grad_weights_ptr,
-        rows: tl.constexpr,
+        rows,
         hidden_size: tl.constexpr,
         grad_output_stride_row: tl.constexpr,
         input_stride_row: tl.constexpr,

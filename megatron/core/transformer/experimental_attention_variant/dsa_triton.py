@@ -32,6 +32,7 @@ _DSA_TRITON_INDEXER_ENV = "MEGATRON_DSA_TRITON_INDEXER"
 _DSA_TRITON_INDEXER_BLOCK_Q_ENV = "MEGATRON_DSA_TRITON_INDEXER_BLOCK_Q"
 _DSA_TRITON_INDEXER_BLOCK_K_ENV = "MEGATRON_DSA_TRITON_INDEXER_BLOCK_K"
 _DSA_TRITON_BF16_GRAD_ATOMICS_ENV = "MEGATRON_DSA_TRITON_BF16_GRAD_ATOMICS"
+_DSA_TRITON_BWD_NUM_WARPS_ENV = "MEGATRON_DSA_TRITON_BWD_NUM_WARPS"
 
 
 def _env_enabled() -> bool:
@@ -87,6 +88,14 @@ def _indexer_block_size(env_name: str, default: int, maximum: int) -> int:
     if value <= 0:
         raise ValueError(f"{env_name} must be positive, got {value}")
     return min(triton.next_power_of_2(value), maximum)
+
+
+def _num_warps_from_env(env_name: str, default: int) -> int:
+    raw = os.getenv(env_name)
+    value = int(raw) if raw else default
+    if value not in (1, 2, 4, 8):
+        raise ValueError(f"{env_name} must be one of 1, 2, 4, or 8, got {value}")
+    return value
 
 
 def is_dsa_indexer_scores_triton_supported(
@@ -382,24 +391,26 @@ def _sparse_dsa_forward_kernel(
     q_start,
     BLOCK_Q: tl.constexpr,
     BLOCK_K: tl.constexpr,
-    BLOCK_D: tl.constexpr,
+    BLOCK_QD: tl.constexpr,
+    BLOCK_VD: tl.constexpr,
     HAS_POSITIONS: tl.constexpr,
 ):
     q_block = tl.program_id(0)
     head_idx = tl.program_id(1)
 
     q_offsets = q_block * BLOCK_Q + tl.arange(0, BLOCK_Q)
-    d_offsets = tl.arange(0, BLOCK_D)
+    qd_offsets = tl.arange(0, BLOCK_QD)
+    vd_offsets = tl.arange(0, BLOCK_VD)
     topk_offsets = tl.arange(0, BLOCK_K)
     q_valid = q_offsets < q_len
 
-    q_ptrs = query_ptr + (q_offsets[:, None] * num_heads + head_idx) * head_dim + d_offsets[None, :]
-    query = tl.load(q_ptrs, mask=q_valid[:, None] & (d_offsets[None, :] < head_dim), other=0.0)
+    q_ptrs = query_ptr + (q_offsets[:, None] * num_heads + head_idx) * head_dim + qd_offsets[None, :]
+    query = tl.load(q_ptrs, mask=q_valid[:, None] & (qd_offsets[None, :] < head_dim), other=0.0)
     query = query.to(tl.float32)
 
     m_i = tl.full((BLOCK_Q,), -float("inf"), tl.float32)
     l_i = tl.full((BLOCK_Q,), 0.0, tl.float32)
-    acc = tl.zeros((BLOCK_Q, BLOCK_D), tl.float32)
+    acc = tl.zeros((BLOCK_Q, BLOCK_VD), tl.float32)
     if HAS_POSITIONS:
         q_abs = tl.load(query_pos_ptr + q_offsets, mask=q_valid, other=0)
     else:
@@ -422,11 +433,11 @@ def _sparse_dsa_forward_kernel(
         key_ptrs = (
             key_ptr
             + (selected[:, :, None] * num_heads + head_idx) * head_dim
-            + d_offsets[None, None, :]
+            + qd_offsets[None, None, :]
         )
         key = tl.load(
             key_ptrs,
-            mask=valid[:, :, None] & (d_offsets[None, None, :] < head_dim),
+            mask=valid[:, :, None] & (qd_offsets[None, None, :] < head_dim),
             other=0.0,
         ).to(tl.float32)
         scores = tl.sum(key * query[:, None, :], axis=2) * softmax_scale
@@ -440,11 +451,11 @@ def _sparse_dsa_forward_kernel(
         value_ptrs = (
             value_ptr
             + (selected[:, :, None] * num_heads + head_idx) * value_dim
-            + d_offsets[None, None, :]
+            + vd_offsets[None, None, :]
         )
         value = tl.load(
             value_ptrs,
-            mask=valid[:, :, None] & (d_offsets[None, None, :] < value_dim),
+            mask=valid[:, :, None] & (vd_offsets[None, None, :] < value_dim),
             other=0.0,
         ).to(tl.float32)
         acc = acc * alpha[:, None] + tl.sum(probs[:, :, None] * value, axis=1)
@@ -452,8 +463,8 @@ def _sparse_dsa_forward_kernel(
         m_i = m_new
 
     output = acc / l_i[:, None]
-    output_ptrs = output_ptr + (q_offsets[:, None] * num_heads + head_idx) * value_dim + d_offsets[None, :]
-    tl.store(output_ptrs, output, mask=q_valid[:, None] & (d_offsets[None, :] < value_dim))
+    output_ptrs = output_ptr + (q_offsets[:, None] * num_heads + head_idx) * value_dim + vd_offsets[None, :]
+    tl.store(output_ptrs, output, mask=q_valid[:, None] & (vd_offsets[None, :] < value_dim))
     tl.store(lse_ptr + q_offsets * num_heads + head_idx, m_i + tl.log(l_i), mask=q_valid)
 
 
@@ -480,39 +491,41 @@ def _sparse_dsa_backward_kernel(
     q_start,
     BLOCK_Q: tl.constexpr,
     BLOCK_K: tl.constexpr,
-    BLOCK_D: tl.constexpr,
+    BLOCK_QD: tl.constexpr,
+    BLOCK_VD: tl.constexpr,
     HAS_POSITIONS: tl.constexpr,
 ):
     q_block = tl.program_id(0)
     head_idx = tl.program_id(1)
 
     q_offsets = q_block * BLOCK_Q + tl.arange(0, BLOCK_Q)
-    d_offsets = tl.arange(0, BLOCK_D)
+    qd_offsets = tl.arange(0, BLOCK_QD)
+    vd_offsets = tl.arange(0, BLOCK_VD)
     topk_offsets = tl.arange(0, BLOCK_K)
     q_valid = q_offsets < q_len
 
-    q_ptrs = query_ptr + (q_offsets[:, None] * num_heads + head_idx) * head_dim + d_offsets[None, :]
-    query = tl.load(q_ptrs, mask=q_valid[:, None] & (d_offsets[None, :] < head_dim), other=0.0)
+    q_ptrs = query_ptr + (q_offsets[:, None] * num_heads + head_idx) * head_dim + qd_offsets[None, :]
+    query = tl.load(q_ptrs, mask=q_valid[:, None] & (qd_offsets[None, :] < head_dim), other=0.0)
     query = query.to(tl.float32)
 
-    grad_output_ptrs = grad_output_ptr + (q_offsets[:, None] * num_heads + head_idx) * value_dim + d_offsets[None, :]
+    grad_output_ptrs = grad_output_ptr + (q_offsets[:, None] * num_heads + head_idx) * value_dim + vd_offsets[None, :]
     grad_output = tl.load(
         grad_output_ptrs,
-        mask=q_valid[:, None] & (d_offsets[None, :] < value_dim),
+        mask=q_valid[:, None] & (vd_offsets[None, :] < value_dim),
         other=0.0,
     ).to(tl.float32)
 
-    output_ptrs = output_ptr + (q_offsets[:, None] * num_heads + head_idx) * value_dim + d_offsets[None, :]
+    output_ptrs = output_ptr + (q_offsets[:, None] * num_heads + head_idx) * value_dim + vd_offsets[None, :]
     output = tl.load(
         output_ptrs,
-        mask=q_valid[:, None] & (d_offsets[None, :] < value_dim),
+        mask=q_valid[:, None] & (vd_offsets[None, :] < value_dim),
         other=0.0,
     ).to(tl.float32)
     row_lse = tl.load(lse_ptr + q_offsets * num_heads + head_idx, mask=q_valid, other=0.0)
     row_lse = row_lse.to(tl.float32)
     delta = tl.sum(grad_output * output, axis=1)
 
-    grad_query = tl.zeros((BLOCK_Q, BLOCK_D), tl.float32)
+    grad_query = tl.zeros((BLOCK_Q, BLOCK_QD), tl.float32)
     if HAS_POSITIONS:
         q_abs = tl.load(query_pos_ptr + q_offsets, mask=q_valid, other=0)
     else:
@@ -535,11 +548,11 @@ def _sparse_dsa_backward_kernel(
         key_ptrs = (
             key_ptr
             + (selected[:, :, None] * num_heads + head_idx) * head_dim
-            + d_offsets[None, None, :]
+            + qd_offsets[None, None, :]
         )
         key = tl.load(
             key_ptrs,
-            mask=valid[:, :, None] & (d_offsets[None, None, :] < head_dim),
+            mask=valid[:, :, None] & (qd_offsets[None, None, :] < head_dim),
             other=0.0,
         ).to(tl.float32)
         scores = tl.sum(key * query[:, None, :], axis=2) * softmax_scale
@@ -550,11 +563,11 @@ def _sparse_dsa_backward_kernel(
         value_ptrs = (
             value_ptr
             + (selected[:, :, None] * num_heads + head_idx) * value_dim
-            + d_offsets[None, None, :]
+            + vd_offsets[None, None, :]
         )
         value = tl.load(
             value_ptrs,
-            mask=valid[:, :, None] & (d_offsets[None, None, :] < value_dim),
+            mask=valid[:, :, None] & (vd_offsets[None, None, :] < value_dim),
             other=0.0,
         ).to(tl.float32)
 
@@ -565,22 +578,22 @@ def _sparse_dsa_backward_kernel(
         tl.atomic_add(
             grad_key_ptr
             + (selected[:, :, None] * num_heads + head_idx) * head_dim
-            + d_offsets[None, None, :],
+            + qd_offsets[None, None, :],
             ds[:, :, None] * query[:, None, :],
             sem="relaxed",
-            mask=valid[:, :, None] & (d_offsets[None, None, :] < head_dim),
+            mask=valid[:, :, None] & (qd_offsets[None, None, :] < head_dim),
         )
         tl.atomic_add(
             grad_value_ptr
             + (selected[:, :, None] * num_heads + head_idx) * value_dim
-            + d_offsets[None, None, :],
+            + vd_offsets[None, None, :],
             probs[:, :, None] * grad_output[:, None, :],
             sem="relaxed",
-            mask=valid[:, :, None] & (d_offsets[None, None, :] < value_dim),
+            mask=valid[:, :, None] & (vd_offsets[None, None, :] < value_dim),
         )
 
-    grad_query_ptrs = grad_query_ptr + (q_offsets[:, None] * num_heads + head_idx) * head_dim + d_offsets[None, :]
-    tl.store(grad_query_ptrs, grad_query, mask=q_valid[:, None] & (d_offsets[None, :] < head_dim))
+    grad_query_ptrs = grad_query_ptr + (q_offsets[:, None] * num_heads + head_idx) * head_dim + qd_offsets[None, :]
+    tl.store(grad_query_ptrs, grad_query, mask=q_valid[:, None] & (qd_offsets[None, :] < head_dim))
 
 
 class SparseDSAAttentionTriton(torch.autograd.Function):
@@ -617,7 +630,9 @@ class SparseDSAAttentionTriton(torch.autograd.Function):
         block_q = _sparse_block_q()
         block_k = _forward_block_k(topk_count)
         backward_block_k = _backward_block_k(topk_count)
-        block_d = triton.next_power_of_2(max(head_dim, value_dim))
+        backward_num_warps = _num_warps_from_env(_DSA_TRITON_BWD_NUM_WARPS_ENV, 4)
+        block_qd = triton.next_power_of_2(head_dim)
+        block_vd = triton.next_power_of_2(value_dim)
         grid = (triton.cdiv(q_len, block_q), num_heads)
 
         _sparse_dsa_forward_kernel[grid](
@@ -638,7 +653,8 @@ class SparseDSAAttentionTriton(torch.autograd.Function):
             int(q_start),
             BLOCK_Q=block_q,
             BLOCK_K=block_k,
-            BLOCK_D=block_d,
+            BLOCK_QD=block_qd,
+            BLOCK_VD=block_vd,
             HAS_POSITIONS=has_positions,
             num_warps=4,
         )
@@ -656,7 +672,9 @@ class SparseDSAAttentionTriton(torch.autograd.Function):
         ctx.block_q = block_q
         ctx.block_k = block_k
         ctx.backward_block_k = backward_block_k
-        ctx.block_d = block_d
+        ctx.backward_num_warps = backward_num_warps
+        ctx.block_qd = block_qd
+        ctx.block_vd = block_vd
 
         return output.reshape(q_len, 1, num_heads * value_dim)
 
@@ -708,9 +726,10 @@ class SparseDSAAttentionTriton(torch.autograd.Function):
             ctx.q_start,
             BLOCK_Q=ctx.block_q,
             BLOCK_K=ctx.backward_block_k,
-            BLOCK_D=ctx.block_d,
+            BLOCK_QD=ctx.block_qd,
+            BLOCK_VD=ctx.block_vd,
             HAS_POSITIONS=ctx.has_positions,
-            num_warps=4,
+            num_warps=ctx.backward_num_warps,
         )
 
         return (

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import gc
 import logging
+import os
 import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -449,6 +450,12 @@ def apply_swiglu_sharded_factory(
 
     def sh_ten_merge_fn(sub_state_dict):
         with torch.no_grad():
+            if os.getenv("MEGATRON_CPU_MERGE_CKPT_FACTORIES", "1").lower() not in (
+                "0",
+                "false",
+                "no",
+            ):
+                return torch.cat([t.cpu() for t in sub_state_dict])
             try:
                 return torch.cat(sub_state_dict)
             except (RuntimeError, torch.cuda.OutOfMemoryError) as e:

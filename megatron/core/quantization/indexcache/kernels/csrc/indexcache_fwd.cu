@@ -1,8 +1,8 @@
 // Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 //
 // Forward CUDA kernel for the IndexCache fp8 e4m3 fake-quant on the DSA
-// indexer K tensor. One block per token, kHeadDim (128) threads per block.
-// Direct port of the per-token math in SGLang's
+// indexer K tensor. One block per token, kHeadDim (128) threads per block
+// (4 warps). Direct port of the per-token math in SGLang's
 //   optimization-playground/python/sglang/jit_kernel/csrc/nsa/fused_store_index_cache.cuh
 // with two adaptations:
 //   1. Output is the dequantized fake-quant tensor (q_fp8 * scale) in the
@@ -10,6 +10,13 @@
 //   2. We additionally save the per-coord fp8 index, the clip mask, the
 //      per-row scale, the per-row argmax-of-|x|, and an eps-active flag
 //      so the backward kernel can skip recomputing them.
+//
+// Launch geometry: at production dims (nt~32, hd=128) the kernel is
+// launch-overhead-dominated on SM100 (B200 ncu shows occupancy ~6%, DRAM
+// ~0%). We deliberately do not annotate __launch_bounds__ — that would
+// constrain the compiler and hurt 4-warp scheduling — and we right-size
+// the block-reduce scratch buffer to the 9 slots actually used so shared
+// memory is not over-allocated.
 
 #include "indexcache.cuh"
 
@@ -65,7 +72,9 @@ __global__ void indexcache_kv_fwd_kernel(
   const int tid = threadIdx.x;
   if (row >= num_rows) return;
 
-  __shared__ float scratch[kHeadDim];
+  // block_reduce_max_128 uses scratch[0..3] for warp partials and
+  // scratch[8] for the broadcast slot, so 9 floats is sufficient.
+  __shared__ float scratch[9];
   __shared__ float scale_sh;
   __shared__ int   argmax_sh;
 

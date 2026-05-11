@@ -33,6 +33,27 @@ class TestGatedNorm:
         assert gated_norm._should_use_torch_mm(4096, 1, torch.bfloat16)
         assert not gated_norm._should_use_torch_mm(4096, 1, torch.float16)
 
+    def test_cute_cuda_alloc_failure_falls_back_to_torch_mm(self, monkeypatch):
+        class _FakeExt:
+            def gated_norm_cute_fwd(self, *args, **kwargs):
+                return gated_norm._CUDA_ERROR_MEMORY_ALLOCATION
+
+        monkeypatch.setattr(gated_norm, "_load_cuda_kernel", lambda: _FakeExt())
+
+        normed = torch.randn(2, 8, dtype=torch.bfloat16)
+        w_down = torch.randn(4, 8, dtype=torch.bfloat16)
+        w_up = torch.randn(8, 4, dtype=torch.bfloat16)
+        output = torch.empty_like(normed)
+
+        assert not gated_norm._gated_norm_cute_forward(
+            normed,
+            w_down,
+            w_up,
+            output,
+            hidden_size=8,
+            rank=4,
+        )
+
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for gated_norm")
     def test_apply_gated_norm_forward_backward_matches_reference(self, dtype):
