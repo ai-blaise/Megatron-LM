@@ -39,6 +39,9 @@ TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-"$HOME/.cache/triton/deepseek_v32_reap_sft
 # 2x the 1B-token target: 61056 samples * 32768 tokens/sample ~= 2.0007B tokens.
 TRAIN_SAMPLES="${TRAIN_SAMPLES:-61056}"
 SAVE_INTERVAL="${SAVE_INTERVAL:-100}"
+DECODER_FIRST_PIPELINE_NUM_LAYERS="${DECODER_FIRST_PIPELINE_NUM_LAYERS:-17}"
+DECODER_LAST_PIPELINE_NUM_LAYERS="${DECODER_LAST_PIPELINE_NUM_LAYERS:-14}"
+OVERLAP_PARAM_GATHER="${OVERLAP_PARAM_GATHER:-0}"
 # Megatron keeps checkpoints whose iteration is divisible by this value and
 # deletes the previous non-retained checkpoint after a new save. Pick a value
 # above the planned run so only the newest checkpoint remains.
@@ -56,6 +59,8 @@ Train samples: $TRAIN_SAMPLES
 Save every:    $SAVE_INTERVAL updates
 Retention:     keep latest normal Megatron checkpoint only
 ZCC:           ENABLE_ZCC=${ENABLE_ZCC:-0} (last successful probe used 0)
+Param gather:  OVERLAP_PARAM_GATHER=$OVERLAP_PARAM_GATHER
+PP layers:     first=$DECODER_FIRST_PIPELINE_NUM_LAYERS middle=auto last=$DECODER_LAST_PIPELINE_NUM_LAYERS
 Triton cache:  TRITON_CACHE_AUTOTUNING=1 TRITON_CACHE_DIR=$TRITON_CACHE_DIR
 EOF
 
@@ -96,7 +101,8 @@ export PP="${PP:-4}"
 export CP="${CP:-1}"
 export EP="${EP:-4}"
 export ETP="${ETP:-1}"
-export DECODER_FIRST_PIPELINE_NUM_LAYERS="${DECODER_FIRST_PIPELINE_NUM_LAYERS:-16}"
+export DECODER_FIRST_PIPELINE_NUM_LAYERS="${DECODER_FIRST_PIPELINE_NUM_LAYERS}"
+export DECODER_LAST_PIPELINE_NUM_LAYERS="${DECODER_LAST_PIPELINE_NUM_LAYERS}"
 export SEQ_LENGTH="${SEQ_LENGTH:-32768}"
 export MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-2}"
 export GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-32}"
@@ -113,6 +119,7 @@ export SAVE_RETAIN_INTERVAL="${SAVE_RETAIN_INTERVAL}"
 export EVAL_INTERVAL="${EVAL_INTERVAL:-100000}"
 export LOG_INTERVAL="${LOG_INTERVAL:-1}"
 export TENSORBOARD_LOG_INTERVAL="${TENSORBOARD_LOG_INTERVAL:-1}"
+export OVERLAP_PARAM_GATHER="${OVERLAP_PARAM_GATHER}"
 export USE_STREAMBP="${USE_STREAMBP:-1}"
 export STREAMBP_CHUNK_SIZE="${STREAMBP_CHUNK_SIZE:-2048}"
 export STREAMBP_MOE_CHUNK_FORWARD="${STREAMBP_MOE_CHUNK_FORWARD:-0}"
