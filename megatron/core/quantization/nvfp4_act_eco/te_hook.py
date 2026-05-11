@@ -21,6 +21,8 @@ fallback BF16 backends) can still import the rest of the
 
 from __future__ import annotations
 
+from collections import deque
+
 import torch
 
 from megatron.core.quantization.nvfp4_act_eco.codec import Nvfp4ActEcoConfig
@@ -65,13 +67,13 @@ def install_act_eco_on_te_linear(
     if getattr(te_linear, "_act_eco_installed", False):
         return
 
-    cell = {"x_pre": None, "dy": None}
+    cell = {"x_pre": deque(), "dy": deque()}
 
     def _pre(_module, args, _kwargs):
         if not args:
             return None
         x = args[0]
-        cell["x_pre"] = x.detach()
+        cell["x_pre"].append(x.detach())
         return None
 
     def _post(_module, _args, output):
@@ -86,16 +88,18 @@ def install_act_eco_on_te_linear(
 
             @staticmethod
             def backward(ctx, dy):
-                cell["dy"] = dy.detach()
+                cell["dy"].append(dy.detach())
                 return dy
 
         return _CaptureGrad.apply(output)
 
     def _weight_hook(grad):
-        x_pre = cell["x_pre"]
-        dy = cell["dy"]
-        if x_pre is None or dy is None:
+        if not cell["x_pre"] and not cell["dy"]:
             return grad
+        if not cell["x_pre"] or not cell["dy"]:
+            raise RuntimeError("Activation-ECO TE hook saw unmatched forward/backward captures")
+        x_pre = cell["x_pre"].popleft()
+        dy = cell["dy"].popleft()
         q_x = nvfp4_act_quant_forward(
             x_pre.reshape(-1, x_pre.shape[-1]).to(torch.float32),
             config,
@@ -105,8 +109,6 @@ def install_act_eco_on_te_linear(
             x_pre.reshape(-1, x_pre.shape[-1]).to(torch.float32),
             q_x,
         )
-        cell["x_pre"] = None
-        cell["dy"] = None
         return grad + correction.to(grad.dtype).reshape(grad.shape)
 
     te_linear.register_forward_pre_hook(_pre, with_kwargs=True)

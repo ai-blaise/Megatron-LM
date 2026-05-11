@@ -20,6 +20,7 @@ custom_fsdp
 dist_optimizer
 optimizer_cpu_offload
 pipeline_parallel_layout
+streambp
 tokenizers
 megatron_energon
 megatron_rl

@@ -1,21 +1,26 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+"""Fused G1 sigmoid gate with autograd support.
 
-# NOTE: I am going to add a lot of comments here for me to understand what the hell is going on.
-# We can remove these later
+Forward kernel is SM100/B200 tuned (CuTe inline-PTX `ex2.approx.ftz.f32` +
+`rcp.approx.ftz.f32` fast sigmoid, N-adaptive launch geometry, BF16x8
+vectorised load/store). Ported from ai-blaise/optimization-playground.
+Backward keeps the analytic kernel.
+"""
+
 import os
 import torch
 
 _g1_gate_cuda = None
 
-# NOTE: lazy load in the kernels
+
 def _load_kernel():
     """JIT-compile the G1 gate CUDA kernel on first use."""
     global _g1_gate_cuda
     if _g1_gate_cuda is not None:
         return _g1_gate_cuda
 
-    from torch.utils.cpp_extension import load # NOTE: I do not know why we ahve an import error here...
+    from torch.utils.cpp_extension import load
 
     kernel_dir = os.path.dirname(os.path.abspath(__file__))
     _g1_gate_cuda = load(
@@ -24,13 +29,20 @@ def _load_kernel():
             os.path.join(kernel_dir, "fused_g1_gate_wrapper.cpp"),
             os.path.join(kernel_dir, "fused_g1_gate.cu"),
         ],
-        extra_cuda_cflags=["-O3", "--use_fast_math"],
+        extra_cuda_cflags=[
+            "-std=c++20",
+            "-O3",
+            "--use_fast_math",
+            "--expt-relaxed-constexpr",
+            "-gencode=arch=compute_100,code=sm_100",
+            "-DFLASHINFER_ENABLE_BF16",
+            "-DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK",
+        ],
         verbose=False,
     )
-    return _g1_gate_cuda # NOTE: I see this is where we actually return the cuda implementation and then can be used later
+    return _g1_gate_cuda
 
-# NOTE: This function is extremely important.
-# this is where the forward kernel is called 
+
 def _g1_gate_fwd(linear_out: torch.Tensor, attn_out: torch.Tensor):
     """Launch the fused G1 gate forward kernel.
 
@@ -90,7 +102,7 @@ class G1GateFunction(torch.autograd.Function):
     def forward(ctx, linear_out, attn_out):
         linear_out = linear_out.contiguous()
         attn_out = attn_out.contiguous()
-        output, gate = _g1_gate_fwd(linear_out, attn_out) # NOTE: this is where the forward pass is called 
+        output, gate = _g1_gate_fwd(linear_out, attn_out)
         ctx.save_for_backward(attn_out, gate)
         return output
 

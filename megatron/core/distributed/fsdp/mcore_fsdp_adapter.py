@@ -422,18 +422,79 @@ def _get_dp_tp_mesh(dp_cp_group, tp_group, ep_size=1, ep_group=None):
         # Pipeline parallelism means each FSDP mesh covers only this pipeline stage,
         # not the full global world.
         mesh_ranks = torch.tensor(dist.get_process_group_ranks(dp_cp_group), device="cpu")
+    elif ep_size == 1:
+        # Pipeline-local dense FSDP mesh with tensor parallelism. Dense DP+CP and TP
+        # are orthogonal groups, so reconstruct the local mesh from the current
+        # rank's TP group shifted across every rank in the current DP+CP group.
+        current_rank = dist.get_rank()
+        tp_group_ranks = dist.get_process_group_ranks(tp_group)
+        mesh_rank_rows = []
+        for dp_rank in dist.get_process_group_ranks(dp_cp_group):
+            rank_shift = dp_rank - current_rank
+            mesh_rank_rows.extend([tp_rank + rank_shift for tp_rank in tp_group_ranks])
+        if len(mesh_rank_rows) != mesh_size:
+            raise RuntimeError(
+                "[Megatron-FSDP] Failed to derive a PP-local dense FSDP mesh for "
+                f"dp_cp={dp_cp_group.size()}, ep={ep_size}, tp={tp_size}; "
+                f"constructed {len(mesh_rank_rows)} ranks, expected {mesh_size}."
+            )
+        mesh_ranks = torch.tensor(mesh_rank_rows, device="cpu")
     elif tp_size == 1 and ep_group is not None:
         # Expert FSDP meshes also exclude other pipeline stages. For EP-only expert
-        # layouts such as EP=4, ETP=1, expert DP=1, the current EP group is the
+        # layouts such as EP=4, ETP=1, expert DP=1, the current EP group can be the
         # complete local expert mesh before the EP dimension is stripped below.
         ep_group_ranks = dist.get_process_group_ranks(ep_group)
-        if len(ep_group_ranks) != mesh_size:
+        if len(ep_group_ranks) == mesh_size:
+            mesh_ranks = torch.tensor(ep_group_ranks, device="cpu")
+        elif len(ep_group_ranks) == ep_size:
+            # With expert data parallelism, Megatron keeps EP and expert-DP as
+            # separate orthogonal groups. Reconstruct the PP-local expert mesh by
+            # shifting the current EP group across every rank in the expert-DP group.
+            current_rank = dist.get_rank()
+            mesh_rank_rows = []
+            for dp_rank in dist.get_process_group_ranks(dp_cp_group):
+                rank_shift = dp_rank - current_rank
+                mesh_rank_rows.extend([ep_rank + rank_shift for ep_rank in ep_group_ranks])
+            if len(mesh_rank_rows) != mesh_size:
+                raise RuntimeError(
+                    "[Megatron-FSDP] Failed to derive a PP-local expert FSDP mesh for "
+                    f"dp_cp={dp_cp_group.size()}, ep={ep_size}, tp={tp_size}; "
+                    f"constructed {len(mesh_rank_rows)} ranks, expected {mesh_size}."
+                )
+            mesh_ranks = torch.tensor(mesh_rank_rows, device="cpu")
+        else:
             raise RuntimeError(
                 "[Megatron-FSDP] Cannot derive a PP-local expert FSDP mesh for "
                 f"dp_cp={dp_cp_group.size()}, ep={ep_size}, tp={tp_size}; "
                 f"EP group has {len(ep_group_ranks)} ranks, expected {mesh_size}."
             )
-        mesh_ranks = torch.tensor(ep_group_ranks, device="cpu")
+    elif ep_group is not None:
+        # Expert tensor parallel layouts such as EP=4, ETP=2, expert DP=1 keep
+        # EP and ETP as orthogonal groups. Reconstruct the local EP x ETP mesh by
+        # shifting the current ETP group across ranks in the current EP group.
+        ep_group_ranks = dist.get_process_group_ranks(ep_group)
+        if len(ep_group_ranks) == mesh_size:
+            mesh_ranks = torch.tensor(ep_group_ranks, device="cpu")
+        elif dp_cp_group.size() == 1 and len(ep_group_ranks) == ep_size:
+            current_rank = dist.get_rank()
+            tp_group_ranks = dist.get_process_group_ranks(tp_group)
+            mesh_rank_rows = []
+            for ep_rank in ep_group_ranks:
+                rank_shift = ep_rank - current_rank
+                mesh_rank_rows.extend([tp_rank + rank_shift for tp_rank in tp_group_ranks])
+            if len(mesh_rank_rows) != mesh_size:
+                raise RuntimeError(
+                    "[Megatron-FSDP] Failed to derive a PP-local expert TP FSDP mesh for "
+                    f"dp_cp={dp_cp_group.size()}, ep={ep_size}, tp={tp_size}; "
+                    f"constructed {len(mesh_rank_rows)} ranks, expected {mesh_size}."
+                )
+            mesh_ranks = torch.tensor(mesh_rank_rows, device="cpu")
+        else:
+            raise RuntimeError(
+                "[Megatron-FSDP] Cannot derive a PP-local expert TP FSDP mesh for "
+                f"dp_cp={dp_cp_group.size()}, ep={ep_size}, tp={tp_size}; "
+                f"EP group has {len(ep_group_ranks)} ranks, expected {mesh_size}."
+            )
     else:
         raise RuntimeError(
             "[Megatron-FSDP] Cannot derive a PP-local FSDP mesh for "

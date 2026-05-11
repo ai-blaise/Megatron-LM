@@ -27,6 +27,11 @@ from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.module import GraphableMegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
+from megatron.core.transformer.streambp import (
+    ChunkRange,
+    slice_streambp_padding_mask,
+    validate_chunk_range,
+)
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module, copy_signature
@@ -592,6 +597,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         padding_mask: Optional[Tensor] = None,
         *,
         inference_params: Optional[Any] = None,
+        chunk_range: Optional[ChunkRange] = None,
     ):
         """
         Perform a forward pass through the attention layer and the layernorms before and after
@@ -626,6 +632,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
+        layernorm_hidden_states = hidden_states
+        if chunk_range is not None:
+            start, end = validate_chunk_range(chunk_range, hidden_states.size(0))
+            if context is not None:
+                raise ValueError("StreamBP chunk_range does not support cross-attention context")
+            layernorm_hidden_states = hidden_states[:end]
+            hidden_states = hidden_states[start:end]
+
         # Residual connection.
         residual = hidden_states
         if self.config.fp32_residual_connection:
@@ -634,7 +648,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # Optional Input Layer norm
         if self.recompute_input_layernorm:
             self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            with off_interface(self.offload_attn_norm, hidden_states, "attn_norm") as hidden_states:
+            with off_interface(
+                self.offload_attn_norm, layernorm_hidden_states, "attn_norm"
+            ) as layernorm_hidden_states:
                 input_layernorm_output = self.input_layernorm_checkpoint.checkpoint(
                     lambda x: self._apply_norm_with_gated_norm(
                         self.input_layernorm,
@@ -642,13 +658,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                         self.input_gated_norm_down,
                         self.input_gated_norm_up,
                     ),
-                    hidden_states,
+                    layernorm_hidden_states,
                 )
         else:
-            with off_interface(self.offload_attn_norm, hidden_states, "attn_norm") as hidden_states:
+            with off_interface(
+                self.offload_attn_norm, layernorm_hidden_states, "attn_norm"
+            ) as layernorm_hidden_states:
                 input_layernorm_output = self._apply_norm_with_gated_norm(
                     self.input_layernorm,
-                    hidden_states,
+                    layernorm_hidden_states,
                     self.input_gated_norm_down,
                     self.input_gated_norm_up,
                 )
@@ -673,6 +691,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             attention_bias=attention_bias,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
+            chunk_range=chunk_range,
         )
         nvtx_range_pop(suffix="self_attention")
 
@@ -746,11 +765,16 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         assert (
             not self.config.enable_hyper_connections
         ), "Please use HyperConnectionTransformerLayer instead"
-        hidden_states, context = self._forward_attention(*args, **kwargs)
+        chunk_range = kwargs.pop("chunk_range", None)
+        hidden_states, context = self._forward_attention(*args, chunk_range=chunk_range, **kwargs)
+        padding_mask = kwargs.get("padding_mask", None)
+        if chunk_range is not None:
+            start, end = chunk_range
+            padding_mask = slice_streambp_padding_mask(padding_mask, start, end)
         output = self._forward_mlp(
             hidden_states,
             kwargs.get("inference_context", None),
-            padding_mask=kwargs.get("padding_mask", None),
+            padding_mask=padding_mask,
         )
         return output, context
 
@@ -787,6 +811,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         hidden_states: Tensor,
         inference_context: BaseInferenceContext | None = None,
         padding_mask: Tensor | None = None,
+        chunk_range: Optional[ChunkRange] = None,
     ) -> Tensor | list[Tensor | None]:
         """
         Perform a forward pass through the feed-forward layer.
@@ -802,6 +827,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         Returns:
             output (Tensor): Transformed hidden states of shape [s, b, h].
         """
+
+        if chunk_range is not None:
+            start, end = validate_chunk_range(chunk_range, hidden_states.size(0))
+            hidden_states = hidden_states[start:end]
+            if padding_mask is not None and padding_mask.dim() >= 2:
+                padding_mask = padding_mask[:, start:end]
 
         # Residual connection.
         residual = hidden_states
@@ -1459,6 +1490,8 @@ class HyperConnectionTransformerLayer(TransformerLayer):
     def forward(self, *args, **kwargs):
         """Forward pass with MHC recompute manager support."""
         kwargs.pop("dynamic_inference_decode_only", None)
+        if kwargs.pop("chunk_range", None) is not None:
+            raise ValueError("StreamBP does not support HyperConnectionTransformerLayer")
 
         mhc_recompute_manager = getattr(self, '_mhc_recompute_manager', None)
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import inspect
+from contextlib import nullcontext
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Callable, Optional, Protocol, Tuple, Union
@@ -35,6 +36,14 @@ from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tens
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
+from megatron.core.transformer.streambp import (
+    ChunkRange,
+    disable_streambp_causal_softmax_fusion,
+    slice_streambp_attention_mask,
+    slice_streambp_bias,
+    slice_streambp_rotary_pos_emb,
+    validate_chunk_range,
+)
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import (
@@ -888,6 +897,7 @@ class Attention(MegatronModule, ABC):
         attention_bias: Optional[Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[int] = None,
+        chunk_range: Optional[ChunkRange] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
     ) -> tuple[Tensor, Tensor]:
@@ -932,6 +942,19 @@ class Attention(MegatronModule, ABC):
 
         # hidden_states: [sq, b, h]
         is_inference_mode = inference_context is not None and not self.training
+        streambp_start = streambp_end = streambp_prefix_end = None
+        if chunk_range is not None:
+            if key_value_states is not None or self.attention_type == "cross":
+                raise ValueError("StreamBP chunk_range only supports decoder self-attention")
+            if inference_context is not None or packed_seq_params is not None:
+                raise ValueError(
+                    "StreamBP chunk_range is training-only and does not support packed sequences"
+                )
+            streambp_start, streambp_end = validate_chunk_range(
+                chunk_range, hidden_states.size(0)
+            )
+            streambp_prefix_end = streambp_end
+            hidden_states = hidden_states[:streambp_prefix_end]
         # is_using_flash_decode - True is we are using the static inference engine with flash decode
         is_using_flash_decode = is_inference_mode and self.config.flash_decode
         # is_using_flashinfer_rope - True if we are using the dynamic inference engine
@@ -974,6 +997,8 @@ class Attention(MegatronModule, ABC):
             ]
         )
         output_gate = self.config.attention_output_gate
+        if chunk_range is not None and not split_qkv:
+            raise ValueError("StreamBP chunk_range requires split QKV projection")
         # Check if fused_single_qkv_rope is requested but either unavailable or not
         # supported for the current use case.
         if self.attention_type != "cross":
@@ -1004,6 +1029,11 @@ class Attention(MegatronModule, ABC):
             else:
                 query, key, value = qkv_output
             mixed_qkv = qkv_split_arg_list = None
+            if chunk_range is not None:
+                assert streambp_start is not None and streambp_end is not None
+                query = query[streambp_start:streambp_end]
+                if gate is not None:
+                    gate = gate[streambp_start:streambp_end]
         else:
             assert (
                 not self.config.attention_output_gate
@@ -1073,6 +1103,27 @@ class Attention(MegatronModule, ABC):
             query = query.squeeze(1)
             key = key.squeeze(1)
             value = value.squeeze(1)
+
+        if chunk_range is not None:
+            assert (
+                streambp_start is not None
+                and streambp_end is not None
+                and streambp_prefix_end is not None
+            )
+            rotary_pos_emb = slice_streambp_rotary_pos_emb(
+                rotary_pos_emb, streambp_start, streambp_end, streambp_prefix_end
+            )
+            attention_mask = slice_streambp_attention_mask(
+                attention_mask,
+                streambp_start,
+                streambp_end,
+                streambp_prefix_end,
+                device=query.device,
+                causal=attn_mask_type == AttnMaskType.causal,
+            )
+            attention_bias = slice_streambp_bias(
+                attention_bias, streambp_start, streambp_end, streambp_prefix_end
+            )
         nvtx_range_pop(suffix="adjust_key_value")
 
         # ================================================
@@ -1149,61 +1200,67 @@ class Attention(MegatronModule, ABC):
         # ==================================
 
         nvtx_range_push(suffix="core_attention")
-        if self.checkpoint_core_attention and self.training:
-            core_attn_out = self._checkpointed_attention_forward(
-                query,
-                key,
-                value,
-                attention_mask,
-                attn_mask_type=attn_mask_type,
-                attention_bias=attention_bias,
-                packed_seq_params=packed_seq_params,
-            )
-        else:
-            if inference_context is None or inference_context.is_static_batching():
-                # Static batching attention kernel.
-                with off_interface(
-                    self.offload_core_attention and self.training, query, "core_attn"
-                ) as query:
-                    core_attn_out = apply_module(self.core_attention)(
-                        query,
-                        key,
-                        value,
-                        attention_mask,
-                        attn_mask_type=attn_mask_type,
-                        attention_bias=attention_bias,
-                        packed_seq_params=packed_seq_params,
-                    )
-
+        core_attention_context = (
+            disable_streambp_causal_softmax_fusion(self.core_attention)
+            if chunk_range is not None
+            else nullcontext()
+        )
+        with core_attention_context:
+            if self.checkpoint_core_attention and self.training:
+                core_attn_out = self._checkpointed_attention_forward(
+                    query,
+                    key,
+                    value,
+                    attention_mask,
+                    attn_mask_type=attn_mask_type,
+                    attention_bias=attention_bias,
+                    packed_seq_params=packed_seq_params,
+                )
             else:
-                # Dynamic batching attention kernel.
-                q, k, v = (query, key, value)
-                cu_query_lengths, max_seqlen_q = inference_context.cu_query_lengths()
-                cu_kv_lengths, kv_lengths, max_seqlen_k = inference_context.cu_kv_lengths()
+                if inference_context is None or inference_context.is_static_batching():
+                    # Static batching attention kernel.
+                    with off_interface(
+                        self.offload_core_attention and self.training, query, "core_attn"
+                    ) as query:
+                        core_attn_out = apply_module(self.core_attention)(
+                            query,
+                            key,
+                            value,
+                            attention_mask,
+                            attn_mask_type=attn_mask_type,
+                            attention_bias=attention_bias,
+                            packed_seq_params=packed_seq_params,
+                        )
 
-                core_attn_out = self.flash_decode_and_prefill(
-                    q,
-                    k,
-                    v,
-                    max_seqlen_q,
-                    max_seqlen_k,
-                    cu_query_lengths,
-                    cu_kv_lengths,
-                    kv_lengths,
-                    block_table,
-                    inference_context.is_decode_only(),
-                )
-                core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
+                else:
+                    # Dynamic batching attention kernel.
+                    q, k, v = (query, key, value)
+                    cu_query_lengths, max_seqlen_q = inference_context.cu_query_lengths()
+                    cu_kv_lengths, kv_lengths, max_seqlen_k = inference_context.cu_kv_lengths()
 
-                # Clear the outputs for padding tokens when using quantization scales
-                # to avoid corrupting amax calculations
-                if is_using_quantization_scales(self.config):
-                    core_attn_out[inference_context.padding_slice] = 0.0
+                    core_attn_out = self.flash_decode_and_prefill(
+                        q,
+                        k,
+                        v,
+                        max_seqlen_q,
+                        max_seqlen_k,
+                        cu_query_lengths,
+                        cu_kv_lengths,
+                        kv_lengths,
+                        block_table,
+                        inference_context.is_decode_only(),
+                    )
+                    core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
 
-            if self.offload_core_attention and self.training:
-                core_attn_out = off_interface.group_commit(
-                    core_attn_out, name="core_attn", forced_released_tensors=[query, key, value]
-                )
+                    # Clear the outputs for padding tokens when using quantization scales
+                    # to avoid corrupting amax calculations
+                    if is_using_quantization_scales(self.config):
+                        core_attn_out[inference_context.padding_slice] = 0.0
+
+                if self.offload_core_attention and self.training:
+                    core_attn_out = off_interface.group_commit(
+                        core_attn_out, name="core_attn", forced_released_tensors=[query, key, value]
+                    )
 
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             # reshape to same output shape as unpacked case

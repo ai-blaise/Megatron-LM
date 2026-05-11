@@ -221,11 +221,34 @@ class _MaybeQuantizedTensor:
                     + f"on device {data.device} with shape {data.shape}."
                 )
             self._data = None
-            self._quantized, self._scales = quantize(
+            quantized, scales = quantize(
                 data, signed=self._signed, sqrt=self._sqrt, softsign=self._softsign
             )
+            if (
+                self._quantized is not None
+                and self._scales is not None
+                and self._quantized.shape == quantized.shape
+                and self._quantized.dtype == quantized.dtype
+                and self._quantized.device == quantized.device
+                and self._scales.shape == scales.shape
+                and self._scales.dtype == scales.dtype
+                and self._scales.device == scales.device
+            ):
+                self._quantized.copy_(quantized)
+                self._scales.copy_(scales)
+            else:
+                self._quantized, self._scales = quantized, scales
         else:
-            self._data = data.to(dtype=self._storage_dtype)
+            new_data = data.to(dtype=self._storage_dtype)
+            if (
+                self._data is not None
+                and self._data.shape == new_data.shape
+                and self._data.dtype == new_data.dtype
+                and self._data.device == new_data.device
+            ):
+                self._data.copy_(new_data)
+            else:
+                self._data = new_data
             self._quantized = None
             self._scales = None
 
@@ -4200,6 +4223,14 @@ def enable_gradient_release_mcore_ddp(
         id(p): g for g in optimizer.param_groups for p in g["params"]
     }
     inner = ddp_module.module if hasattr(ddp_module, "module") else ddp_module
+    inner_config = getattr(inner, "config", None)
+    if getattr(inner_config, "use_streambp", False) and not overlap_grad_reduce:
+        raise ValueError(
+            "StreamBP with enable_gradient_release_mcore_ddp() requires "
+            "overlap_grad_reduce=True. The non-overlap per-parameter "
+            "post-accumulate hook would step after each StreamBP chunk instead "
+            "of after the final accumulated chunk."
+        )
 
     if overlap_grad_reduce:
         # NOTE: pure-NVFP4 training (this fork's target) requires

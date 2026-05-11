@@ -24,6 +24,12 @@ from megatron.core.transformer.enums import CudaGraphScope, LayerType
 from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
+from megatron.core.transformer.streambp import (
+    configure_streambp_profiler,
+    moe_streambp_requires_full_replay,
+    streambp_checkpoint_layer,
+    supports_streambp_moe_hybrid_replay,
+)
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
@@ -330,6 +336,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         self.num_residual_streams = config.num_residual_streams
         self._build_layers()
         self.num_layers_per_pipeline_rank = len(self.layers)
+        self._streambp_summary_logged = False
 
     def _build_layers(self):
         # Transformer layers.
@@ -446,6 +453,103 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
     def _get_layer(self, layer_number: int):
         return self.layers[layer_number]
+
+    def _layer_has_dsa_attention(self, layer: torch.nn.Module) -> bool:
+        """Best-effort detection for DSA-backed attention modules."""
+        for module in layer.modules():
+            module_name = module.__class__.__name__.lower()
+            module_path = module.__class__.__module__.lower()
+            if "dsattention" in module_name or ".dsa" in module_path or "dsa" in module_name:
+                return True
+        return False
+
+    def _should_streambp_layer(
+        self,
+        layer: torch.nn.Module,
+        *,
+        inference_context: Optional[BaseInferenceContext],
+        packed_seq_params: Optional[PackedSeqParams],
+        mhc_manager: Optional[CheckpointManager],
+    ) -> bool:
+        return self._streambp_layer_decision(
+            layer,
+            inference_context=inference_context,
+            packed_seq_params=packed_seq_params,
+            mhc_manager=mhc_manager,
+        )[0]
+
+    def _streambp_layer_decision(
+        self,
+        layer: torch.nn.Module,
+        *,
+        inference_context: Optional[BaseInferenceContext],
+        packed_seq_params: Optional[PackedSeqParams],
+        mhc_manager: Optional[CheckpointManager],
+    ) -> Tuple[bool, str]:
+        if not (self.training and self.config.use_streambp):
+            return False, "disabled"
+        if inference_context is not None:
+            return False, "inference"
+        if mhc_manager is not None:
+            return False, "mhc"
+        is_moe_layer = getattr(layer, "is_moe_layer", False)
+        if self.config.streambp_skip_moe and is_moe_layer:
+            return False, "skip_moe"
+        if self.config.streambp_skip_dsa and self._layer_has_dsa_attention(layer):
+            return False, "skip_dsa"
+        if is_moe_layer:
+            if moe_streambp_requires_full_replay(layer):
+                if (
+                    not self._streambp_chunk_forward_for_mode("chunked_moe")
+                    and supports_streambp_moe_hybrid_replay(layer)
+                ):
+                    return True, "chunked_moe"
+                return True, "full_replay_moe"
+            return True, "chunked_moe"
+        if packed_seq_params is not None:
+            if self._layer_has_dsa_attention(layer):
+                return True, "chunked_packed_dsa"
+            return True, "full_replay_packed_non_moe"
+        return True, "chunked"
+
+    def _log_streambp_summary(self, counts: dict) -> None:
+        """Log one StreamBP routing summary per transformer block instance."""
+        self._streambp_summary_logged = True
+        try:
+            if parallel_state.get_tensor_model_parallel_rank() != 0:
+                return
+            pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+        except Exception:
+            pp_rank = get_pg_rank(self.pg_collection.pp)
+
+        skipped = counts.get("skipped", {})
+        skipped_text = ", ".join(f"{key}={value}" for key, value in sorted(skipped.items()))
+        if not skipped_text:
+            skipped_text = "none"
+        moe_chunk_forward = self._streambp_chunk_forward_for_mode("chunked_moe")
+        logger.info(
+            "StreamBP layer routing summary: pp_rank=%s, layers=%s, chunked=%s, "
+            "chunked_moe=%s, chunked_packed_dsa=%s, full_replay_moe=%s, "
+            "full_replay_packed_non_moe=%s, moe_chunk_forward=%s, skipped={%s}",
+            pp_rank,
+            len(self.layers),
+            counts.get("chunked", 0),
+            counts.get("chunked_moe", 0),
+            counts.get("chunked_packed_dsa", 0),
+            counts.get("full_replay_moe", 0),
+            counts.get("full_replay_packed_non_moe", 0),
+            moe_chunk_forward,
+            skipped_text,
+        )
+
+    def _streambp_chunk_forward_for_mode(self, streambp_mode: str) -> bool:
+        """Resolve StreamBP no-grad forward chunking for a routed layer mode."""
+        if (
+            streambp_mode == "chunked_moe"
+            and self.config.streambp_moe_chunk_forward is not None
+        ):
+            return self.config.streambp_moe_chunk_forward
+        return self.config.streambp_chunk_forward
 
     def _checkpointed_forward(
         self,
@@ -871,21 +975,37 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     # No intermediate_hidden_states requested: just hidden_states
                     hidden_states = checkpointed_result
             else:
+                if self.training and self.config.use_streambp:
+                    configure_streambp_profiler(
+                        enabled=self.config.streambp_profile,
+                        output_dir=self.config.streambp_profile_dir,
+                        rank=self.config.streambp_profile_rank,
+                        limit=self.config.streambp_profile_limit,
+                        record_shapes=self.config.streambp_profile_record_shapes,
+                        with_stack=self.config.streambp_profile_with_stack,
+                        name_filter=self.config.streambp_profile_filter,
+                    )
+                streambp_counts = None
+                if self.training and self.config.use_streambp and not self._streambp_summary_logged:
+                    streambp_counts = {
+                        "chunked": 0,
+                        "chunked_moe": 0,
+                        "chunked_packed_dsa": 0,
+                        "full_replay_moe": 0,
+                        "full_replay_packed_non_moe": 0,
+                        "skipped": {},
+                    }
+
                 for l_no, layer in enumerate(self.layers):
-                    # Get appropriate inner quantization context
-                    if use_inner_quantization_context:
+                    def make_inner_quantization_context(current_layer=layer):
+                        """Create the per-layer FP8/FP4 context for forward and recompute."""
+                        if not use_inner_quantization_context:
+                            return nullcontext()
                         if self.config.fp8:
-                            inner_quantization_context = get_fp8_context(
-                                self.config, layer.layer_number - 1
-                            )
-                        elif self.config.fp4:
-                            inner_quantization_context = get_fp4_context(
-                                self.config, layer.layer_number - 1
-                            )
-                        else:
-                            inner_quantization_context = nullcontext()
-                    else:
-                        inner_quantization_context = nullcontext()
+                            return get_fp8_context(self.config, current_layer.layer_number - 1)
+                        if self.config.fp4:
+                            return get_fp4_context(self.config, current_layer.layer_number - 1)
+                        return nullcontext()
 
                     mhc_manager = mhc_layer_managers[l_no]
                     if mhc_manager is not None:
@@ -893,23 +1013,60 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             mhc_is_last_in_recompute_block[l_no]
                         )
 
-                    with self.offload_context, inner_quantization_context:
-                        hidden_states, context = layer(
-                            hidden_states=hidden_states,
-                            attention_mask=attention_mask,
-                            context=context,
-                            context_mask=context_mask,
-                            rotary_pos_emb=rotary_pos_emb,
-                            rotary_pos_cos=rotary_pos_cos,
-                            rotary_pos_sin=rotary_pos_sin,
-                            rotary_pos_cos_sin=rotary_pos_cos_sin,
-                            attention_bias=attention_bias,
-                            inference_context=inference_context,
-                            packed_seq_params=packed_seq_params,
-                            sequence_len_offset=sequence_len_offset,
-                            padding_mask=padding_mask,
-                            mhc_recompute_manager=mhc_manager,
-                        )
+                    use_streambp_layer, streambp_mode = self._streambp_layer_decision(
+                        layer,
+                        inference_context=inference_context,
+                        packed_seq_params=packed_seq_params,
+                        mhc_manager=mhc_manager,
+                    )
+                    if streambp_counts is not None:
+                        if use_streambp_layer:
+                            streambp_counts[streambp_mode] = streambp_counts.get(streambp_mode, 0) + 1
+                        else:
+                            skipped = streambp_counts["skipped"]
+                            skipped[streambp_mode] = skipped.get(streambp_mode, 0) + 1
+
+                    if use_streambp_layer:
+                        with self.offload_context:
+                            hidden_states, context = streambp_checkpoint_layer(
+                                layer,
+                                hidden_states,
+                                chunk_size=self.config.streambp_chunk_size,
+                                chunk_forward=self._streambp_chunk_forward_for_mode(streambp_mode),
+                                context_factory=make_inner_quantization_context,
+                                full_replay=streambp_mode.startswith("full_replay"),
+                                attention_mask=attention_mask,
+                                context=context,
+                                context_mask=context_mask,
+                                rotary_pos_emb=rotary_pos_emb,
+                                rotary_pos_cos=rotary_pos_cos,
+                                rotary_pos_sin=rotary_pos_sin,
+                                rotary_pos_cos_sin=rotary_pos_cos_sin,
+                                attention_bias=attention_bias,
+                                inference_context=inference_context,
+                                packed_seq_params=packed_seq_params,
+                                sequence_len_offset=sequence_len_offset,
+                                padding_mask=padding_mask,
+                                mhc_recompute_manager=mhc_manager,
+                            )
+                    else:
+                        with self.offload_context, make_inner_quantization_context():
+                            hidden_states, context = layer(
+                                hidden_states=hidden_states,
+                                attention_mask=attention_mask,
+                                context=context,
+                                context_mask=context_mask,
+                                rotary_pos_emb=rotary_pos_emb,
+                                rotary_pos_cos=rotary_pos_cos,
+                                rotary_pos_sin=rotary_pos_sin,
+                                rotary_pos_cos_sin=rotary_pos_cos_sin,
+                                attention_bias=attention_bias,
+                                inference_context=inference_context,
+                                packed_seq_params=packed_seq_params,
+                                sequence_len_offset=sequence_len_offset,
+                                padding_mask=padding_mask,
+                                mhc_recompute_manager=mhc_manager,
+                            )
                     self._finalize_mhc_recompute_layer(
                         mhc_manager=mhc_manager,
                         hidden_states=hidden_states,
@@ -926,6 +1083,9 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     # Extract intermediate embeddings using global layer index
                     if (l_no + layer_offset) in extract_layer_indices:
                         intermediate_hidden_states.append(hidden_states)
+
+                if streambp_counts is not None:
+                    self._log_streambp_summary(streambp_counts)
 
         # Only contract if the final layer norm is in this stage
         if self.config.enable_hyper_connections and self.has_final_layernorm_in_this_stage():
@@ -947,6 +1107,16 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         # on the computational graph and will lead to unexpected errors in pipeline schedules.
         if not self.pre_process and len(self.layers) == 0 and not self.final_layernorm:
             hidden_states = hidden_states.clone()
+
+        # Full recompute/FSDP paths can return a view even when individual layers
+        # produce viewless tensors. Pipeline schedules may pseudo-free boundary
+        # tensors after send, so keep the block output viewless as the final
+        # producer-side contract.
+        hidden_states = make_viewless_tensor(
+            inp=hidden_states,
+            requires_grad=hidden_states.requires_grad,
+            keep_graph=True,
+        )
 
         if len(extract_layer_indices) > 0:
             return hidden_states, intermediate_hidden_states

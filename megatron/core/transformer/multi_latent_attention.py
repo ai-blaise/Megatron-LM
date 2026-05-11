@@ -2,6 +2,7 @@
 
 
 import math
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import NoReturn, Optional, Union
 
@@ -36,6 +37,14 @@ from megatron.core.tensor_parallel.mappings import (
 from megatron.core.transformer.attention import Attention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
+from megatron.core.transformer.streambp import (
+    ChunkRange,
+    disable_streambp_causal_softmax_fusion,
+    make_streambp_packed_seq_params,
+    make_streambp_single_sequence_packed_seq_params,
+    slice_streambp_attention_mask,
+    validate_chunk_range,
+)
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.typed_torch import apply_module
@@ -217,6 +226,7 @@ class MultiLatentAttention(Attention):
         sequence_len_offset=None,
         *,
         inference_params=None,
+        chunk_range: Optional[ChunkRange] = None,
     ):
         """Forward pass for multi-latent attention"""
         assert rotary_pos_emb is None, "Rotary position embeddings should not be passed into MLA."
@@ -232,6 +242,53 @@ class MultiLatentAttention(Attention):
         # hidden_states: [sq, b, h]
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
+        streambp_start = streambp_end = streambp_prefix_end = None
+        streambp_prefix_packed_seq_params = packed_seq_params
+        streambp_core_packed_seq_params = packed_seq_params
+        streambp_use_sequence_parallel = False
+        streambp_use_sequence_parallel_packed = False
+        if chunk_range is not None:
+            if key_value_states is not None:
+                raise ValueError("StreamBP chunk_range only supports MLA self-attention")
+            if inference_context is not None:
+                raise ValueError("StreamBP chunk_range is training-only")
+            streambp_start, streambp_end = validate_chunk_range(
+                chunk_range, hidden_states.size(0)
+            )
+            streambp_use_sequence_parallel = (
+                self.config.sequence_parallel and get_pg_size(self.tp_group) > 1
+            )
+            streambp_use_sequence_parallel_packed = (
+                packed_seq_params is not None
+                and packed_seq_params.qkv_format == "thd"
+                and streambp_use_sequence_parallel
+            )
+            if streambp_use_sequence_parallel_packed:
+                streambp_prefix_end = hidden_states.size(0)
+                streambp_prefix_packed_seq_params = make_streambp_single_sequence_packed_seq_params(
+                    packed_seq_params,
+                    streambp_prefix_end,
+                    streambp_prefix_end,
+                )
+                streambp_core_packed_seq_params = make_streambp_single_sequence_packed_seq_params(
+                    packed_seq_params,
+                    streambp_end - streambp_start,
+                    streambp_prefix_end,
+                )
+            else:
+                streambp_prefix_end = streambp_end
+            if packed_seq_params is not None and not streambp_use_sequence_parallel_packed:
+                (
+                    streambp_prefix_packed_seq_params,
+                    streambp_core_packed_seq_params,
+                ) = make_streambp_packed_seq_params(
+                    packed_seq_params,
+                    streambp_start,
+                    streambp_end,
+                    kv_end=streambp_prefix_end,
+                )
+            if not streambp_use_sequence_parallel_packed:
+                hidden_states = hidden_states[:streambp_prefix_end]
         if inference_context and not inference_context.is_static_batching():
             assert (
                 self.config.cache_mla_latents
@@ -246,14 +303,99 @@ class MultiLatentAttention(Attention):
         # Get the query, key and value tensors based on the type of attention -
         # self or cross attn.
         # query: [96, 1, 16, 128], key:[96, 1, 16, 128], value:[96, 1, 16, 128]
+        def select_streambp_sequence_parallel_chunk(tensor, start, end, tp_size):
+            """Select each TP rank's local StreamBP chunk from an SP-gathered tensor."""
+
+            if tensor.size(0) % tp_size != 0:
+                raise ValueError(
+                    f"StreamBP sequence-parallel tensor length {tensor.size(0)} is not "
+                    f"divisible by TP size {tp_size}"
+                )
+            prefix_per_rank = tensor.size(0) // tp_size
+            if end > prefix_per_rank:
+                raise ValueError(
+                    f"StreamBP chunk [{start}, {end}) exceeds per-rank prefix "
+                    f"length {prefix_per_rank}"
+                )
+            shape = (tp_size, prefix_per_rank, *tensor.shape[1:])
+            return tensor.reshape(shape)[:, start:end].reshape(
+                tp_size * (end - start), *tensor.shape[1:]
+            )
+
+        def make_streambp_sequence_parallel_positions(start, end, prefix_len, tp_size, device):
+            if prefix_len % tp_size != 0:
+                raise ValueError(
+                    f"StreamBP sequence-parallel prefix length {prefix_len} is not "
+                    f"divisible by TP size {tp_size}"
+                )
+            prefix_per_rank = prefix_len // tp_size
+            rank_offsets = torch.arange(tp_size, device=device, dtype=torch.long) * prefix_per_rank
+            local_positions = torch.arange(start, end, device=device, dtype=torch.long)
+            return (rank_offsets[:, None] + local_positions[None, :]).reshape(-1)
+
         with off_interface(self.offload_qkv_linear, hidden_states, "qkv_linear") as hidden_states:
             query, key, value, q_compressed, kv_compressed, gate = self.get_query_key_value_tensors(
                 hidden_states,
                 key_value_states,
                 position_ids,
-                packed_seq_params,
+                streambp_prefix_packed_seq_params,
                 inference_context=inference_context,
+                chunk_range=chunk_range,
             )
+            q_compressed_for_dsa = q_compressed
+            hidden_states_for_dsa = hidden_states
+            streambp_query_positions = None
+            streambp_key_positions = None
+            if chunk_range is not None:
+                assert (
+                    streambp_start is not None
+                    and streambp_end is not None
+                    and streambp_prefix_end is not None
+                )
+                if streambp_use_sequence_parallel:
+                    tp_size = get_pg_size(self.tp_group)
+                    query = select_streambp_sequence_parallel_chunk(
+                        query, streambp_start, streambp_end, tp_size
+                    )
+                    if gate is not None:
+                        if gate.size(0) * tp_size == key.size(0):
+                            gate = gather_from_sequence_parallel_region(gate, group=self.tp_group)
+                        gate = select_streambp_sequence_parallel_chunk(
+                            gate, streambp_start, streambp_end, tp_size
+                        )
+                    streambp_query_positions = make_streambp_sequence_parallel_positions(
+                        streambp_start,
+                        streambp_end,
+                        key.size(0),
+                        tp_size,
+                        query.device,
+                    )
+                    streambp_key_positions = torch.arange(
+                        key.size(0), device=key.device, dtype=torch.long
+                    )
+                    if streambp_use_sequence_parallel_packed:
+                        streambp_core_packed_seq_params = (
+                            make_streambp_single_sequence_packed_seq_params(
+                                packed_seq_params,
+                                query.size(0),
+                                key.size(0),
+                            )
+                        )
+                else:
+                    query = query[streambp_start:streambp_end]
+                    streambp_query_positions = torch.arange(
+                        streambp_start,
+                        streambp_start + query.size(0),
+                        device=query.device,
+                        dtype=torch.long,
+                    )
+                    streambp_key_positions = torch.arange(
+                        streambp_prefix_end,
+                        device=query.device,
+                        dtype=torch.long,
+                    )
+                    if gate is not None:
+                        gate = gate[streambp_start:streambp_end]
         if self.offload_qkv_linear:
             query = off_interface.group_commit(
                 query, name="qkv_linear", forced_released_tensors=[hidden_states]
@@ -266,6 +408,21 @@ class MultiLatentAttention(Attention):
         query, key, value, _, attn_mask_type, block_table = self._adjust_key_value_for_inference(
             inference_context, query, key, value, rotary_pos_emb=None
         )
+
+        if chunk_range is not None:
+            assert (
+                streambp_start is not None
+                and streambp_end is not None
+                and streambp_prefix_end is not None
+            )
+            attention_mask = slice_streambp_attention_mask(
+                attention_mask,
+                streambp_start,
+                streambp_end,
+                streambp_prefix_end,
+                device=query.device,
+                causal=attn_mask_type == AttnMaskType.causal,
+            )
 
         # TODO: Currently, TE can only accept contiguous tensors for MLA
         query = query.contiguous()
@@ -281,7 +438,11 @@ class MultiLatentAttention(Attention):
         # Need corresponding TE change
         if self.checkpoint_core_attention and self.training:
             core_attn_out = self._checkpointed_attention_forward(
-                query, key, value, attention_mask, packed_seq_params=packed_seq_params
+                query,
+                key,
+                value,
+                attention_mask,
+                packed_seq_params=streambp_core_packed_seq_params,
             )
         else:
             if inference_context is None or inference_context.is_static_batching():
@@ -289,20 +450,31 @@ class MultiLatentAttention(Attention):
                 if self.config.experimental_attention_variant == "dsa":
                     # For dsa we need to pass in the original hidden states and the compressed
                     # query representation.
-                    extra_kwargs["x"] = hidden_states
-                    extra_kwargs["qr"] = q_compressed
+                    extra_kwargs["x"] = hidden_states_for_dsa
+                    extra_kwargs["qr"] = q_compressed_for_dsa
+                    if chunk_range is not None:
+                        extra_kwargs["streambp_positions"] = (
+                            streambp_query_positions,
+                            streambp_key_positions,
+                        )
                 with off_interface(
                     self.offload_core_attention and self.training, query, "core_attn"
                 ) as query:
-                    core_attn_out = self.core_attention(
-                        query,
-                        key,
-                        value,
-                        attention_mask,
-                        packed_seq_params=packed_seq_params,
-                        attn_mask_type=attn_mask_type,
-                        **extra_kwargs,
+                    core_attention_context = (
+                        disable_streambp_causal_softmax_fusion(self.core_attention)
+                        if chunk_range is not None
+                        else nullcontext()
                     )
+                    with core_attention_context:
+                        core_attn_out = self.core_attention(
+                            query,
+                            key,
+                            value,
+                            attention_mask,
+                            packed_seq_params=streambp_core_packed_seq_params,
+                            attn_mask_type=attn_mask_type,
+                            **extra_kwargs,
+                        )
             elif self.cache_mla_latents:
                 # Dynamic batching attention kernel.
                 q, k, v = (query, key, value)
@@ -598,6 +770,7 @@ class MLASelfAttention(MultiLatentAttention):
         inference_context=None,
         *,
         inference_params=None,
+        chunk_range: Optional[ChunkRange] = None,
     ):
         """
         Derives `query`, `key` and `value` tensors from `hidden_states`.
@@ -816,6 +989,7 @@ class MLASelfAttention(MultiLatentAttention):
             otherwise, they maintain the unpacked shape [s, b, ...]. In subsequent code comments,
             we uniformly use [num_tokens, ...] to denote [s, b, ...] or [t, ...] for two cases.
             """
+            rope_mscale = mscale
             if self.config.q_lora_rank is not None:
                 # q_compressed: [num_tokens, q_lora_rank]
                 # q: [num_tokens, n * (qk_head_dim + qk_pos_emb_head_dim)]
@@ -897,13 +1071,64 @@ class MLASelfAttention(MultiLatentAttention):
                     kv, [self.config.qk_head_dim, self.config.v_head_dim], dim=-1
                 )
 
+                rope_cu_seqlens_q = cu_seqlens_q
+                rope_cu_seqlens_kv = cu_seqlens_kv
+                if (
+                    chunk_range is not None
+                    and packed_seq_params is not None
+                    and packed_seq_params.qkv_format == "thd"
+                ):
+
+                    def reconcile_rope_cu(cu_seqlens, target_len):
+                        if cu_seqlens is None:
+                            return None
+                        seqlens = cu_seqlens[1:] - cu_seqlens[:-1]
+                        if int(seqlens.sum().item()) == target_len:
+                            return cu_seqlens
+                        return torch.tensor(
+                            [0, target_len],
+                            dtype=cu_seqlens.dtype,
+                            device=cu_seqlens.device,
+                        )
+
+                    rope_cu_seqlens_q = reconcile_rope_cu(
+                        rope_cu_seqlens_q, q_pos_emb.size(0)
+                    )
+                    rope_cu_seqlens_kv = reconcile_rope_cu(
+                        rope_cu_seqlens_kv, k_pos_emb.size(0)
+                    )
+                    required_rotary_seq_len = 0
+                    if rope_cu_seqlens_q is not None:
+                        required_rotary_seq_len = max(
+                            required_rotary_seq_len, int(rope_cu_seqlens_q[-1].item())
+                        )
+                    if rope_cu_seqlens_kv is not None:
+                        required_rotary_seq_len = max(
+                            required_rotary_seq_len, int(rope_cu_seqlens_kv[-1].item())
+                        )
+                    if required_rotary_seq_len:
+                        current_rotary_seq_len = (
+                            rotary_pos_emb[0].size(0)
+                            if isinstance(rotary_pos_emb, tuple)
+                            else rotary_pos_emb.size(0)
+                        )
+                        if current_rotary_seq_len < required_rotary_seq_len:
+                            if self.config.rope_type == "rope":
+                                rotary_pos_emb = self.rotary_pos_emb(
+                                    required_rotary_seq_len, packed_seq=True
+                                )
+                            else:
+                                rotary_pos_emb, rope_mscale = self.rotary_pos_emb(
+                                    required_rotary_seq_len, packed_seq=True
+                                )
+
                 # q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
                 q_pos_emb = apply_rotary_pos_emb(
                     q_pos_emb,
                     rotary_pos_emb,
                     config=self.config,
-                    cu_seqlens=cu_seqlens_q,
-                    mscale=mscale,
+                    cu_seqlens=rope_cu_seqlens_q,
+                    mscale=rope_mscale,
                     cp_group=self.pg_collection.cp,
                     mla_rotary_interleaved=True,
                 )
@@ -912,8 +1137,8 @@ class MLASelfAttention(MultiLatentAttention):
                     k_pos_emb,
                     rotary_pos_emb,
                     config=self.config,
-                    cu_seqlens=cu_seqlens_kv,
-                    mscale=mscale,
+                    cu_seqlens=rope_cu_seqlens_kv,
+                    mscale=rope_mscale,
                     cp_group=self.pg_collection.cp,
                     mla_rotary_interleaved=True,
                 )

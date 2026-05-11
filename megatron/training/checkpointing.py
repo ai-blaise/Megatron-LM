@@ -1145,7 +1145,12 @@ def _load_global_dist_base_checkpoint(
         )
     if checkpointing_context is not None:
         checkpointing_context["load_strategy"] = load_strategy
-    state_dict = dist_checkpointing.load(sharded_state_dict, checkpoint_name, load_strategy, strict=args.dist_ckpt_strictness)
+    state_dict = dist_checkpointing.load(
+        sharded_state_dict,
+        checkpoint_name,
+        load_strategy,
+        strict=args.dist_ckpt_strictness,
+    )
     return state_dict, checkpoint_name, release, CheckpointType.GLOBAL
 
 
@@ -1674,11 +1679,21 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
             if args.finetune and hasattr(model[0], "hide_loss_modules"):
                 for m in model:
                     stack.enter_context(m.hide_loss_modules())
-            load_kwargs['sharded_state_dict'] = generate_state_dict(
-                args, model, gen_sd_optim, gen_sd_opt_param_scheduler, gen_sd_rng_state,
-                optim_sd_kwargs=optim_sd_kwargs, model_sd_kwargs=model_sd_kwargs,
-                rerun_state=gen_sd_rerun_state
-            )
+            # When auto-detecting a source checkpoint format that differs from
+            # the run's target save format, generate the load template in the
+            # source format. For example, Megatron-FSDP runs save future
+            # checkpoints as fsdp_dtensor but may bootstrap from a converted
+            # torch_dist checkpoint.
+            original_ckpt_format = args.ckpt_format
+            args.ckpt_format = ckpt_format
+            try:
+                load_kwargs['sharded_state_dict'] = generate_state_dict(
+                    args, model, gen_sd_optim, gen_sd_opt_param_scheduler, gen_sd_rng_state,
+                    optim_sd_kwargs=optim_sd_kwargs, model_sd_kwargs=model_sd_kwargs,
+                    rerun_state=gen_sd_rerun_state
+                )
+            finally:
+                args.ckpt_format = original_ckpt_format
     elif args.ckpt_format == "torch_dcp":
         model_sd = model[0].state_dict()
         optimizer_sd = optimizer.state_dict(is_loading=True)
@@ -1789,10 +1804,38 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 # Fallback support for backward compatibility breaking changes in TransformerEngine
                 load_return = module.load_state_dict(state_dict, strict=False)
                 print(f"load_return: {load_return}")
+
+    def _extract_root_model_state_dict(state_dict):
+        """Extract a root-keyed model state dict from converted torch_dist checkpoints."""
+        common_state_keys = {
+            'args',
+            'checkpoint_version',
+            'content_metadata',
+            'iteration',
+            'num_floating_point_operations_so_far',
+            'opt_param_scheduler',
+            'rng_state',
+            'rerun_state_machine',
+            'total_iters',
+        }
+        return {
+            key: value
+            for key, value in state_dict.items()
+            if key not in common_state_keys and not key.startswith('optimizer')
+        }
+
     # Model.
     if not skip_load_to_model_and_opt:
         if len(ddp_model) == 1:
-            load_model_state_dict(ddp_model[0], state_dict['model'], strict)
+            if 'model' in state_dict:
+                model_state_dict = state_dict['model']
+            elif getattr(args, 'use_megatron_fsdp', False) and ckpt_format == 'torch_dist':
+                model_state_dict = _extract_root_model_state_dict(state_dict)
+                if not model_state_dict:
+                    raise KeyError('model')
+            else:
+                raise KeyError('model')
+            load_model_state_dict(ddp_model[0], model_state_dict, strict)
         else:
             for i in range(len(ddp_model)):
                 # If there is no corresponding model in the state_dict, it will be ignored.

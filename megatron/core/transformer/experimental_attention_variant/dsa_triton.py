@@ -26,6 +26,13 @@ if not HAVE_TRITON:
 
 _DSA_TRITON_ENV = "MEGATRON_DSA_TRITON"
 _DSA_TRITON_BLOCK_K_ENV = "MEGATRON_DSA_TRITON_BLOCK_K"
+_DSA_TRITON_BLOCK_K_BWD_ENV = "MEGATRON_DSA_TRITON_BLOCK_K_BWD"
+_DSA_TRITON_BLOCK_Q_ENV = "MEGATRON_DSA_TRITON_BLOCK_Q"
+_DSA_TRITON_INDEXER_ENV = "MEGATRON_DSA_TRITON_INDEXER"
+_DSA_TRITON_INDEXER_BLOCK_Q_ENV = "MEGATRON_DSA_TRITON_INDEXER_BLOCK_Q"
+_DSA_TRITON_INDEXER_BLOCK_K_ENV = "MEGATRON_DSA_TRITON_INDEXER_BLOCK_K"
+_DSA_TRITON_BF16_GRAD_ATOMICS_ENV = "MEGATRON_DSA_TRITON_BF16_GRAD_ATOMICS"
+_DSA_TRITON_BWD_NUM_WARPS_ENV = "MEGATRON_DSA_TRITON_BWD_NUM_WARPS"
 
 
 def _env_enabled() -> bool:
@@ -33,16 +40,280 @@ def _env_enabled() -> bool:
     return raw not in {"0", "false", "off", "no"}
 
 
-def _block_k(topk: int) -> int:
-    raw = os.getenv(_DSA_TRITON_BLOCK_K_ENV)
+def _indexer_env_enabled() -> bool:
+    raw = os.getenv(_DSA_TRITON_INDEXER_ENV, "1").strip().lower()
+    return raw not in {"0", "false", "off", "no"}
+
+
+def _bf16_grad_atomics_enabled() -> bool:
+    # Experimental bandwidth knob only. The default path keeps K/V gradient
+    # accumulation in fp32 so W4A4KV4 + IndexCache FP8 semantics are unchanged.
+    raw = os.getenv(_DSA_TRITON_BF16_GRAD_ATOMICS_ENV, "0").strip().lower()
+    return raw not in {"0", "false", "off", "no"}
+
+
+def _block_k_from_env(env_name: str, topk: int, large_topk_default: int) -> int:
+    raw = os.getenv(env_name)
     if raw:
         value = int(raw)
         if value <= 0:
-            raise ValueError(f"{_DSA_TRITON_BLOCK_K_ENV} must be positive, got {value}")
+            raise ValueError(f"{env_name} must be positive, got {value}")
         return min(triton.next_power_of_2(value), 256)
     if topk >= 1024:
-        return 64
+        return large_topk_default
     return min(triton.next_power_of_2(topk), 128)
+
+
+def _forward_block_k(topk: int) -> int:
+    return _block_k_from_env(_DSA_TRITON_BLOCK_K_ENV, topk, large_topk_default=128)
+
+
+def _backward_block_k(topk: int) -> int:
+    return _block_k_from_env(_DSA_TRITON_BLOCK_K_BWD_ENV, topk, large_topk_default=64)
+
+
+def _sparse_block_q() -> int:
+    raw = os.getenv(_DSA_TRITON_BLOCK_Q_ENV)
+    if not raw:
+        return 1
+    value = int(raw)
+    if value <= 0:
+        raise ValueError(f"{_DSA_TRITON_BLOCK_Q_ENV} must be positive, got {value}")
+    return min(triton.next_power_of_2(value), 4)
+
+
+def _indexer_block_size(env_name: str, default: int, maximum: int) -> int:
+    raw = os.getenv(env_name)
+    value = int(raw) if raw else default
+    if value <= 0:
+        raise ValueError(f"{env_name} must be positive, got {value}")
+    return min(triton.next_power_of_2(value), maximum)
+
+
+def _num_warps_from_env(env_name: str, default: int) -> int:
+    raw = os.getenv(env_name)
+    value = int(raw) if raw else default
+    if value not in (1, 2, 4, 8):
+        raise ValueError(f"{env_name} must be one of 1, 2, 4, or 8, got {value}")
+    return value
+
+
+def is_dsa_indexer_scores_triton_supported(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    k: torch.Tensor,
+    mask: torch.Tensor | None,
+    is_causal: bool,
+    query_positions: torch.Tensor | None = None,
+    key_positions: torch.Tensor | None = None,
+) -> bool:
+    """Return whether the fused DSA indexer score kernel can handle this call."""
+
+    if not (_env_enabled() and _indexer_env_enabled()) or not HAVE_TRITON:
+        return False
+    if not (q.is_cuda and weights.is_cuda and k.is_cuda):
+        return False
+    if q.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+        return False
+    if k.dtype != q.dtype or weights.dtype != q.dtype:
+        return False
+    if mask is not None or not is_causal:
+        return False
+    if (query_positions is None) != (key_positions is None):
+        return False
+    if query_positions is not None:
+        if not (query_positions.is_cuda and key_positions.is_cuda):
+            return False
+        if query_positions.dim() != 1 or key_positions.dim() != 1:
+            return False
+        if query_positions.size(0) != q.size(0) or key_positions.size(0) != k.size(0):
+            return False
+    if q.dim() != 4 or weights.dim() != 3 or k.dim() != 3:
+        return False
+    if q.size(0) <= 0 or k.size(0) <= 0:
+        return False
+    if q.size(1) != k.size(1) or q.size(1) != weights.size(1):
+        return False
+    if q.size(2) != weights.size(2):
+        return False
+    if q.size(3) != k.size(2):
+        return False
+    if q.size(2) <= 0 or q.size(2) > 128:
+        return False
+    if q.size(3) <= 0 or q.size(3) > 256:
+        return False
+    return True
+
+
+@triton.jit
+def _dsa_indexer_scores_kernel(
+    q_ptr,
+    weights_ptr,
+    k_ptr,
+    query_pos_ptr,
+    key_pos_ptr,
+    scores_ptr,
+    q_len: tl.constexpr,
+    sk: tl.constexpr,
+    num_index_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    q_start,
+    q_stride_s: tl.constexpr,
+    q_stride_b: tl.constexpr,
+    q_stride_h: tl.constexpr,
+    q_stride_d: tl.constexpr,
+    w_stride_s: tl.constexpr,
+    w_stride_b: tl.constexpr,
+    w_stride_h: tl.constexpr,
+    k_stride_s: tl.constexpr,
+    k_stride_b: tl.constexpr,
+    k_stride_d: tl.constexpr,
+    out_stride_b: tl.constexpr,
+    out_stride_s: tl.constexpr,
+    HAS_POSITIONS: tl.constexpr,
+    BLOCK_Q: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    q_block = tl.program_id(0)
+    k_block = tl.program_id(1)
+    batch_idx = tl.program_id(2)
+
+    q_offsets = q_block * BLOCK_Q + tl.arange(0, BLOCK_Q)
+    k_offsets = k_block * BLOCK_K + tl.arange(0, BLOCK_K)
+    d_offsets = tl.arange(0, BLOCK_D)
+    q_valid = q_offsets < q_len
+    k_valid = k_offsets < sk
+
+    scores = tl.zeros((BLOCK_Q, BLOCK_K), tl.float32)
+    for head_idx in tl.range(0, num_index_heads):
+        q_ptrs = (
+            q_ptr
+            + q_offsets[:, None] * q_stride_s
+            + batch_idx * q_stride_b
+            + head_idx * q_stride_h
+            + d_offsets[None, :] * q_stride_d
+        )
+        k_ptrs = (
+            k_ptr
+            + k_offsets[None, :] * k_stride_s
+            + batch_idx * k_stride_b
+            + d_offsets[:, None] * k_stride_d
+        )
+        q_tile = tl.load(
+            q_ptrs,
+            mask=q_valid[:, None] & (d_offsets[None, :] < head_dim),
+            other=0.0,
+        )
+        k_tile = tl.load(
+            k_ptrs,
+            mask=k_valid[None, :] & (d_offsets[:, None] < head_dim),
+            other=0.0,
+        )
+        head_scores = tl.dot(
+            q_tile,
+            k_tile,
+            input_precision="tf32",
+            out_dtype=tl.float32,
+        )
+        head_scores = tl.maximum(head_scores, 0.0)
+        head_weights = tl.load(
+            weights_ptr
+            + q_offsets * w_stride_s
+            + batch_idx * w_stride_b
+            + head_idx * w_stride_h,
+            mask=q_valid,
+            other=0.0,
+        ).to(tl.float32)
+        scores += head_scores * head_weights[:, None]
+
+    if HAS_POSITIONS:
+        query_abs = tl.load(query_pos_ptr + q_offsets, mask=q_valid, other=0)
+        key_abs = tl.load(key_pos_ptr + k_offsets, mask=k_valid, other=0)
+    else:
+        query_abs = q_start + q_offsets
+        key_abs = k_offsets
+    valid = q_valid[:, None] & k_valid[None, :] & (key_abs[None, :] <= query_abs[:, None])
+    scores = tl.where(valid, scores, -float("inf"))
+
+    out_ptrs = (
+        scores_ptr
+        + batch_idx * out_stride_b
+        + q_offsets[:, None] * out_stride_s
+        + k_offsets[None, :]
+    )
+    tl.store(out_ptrs, scores, mask=q_valid[:, None] & k_valid[None, :])
+
+
+def dsa_indexer_scores_triton(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    k: torch.Tensor,
+    q_start: int = 0,
+    query_positions: torch.Tensor | None = None,
+    key_positions: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Fused DSA indexer score construction for the no-indexer-loss path."""
+
+    q_len, batch_size, num_index_heads, head_dim = q.shape
+    sk = k.shape[0]
+    if out is None:
+        scores = torch.empty((batch_size, q_len, sk), device=q.device, dtype=torch.float32)
+    else:
+        expected_shape = (batch_size, q_len, sk)
+        if tuple(out.shape) != expected_shape:
+            raise ValueError(
+                f"DSA indexer score output must have shape {expected_shape}, "
+                f"got {tuple(out.shape)}"
+            )
+        if out.device != q.device or out.dtype != torch.float32:
+            raise ValueError("DSA indexer score output must be a float32 tensor on q.device")
+        scores = out
+    has_positions = query_positions is not None
+    if has_positions:
+        query_positions = query_positions.contiguous()
+        key_positions = key_positions.contiguous()
+    else:
+        query_positions = scores
+        key_positions = scores
+
+    block_q = _indexer_block_size(_DSA_TRITON_INDEXER_BLOCK_Q_ENV, 8, 16)
+    block_k = _indexer_block_size(_DSA_TRITON_INDEXER_BLOCK_K_ENV, 64, 128)
+    block_d = triton.next_power_of_2(head_dim)
+    grid = (triton.cdiv(q_len, block_q), triton.cdiv(sk, block_k), batch_size)
+
+    _dsa_indexer_scores_kernel[grid](
+        q,
+        weights,
+        k,
+        query_positions,
+        key_positions,
+        scores,
+        q_len,
+        sk,
+        num_index_heads,
+        head_dim,
+        int(q_start),
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        q.stride(3),
+        weights.stride(0),
+        weights.stride(1),
+        weights.stride(2),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        scores.stride(0),
+        scores.stride(1),
+        HAS_POSITIONS=has_positions,
+        BLOCK_Q=block_q,
+        BLOCK_K=block_k,
+        BLOCK_D=block_d,
+        num_warps=4,
+    )
+    return scores
 
 
 def is_sparse_dsa_triton_supported(
@@ -65,7 +336,7 @@ def is_sparse_dsa_triton_supported(
         return False
     if key.dtype != query.dtype or value.dtype != query.dtype:
         return False
-    if topk_indices.dtype not in (torch.int32, torch.int64):
+    if topk_indices.dtype not in (torch.int16, torch.int32, torch.int64):
         return False
     if (query_positions is None) != (key_positions is None):
         return False
@@ -112,70 +383,89 @@ def _sparse_dsa_forward_kernel(
     output_ptr,
     lse_ptr,
     softmax_scale,
+    q_len: tl.constexpr,
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
     value_dim: tl.constexpr,
     topk_count: tl.constexpr,
     q_start,
+    BLOCK_Q: tl.constexpr,
     BLOCK_K: tl.constexpr,
-    BLOCK_D: tl.constexpr,
+    BLOCK_QD: tl.constexpr,
+    BLOCK_VD: tl.constexpr,
     HAS_POSITIONS: tl.constexpr,
 ):
-    q_idx = tl.program_id(0)
+    q_block = tl.program_id(0)
     head_idx = tl.program_id(1)
 
-    d_offsets = tl.arange(0, BLOCK_D)
+    q_offsets = q_block * BLOCK_Q + tl.arange(0, BLOCK_Q)
+    qd_offsets = tl.arange(0, BLOCK_QD)
+    vd_offsets = tl.arange(0, BLOCK_VD)
     topk_offsets = tl.arange(0, BLOCK_K)
+    q_valid = q_offsets < q_len
 
-    q_ptrs = query_ptr + (q_idx * num_heads + head_idx) * head_dim + d_offsets
-    query = tl.load(q_ptrs, mask=d_offsets < head_dim, other=0.0).to(tl.float32)
+    q_ptrs = query_ptr + (q_offsets[:, None] * num_heads + head_idx) * head_dim + qd_offsets[None, :]
+    query = tl.load(q_ptrs, mask=q_valid[:, None] & (qd_offsets[None, :] < head_dim), other=0.0)
+    query = query.to(tl.float32)
 
-    m_i = tl.full((), -float("inf"), tl.float32)
-    l_i = tl.full((), 0.0, tl.float32)
-    acc = tl.zeros((BLOCK_D,), tl.float32)
+    m_i = tl.full((BLOCK_Q,), -float("inf"), tl.float32)
+    l_i = tl.full((BLOCK_Q,), 0.0, tl.float32)
+    acc = tl.zeros((BLOCK_Q, BLOCK_VD), tl.float32)
     if HAS_POSITIONS:
-        q_abs = tl.load(query_pos_ptr + q_idx)
+        q_abs = tl.load(query_pos_ptr + q_offsets, mask=q_valid, other=0)
     else:
-        q_abs = q_start + q_idx
+        q_abs = q_start + q_offsets
 
     for topk_start in tl.range(0, topk_count, BLOCK_K):
         k_offsets = topk_start + topk_offsets
         valid_topk = k_offsets < topk_count
-        selected = tl.load(topk_ptr + q_idx * topk_count + k_offsets, mask=valid_topk, other=0)
+        selected = tl.load(
+            topk_ptr + q_offsets[:, None] * topk_count + k_offsets[None, :],
+            mask=q_valid[:, None] & valid_topk[None, :],
+            other=0,
+        ).to(tl.int64)
         if HAS_POSITIONS:
-            selected_abs = tl.load(key_pos_ptr + selected, mask=valid_topk, other=0)
-            valid = valid_topk & (selected_abs <= q_abs)
+            selected_abs = tl.load(key_pos_ptr + selected, mask=q_valid[:, None] & valid_topk[None, :], other=0)
+            valid = q_valid[:, None] & valid_topk[None, :] & (selected_abs <= q_abs[:, None])
         else:
-            valid = valid_topk & (selected <= q_abs)
+            valid = q_valid[:, None] & valid_topk[None, :] & (selected <= q_abs[:, None])
 
         key_ptrs = (
-            key_ptr + (selected[:, None] * num_heads + head_idx) * head_dim + d_offsets[None, :]
+            key_ptr
+            + (selected[:, :, None] * num_heads + head_idx) * head_dim
+            + qd_offsets[None, None, :]
         )
         key = tl.load(
-            key_ptrs, mask=valid[:, None] & (d_offsets[None, :] < head_dim), other=0.0
+            key_ptrs,
+            mask=valid[:, :, None] & (qd_offsets[None, None, :] < head_dim),
+            other=0.0,
         ).to(tl.float32)
-        scores = tl.sum(key * query[None, :], axis=1) * softmax_scale
+        scores = tl.sum(key * query[:, None, :], axis=2) * softmax_scale
         scores = tl.where(valid, scores, -float("inf"))
 
-        block_m = tl.max(scores, axis=0)
+        block_m = tl.max(scores, axis=1)
         m_new = tl.maximum(m_i, block_m)
         alpha = tl.exp(m_i - m_new)
-        probs = tl.exp(scores - m_new)
+        probs = tl.exp(scores - m_new[:, None])
 
         value_ptrs = (
-            value_ptr + (selected[:, None] * num_heads + head_idx) * value_dim + d_offsets[None, :]
+            value_ptr
+            + (selected[:, :, None] * num_heads + head_idx) * value_dim
+            + vd_offsets[None, None, :]
         )
         value = tl.load(
-            value_ptrs, mask=valid[:, None] & (d_offsets[None, :] < value_dim), other=0.0
+            value_ptrs,
+            mask=valid[:, :, None] & (vd_offsets[None, None, :] < value_dim),
+            other=0.0,
         ).to(tl.float32)
-        acc = acc * alpha + tl.sum(probs[:, None] * value, axis=0)
-        l_i = l_i * alpha + tl.sum(probs, axis=0)
+        acc = acc * alpha[:, None] + tl.sum(probs[:, :, None] * value, axis=1)
+        l_i = l_i * alpha + tl.sum(probs, axis=1)
         m_i = m_new
 
-    output = acc / l_i
-    output_ptrs = output_ptr + (q_idx * num_heads + head_idx) * value_dim + d_offsets
-    tl.store(output_ptrs, output, mask=d_offsets < value_dim)
-    tl.store(lse_ptr + q_idx * num_heads + head_idx, m_i + tl.log(l_i))
+    output = acc / l_i[:, None]
+    output_ptrs = output_ptr + (q_offsets[:, None] * num_heads + head_idx) * value_dim + vd_offsets[None, :]
+    tl.store(output_ptrs, output, mask=q_valid[:, None] & (vd_offsets[None, :] < value_dim))
+    tl.store(lse_ptr + q_offsets * num_heads + head_idx, m_i + tl.log(l_i), mask=q_valid)
 
 
 @triton.jit
@@ -193,89 +483,117 @@ def _sparse_dsa_backward_kernel(
     grad_key_ptr,
     grad_value_ptr,
     softmax_scale,
+    q_len: tl.constexpr,
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
     value_dim: tl.constexpr,
     topk_count: tl.constexpr,
     q_start,
+    BLOCK_Q: tl.constexpr,
     BLOCK_K: tl.constexpr,
-    BLOCK_D: tl.constexpr,
+    BLOCK_QD: tl.constexpr,
+    BLOCK_VD: tl.constexpr,
     HAS_POSITIONS: tl.constexpr,
 ):
-    q_idx = tl.program_id(0)
+    q_block = tl.program_id(0)
     head_idx = tl.program_id(1)
 
-    d_offsets = tl.arange(0, BLOCK_D)
+    q_offsets = q_block * BLOCK_Q + tl.arange(0, BLOCK_Q)
+    qd_offsets = tl.arange(0, BLOCK_QD)
+    vd_offsets = tl.arange(0, BLOCK_VD)
     topk_offsets = tl.arange(0, BLOCK_K)
+    q_valid = q_offsets < q_len
 
-    q_ptrs = query_ptr + (q_idx * num_heads + head_idx) * head_dim + d_offsets
-    query = tl.load(q_ptrs, mask=d_offsets < head_dim, other=0.0).to(tl.float32)
+    q_ptrs = query_ptr + (q_offsets[:, None] * num_heads + head_idx) * head_dim + qd_offsets[None, :]
+    query = tl.load(q_ptrs, mask=q_valid[:, None] & (qd_offsets[None, :] < head_dim), other=0.0)
+    query = query.to(tl.float32)
 
-    grad_output_ptrs = grad_output_ptr + (q_idx * num_heads + head_idx) * value_dim + d_offsets
-    grad_output = tl.load(grad_output_ptrs, mask=d_offsets < value_dim, other=0.0).to(tl.float32)
+    grad_output_ptrs = grad_output_ptr + (q_offsets[:, None] * num_heads + head_idx) * value_dim + vd_offsets[None, :]
+    grad_output = tl.load(
+        grad_output_ptrs,
+        mask=q_valid[:, None] & (vd_offsets[None, :] < value_dim),
+        other=0.0,
+    ).to(tl.float32)
 
-    output_ptrs = output_ptr + (q_idx * num_heads + head_idx) * value_dim + d_offsets
-    output = tl.load(output_ptrs, mask=d_offsets < value_dim, other=0.0).to(tl.float32)
-    row_lse = tl.load(lse_ptr + q_idx * num_heads + head_idx).to(tl.float32)
-    delta = tl.sum(grad_output * output, axis=0)
+    output_ptrs = output_ptr + (q_offsets[:, None] * num_heads + head_idx) * value_dim + vd_offsets[None, :]
+    output = tl.load(
+        output_ptrs,
+        mask=q_valid[:, None] & (vd_offsets[None, :] < value_dim),
+        other=0.0,
+    ).to(tl.float32)
+    row_lse = tl.load(lse_ptr + q_offsets * num_heads + head_idx, mask=q_valid, other=0.0)
+    row_lse = row_lse.to(tl.float32)
+    delta = tl.sum(grad_output * output, axis=1)
 
-    grad_query = tl.zeros((BLOCK_D,), tl.float32)
+    grad_query = tl.zeros((BLOCK_Q, BLOCK_QD), tl.float32)
     if HAS_POSITIONS:
-        q_abs = tl.load(query_pos_ptr + q_idx)
+        q_abs = tl.load(query_pos_ptr + q_offsets, mask=q_valid, other=0)
     else:
-        q_abs = q_start + q_idx
+        q_abs = q_start + q_offsets
 
     for topk_start in tl.range(0, topk_count, BLOCK_K):
         k_offsets = topk_start + topk_offsets
         valid_topk = k_offsets < topk_count
-        selected = tl.load(topk_ptr + q_idx * topk_count + k_offsets, mask=valid_topk, other=0)
+        selected = tl.load(
+            topk_ptr + q_offsets[:, None] * topk_count + k_offsets[None, :],
+            mask=q_valid[:, None] & valid_topk[None, :],
+            other=0,
+        ).to(tl.int64)
         if HAS_POSITIONS:
-            selected_abs = tl.load(key_pos_ptr + selected, mask=valid_topk, other=0)
-            valid = valid_topk & (selected_abs <= q_abs)
+            selected_abs = tl.load(key_pos_ptr + selected, mask=q_valid[:, None] & valid_topk[None, :], other=0)
+            valid = q_valid[:, None] & valid_topk[None, :] & (selected_abs <= q_abs[:, None])
         else:
-            valid = valid_topk & (selected <= q_abs)
+            valid = q_valid[:, None] & valid_topk[None, :] & (selected <= q_abs[:, None])
 
         key_ptrs = (
-            key_ptr + (selected[:, None] * num_heads + head_idx) * head_dim + d_offsets[None, :]
+            key_ptr
+            + (selected[:, :, None] * num_heads + head_idx) * head_dim
+            + qd_offsets[None, None, :]
         )
         key = tl.load(
-            key_ptrs, mask=valid[:, None] & (d_offsets[None, :] < head_dim), other=0.0
+            key_ptrs,
+            mask=valid[:, :, None] & (qd_offsets[None, None, :] < head_dim),
+            other=0.0,
         ).to(tl.float32)
-        scores = tl.sum(key * query[None, :], axis=1) * softmax_scale
+        scores = tl.sum(key * query[:, None, :], axis=2) * softmax_scale
         scores = tl.where(valid, scores, -float("inf"))
-        probs = tl.exp(scores - row_lse)
+        probs = tl.exp(scores - row_lse[:, None])
         probs = tl.where(valid, probs, 0.0)
 
         value_ptrs = (
-            value_ptr + (selected[:, None] * num_heads + head_idx) * value_dim + d_offsets[None, :]
+            value_ptr
+            + (selected[:, :, None] * num_heads + head_idx) * value_dim
+            + vd_offsets[None, None, :]
         )
         value = tl.load(
-            value_ptrs, mask=valid[:, None] & (d_offsets[None, :] < value_dim), other=0.0
+            value_ptrs,
+            mask=valid[:, :, None] & (vd_offsets[None, None, :] < value_dim),
+            other=0.0,
         ).to(tl.float32)
 
-        dp = tl.sum(value * grad_output[None, :], axis=1)
-        ds = probs * (dp - delta) * softmax_scale
-        grad_query += tl.sum(ds[:, None] * key, axis=0)
+        dp = tl.sum(value * grad_output[:, None, :], axis=2)
+        ds = probs * (dp - delta[:, None]) * softmax_scale
+        grad_query += tl.sum(ds[:, :, None] * key, axis=1)
 
         tl.atomic_add(
             grad_key_ptr
-            + (selected[:, None] * num_heads + head_idx) * head_dim
-            + d_offsets[None, :],
-            ds[:, None] * query[None, :],
+            + (selected[:, :, None] * num_heads + head_idx) * head_dim
+            + qd_offsets[None, None, :],
+            ds[:, :, None] * query[:, None, :],
             sem="relaxed",
-            mask=valid[:, None] & (d_offsets[None, :] < head_dim),
+            mask=valid[:, :, None] & (qd_offsets[None, None, :] < head_dim),
         )
         tl.atomic_add(
             grad_value_ptr
-            + (selected[:, None] * num_heads + head_idx) * value_dim
-            + d_offsets[None, :],
-            probs[:, None] * grad_output[None, :],
+            + (selected[:, :, None] * num_heads + head_idx) * value_dim
+            + vd_offsets[None, None, :],
+            probs[:, :, None] * grad_output[:, None, :],
             sem="relaxed",
-            mask=valid[:, None] & (d_offsets[None, :] < value_dim),
+            mask=valid[:, :, None] & (vd_offsets[None, None, :] < value_dim),
         )
 
-    grad_query_ptrs = grad_query_ptr + (q_idx * num_heads + head_idx) * head_dim + d_offsets
-    tl.store(grad_query_ptrs, grad_query, mask=d_offsets < head_dim)
+    grad_query_ptrs = grad_query_ptr + (q_offsets[:, None] * num_heads + head_idx) * head_dim + qd_offsets[None, :]
+    tl.store(grad_query_ptrs, grad_query, mask=q_valid[:, None] & (qd_offsets[None, :] < head_dim))
 
 
 class SparseDSAAttentionTriton(torch.autograd.Function):
@@ -309,9 +627,13 @@ class SparseDSAAttentionTriton(torch.autograd.Function):
 
         output = torch.empty((q_len, num_heads, value_dim), device=query.device, dtype=query.dtype)
         lse = torch.empty((q_len, num_heads), device=query.device, dtype=torch.float32)
-        block_k = _block_k(topk_count)
-        block_d = triton.next_power_of_2(max(head_dim, value_dim))
-        grid = (q_len, num_heads)
+        block_q = _sparse_block_q()
+        block_k = _forward_block_k(topk_count)
+        backward_block_k = _backward_block_k(topk_count)
+        backward_num_warps = _num_warps_from_env(_DSA_TRITON_BWD_NUM_WARPS_ENV, 4)
+        block_qd = triton.next_power_of_2(head_dim)
+        block_vd = triton.next_power_of_2(value_dim)
+        grid = (triton.cdiv(q_len, block_q), num_heads)
 
         _sparse_dsa_forward_kernel[grid](
             query_flat,
@@ -323,13 +645,16 @@ class SparseDSAAttentionTriton(torch.autograd.Function):
             output,
             lse,
             float(softmax_scale),
+            q_len,
             num_heads,
             head_dim,
             value_dim,
             topk_count,
             int(q_start),
+            BLOCK_Q=block_q,
             BLOCK_K=block_k,
-            BLOCK_D=block_d,
+            BLOCK_QD=block_qd,
+            BLOCK_VD=block_vd,
             HAS_POSITIONS=has_positions,
             num_warps=4,
         )
@@ -344,8 +669,12 @@ class SparseDSAAttentionTriton(torch.autograd.Function):
         ctx.head_dim = head_dim
         ctx.value_dim = value_dim
         ctx.topk_count = topk_count
+        ctx.block_q = block_q
         ctx.block_k = block_k
-        ctx.block_d = block_d
+        ctx.backward_block_k = backward_block_k
+        ctx.backward_num_warps = backward_num_warps
+        ctx.block_qd = block_qd
+        ctx.block_vd = block_vd
 
         return output.reshape(q_len, 1, num_heads * value_dim)
 
@@ -364,11 +693,16 @@ class SparseDSAAttentionTriton(torch.autograd.Function):
         grad_query = torch.empty(
             (q_len, num_heads, head_dim), device=query.device, dtype=torch.float32
         )
-        grad_key = torch.zeros((sk, num_heads, head_dim), device=key.device, dtype=torch.float32)
-        grad_value = torch.zeros(
-            (sk, num_heads, value_dim), device=value.device, dtype=torch.float32
+        kv_grad_dtype = (
+            key.dtype
+            if _bf16_grad_atomics_enabled() and key.dtype in (torch.bfloat16, torch.float16)
+            else torch.float32
         )
-        grid = (q_len, num_heads)
+        grad_key = torch.zeros((sk, num_heads, head_dim), device=key.device, dtype=kv_grad_dtype)
+        grad_value = torch.zeros(
+            (sk, num_heads, value_dim), device=value.device, dtype=kv_grad_dtype
+        )
+        grid = (triton.cdiv(q_len, ctx.block_q), num_heads)
 
         _sparse_dsa_backward_kernel[grid](
             query,
@@ -384,15 +718,18 @@ class SparseDSAAttentionTriton(torch.autograd.Function):
             grad_key,
             grad_value,
             ctx.softmax_scale,
+            q_len,
             num_heads,
             head_dim,
             value_dim,
             ctx.topk_count,
             ctx.q_start,
-            BLOCK_K=ctx.block_k,
-            BLOCK_D=ctx.block_d,
+            BLOCK_Q=ctx.block_q,
+            BLOCK_K=ctx.backward_block_k,
+            BLOCK_QD=ctx.block_qd,
+            BLOCK_VD=ctx.block_vd,
             HAS_POSITIONS=ctx.has_positions,
-            num_warps=4,
+            num_warps=ctx.backward_num_warps,
         )
 
         return (

@@ -243,6 +243,8 @@ def force_all_tensors_to_non_fp8(sharded_state_dict: ShardedStateDict):
 
     for v in nested_values(sharded_state_dict):
         if hasattr(v, "data") and is_float8tensor(v.data):
+            if type(v.data).__name__ == "NVFP4Tensor":
+                continue
             v.data = dequantize_fp8_tensor(v.data)
 
 

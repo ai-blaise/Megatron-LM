@@ -692,6 +692,18 @@ class GPTModel(LanguageModule):
                 labels=labels,
                 **output_layer_kwargs,
             )
+        elif self.training and self.config.use_streambp:
+            from megatron.core.transformer.streambp import streambp_lm_head_loss
+
+            output_layer_kwargs.pop("input_")
+            loss = streambp_lm_head_loss(
+                self.output_layer,
+                hidden_states,
+                labels,
+                loss_func=self.compute_language_model_loss,
+                chunk_size=self.config.streambp_logits_chunk_size,
+                **output_layer_kwargs,
+            )
         else:
             logits, _ = self.output_layer(**output_layer_kwargs)
             loss = self.compute_language_model_loss(labels, logits)

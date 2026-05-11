@@ -14,6 +14,7 @@
 
 import functools
 import importlib
+import os
 import logging
 from contextlib import contextmanager
 from enum import Enum, auto
@@ -309,6 +310,23 @@ class MegatronFSDP(torch.nn.Module):
         for param in self.module.parameters():
             # Attach MegatronFSDP reference to the parameter.
             setattr(param, "_megatron_fsdp_model", self)
+
+    def sharded_state_dict(self, *args, **kwargs):
+        """Delegate Megatron torch_dist checkpoint templates to the wrapped module.
+
+        Keep Megatron-FSDP DTensor parameters installed. They carry exact uneven
+        shard metadata used by the torch_dist load template; swapping back to
+        raw buffer-backed parameters loses that metadata and can create invalid
+        zero-shaped checkpoint coverage.
+        """
+        if os.getenv("MEGATRON_FSDP_USE_RAW_STATE_DICT", "0") != "1":
+            return self.module.sharded_state_dict(*args, **kwargs)
+
+        self._replace_param_with_raw_if_needed()
+        try:
+            return self.module.sharded_state_dict(*args, **kwargs)
+        finally:
+            self._replace_param_with_distributed_if_needed()
 
     def _check_module_parameter_types(self):
         """

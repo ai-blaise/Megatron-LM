@@ -15,6 +15,14 @@ set -euo pipefail
 # Environment
 # ======================
 USE_MEGATRON_FSDP="${USE_MEGATRON_FSDP:-0}"
+USE_STREAMBP="${USE_STREAMBP:-0}"
+if [[ -z "${RECOMPUTE+x}" ]]; then
+    if [[ "$USE_STREAMBP" == "1" ]]; then
+        RECOMPUTE=0
+    else
+        RECOMPUTE=1
+    fi
+fi
 if [[ "$USE_MEGATRON_FSDP" == "1" ]]; then
     export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-8}"
 else
@@ -31,9 +39,42 @@ export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export MEGATRON_DSA_TRITON="${MEGATRON_DSA_TRITON:-1}"
+export MEGATRON_DSA_TRITON_INDEXER="${MEGATRON_DSA_TRITON_INDEXER:-1}"
 export MEGATRON_DSA_STREAMING_INDEXER_TOPK="${MEGATRON_DSA_STREAMING_INDEXER_TOPK:-1}"
-export MEGATRON_DSA_INDEXER_KEY_BLOCK_SIZE="${MEGATRON_DSA_INDEXER_KEY_BLOCK_SIZE:-2048}"
+export MEGATRON_DSA_INDEXER_KEY_BLOCK_SIZE="${MEGATRON_DSA_INDEXER_KEY_BLOCK_SIZE:-4096}"
+export MEGATRON_DSA_SORT_TOPK_INDICES="${MEGATRON_DSA_SORT_TOPK_INDICES:-0}"
+export MEGATRON_DSA_COMPACT_TOPK_INDICES="${MEGATRON_DSA_COMPACT_TOPK_INDICES:-0}"
+export MEGATRON_DSA_TRITON_BF16_GRAD_ATOMICS="${MEGATRON_DSA_TRITON_BF16_GRAD_ATOMICS:-1}"
+export MEGATRON_DSA_TRITON_BWD_NUM_WARPS="${MEGATRON_DSA_TRITON_BWD_NUM_WARPS:-2}"
+export MEGATRON_WEIGHTED_SWIGLU_FUSER="${MEGATRON_WEIGHTED_SWIGLU_FUSER:-eager}"
 export MEGATRON_FLASH_ADAMW_NVFP4_IMMEDIATE_CAST="${MEGATRON_FLASH_ADAMW_NVFP4_IMMEDIATE_CAST:-1}"
+DISTRIBUTED_TIMEOUT_MINUTES="${DISTRIBUTED_TIMEOUT_MINUTES:-60}"
+
+DISTRIBUTED_BACKEND="${DISTRIBUTED_BACKEND:-nccl}"
+if [[ "$DISTRIBUTED_BACKEND" == "ncclx" ]]; then
+    if ulimit -Sn "$(ulimit -Hn)" 2>/dev/null; then
+        :
+    fi
+    export MEGATRON_USE_TORCHCOMMS="${MEGATRON_USE_TORCHCOMMS:-1}"
+    export MEGATRON_NCCLX_MEM_POOL="${MEGATRON_NCCLX_MEM_POOL:-1}"
+    export MEGATRON_NCCLX_RDMA="${MEGATRON_NCCLX_RDMA:-1}"
+    export MEGATRON_NCCLX_RDMA_PROFILE="${MEGATRON_NCCLX_RDMA_PROFILE:-roce}"
+    export MEGATRON_NCCLX_RDMA_BACKENDS="${MEGATRON_NCCLX_RDMA_BACKENDS:-ib,nvl,socket}"
+    export TORCHCOMM_TIMEOUT_SECONDS="${TORCHCOMM_TIMEOUT_SECONDS:-$((DISTRIBUTED_TIMEOUT_MINUTES * 60))}"
+    if [[ -z "${NCCL_SOCKET_IFNAME:-}" || "$NCCL_SOCKET_IFNAME" == "gpu" ]]; then
+        export NCCL_SOCKET_IFNAME="gpu0rdma0"
+    fi
+    export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-$NCCL_SOCKET_IFNAME}"
+    export NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-0}"
+    export NCCL_IGNORE_TOPO_LOAD_FAILURE="${NCCL_IGNORE_TOPO_LOAD_FAILURE:-0}"
+    if [[ -z "${NCCL_TOPO_FILE_PATH:-}" && -f "$HOME/ncclx_topology.env" ]]; then
+        export NCCL_TOPO_FILE_PATH="$HOME/ncclx_topology.env"
+    fi
+    if [[ -z "${NCCL_TOPO_FILE_PATH:-}" || ! -f "$NCCL_TOPO_FILE_PATH" ]]; then
+        echo "DISTRIBUTED_BACKEND=ncclx requires NCCL_TOPO_FILE_PATH or $HOME/ncclx_topology.env" >&2
+        exit 1
+    fi
+fi
 
 # ======================
 # Path setup
@@ -88,6 +129,10 @@ DISTRIBUTED_ARGS=(
     --master_port "$MASTER_PORT"
 )
 
+DISTRIBUTED_BACKEND_ARGS=(
+    --distributed-backend "$DISTRIBUTED_BACKEND"
+)
+
 # ======================
 # Parallelism
 # ======================
@@ -98,6 +143,10 @@ PP="${PP:-2}"
 CP="${CP:-1}"
 EP="${EP:-4}"
 ETP="${ETP:-1}"
+if [[ "$USE_STREAMBP" == "1" && "$CP" != "1" ]]; then
+    echo "USE_STREAMBP=1 requires CP=1; StreamBP does not yet support context parallelism" >&2
+    exit 1
+fi
 if [[ -z "${DECODER_FIRST_PIPELINE_NUM_LAYERS:-}" ]]; then
     if [[ "$PP" -eq 4 ]]; then
         DECODER_FIRST_PIPELINE_NUM_LAYERS=16
@@ -178,12 +227,21 @@ MLA_ARGS=(
     --v-head-dim 128
 )
 
+if [[ -z "${DSA_CHUNK_SIZE:-}" ]]; then
+    if [[ "$USE_STREAMBP" == "1" ]]; then
+        DSA_CHUNK_SIZE="${DSA_STREAMBP_CHUNK_SIZE:-4096}"
+    else
+        DSA_CHUNK_SIZE=256
+    fi
+fi
+
 DSA_ARGS=(
     --experimental-attention-variant dsa
     --dsa-indexer-n-heads 64
     --dsa-indexer-head-dim 128
     --dsa-indexer-topk "${DSA_INDEXER_TOPK:-2048}"
     --dsa-indexer-loss-coeff "${DSA_INDEXER_LOSS_COEFF:-0.0}"
+    --dsa-chunk-size "$DSA_CHUNK_SIZE"
 )
 
 # ======================
@@ -216,6 +274,15 @@ if [[ "${MOE_PERMUTE_FUSION:-1}" == "1" ]]; then
 fi
 if [[ "${MOE_PER_LAYER_LOGGING:-1}" == "1" ]]; then
     MOE_ARGS+=(--moe-per-layer-logging)
+fi
+if [[ "${MOE_ROUTER_PADDING_FOR_QUANTIZATION:-0}" == "1" ]]; then
+    MOE_ARGS+=(--moe-router-padding-for-quantization)
+fi
+if [[ -n "${MOE_EXPERT_CAPACITY_FACTOR:-}" ]]; then
+    MOE_ARGS+=(--moe-expert-capacity-factor "$MOE_EXPERT_CAPACITY_FACTOR")
+fi
+if [[ "${MOE_PAD_EXPERT_INPUT_TO_CAPACITY:-0}" == "1" ]]; then
+    MOE_ARGS+=(--moe-pad-expert-input-to-capacity)
 fi
 
 # ======================
@@ -298,6 +365,85 @@ if [[ "${GRAD_REDUCE_IN_BF16:-1}" == "1" ]]; then
 fi
 if [[ "${FLASH_ADAMW_COMPRESS_STATE_DICT:-1}" == "1" ]]; then
     TRAINING_ARGS+=(--flash-adamw-compress-state-dict)
+fi
+
+STREAMBP_ARGS=()
+if [[ "$USE_STREAMBP" == "1" ]]; then
+    if [[ "$RECOMPUTE" == "1" ]]; then
+        echo "USE_STREAMBP=1 is incompatible with full activation recompute; set RECOMPUTE=0" >&2
+        exit 1
+    fi
+    STREAMBP_ARGS+=(--use-streambp)
+    if [[ -n "${STREAMBP_CHUNK_SIZE:-}" ]]; then
+        STREAMBP_ARGS+=(--streambp-chunk-size "$STREAMBP_CHUNK_SIZE")
+    fi
+    if [[ -n "${STREAMBP_LOGITS_CHUNK_SIZE:-}" ]]; then
+        STREAMBP_ARGS+=(--streambp-logits-chunk-size "$STREAMBP_LOGITS_CHUNK_SIZE")
+    fi
+    if [[ -n "${STREAMBP_CHUNK_FORWARD:-}" ]]; then
+        if [[ "$STREAMBP_CHUNK_FORWARD" == "1" ]]; then
+            STREAMBP_ARGS+=(--streambp-chunk-forward)
+        else
+            STREAMBP_ARGS+=(--no-streambp-chunk-forward)
+        fi
+    fi
+    if [[ -n "${STREAMBP_MOE_CHUNK_FORWARD:-}" ]]; then
+        if [[ "$STREAMBP_MOE_CHUNK_FORWARD" == "1" ]]; then
+            STREAMBP_ARGS+=(--streambp-moe-chunk-forward)
+        else
+            STREAMBP_ARGS+=(--no-streambp-moe-chunk-forward)
+        fi
+    fi
+    if [[ "${STREAMBP_SKIP_MOE:-0}" == "1" ]]; then
+        STREAMBP_ARGS+=(--streambp-skip-moe)
+    else
+        STREAMBP_ARGS+=(--no-streambp-skip-moe)
+    fi
+    if [[ "${STREAMBP_SKIP_DSA:-0}" == "1" ]]; then
+        STREAMBP_ARGS+=(--streambp-skip-dsa)
+    else
+        STREAMBP_ARGS+=(--no-streambp-skip-dsa)
+    fi
+    if [[ "${STREAMBP_VALIDATE:-0}" == "1" ]]; then
+        STREAMBP_ARGS+=(--streambp-validate)
+    fi
+    if [[ "${STREAMBP_PROFILE:-0}" == "1" ]]; then
+        STREAMBP_ARGS+=(--streambp-profile)
+        STREAMBP_ARGS+=(--streambp-profile-rank "${STREAMBP_PROFILE_RANK:-0}")
+        STREAMBP_ARGS+=(--streambp-profile-limit "${STREAMBP_PROFILE_LIMIT:-4}")
+        if [[ -n "${STREAMBP_PROFILE_DIR:-}" ]]; then
+            STREAMBP_ARGS+=(--streambp-profile-dir "$STREAMBP_PROFILE_DIR")
+        fi
+        if [[ -n "${STREAMBP_PROFILE_FILTER:-}" ]]; then
+            STREAMBP_ARGS+=(--streambp-profile-filter "$STREAMBP_PROFILE_FILTER")
+        fi
+        if [[ "${STREAMBP_PROFILE_RECORD_SHAPES:-0}" == "1" ]]; then
+            STREAMBP_ARGS+=(--streambp-profile-record-shapes)
+        fi
+        if [[ "${STREAMBP_PROFILE_WITH_STACK:-0}" == "1" ]]; then
+            STREAMBP_ARGS+=(--streambp-profile-with-stack)
+        fi
+    fi
+fi
+
+ZCC_ARGS=()
+if [[ "${ENABLE_ZCC:-0}" == "1" ]]; then
+    ZCC_ARGS+=(
+        --enable-zero-cost-checkpoint
+        --zcc-flash-device "${ZCC_FLASH_DEVICE:-/dev/shm/megatron_zcc}"
+        --zcc-durable-interval "${ZCC_DURABLE_INTERVAL:-10}"
+        --zcc-compress "${ZCC_COMPRESS:-zstd:1}"
+        --zcc-retain-latest "${ZCC_RETAIN_LATEST:-1}"
+    )
+    if [[ -n "${ZCC_FLASH_STRIPE:-}" ]]; then
+        ZCC_ARGS+=(--zcc-flash-stripe "$ZCC_FLASH_STRIPE")
+    fi
+    if [[ -n "${ZCC_DURABLE_DIR:-}" ]]; then
+        ZCC_ARGS+=(--zcc-durable-dir "$ZCC_DURABLE_DIR")
+    fi
+    if [[ -n "${ZCC_EXTRA_TENSOR_ATTRS:-}" ]]; then
+        ZCC_ARGS+=(--zcc-extra-tensor-attrs "$ZCC_EXTRA_TENSOR_ATTRS")
+    fi
 fi
 
 FSDP_ARGS=()
@@ -402,6 +548,23 @@ if [[ "${ENABLE_PROFILING:-0}" == "1" ]]; then
         --profile-step-start "${PROFILE_STEP_START:-4}"
         --profile-step-end "${PROFILE_STEP_END:-6}"
     )
+    if [[ "${USE_PYTORCH_PROFILER:-0}" == "1" ]]; then
+        PROFILING_ARGS+=(--use-pytorch-profiler)
+    fi
+    if [[ "${PYTORCH_PROFILER_COLLECT_SHAPES:-0}" == "1" ]]; then
+        PROFILING_ARGS+=(--pytorch-profiler-collect-shapes)
+    fi
+    if [[ "${PYTORCH_PROFILER_COLLECT_CALLSTACK:-0}" == "1" ]]; then
+        PROFILING_ARGS+=(--pytorch-profiler-collect-callstack)
+    fi
+    if [[ "${PYTORCH_PROFILER_COLLECT_CHAKRA:-0}" == "1" ]]; then
+        PROFILING_ARGS+=(--pytorch-profiler-collect-chakra)
+    fi
+    if [[ -n "${PROFILE_RANKS:-}" ]]; then
+        # shellcheck disable=SC2206
+        PROFILE_RANK_ARGS=(${PROFILE_RANKS//,/ })
+        PROFILING_ARGS+=(--profile-ranks "${PROFILE_RANK_ARGS[@]}")
+    fi
 fi
 
 if [[ "$USE_MEGATRON_FSDP" == "1" ]]; then
@@ -412,9 +575,9 @@ fi
 
 CKPT_ARGS=(
     --eval-interval "${EVAL_INTERVAL:-100}"
-    --eval-iters "${EVAL_ITERS:-10}"
+    --eval-iters "${EVAL_ITERS:-0}"
     --load "$LOAD_CKPT"
-    --distributed-timeout-minutes "${DISTRIBUTED_TIMEOUT_MINUTES:-60}"
+    --distributed-timeout-minutes "$DISTRIBUTED_TIMEOUT_MINUTES"
     --ckpt-format "$CKPT_FORMAT_VALUE"
     --auto-detect-ckpt-format
 )
@@ -423,6 +586,9 @@ if [[ "${DISABLE_SAVE:-0}" != "1" ]]; then
         --save-interval "${SAVE_INTERVAL:-500}"
         --save "$SAVE_CKPT"
     )
+    if [[ -n "${SAVE_RETAIN_INTERVAL:-}" ]]; then
+        CKPT_ARGS+=(--save-retain-interval "$SAVE_RETAIN_INTERVAL")
+    fi
 fi
 if [[ "${NO_SAVE_OPTIM:-0}" == "1" ]]; then
     CKPT_ARGS+=(--no-save-optim)
@@ -435,12 +601,15 @@ CMD=(
     uv run --no-sync torchrun
     "${DISTRIBUTED_ARGS[@]}"
     pretrain_gpt.py
+    "${DISTRIBUTED_BACKEND_ARGS[@]}"
     "${MODEL_ARGS[@]}"
     "${MLA_ARGS[@]}"
     "${DSA_ARGS[@]}"
     "${MOE_ARGS[@]}"
     "${MODEL_PARALLEL_ARGS[@]}"
     "${TRAINING_ARGS[@]}"
+    "${STREAMBP_ARGS[@]}"
+    "${ZCC_ARGS[@]}"
     "${FSDP_ARGS[@]}"
     "${RECOMPUTE_ARGS[@]}"
     "${DTYPE_ARGS[@]}"

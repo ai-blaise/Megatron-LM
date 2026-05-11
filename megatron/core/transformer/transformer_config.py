@@ -290,6 +290,9 @@ class TransformerConfig(ModelParallelConfig):
     """Whether to use sparse DSA indexer loss. If True, the indexer loss will be computed using the
     top-k indices."""
 
+    dsa_chunk_size: int = 128
+    """Query chunk size used by DSA's internal indexer and sparse attention path."""
+
     ####################
     # linear attention
     ####################
@@ -450,6 +453,58 @@ class TransformerConfig(ModelParallelConfig):
     "moe_act", "layernorm", "mla_up_proj", and "mhc" use output-discarding checkpointing,
     "core_attn", "mlp", "moe", and "shared_experts" use normal checkpointing.
     """
+
+    use_streambp: bool = False
+    """If True, enable native StreamBP chunked backward recomputation for decoder layers."""
+
+    streambp_chunk_size: Optional[int] = None
+    """Sequence chunk size for StreamBP layer recomputation. None uses the StreamBP heuristic."""
+
+    streambp_logits_chunk_size: Optional[int] = None
+    """Sequence chunk size for StreamBP LM-head loss. None uses the StreamBP heuristic."""
+
+    streambp_chunk_forward: bool = True
+    """If True, chunk the no-grad StreamBP forward. If False, match reference StreamBP."""
+
+    streambp_moe_chunk_forward: Optional[bool] = None
+    """Optional MoE-specific override for streambp_chunk_forward.
+
+    None inherits streambp_chunk_forward. False keeps StreamBP's backward replay chunked and
+    runs the no-grad forward with chunked attention plus one full-sequence MoE MLP. This avoids
+    multiplying MoE dispatch collectives during the no-grad forward path without forcing DSA
+    attention into a full-sequence kernel shape.
+    """
+
+    streambp_skip_moe: bool = False
+    """If True, do not apply StreamBP to MoE transformer layers."""
+
+    streambp_skip_dsa: bool = False
+    """If True, do not apply StreamBP to layers using a DSA attention implementation."""
+
+    streambp_validate: bool = False
+    """If True, enable extra StreamBP validation checks in debug/test runs."""
+
+    streambp_profile: bool = False
+    """If True, export per-chunk StreamBP profiler traces from selected ranks."""
+
+    streambp_profile_dir: Optional[str] = None
+    """Directory for per-chunk StreamBP profiler traces."""
+
+    streambp_profile_rank: int = 0
+    """Global rank selected for per-chunk StreamBP profiling."""
+
+    streambp_profile_limit: int = 4
+    """Maximum number of StreamBP chunk profiler traces to export on the selected rank."""
+
+    streambp_profile_record_shapes: bool = False
+    """If True, collect tensor shapes in per-chunk StreamBP profiler traces."""
+
+    streambp_profile_with_stack: bool = False
+    """If True, collect Python stack traces in per-chunk StreamBP profiler traces."""
+
+    streambp_profile_filter: Optional[str] = None
+    """Optional substring filter for per-chunk StreamBP profiler range names."""
+
 
     ####################
     # fp8 related
@@ -1332,6 +1387,9 @@ class TransformerConfig(ModelParallelConfig):
                 "Currently there is no support for Pipeline parallelism with CPU offloading"
             )
 
+        if self.dsa_chunk_size <= 0:
+            raise ValueError("dsa_chunk_size must be positive")
+
         if self.cpu_offloading and self.recompute_granularity is not None:
             raise ValueError(
                 "CPU offloading does not work when activation recomputation is enabled"
@@ -1375,6 +1433,32 @@ class TransformerConfig(ModelParallelConfig):
                     f"distribute_saved_activations: {self.distribute_saved_activations} must be "
                     f"false when sequence parallel is enabled: {self.sequence_parallel}"
                 )
+
+        if self.use_streambp:
+            if self.cpu_offloading:
+                raise ValueError("StreamBP cannot be combined with CPU offloading")
+            if self.recompute_granularity == "full":
+                raise ValueError("StreamBP cannot be combined with full activation recompute")
+            if self.context_parallel_size > 1:
+                raise ValueError("StreamBP currently does not support context parallelism")
+            if self.enable_hyper_connections:
+                raise ValueError("StreamBP currently does not support hyper connections")
+            if self.fused_single_qkv_rope:
+                raise ValueError("StreamBP currently does not support fused_single_qkv_rope")
+            if self.hidden_dropout != 0.0 or self.attention_dropout != 0.0:
+                raise ValueError(
+                    "StreamBP requires hidden_dropout=0.0 and attention_dropout=0.0 for exact "
+                    "chunked recomputation"
+                )
+            if self.streambp_chunk_size is not None and self.streambp_chunk_size <= 0:
+                raise ValueError("streambp_chunk_size must be positive when set")
+            if (
+                self.streambp_logits_chunk_size is not None
+                and self.streambp_logits_chunk_size <= 0
+            ):
+                raise ValueError("streambp_logits_chunk_size must be positive when set")
+            if self.streambp_profile_limit <= 0:
+                raise ValueError("streambp_profile_limit must be positive")
 
         if self.recompute_modules is None:
             self.recompute_modules = ["core_attn"]

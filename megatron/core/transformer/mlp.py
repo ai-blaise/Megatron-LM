@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import gc
 import logging
+import os
 import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -26,6 +27,7 @@ from megatron.core.fusions.fused_bias_geglu import (
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.streambp import ChunkRange, validate_chunk_range
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import (
@@ -244,9 +246,19 @@ class MLP(MegatronModule):
         )
 
     def forward(
-        self, hidden_states: torch.Tensor, per_token_scale: torch.Tensor | None = None, **kwargs
+        self,
+        hidden_states: torch.Tensor,
+        per_token_scale: torch.Tensor | None = None,
+        chunk_range: ChunkRange | None = None,
+        **kwargs,
     ):
         """Perform the forward pass through the MLP block."""
+        if chunk_range is not None:
+            start, end = validate_chunk_range(chunk_range, hidden_states.size(0))
+            hidden_states = hidden_states[start:end]
+            if per_token_scale is not None and per_token_scale.dim() >= 1:
+                per_token_scale = per_token_scale[start:end]
+
         # [s, b, 4 * h/p]
         nvtx_range_push(suffix="linear_fc1")
         intermediate_parallel, bias_parallel = apply_module(self.linear_fc1)(hidden_states)
@@ -339,7 +351,7 @@ class MLP(MegatronModule):
         if per_token_scale is not None and output_bias is not None:
             # if this MLP is an expert, and bias is required, we add the bias to output directly
             # without doing bda later.
-            output += output_bias.unsqueeze(0) * per_token_scale.unsqueeze(-1)
+            output = output + output_bias.unsqueeze(0) * per_token_scale.unsqueeze(-1)
             output_bias = None
 
         return output, output_bias
@@ -377,15 +389,24 @@ def apply_swiglu_sharded_factory(
 
     swiglu_shard_axis = 0
     prepend_axis_num = len(sharded_offsets)
+    if original_sh_ten.axis_fragmentations is None and not singleton_local_shards:
+        return original_sh_ten
+
     original_shape = original_sh_ten.local_shape
     original_numel = int(np.prod(original_shape))
     local_axis_size = original_shape[swiglu_shard_axis]
-    assert (
-        original_sh_ten.global_offset[swiglu_shard_axis + prepend_axis_num] % local_axis_size == 0
-    )
-    rank_offset = (
-        original_sh_ten.global_offset[swiglu_shard_axis + prepend_axis_num] // local_axis_size
-    )
+    if local_axis_size == 0:
+        rank_offset = 0
+    else:
+        assert (
+            original_sh_ten.global_offset[swiglu_shard_axis + prepend_axis_num]
+            % local_axis_size
+            == 0
+        )
+        rank_offset = (
+            original_sh_ten.global_offset[swiglu_shard_axis + prepend_axis_num]
+            // local_axis_size
+        )
     axis_frag = original_sh_ten.axis_fragmentations[swiglu_shard_axis + prepend_axis_num]
 
     @torch.no_grad()
@@ -429,6 +450,12 @@ def apply_swiglu_sharded_factory(
 
     def sh_ten_merge_fn(sub_state_dict):
         with torch.no_grad():
+            if os.getenv("MEGATRON_CPU_MERGE_CKPT_FACTORIES", "1").lower() not in (
+                "0",
+                "false",
+                "no",
+            ):
+                return torch.cat([t.cpu() for t in sub_state_dict])
             try:
                 return torch.cat(sub_state_dict)
             except (RuntimeError, torch.cuda.OutOfMemoryError) as e:

@@ -1233,6 +1233,91 @@ def update_train_iters(args):
     print_rank_0(f'setting training iterations to {args.train_iters}')
 
 
+def _get_model_num_parameters(model):
+    """Return total parameters for a possibly chunked model list."""
+    return sum(sum(p.nelement() for p in model_module.parameters()) for model_module in model)
+
+
+def _wrap_model_with_ddp(model, args, num_parameters):
+    """Wrap model chunks with the configured data-parallel wrapper."""
+    if args.use_torch_fsdp2:
+        assert HAVE_FSDP2, "Torch FSDP2 requires torch>=2.4.0"
+        DP = torch_FSDP
+    elif args.use_megatron_fsdp:
+        DP = megatron_FSDP
+    else:
+        DP = DDP
+
+    config = get_model_config(model[0])
+
+    if getattr(args, "use_torch_fsdp2", False):
+        reshard_after_forward = getattr(args, "torch_fsdp2_reshard_after_forward", True)
+        ddp_config = TorchFullyShardedDataParallelConfig(reshard_after_forward=reshard_after_forward)
+    else:
+        kwargs = {}
+        for f in dataclasses.fields(DistributedDataParallelConfig):
+            if hasattr(args, f.name):
+                kwargs[f.name] = getattr(args, f.name)
+        kwargs['grad_reduce_in_fp32'] = args.accumulate_allreduce_grads_in_fp32
+        kwargs['check_for_nan_in_grad'] = args.check_for_nan_in_loss_and_grad
+        kwargs['check_for_large_grads'] = args.check_for_large_grads
+        if args.ddp_num_buckets is not None:
+            assert args.ddp_bucket_size is None, \
+                "Cannot specify both --ddp-num-buckets and --ddp-bucket-size"
+            assert args.ddp_num_buckets > 0, \
+                "--ddp-num-buckets must be greater than 0"
+            kwargs['bucket_size'] = num_parameters // args.ddp_num_buckets
+        else:
+            kwargs['bucket_size'] = args.ddp_bucket_size
+        kwargs['pad_buckets_for_high_nccl_busbw'] = args.ddp_pad_buckets_for_high_nccl_busbw
+        kwargs['reduce_scatter_with_fp32_accumulation'] = args.ddp_reduce_scatter_with_fp32_accumulation
+        kwargs['average_in_collective'] = args.ddp_average_in_collective
+        ddp_config = DistributedDataParallelConfig(**kwargs)
+
+        # In the Megatron FSDP and DDP use path, we need to initialize the bucket size.
+        # If bucket_size is not provided as an input, use sane default.
+        # If using very large dp_sizes, make buckets larger to ensure that chunks used in NCCL
+        # ring-reduce implementations are large enough to remain bandwidth-bound rather than
+        # latency-bound.
+        if ddp_config.bucket_size is None:
+            ddp_config.bucket_size = max(
+                40000000, 1000000 * mpu.get_data_parallel_world_size(with_context_parallel=True)
+            )
+        # Set bucket_size to infinity if overlap_grad_reduce is False.
+        if not ddp_config.overlap_grad_reduce:
+            ddp_config.bucket_size = None
+
+    # Setup stream for ddp initialization. The side-stream may be necessary for cuda graph
+    #  capture support with DDP, but we sync it with the current stream to avoid races.
+    ddp_stream = torch.cuda.Stream()
+    # Wait for the default stream to complete before starting ddp_stream
+    ddp_stream.wait_stream(torch.cuda.current_stream())
+    # Make ddp_stream start after whatever the default stream already queued
+    with torch.cuda.stream(ddp_stream):
+        model = [
+            DP(
+                config=config,
+                ddp_config=ddp_config,
+                module=model_chunk,
+                # Turn off bucketing for model_chunk 2 onwards, since communication for these
+                # model chunks is overlapped with compute anyway.
+                disable_bucketing=(model_chunk_idx > 0)
+                or args.overlap_param_gather_with_optimizer_step,
+            )
+            for (model_chunk_idx, model_chunk) in enumerate(model)
+        ]
+    # End of setup_stream
+    # Critical: ensure side-stream work completes before touching params on default stream
+    torch.cuda.current_stream().wait_stream(ddp_stream)
+
+    # Broadcast params from data parallel src rank to other data parallel ranks.
+    if args.data_parallel_random_init:
+        for model_module in model:
+            model_module.broadcast_params()
+
+    return model
+
+
 def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=True, config=None, pg_collection=None):
     """Build the model."""
     args = get_args()
@@ -1308,9 +1393,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             tensor_parallel.set_defaults_if_not_set_tensor_model_parallel_attributes(param)
 
     # Print number of parameters.
-    num_parameters = sum(
-        [sum([p.nelement() for p in model_module.parameters()]) for model_module in model]
-    )
+    num_parameters = _get_model_num_parameters(model)
     if get_pg_rank(pg_collection.dp) == 0 and get_pg_rank(pg_collection.cp) == 0:
         print(
             ' > number of parameters on (tensor, pipeline) '
@@ -1349,79 +1432,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     correct_amax_history_if_needed(model)
 
     if wrap_with_ddp:
-        if args.use_torch_fsdp2:
-            assert HAVE_FSDP2, "Torch FSDP2 requires torch>=2.4.0"
-            DP = torch_FSDP
-        elif args.use_megatron_fsdp:
-            DP = megatron_FSDP
-        else:
-            DP = DDP
-
-        config = get_model_config(model[0])
-
-        if getattr(args, "use_torch_fsdp2", False):
-            reshard_after_forward = getattr(args, "torch_fsdp2_reshard_after_forward", True)
-            ddp_config = TorchFullyShardedDataParallelConfig(reshard_after_forward=reshard_after_forward)
-        else:
-            kwargs = {}
-            for f in dataclasses.fields(DistributedDataParallelConfig):
-                if hasattr(args, f.name):
-                    kwargs[f.name] = getattr(args, f.name)
-            kwargs['grad_reduce_in_fp32'] = args.accumulate_allreduce_grads_in_fp32
-            kwargs['check_for_nan_in_grad'] = args.check_for_nan_in_loss_and_grad
-            kwargs['check_for_large_grads'] = args.check_for_large_grads
-            if args.ddp_num_buckets is not None:
-                assert args.ddp_bucket_size is None, \
-                    "Cannot specify both --ddp-num-buckets and --ddp-bucket-size"
-                assert args.ddp_num_buckets > 0, \
-                    "--ddp-num-buckets must be greater than 0"
-                kwargs['bucket_size'] = num_parameters // args.ddp_num_buckets
-            else:
-                kwargs['bucket_size'] = args.ddp_bucket_size
-            kwargs['pad_buckets_for_high_nccl_busbw'] = args.ddp_pad_buckets_for_high_nccl_busbw
-            kwargs['reduce_scatter_with_fp32_accumulation'] = args.ddp_reduce_scatter_with_fp32_accumulation
-            kwargs['average_in_collective'] = args.ddp_average_in_collective
-            ddp_config = DistributedDataParallelConfig(**kwargs)
-
-            # In the Megatron FSDP and DDP use path, we need to initialize the bucket size.
-            # If bucket_size is not provided as an input, use sane default.
-            # If using very large dp_sizes, make buckets larger to ensure that chunks used in NCCL
-            # ring-reduce implementations are large enough to remain bandwidth-bound rather than
-            # latency-bound.
-            if ddp_config.bucket_size is None:
-                ddp_config.bucket_size = max(
-                    40000000, 1000000 * mpu.get_data_parallel_world_size(with_context_parallel=True)
-                )
-            # Set bucket_size to infinity if overlap_grad_reduce is False.
-            if not ddp_config.overlap_grad_reduce:
-                ddp_config.bucket_size = None
-        # Setup stream for ddp initialization. The side-stream may be necessary for cuda graph
-        #  capture support with DDP, but we sync it with the current stream to avoid races.
-        ddp_stream = torch.cuda.Stream()
-        # Wait for the default stream to complete before starting ddp_stream
-        ddp_stream.wait_stream(torch.cuda.current_stream())
-        # Make ddp_stream start after whatever the default stream already queued
-        with torch.cuda.stream(ddp_stream):
-            model = [
-                DP(
-                    config=config,
-                    ddp_config=ddp_config,
-                    module=model_chunk,
-                    # Turn off bucketing for model_chunk 2 onwards, since communication for these
-                    # model chunks is overlapped with compute anyway.
-                    disable_bucketing=(model_chunk_idx > 0)
-                    or args.overlap_param_gather_with_optimizer_step,
-                )
-                for (model_chunk_idx, model_chunk) in enumerate(model)
-            ]
-        # End of setup_stream
-        # Critical: ensure side-stream work completes before touching params on default stream
-        torch.cuda.current_stream().wait_stream(ddp_stream)
-
-        # Broadcast params from data parallel src rank to other data parallel ranks.
-        if args.data_parallel_random_init:
-            for model_module in model:
-                model_module.broadcast_params()
+        model = _wrap_model_with_ddp(model, args, num_parameters)
 
     return model
 
@@ -1508,14 +1519,46 @@ def setup_model_and_optimizer(
     timers = get_timers()
     one_logger = get_one_logger()
 
+    def _should_defer_optimizer_build_until_after_load():
+        """Avoid load-time peak memory when optimizer state will not be restored."""
+        defer_enabled = os.getenv("MEGATRON_DEFER_OPTIMIZER_BUILD_FOR_LOAD", "1").lower()
+        return (
+            defer_enabled not in ("0", "false", "no")
+            and not args.skip_train
+            and not args.moe_use_upcycling
+            and (args.load is not None or args.pretrained_checkpoint is not None)
+            and (args.finetune or args.no_load_optim)
+        )
+
     wrap_with_ddp = not args.skip_train
-    model = get_model(model_provider_func, model_type, wrap_with_ddp=wrap_with_ddp)
+    defer_optimizer_build = _should_defer_optimizer_build_until_after_load()
+
+    def _should_defer_ddp_wrap_until_after_load():
+        """Avoid allocating DDP buffers during model-only checkpoint bootstrap."""
+        defer_enabled = os.getenv("MEGATRON_DEFER_DDP_WRAP_FOR_LOAD", "1").lower()
+        return (
+            defer_enabled not in ("0", "false", "no")
+            and defer_optimizer_build
+            and wrap_with_ddp
+            # FSDP wrappers define checkpoint state differently, so keep their original ordering.
+            and not args.use_torch_fsdp2
+            and not args.use_megatron_fsdp
+        )
+
+    defer_ddp_wrap = _should_defer_ddp_wrap_until_after_load()
+    if defer_ddp_wrap:
+        print_rank_0(
+            "Deferring DDP wrapping until after checkpoint load "
+            "because optimizer state is not being loaded."
+        )
+
+    model = get_model(model_provider_func, model_type, wrap_with_ddp=wrap_with_ddp and not defer_ddp_wrap)
     unwrapped_model = unwrap_model(model)
 
-    one_logger and one_logger.log_metrics({"app_build_optimzer_start_time": one_logger_utils.get_timestamp_in_ms()})
-    if args.skip_train:
-        optimizer, opt_param_scheduler = None, None
-    else:
+    def _build_optimizer_and_scheduler():
+        one_logger and one_logger.log_metrics(
+            {"app_build_optimzer_start_time": one_logger_utils.get_timestamp_in_ms()}
+        )
         config, config_overrides = get_megatron_optimizer_config(args)
         config.timers = timers
 
@@ -1527,8 +1570,21 @@ def setup_model_and_optimizer(
             dump_param_to_param_group_map=args.dump_param_to_param_group_map,
         )
         opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
+        one_logger and one_logger.log_metrics(
+            {"app_build_optimzer_finish_time": one_logger_utils.get_timestamp_in_ms()}
+        )
+        return optimizer, opt_param_scheduler
 
-    one_logger and one_logger.log_metrics({"app_build_optimzer_finish_time": one_logger_utils.get_timestamp_in_ms()})
+    if args.skip_train:
+        optimizer, opt_param_scheduler = None, None
+    elif defer_optimizer_build:
+        print_rank_0(
+            "Deferring optimizer construction until after checkpoint load "
+            "because optimizer state is not being loaded."
+        )
+        optimizer, opt_param_scheduler = None, None
+    else:
+        optimizer, opt_param_scheduler = _build_optimizer_and_scheduler()
 
     if args.moe_use_upcycling:
         torch.distributed.barrier()
@@ -1606,6 +1662,14 @@ def setup_model_and_optimizer(
         args.iteration = 0
         args.num_floating_point_operations_so_far = 0
 
+    if defer_ddp_wrap:
+        print_rank_0("Wrapping model with DDP after checkpoint load.")
+        model = _wrap_model_with_ddp(model, args, _get_model_num_parameters(model))
+        unwrapped_model = unwrap_model(model)
+
+    if defer_optimizer_build:
+        optimizer, opt_param_scheduler = _build_optimizer_and_scheduler()
+
     # get model without FP16 and/or DDP wrappers
     if (
         args.iteration == 0
@@ -1672,6 +1736,41 @@ def dummy_train_step(data_iterator):
             batch = get_batch_on_this_cp_rank(batch)
 
 
+def _adjust_tensor_shapes_for_sft_packed(recv_tensor_shapes, send_tensor_shapes):
+    """Keep packed SFT activations in THD layout across pipeline stages."""
+
+    def _flatten_batch_dim(tensor_shapes):
+        adjusted = []
+        for tensor_shape in tensor_shapes:
+            if tensor_shape is None:
+                adjusted.append(tensor_shape)
+                continue
+            if len(tensor_shape) != 3:
+                raise ValueError(
+                    f"SFT packed pipeline tensor shape must have rank 3, got {tensor_shape}"
+                )
+            seq_length, micro_batch_size, hidden_size = tensor_shape
+            adjusted.append((seq_length * micro_batch_size, 1, hidden_size))
+        return adjusted
+
+    return _flatten_batch_dim(recv_tensor_shapes), _flatten_batch_dim(send_tensor_shapes)
+
+
+def _compose_tensor_shapes_adjust_fns(*adjust_fns):
+    adjust_fns = [fn for fn in adjust_fns if fn is not None]
+    if not adjust_fns:
+        return None
+
+    def _adjust(recv_tensor_shapes, send_tensor_shapes):
+        for adjust_fn in adjust_fns:
+            recv_tensor_shapes, send_tensor_shapes = adjust_fn(
+                recv_tensor_shapes, send_tensor_shapes
+            )
+        return recv_tensor_shapes, send_tensor_shapes
+
+    return _adjust
+
+
 def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=None):
     """Single training step."""
     args = get_args()
@@ -1698,14 +1797,30 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
         if has_nvidia_modelopt:
             # [ModelOpt]: Pipeline-parallel Distillation stacks student and teacher tensors
-            adjust_tensor_shapes_fn = get_tensor_shapes_adjust_fn_for_distillation(
+            modelopt_adjust_tensor_shapes_fn = get_tensor_shapes_adjust_fn_for_distillation(
                 model,
                 seq_length=args.seq_length,
                 micro_batch_size=args.micro_batch_size,
                 decoder_seq_length=args.decoder_seq_length,
             )
         else:
-            adjust_tensor_shapes_fn = None
+            modelopt_adjust_tensor_shapes_fn = None
+
+        sft_packed_adjust_tensor_shapes_fn = (
+            _adjust_tensor_shapes_for_sft_packed
+            if (
+                args.sft
+                and not args.hybrid_context_parallel
+                and args.pipeline_model_parallel_size > 1
+                and args.virtual_pipeline_model_parallel_size is None
+                and not args.overlap_moe_expert_parallel_comm
+            )
+            else None
+        )
+        adjust_tensor_shapes_fn = _compose_tensor_shapes_adjust_fns(
+            modelopt_adjust_tensor_shapes_fn,
+            sft_packed_adjust_tensor_shapes_fn,
+        )
 
         # For the mxfp8_param with reuse_grad_buf_for_mxfp8_param_ag and dp_ag_overlap,
         # we need to call the _copy_main_params_to_param_buffer() after the grad buffer
@@ -1821,6 +1936,10 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         optimizer_probe_reserved_before = torch.cuda.memory_reserved()
         optimizer_probe_start = time.perf_counter()
 
+    zcc_manager = getattr(optimizer, "zero_cost_checkpoint_manager", None)
+    if zcc_manager is not None:
+        zcc_manager.sync_before_step()
+
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
 
@@ -1903,6 +2022,11 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     if update_successful:
         increment = get_num_microbatches() * args.micro_batch_size * args.data_parallel_size
         opt_param_scheduler.step(increment=increment)
+        if zcc_manager is not None:
+            zcc_manager.snapshot_after_step(
+                (iteration + 1) if iteration is not None else 0,
+                opt_param_scheduler=opt_param_scheduler,
+            )
         skipped_iter = 0
     else:
         skipped_iter = 1
@@ -2912,9 +3036,7 @@ def train(
         if (args.profile 
             and (len(args.profile_ranks) == 0 or
                  torch.distributed.get_rank() in args.profile_ranks)):
-            if args.use_pytorch_profiler:
-                prof.step()
-            elif iteration == args.profile_step_start:
+            if not args.use_pytorch_profiler and iteration == args.profile_step_start:
                 torch.cuda.check_error(torch.cuda.cudart().cudaProfilerStart())
                 nsys_nvtx_context = torch.autograd.profiler.emit_nvtx(record_shapes=True)
                 nsys_nvtx_context.__enter__()
@@ -3029,6 +3151,12 @@ def train(
             forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration
         )
         ft_integration.on_training_step_end()
+        if (
+            args.profile
+            and args.use_pytorch_profiler
+            and (len(args.profile_ranks) == 0 or torch.distributed.get_rank() in args.profile_ranks)
+        ):
+            prof.step()
         if should_checkpoint:
             save_checkpoint_and_time(
                 iteration,

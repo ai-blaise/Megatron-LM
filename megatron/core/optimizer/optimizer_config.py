@@ -299,6 +299,54 @@ class OptimizerConfig:
     fp16 scales instead of materializing bf16 state tensors. This reduces checkpoint peak memory,
     but compressed state dicts must be resumed with the same optimizer-state sharding."""
 
+    enable_zero_cost_checkpoint: bool = False
+    """Enable per-rank zero-cost checkpoint snapshots after successful optimizer steps."""
+
+    zcc_workers_num: int = 1
+    """Number of background durable dump workers per rank."""
+
+    zcc_flash_device: str = "/dev/shm/megatron_zcc"
+    """Tier-1 ZCC snapshot root."""
+
+    zcc_flash_stripe: str = ""
+    """Comma-separated additional tier-1 roots. Ranks are striped across these roots."""
+
+    zcc_durable_dir: Optional[str] = None
+    """Optional tier-2 durable ZCC snapshot root."""
+
+    zcc_durable_interval: int = 10
+    """Write durable ZCC snapshots every N optimizer steps."""
+
+    zcc_compress: str = "zstd:1"
+    """Tier-2 ZCC compression mode: none or zstd:<level>."""
+
+    zcc_include_rng: bool = True
+    """Include PyTorch CPU/CUDA RNG state in ZCC metadata."""
+
+    zcc_include_dither: bool = True
+    """Include the NVFP4 stochastic-rounding dither counter in ZCC metadata."""
+
+    zcc_bucket_hook: bool = True
+    """Allow ZCC bucket-copy hooks when available."""
+
+    zcc_numa_pin: bool = True
+    """NUMA-pin ZCC workers when topology is available."""
+
+    zcc_use_gds: bool = False
+    """Use GPUDirect Storage for ZCC tier-1 when available."""
+
+    zcc_fault_inject: bool = False
+    """Enable ZCC failure-injection paths for tests."""
+
+    zcc_recovery_mode: str = "auto"
+    """ZCC resume source: auto, flash, peer, or durable."""
+
+    zcc_extra_tensor_attrs: str = ""
+    """Comma-separated parameter-side tensor attributes to include in ZCC snapshots."""
+
+    zcc_retain_latest: int = 1
+    """Number of latest ZCC step directories to retain per local snapshot root. Use 0 to keep all."""
+
     #######################
     # Distributed optimizer
     #######################
@@ -466,6 +514,15 @@ class OptimizerConfig:
             assert (
                 self.flash_adamw_quantize or not self.flash_adamw_compress_state_dict
             ), '--flash-adamw-compress-state-dict requires quantized FlashAdamW states'
+        assert self.zcc_durable_interval >= 1, '--zcc-durable-interval must be positive'
+        assert self.zcc_workers_num >= 1, '--zcc-workers-num must be positive'
+        assert self.zcc_retain_latest >= 0, '--zcc-retain-latest must be non-negative'
+        assert self.zcc_recovery_mode in (
+            'auto',
+            'flash',
+            'peer',
+            'durable',
+        ), '--zcc-recovery-mode must be one of auto, flash, peer, durable'
 
 
 # Backward-compatible aliases (deprecated; use OptimizerConfig directly).

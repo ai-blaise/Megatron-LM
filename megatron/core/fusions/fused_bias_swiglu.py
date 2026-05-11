@@ -3,14 +3,25 @@
 
 # pylint: disable=missing-function-docstring, missing-class-docstring
 
+import os
+
 import torch
 import torch.nn.functional as F
 
 from megatron.core.jit import jit_fuser
 from megatron.core.utils import nvtx_decorator
 
-###### BIAS SWIGLU FUSION/ NO AUTOGRAD ################
+try:
+    import triton
+    import triton.language as tl
 
+    HAVE_TRITON = True
+except ImportError:
+    HAVE_TRITON = False
+    triton = None
+    tl = None
+
+###### BIAS SWIGLU FUSION/ NO AUTOGRAD ################
 
 @jit_fuser
 def swiglu(y):
@@ -41,10 +52,61 @@ def bias_swiglu(y, bias):
     return swiglu(y)
 
 
-@jit_fuser
+def _weighted_swiglu_fuser(func):
+    mode = os.getenv("MEGATRON_WEIGHTED_SWIGLU_FUSER", "eager").lower()
+    if mode in ("0", "off", "false", "no", "none", "eager", "triton", "triton_kernel", "kernel"):
+        return func
+    if mode in ("dynamic", "dynamic_compile"):
+        try:
+            return torch.compile(dynamic=True)(func)
+        except TypeError:
+            return torch.compile(func, dynamic=True)
+    return jit_fuser(func)
+
+
+def _env_enabled(name: str, default: str = "0") -> bool:
+    value = os.getenv(name, default).strip().lower()
+    return value not in ("0", "false", "off", "no")
+
+
+def _weighted_swiglu_triton_enabled() -> bool:
+    mode = os.getenv("MEGATRON_WEIGHTED_SWIGLU_FUSER", "eager").lower()
+    return mode in ("triton", "triton_kernel", "kernel") or _env_enabled(
+        "MEGATRON_WEIGHTED_SWIGLU_TRITON", "0"
+    )
+
+
+def _weighted_swiglu_triton_block_h(hidden_size: int) -> int:
+    raw = os.getenv("MEGATRON_WEIGHTED_SWIGLU_TRITON_BLOCK_H")
+    value = int(raw) if raw else 1024
+    if value <= 0:
+        raise ValueError(f"MEGATRON_WEIGHTED_SWIGLU_TRITON_BLOCK_H must be positive, got {value}")
+    return min(triton.next_power_of_2(value), triton.next_power_of_2(hidden_size), 2048)
+
+
+def _can_use_weighted_swiglu_triton(input: torch.Tensor, weights: torch.Tensor) -> bool:
+    if not (HAVE_TRITON and _weighted_swiglu_triton_enabled()):
+        return False
+    if not (input.is_cuda and weights.is_cuda):
+        return False
+    if input.dim() != 2 or weights.dim() not in (1, 2):
+        return False
+    if input.size(-1) % 2 != 0 or input.size(0) <= 0:
+        return False
+    if weights.numel() != input.size(0):
+        return False
+    if input.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+        return False
+    if weights.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+        return False
+    return input.is_contiguous() and weights.is_contiguous()
+
+
+@_weighted_swiglu_fuser
 def weighted_swiglu(y, weights):
     dtype = y.dtype
-    res = swiglu(y) * weights
+    y_1, y_2 = torch.chunk(y, 2, -1)
+    res = F.silu(y_1) * y_2 * weights
     return res.to(dtype)
 
 
@@ -86,15 +148,168 @@ def bias_swiglu_back(g, y, bias):
     return swiglu_back(g, y)
 
 
-@jit_fuser
+@_weighted_swiglu_fuser
 def weighted_swiglu_back(g, y, weights):
     input_dtype = y.dtype
     w_dtype = weights.dtype
-    input_grad = swiglu_back(g * weights, y)
+    y_1, y_2 = torch.chunk(y, 2, -1)
+    weighted_grad = g * weights
+    input_grad = torch.cat(
+        (
+            weighted_grad
+            * torch.sigmoid(y_1)
+            * (1 + y_1 * (1 - torch.sigmoid(y_1)))
+            * y_2,
+            weighted_grad * F.silu(y_1),
+        ),
+        -1,
+    )
     # precison of w may be higher than y and g, so we need to cast g to w_dtype
-    weights_grad = swiglu(y) * g.to(w_dtype)
+    weights_grad = F.silu(y_1) * y_2 * g.to(w_dtype)
     weights_grad = torch.sum(weights_grad, dim=-1, keepdim=True)
     return input_grad.to(input_dtype), weights_grad.to(w_dtype)
+
+
+if HAVE_TRITON:
+
+    @triton.jit
+    def _weighted_swiglu_forward_kernel(
+        input_ptr,
+        weights_ptr,
+        output_ptr,
+        rows,
+        hidden_size: tl.constexpr,
+        input_stride_row: tl.constexpr,
+        weights_stride_row: tl.constexpr,
+        output_stride_row: tl.constexpr,
+        BLOCK_H: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        block = tl.program_id(1)
+        offsets = block * BLOCK_H + tl.arange(0, BLOCK_H)
+        mask = offsets < hidden_size
+
+        x1 = tl.load(input_ptr + row * input_stride_row + offsets, mask=mask, other=0.0).to(
+            tl.float32
+        )
+        x2 = tl.load(
+            input_ptr + row * input_stride_row + hidden_size + offsets, mask=mask, other=0.0
+        ).to(tl.float32)
+        weights = tl.load(weights_ptr + row * weights_stride_row).to(tl.float32)
+        sigmoid = 1.0 / (1.0 + tl.exp(-x1))
+        output = x1 * sigmoid * x2 * weights
+        tl.store(output_ptr + row * output_stride_row + offsets, output, mask=mask)
+
+
+    @triton.jit
+    def _weighted_swiglu_backward_kernel(
+        grad_output_ptr,
+        input_ptr,
+        weights_ptr,
+        grad_input_ptr,
+        grad_weights_ptr,
+        rows,
+        hidden_size: tl.constexpr,
+        grad_output_stride_row: tl.constexpr,
+        input_stride_row: tl.constexpr,
+        weights_stride_row: tl.constexpr,
+        grad_input_stride_row: tl.constexpr,
+        grad_weights_stride_row: tl.constexpr,
+        BLOCK_H: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        block = tl.program_id(1)
+        offsets = block * BLOCK_H + tl.arange(0, BLOCK_H)
+        mask = offsets < hidden_size
+
+        grad_output = tl.load(
+            grad_output_ptr + row * grad_output_stride_row + offsets, mask=mask, other=0.0
+        ).to(tl.float32)
+        x1 = tl.load(input_ptr + row * input_stride_row + offsets, mask=mask, other=0.0).to(
+            tl.float32
+        )
+        x2 = tl.load(
+            input_ptr + row * input_stride_row + hidden_size + offsets, mask=mask, other=0.0
+        ).to(tl.float32)
+        weights = tl.load(weights_ptr + row * weights_stride_row).to(tl.float32)
+
+        sigmoid = 1.0 / (1.0 + tl.exp(-x1))
+        silu = x1 * sigmoid
+        weighted_grad = grad_output * weights
+        grad_x1 = weighted_grad * sigmoid * (1.0 + x1 * (1.0 - sigmoid)) * x2
+        grad_x2 = weighted_grad * silu
+        grad_weights = tl.sum(silu * x2 * grad_output, axis=0)
+
+        tl.store(grad_input_ptr + row * grad_input_stride_row + offsets, grad_x1, mask=mask)
+        tl.store(
+            grad_input_ptr + row * grad_input_stride_row + hidden_size + offsets,
+            grad_x2,
+            mask=mask,
+        )
+        tl.atomic_add(
+            grad_weights_ptr + row * grad_weights_stride_row,
+            grad_weights,
+            sem="relaxed",
+        )
+
+
+class WeightedSwiGLUTritonFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input, weights, fp8_input_store):
+        rows, doubled_hidden = input.shape
+        hidden_size = doubled_hidden // 2
+        output = torch.empty((rows, hidden_size), device=input.device, dtype=input.dtype)
+        block_h = _weighted_swiglu_triton_block_h(hidden_size)
+        grid = (rows, triton.cdiv(hidden_size, block_h))
+
+        _weighted_swiglu_forward_kernel[grid](
+            input,
+            weights,
+            output,
+            rows,
+            hidden_size,
+            input.stride(0),
+            weights.stride(0) if weights.dim() > 1 else 1,
+            output.stride(0),
+            BLOCK_H=block_h,
+            num_warps=4,
+        )
+
+        input_for_backward = input.to(torch.float8_e4m3fn) if fp8_input_store else input
+        ctx.save_for_backward(input_for_backward, weights)
+        ctx.ori_input_dtype = input.dtype
+        ctx.fp8_input_store = fp8_input_store
+        ctx.block_h = block_h
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        input, weights = ctx.saved_tensors
+        input = input.to(ctx.ori_input_dtype) if ctx.fp8_input_store else input
+        grad_output = grad_output.contiguous()
+        rows, doubled_hidden = input.shape
+        hidden_size = doubled_hidden // 2
+        grad_input = torch.empty_like(input)
+        grad_weights = torch.zeros_like(weights)
+        grid = (rows, triton.cdiv(hidden_size, ctx.block_h))
+
+        _weighted_swiglu_backward_kernel[grid](
+            grad_output,
+            input,
+            weights,
+            grad_input,
+            grad_weights,
+            rows,
+            hidden_size,
+            grad_output.stride(0),
+            input.stride(0),
+            weights.stride(0) if weights.dim() > 1 else 1,
+            grad_input.stride(0),
+            grad_weights.stride(0) if grad_weights.dim() > 1 else 1,
+            BLOCK_H=ctx.block_h,
+            num_warps=4,
+        )
+        return grad_input, grad_weights, None
 
 
 class BiasSwiGLUFunction(torch.autograd.Function):
@@ -246,7 +461,10 @@ def weighted_bias_swiglu_impl(input, bias, weights, fp8_input_store=False):
     if bias is not None:
         raise NotImplementedError("Bias is not supported for weighted swiglu fusion")
     else:
-        output = WeightedSwiGLUFunction.apply(input, weights, fp8_input_store)
+        if _can_use_weighted_swiglu_triton(input, weights):
+            output = WeightedSwiGLUTritonFunction.apply(input, weights, fp8_input_store)
+        else:
+            output = WeightedSwiGLUFunction.apply(input, weights, fp8_input_store)
 
     return output if len(ori_shape) == 2 else output.view(ori_shape[0], ori_shape[1], -1)
 

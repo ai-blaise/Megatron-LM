@@ -1,5 +1,28 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+"""Fused GatedNorm: ``output = normed * sigmoid(silu(normed @ w_down.T) @ w_up.T)``.
+
+Forward fast paths, in priority order:
+
+1. **CuTe SM100 CUDA kernel** (``gated_norm_cute.cu``) — preferred on B200.
+   Two-pass tensor-core implementation (mma.sync.aligned.m16n8k16 +
+   cp.async double-buffer). Handles the small/medium ``num_tokens`` regime
+   that the previous Triton path served, but ~1.05-1.49× faster than
+   ``torch.mm`` at production rank R=16, D=7168.
+2. **torch.mm fallback** — used when ``num_tokens`` is large (cuBLAS dominates
+   the launch-overhead-amortised regime; see ``_torch_mm_min_tokens``) or when
+   the CuTe launcher returns ``cudaErrorInvalidValue`` (R=64 N≥16, R≤48 with
+   N≥4096; matches the SMEM-overflow contract from the reference kernel).
+3. **Triton kernel** — retained as a debug fallback under
+   ``MEGATRON_GATED_NORM_USE_TRITON=1``; also drives the backward pass.
+
+The public surface — ``apply_gated_norm`` and ``GatedNormFunction`` — is
+unchanged. Backward continues to run through the Triton implementation; when
+backward is needed, the CuTe forward additionally recomputes the pre-silu
+``z = normed @ w_down.T`` workspace via ``torch.mm`` so the saved tensor
+matches what the Triton backward expects.
+"""
+
 from __future__ import annotations
 
 import os
@@ -126,6 +149,122 @@ def _validate_gated_norm_inputs(
 def _require_triton() -> None:
     if not HAVE_TRITON:
         raise RuntimeError("apply_gated_norm requires Triton")
+
+
+# ---------------------------------------------------------------------------
+# CuTe CUDA fast path (SM100 / B200).
+# ---------------------------------------------------------------------------
+# `cudaErrorInvalidValue` (== 1) is the documented "fall back to torch.mm"
+# signal from the kernel launcher (R=64 N>=16, R<=48 N>=4096, SMEM overflow).
+_CUDA_ERROR_INVALID_VALUE = 1
+_CUDA_ERROR_MEMORY_ALLOCATION = 2
+_USE_TRITON_ENV = "MEGATRON_GATED_NORM_USE_TRITON"
+_DISABLE_CUTE_ENV = "MEGATRON_GATED_NORM_DISABLE_CUTE"
+
+_gated_norm_cuda_module = None
+_gated_norm_cuda_load_failed = False
+
+
+def _gated_norm_cuda_extra_flags() -> list[str]:
+    """Build flags mandated by the optimization-playground CuTe pattern.
+
+    See ``docs/developer_guide/cute_kernels_b200.md`` for derivation.
+    Use sm_100 (NOT sm_100a) — CuTe barrier code crashes with sm_100a.
+    """
+    return [
+        "-std=c++20",
+        "-O3",
+        "--expt-relaxed-constexpr",
+        "-gencode=arch=compute_100,code=sm_100",
+        "-DFLASHINFER_ENABLE_BF16",
+        "-DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK",
+    ]
+
+
+def _load_cuda_kernel():
+    """JIT-compile the CuTe GatedNorm kernel on first use.
+
+    Returns the loaded extension, or ``None`` if the build fails (e.g., on a
+    pre-Blackwell GPU or without nvcc). A failed load is sticky — we don't
+    retry on every call.
+    """
+    global _gated_norm_cuda_module, _gated_norm_cuda_load_failed
+    if _gated_norm_cuda_module is not None:
+        return _gated_norm_cuda_module
+    if _gated_norm_cuda_load_failed:
+        return None
+    if os.getenv(_DISABLE_CUTE_ENV) == "1":
+        _gated_norm_cuda_load_failed = True
+        return None
+
+    try:
+        from torch.utils.cpp_extension import load
+    except ImportError:
+        _gated_norm_cuda_load_failed = True
+        return None
+
+    kernel_dir = os.path.dirname(os.path.abspath(__file__))
+    try:
+        _gated_norm_cuda_module = load(
+            name="megatron_gated_norm_cute",
+            sources=[
+                os.path.join(kernel_dir, "gated_norm_cute_wrapper.cpp"),
+                os.path.join(kernel_dir, "gated_norm_cute.cu"),
+            ],
+            extra_cuda_cflags=_gated_norm_cuda_extra_flags(),
+            verbose=False,
+        )
+    except Exception:  # noqa: BLE001 — any build failure is non-fatal
+        _gated_norm_cuda_load_failed = True
+        _gated_norm_cuda_module = None
+        return None
+
+    return _gated_norm_cuda_module
+
+
+def _gated_norm_cute_forward(
+    flat_normed: torch.Tensor,
+    w_down: torch.Tensor,
+    w_up: torch.Tensor,
+    output: torch.Tensor,
+    hidden_size: int,
+    rank: int,
+) -> bool:
+    """Run the CuTe forward.
+
+    Returns True on success; False if the kernel returned
+    ``cudaErrorInvalidValue`` (caller must dispatch to torch.mm) or the
+    extension is unavailable.
+    """
+    if flat_normed.dtype != torch.bfloat16:
+        return False
+    ext = _load_cuda_kernel()
+    if ext is None:
+        return False
+
+    num_tokens = flat_normed.shape[0]
+    output_flat = output.reshape(-1, hidden_size)
+    err = ext.gated_norm_cute_fwd(
+        flat_normed,
+        w_down,
+        w_up,
+        output_flat,
+        num_tokens,
+        hidden_size,
+        rank,
+    )
+    if err == 0:
+        return True
+    if err in (_CUDA_ERROR_INVALID_VALUE, _CUDA_ERROR_MEMORY_ALLOCATION):
+        # InvalidValue is the documented shape fallback. MemoryAllocation is
+        # also non-fatal here: PP2 32k SFT can have only tiny scratch headroom,
+        # while the torch.mm path does not need the CuTe cudaMallocAsync
+        # workspace.
+        return False
+    raise RuntimeError(
+        f"GatedNorm CuTe kernel failed with cudaError={err} (rank={rank}, "
+        f"hidden_size={hidden_size}, num_tokens={num_tokens})"
+    )
 
 
 def _next_power_of_2(value: int, maximum: int) -> int:
@@ -279,10 +418,19 @@ def _gated_norm_torch_mm_forward(
 
 
 def _gated_norm_forward(
-    normed: torch.Tensor, w_down: torch.Tensor, w_up: torch.Tensor, hidden_size: int, rank: int
+    normed: torch.Tensor,
+    w_down: torch.Tensor,
+    w_up: torch.Tensor,
+    hidden_size: int,
+    rank: int,
+    needs_backward: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    _require_triton()
+    """Dispatch the forward pass.
 
+    Order: CuTe SM100 → torch.mm → Triton (debug). The CuTe path is the
+    default fast path; it is skipped automatically on non-bf16 inputs and on
+    GPUs where the build fails to load.
+    """
     input_shape = normed.shape
     flat_normed = normed.reshape(-1, hidden_size).contiguous()
     w_down = w_down.contiguous()
@@ -295,10 +443,27 @@ def _gated_norm_forward(
     if num_tokens == 0:
         return output.reshape(input_shape), flat_normed, w_down, w_up, z
 
-    if _should_use_torch_mm(num_tokens, rank, normed.dtype):
+    use_torch_mm = _should_use_torch_mm(num_tokens, rank, normed.dtype)
+    use_triton_debug = os.getenv(_USE_TRITON_ENV) == "1"
+
+    if use_torch_mm:
         z = _gated_norm_torch_mm_forward(flat_normed, w_down, w_up, output, hidden_size)
         return output.reshape(input_shape), flat_normed, w_down, w_up, z
 
+    if not use_triton_debug:
+        if _gated_norm_cute_forward(
+            flat_normed, w_down, w_up, output, hidden_size, rank
+        ):
+            # CuTe doesn't externalize z. Recompute it via torch.mm only when
+            # backward is actually needed. Inference skips this entirely.
+            if needs_backward:
+                z = torch.mm(flat_normed, w_down.t()).float()
+            return output.reshape(input_shape), flat_normed, w_down, w_up, z
+        # CuTe declined (cudaErrorInvalidValue / unavailable) → torch.mm.
+        z = _gated_norm_torch_mm_forward(flat_normed, w_down, w_up, output, hidden_size)
+        return output.reshape(input_shape), flat_normed, w_down, w_up, z
+
+    _require_triton()
     block_h = _next_power_of_2(hidden_size, 128)
     block_r = _next_power_of_2(rank, 64)
     _gated_norm_forward_kernel[(num_tokens,)](
@@ -362,8 +527,12 @@ class GatedNormFunction(torch.autograd.Function):
     def forward(ctx, normed: torch.Tensor, w_down: torch.Tensor, w_up: torch.Tensor):
         hidden_size, rank = _validate_gated_norm_inputs(normed, w_down, w_up)
 
+        # torch.is_grad_enabled() is false inside autograd.Function.forward even
+        # when callers require gradients. Use the autograd-provided input flags
+        # so the CuTe forward saves the z workspace needed by backward.
+        needs_backward = any(ctx.needs_input_grad)
         output, flat_normed, w_down, w_up, z = _gated_norm_forward(
-            normed, w_down, w_up, hidden_size, rank
+            normed, w_down, w_up, hidden_size, rank, needs_backward
         )
 
         ctx.input_shape = normed.shape

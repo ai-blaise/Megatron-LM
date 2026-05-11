@@ -296,8 +296,15 @@ def mcore_to_pyt_state_dict(
         is_pre_mcore_014_sh_ten = (
             sh_tens[0].prepend_axis_num or sh_tens[0].flattened_range is not None
         )
+        is_loading_prepended_nvfp4_sh_ten = (
+            is_loading
+            and sh_tens[0].prepend_axis_num
+            and any(type(sh_ten.data).__name__ == "NVFP4Tensor" for sh_ten in sh_tens)
+        )
         if (
-            not is_pre_mcore_014_sh_ten or not sh_tens[0].has_regular_grid
+            is_loading_prepended_nvfp4_sh_ten
+            or not is_pre_mcore_014_sh_ten
+            or not sh_tens[0].has_regular_grid
         ) and is_torch_min_version("2.6a0"):
             assert sh_tens[0].flattened_range is None
             if len(sh_tens) > 1:
@@ -499,6 +506,7 @@ class MCoreLoadPlanner(DefaultLoadPlanner):
         self.shapes_validation_sharded_tensors = shapes_validation_sharded_tensors
         self.allow_shape_mismatch_sharded_tensors = allow_shape_mismatch_sharded_tensors
         self._intermediate_read_item_and_target: Optional[Tuple[ReadItem, torch.Tensor]] = None
+        self._nvfp4_prepend_read_item_and_target: Optional[Tuple[ReadItem, torch.Tensor]] = None
 
     def _validate_global_shapes(self, metadata, sharded_tensors):
         for sh_ten in sharded_tensors:
@@ -551,6 +559,26 @@ class MCoreLoadPlanner(DefaultLoadPlanner):
 
         return local_plan
 
+    def _lookup_checkpointable_base_tensor(self, read_item: ReadItem) -> Optional[torch.Tensor]:
+        """Return the MCore base tensor behind a DCP checkpointable shard."""
+        obj = self.state_dict.get(read_item.dest_index.fqn)
+        if isinstance(obj, CheckpointableShardedTensor):
+            return obj._sh_ten.data
+        if isinstance(obj, LocalShardsContainer):
+            shards = obj._local_shards
+            if read_item.dest_index.index is not None:
+                index = read_item.dest_index.index
+                if (
+                    len(shards) > index
+                    and torch.Size(shards[index]._sh_ten.global_offset)
+                    == read_item.dest_index.offset
+                ):
+                    return shards[index]._sh_ten.data
+            for shard in shards:
+                if torch.Size(shard._sh_ten.global_offset) == read_item.dest_index.offset:
+                    return shard._sh_ten.data
+        return None
+
     def resolve_tensor(self, read_item: ReadItem):
         """Override to add FP8 support.
 
@@ -562,6 +590,24 @@ class MCoreLoadPlanner(DefaultLoadPlanner):
         and restoring it in `commit_tensor` method.
         """
         target_tensor = super().resolve_tensor(read_item)
+        if (
+            HAVE_TE
+            and type(target_tensor).__name__ == "NVFP4Tensor"
+            and target_tensor.dim() > 0
+            and target_tensor.size(0) == 1
+        ):
+            base_target_tensor = self._lookup_checkpointable_base_tensor(read_item)
+            if (
+                base_target_tensor is not None
+                and type(base_target_tensor).__name__ == "NVFP4Tensor"
+                and base_target_tensor.shape != target_tensor.shape
+            ):
+                self._nvfp4_prepend_read_item_and_target = (read_item, base_target_tensor)
+                return torch.empty(
+                    target_tensor.shape,
+                    dtype=target_tensor.dtype,
+                    device=target_tensor.device,
+                )
         if (
             not target_tensor.is_contiguous()
             and HAVE_TE
@@ -575,6 +621,16 @@ class MCoreLoadPlanner(DefaultLoadPlanner):
 
     def commit_tensor(self, read_item: ReadItem, tensor: torch.Tensor) -> None:
         """Restores the original FP8 tensor saved in `resolve_tensor`."""
+        if self._nvfp4_prepend_read_item_and_target is not None:
+            nvfp4_read_item, target_tensor = self._nvfp4_prepend_read_item_and_target
+            assert (
+                nvfp4_read_item is read_item
+            ), '`commit_tensor` method should be called right after `resolve_tensor`'
+            while tensor.dim() > target_tensor.dim() and tensor.size(0) == 1:
+                tensor = tensor[0]
+            target_tensor.copy_(tensor)
+            tensor = target_tensor
+            self._nvfp4_prepend_read_item_and_target = None
         if self._intermediate_read_item_and_target is not None:
             interm_read_item, target_tensor = self._intermediate_read_item_and_target
             assert (

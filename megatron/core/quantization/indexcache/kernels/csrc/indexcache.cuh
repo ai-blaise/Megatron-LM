@@ -43,6 +43,12 @@ __device__ __forceinline__ float warp_reduce_sum(float v) {
 // Block reduction over kHeadDim (128) threads, broadcasting the result to
 // every thread. Mirrors the broadcast-via-fresh-slot pattern we adopted
 // for TurboQuant (avoids the alias-with-warp-partial trap).
+//
+// The trailing __syncthreads() after the broadcast read is intentionally
+// omitted: every kernel that calls this helper invokes it once per block
+// before its other shared-memory uses, so a second sync would be dead.
+// The minimum scratch span used is 9 floats (slots 0..3 for warp partials,
+// slot 8 for the broadcast); callers should size accordingly.
 __device__ __forceinline__ float block_reduce_max_128(
     float v, float* __restrict__ scratch) {
   const int tid = threadIdx.x;
@@ -59,9 +65,7 @@ __device__ __forceinline__ float block_reduce_max_128(
     }
   }
   __syncthreads();
-  const float total = scratch[8];
-  __syncthreads();
-  return total;
+  return scratch[8];
 }
 
 }  // namespace indexcache
