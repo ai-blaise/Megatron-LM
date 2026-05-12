@@ -50,7 +50,7 @@ Expected result: all tests pass. The May 12, 2026 H200 run reported
 
 ## Common GPT Smoke Arguments
 
-Use these arguments for GPipe and ZeroBubble:
+Use these arguments for all schedule smokes below:
 
 ```bash
 COMMON_ARGS="\
@@ -95,13 +95,13 @@ python -m torch.distributed.run --standalone --nproc_per_node=8 \
   pretrain_gpt.py $COMMON_ARGS \
   --pipeline-parallel-schedule gpipe_fill_drain \
   --num-layers 8 \
-  2>&1 | tee /tmp/pipeline_gpipe_pp4_tp2_train_nosp.log
+  2>&1 | tee /tmp/pipeline_gpipe_pp4_tp2_train.log
 
 python -m torch.distributed.run --standalone --nproc_per_node=8 \
   pretrain_gpt.py $COMMON_ARGS \
   --pipeline-parallel-schedule zero_bubble \
   --num-layers 8 \
-  2>&1 | tee /tmp/pipeline_zero_bubble_pp4_tp2_train_nosp_final.log
+  2>&1 | tee /tmp/pipeline_zero_bubble_pp4_tp2_train.log
 ```
 
 Pass criteria:
@@ -125,7 +125,7 @@ python -m torch.distributed.run --standalone --nproc_per_node=8 \
   --pipeline-parallel-schedule dualpipe_v \
   --num-layers 16 \
   --num-virtual-stages-per-pipeline-rank 2 \
-  2>&1 | tee /tmp/pipeline_dualpipe_v_pp4_tp2_train_nosp_logfix.log
+  2>&1 | tee /tmp/pipeline_dualpipe_v_pp4_tp2_train.log
 ```
 
 ZeroBubble-V derives its two virtual stages from the selector and layer count:
@@ -135,7 +135,7 @@ python -m torch.distributed.run --standalone --nproc_per_node=8 \
   pretrain_gpt.py $COMMON_ARGS \
   --pipeline-parallel-schedule zero_bubble_v \
   --num-layers 16 \
-  2>&1 | tee /tmp/pipeline_zero_bubble_v_pp4_tp2_train_nosp_logfix.log
+  2>&1 | tee /tmp/pipeline_zero_bubble_v_pp4_tp2_train.log
 ```
 
 Expected May 12, 2026 V-schedule smoke result:

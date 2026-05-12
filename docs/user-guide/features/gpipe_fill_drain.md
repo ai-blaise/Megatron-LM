@@ -33,7 +33,7 @@ Leaving the selector at `auto` preserves the existing Megatron behavior:
 no pipelining for PP=1, non-interleaved 1F1B for PP>1 without virtual pipeline
 stages, and interleaved 1F1B when virtual pipeline stages are configured.
 
-## Memory And Performance
+## Memory and Performance
 
 GPipe fill-drain is useful as a compatibility and correctness baseline for
 schedule comparisons. It should not be treated as a throughput improvement over

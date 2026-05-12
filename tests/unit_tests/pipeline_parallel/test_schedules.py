@@ -86,13 +86,20 @@ def test_get_forward_backward_func_with_gpipe_fill_drain_selector():
             pp_size=2, vp_size=2, pipeline_parallel_schedule="gpipe_fill_drain"
         )
 
+    with pytest.raises(ValueError, match="requires pipeline_model_parallel_size > 1"):
+        schedule.get_forward_backward_func(
+            pp_size=1, vp_size=None, pipeline_parallel_schedule="gpipe_fill_drain"
+        )
+
 
 def test_pipeline_parallel_schedule_normalizes_gpipe_alias():
     assert normalize_pipeline_parallel_schedule("gpipe-fill-drain") == "gpipe_fill_drain"
 
 
 def test_model_parallel_config_rejects_gpipe_with_virtual_stages():
-    with pytest.raises(ValueError, match="requires virtual_pipeline_model_parallel_size to be None"):
+    with pytest.raises(
+        ValueError, match="requires virtual_pipeline_model_parallel_size to be None"
+    ):
         ModelParallelConfig(
             pipeline_model_parallel_size=2,
             pipeline_dtype=torch.float,

@@ -297,3 +297,27 @@ def test_zero_bubble_runtime_rejects_unwired_paths(field, value, match):
             allow_vp=False,
             forward_only=False,
         )
+
+
+def test_zero_bubble_v_runtime_requires_exactly_one_matching_p2p_tensor_shape():
+    from megatron.core.pipeline_parallel.zerobubble.runtime import (
+        _validate_single_p2p_tensor_shapes,
+    )
+
+    assert _validate_single_p2p_tensor_shapes(
+        [(4, 2, 8)], [(4, 2, 8)], "zero_bubble_v"
+    ) == (4, 2, 8)
+    with pytest.raises(ValueError, match="exactly one pipeline tensor"):
+        _validate_single_p2p_tensor_shapes(
+            [(4, 2, 8), (4, 2, 8)], [(4, 2, 8)], "zero_bubble_v"
+        )
+    with pytest.raises(ValueError, match="matching send and receive"):
+        _validate_single_p2p_tensor_shapes([(4, 2, 8)], [(4, 2, 16)], "zero_bubble_v")
+
+
+def test_zero_bubble_v_runtime_rejects_mismatched_send_tensor_shape():
+    from megatron.core.pipeline_parallel.zerobubble.runtime import _validate_p2p_send_tensor_shape
+
+    _validate_p2p_send_tensor_shape(torch.empty(4, 2, 8), (4, 2, 8), "zero_bubble_v")
+    with pytest.raises(ValueError, match=r"expected pipeline tensor shape .* got"):
+        _validate_p2p_send_tensor_shape(torch.empty(4, 2, 16), (4, 2, 8), "zero_bubble_v")

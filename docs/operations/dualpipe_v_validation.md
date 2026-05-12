@@ -115,9 +115,9 @@ Pass criteria:
 
 ## NCCL-First Production Megatron Gate
 
-After the DualPipeV runtime/config lane is merged, run the same model shape with
-the baseline pipeline schedule and with DualPipeV. Use mock data first so data
-loading cannot mask scheduler failures. The cross-schedule H200 smoke runbook in
+Run the same model shape with the baseline pipeline schedule and with
+DualPipeV. Use mock data first so data loading cannot mask scheduler failures.
+The cross-schedule H200 smoke runbook in
 `docs/operations/pipeline_schedule_validation.md` records the exact command
 shape used for the May 12, 2026 all-8 validation.
 

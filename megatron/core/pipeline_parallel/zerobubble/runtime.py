@@ -150,6 +150,22 @@ def _run_backward_split(input_tensor, output_tensor, output_tensor_grad, model_t
     return input_tensor_grad
 
 
+def _validate_single_p2p_tensor_shapes(recv_tensor_shapes, send_tensor_shapes, schedule_name):
+    if len(recv_tensor_shapes) != 1 or len(send_tensor_shapes) != 1:
+        raise ValueError(f"{schedule_name} currently supports exactly one pipeline tensor")
+    if recv_tensor_shapes[0] != send_tensor_shapes[0]:
+        raise ValueError(f"{schedule_name} requires matching send and receive tensor shapes")
+    return recv_tensor_shapes[0]
+
+
+def _validate_p2p_send_tensor_shape(tensor, tensor_shape, schedule_name):
+    if tuple(tensor.size()) != tuple(tensor_shape):
+        raise ValueError(
+            f"{schedule_name} expected pipeline tensor shape {tensor_shape}, "
+            f"got {tuple(tensor.size())}"
+        )
+
+
 def forward_backward_pipelining_with_zero_bubble(
     *,
     forward_step_func,
@@ -444,11 +460,9 @@ def forward_backward_pipelining_with_zero_bubble_v(
         pp_group=pp_group,
         is_recv=False,
     )
-    if len(recv_tensor_shapes) != 1 or len(send_tensor_shapes) != 1:
-        raise ValueError("zero_bubble_v currently supports exactly one pipeline tensor")
-    if recv_tensor_shapes[0] != send_tensor_shapes[0]:
-        raise ValueError("zero_bubble_v requires matching send and receive tensor shapes")
-    tensor_shape = recv_tensor_shapes[0]
+    tensor_shape = _validate_single_p2p_tensor_shapes(
+        recv_tensor_shapes, send_tensor_shapes, "zero_bubble_v"
+    )
 
     forward_data_store = []
     total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
@@ -492,6 +506,7 @@ def forward_backward_pipelining_with_zero_bubble_v(
         if len(tensor_list) != 1:
             raise ValueError("zero_bubble_v currently supports exactly one pipeline tensor")
         for tensor in tensor_list:
+            _validate_p2p_send_tensor_shape(tensor, tensor_shape, "zero_bubble_v")
             comm_ops.append(
                 torch.distributed.P2POp(torch.distributed.isend, tensor, peer_rank, pp_group)
             )

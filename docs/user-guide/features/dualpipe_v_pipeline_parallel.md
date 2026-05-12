@@ -3,18 +3,17 @@
 DualPipeV is the V-shaped form of DeepSeek DualPipe. It uses two virtual
 pipeline stages per physical pipeline rank:
 
-- phase 0 maps logical stages `0..PP-1` from rank 0 to rank `PP-1`;
-- phase 1 maps logical stages `2*PP-1..PP` from rank 0 to rank `PP-1`;
-- rank `PP-1` bridges phase 0 into phase 1;
+- phase 0 maps logical stages `0..PP-1` and forwards from rank 0 to rank `PP-1`;
+- phase 1 maps logical stages `PP..2*PP-1` and forwards from rank `PP-1` to rank 0;
+- rank `PP-1` bridges phase 0 output into phase 1 input;
 - rank 0 owns both the input side and the loss/output side.
 
 The current runtime is a conservative sequential V-topology production
 baseline. It preserves the V-shaped rank mapping and NCCL P2P data path, but it
 does not claim overlapped zero-bubble timing.
 
-This branch prioritizes DualPipeV first. The validation harness in
-`tools/dualpipe_v_schedule_verify.py` is DualPipeV-specific and does not claim
-support for other pipeline schedules.
+The validation harness in `tools/dualpipe_v_schedule_verify.py` is
+DualPipeV-specific and does not claim support for other pipeline schedules.
 
 ## Configuration Contract
 
@@ -40,7 +39,7 @@ model so the pipeline returns to rank 0 for loss and output handling.
 Run this before launching distributed work:
 
 ```bash
-cd ~/work/Megatron-LM-pipeline-parallels
+cd ~/work/Megatron-LM-pipeline-parallels-integration
 python tools/dualpipe_v_schedule_verify.py \
   --mode static \
   --pipeline-model-parallel-size 8 \
@@ -60,8 +59,8 @@ Use torchrun on the H200 VM to verify NCCL process-group setup, sequential
 V-shaped point-to-point movement, and deterministic forward/backward parity:
 
 ```bash
-cd ~/work/Megatron-LM-pipeline-parallels
-source ~/streambp-py312/bin/activate
+cd ~/work/Megatron-LM-pipeline-parallels-integration
+source ~/work/pipeline-py312/bin/activate
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NCCL_DEBUG=WARN
 
