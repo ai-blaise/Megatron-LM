@@ -742,6 +742,27 @@ class MLASelfAttention(MultiLatentAttention):
             )
             self.turboquant_kv_buffers = buffers
 
+        self.higgs_kv_buffers = None
+        if getattr(self.config, "enable_higgs_dense_2bit_kv_cache", False):
+            from megatron.core.quantization.higgs import build_higgs_buffers
+
+            higgs_buffers = build_higgs_buffers(
+                latent_dim=self.config.kv_lora_rank,
+                preset=getattr(self.config, "higgs_kv_preset", "dense_2bit"),
+                layer_idx=layer_number,
+                device="cpu",
+                dtype=torch.float32,
+            )
+            self.register_buffer(
+                "_higgs_codebook", higgs_buffers.codebook, persistent=False
+            )
+            self.register_buffer(
+                "_higgs_codebook_norm_sq",
+                higgs_buffers.codebook_norm_sq,
+                persistent=False,
+            )
+            self.higgs_kv_buffers = higgs_buffers
+
     def _refresh_turboquant_buffers_device(self) -> None:
         """Sync the cached buffer dataclass with the registered tensors."""
 
@@ -759,6 +780,22 @@ class MLASelfAttention(MultiLatentAttention):
             boundaries_low=self._turboquant_boundaries_low,
             centroids_high=self._turboquant_centroids_high,
             centroids_low=self._turboquant_centroids_low,
+        )
+
+    def _refresh_higgs_buffers_device(self) -> None:
+        """Sync the cached HIGGS buffer dataclass with the registered tensors."""
+
+        if self.higgs_kv_buffers is None:
+            return
+        from megatron.core.quantization.higgs import HiggsBuffers
+
+        self.higgs_kv_buffers = HiggsBuffers(
+            latent_dim=self.higgs_kv_buffers.latent_dim,
+            pair_dim=self.higgs_kv_buffers.pair_dim,
+            codebook_size=self.higgs_kv_buffers.codebook_size,
+            bits_per_scalar=self.higgs_kv_buffers.bits_per_scalar,
+            codebook=self._higgs_codebook,
+            codebook_norm_sq=self._higgs_codebook_norm_sq,
         )
 
     def get_query_key_value_tensors(
@@ -909,6 +946,14 @@ class MLASelfAttention(MultiLatentAttention):
 
             self._refresh_turboquant_buffers_device()
             kv_compressed = apply_turboquant_kv(kv_compressed, self.turboquant_kv_buffers)
+
+        if self.higgs_kv_buffers is not None:
+            from megatron.core.quantization.higgs import apply_higgs_dense_2bit_kv
+
+            self._refresh_higgs_buffers_device()
+            kv_compressed = apply_higgs_dense_2bit_kv(
+                kv_compressed, self.higgs_kv_buffers
+            )
 
         # =========================================
         # QKV up projection and RoPE apply

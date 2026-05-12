@@ -668,6 +668,30 @@ class TransformerConfig(ModelParallelConfig):
 
 
     ####################
+    # HIGGS 2-bit dense MLA-latent KV
+    ####################
+    enable_higgs_dense_2bit_kv_cache: bool = False
+    """Enable 2-bit HIGGS fake-quant on the MLA latent KV during training.
+
+    HIGGS (``arXiv:2501.19392``) compresses the 512-dim MLA latent with a
+    single orthonormal block-Hadamard rotation, an fp16 per-token block
+    scale, and a 4-bit index per pair into the public AquaKV EDEN2-16
+    codebook (2 bits per scalar). Slot layout is 258 B / token vs the
+    274 B / token of 2.5-bit TurboQuant. The op is per-token-local on the
+    post-projection latent (kv_lora_rank dimension) and is safe under
+    TP/SP/CP/EP. RoPE features pass through unchanged. Frozen buffers
+    (the EDEN2-16 codebook and its per-codeword squared norms) are public
+    constants so every rank constructs identical state without collective
+    communication.
+
+    Mutually exclusive with ``turboquant_kv_enabled``; only one fake-quant
+    scheme acts on the dense MLA KV at a time."""
+
+    higgs_kv_preset: str = "dense_2bit"
+    """Quantizer preset. Currently only ``dense_2bit`` is supported."""
+
+
+    ####################
     # IndexCache fake-quant on the DSA indexer K
     ####################
     dsa_indexcache_quant_enabled: bool = False
@@ -1398,6 +1422,25 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.dsa_chunk_size <= 0:
             raise ValueError("dsa_chunk_size must be positive")
+
+        # HIGGS and TurboQuant both act on the dense MLA latent KV; running both
+        # at once would apply two fake-quant schemes back-to-back to the same
+        # tensor, which is not a meaningful configuration. Surface this loudly
+        # at config-validate time rather than letting it silently double-quant.
+        if self.turboquant_kv_enabled and self.enable_higgs_dense_2bit_kv_cache:
+            raise ValueError(
+                "turboquant_kv_enabled and enable_higgs_dense_2bit_kv_cache are "
+                "mutually exclusive: both act on the dense MLA latent KV. "
+                "Pick one fake-quant scheme."
+            )
+
+        if self.enable_higgs_dense_2bit_kv_cache:
+            valid_presets = {"dense_2bit"}
+            if self.higgs_kv_preset not in valid_presets:
+                raise ValueError(
+                    f"Unknown HIGGS preset {self.higgs_kv_preset!r}; "
+                    f"expected one of {sorted(valid_presets)}."
+                )
 
         if self.cpu_offloading and self.recompute_granularity is not None:
             raise ValueError(

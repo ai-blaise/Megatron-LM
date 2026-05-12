@@ -2109,6 +2109,22 @@ def _add_spinquant_args(parser):
         help="Base seed for per-layer sign vectors. Final seed is base*2654435761+layer_idx.",
     )
 
+    group = parser.add_argument_group(title="higgs")
+    group.add_argument(
+        "--enable-higgs-dense-2bit-kv-cache",
+        action="store_true",
+        default=False,
+        help="Enable 2-bit HIGGS fake-quant on the MLA latent KV during training. "
+        "Mutually exclusive with --turboquant-kv-enabled.",
+    )
+    group.add_argument(
+        "--higgs-kv-preset",
+        type=str,
+        default="dense_2bit",
+        choices=["dense_2bit"],
+        help="HIGGS quantizer preset.",
+    )
+
     group = parser.add_argument_group(title="indexcache")
     group.add_argument(
         "--dsa-indexcache-quant-enabled",
@@ -2454,6 +2470,8 @@ def _add_network_size_args(parser):
         "turboquant_kv_enabled",
         "turboquant_kv_preset",
         "turboquant_kv_seed",
+        "enable_higgs_dense_2bit_kv_cache",
+        "higgs_kv_preset",
         "dsa_indexcache_quant_enabled",
         "dsa_indexcache_quantization",
         "dsa_indexcache_quant_eps",
