@@ -197,7 +197,8 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp):
         )
 
         # Unpack the result
-        tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params = result
+        tokens, labels, loss_mask, attention_mask, position_ids, padding_mask, packed_seq_params = result
+        assert padding_mask is None
 
         # Get parallel state info
         tp_rank = parallel_state.get_tensor_model_parallel_rank()

@@ -29,11 +29,15 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.streambp import (
+    StreamBPMoeAuxState,
+    StreamBPMoeAuxStats,
+    current_streambp_moe_aux_replay,
     iter_streambp_chunks,
     make_streambp_packed_seq_params,
     make_streambp_single_sequence_packed_seq_params,
     mark_streambp_pending_chunks,
     moe_streambp_requires_full_replay,
+    replay_streambp_moe_aux_stats,
     should_streambp_register_grad_ready,
     slice_streambp_attention_mask,
     slice_streambp_padding_mask,
@@ -401,6 +405,99 @@ def test_streambp_moe_nonchunk_forward_and_backward_chunk_attention_once_for_mlp
     assert recompute_phases == [False, False, False, False, True, True, True, True]
     assert torch.allclose(hidden_states.grad, full_hidden_states.grad)
     assert torch.allclose(layer.weight.grad, full_layer.weight.grad)
+
+
+def test_streambp_moe_hybrid_can_split_mlp_replay_into_large_chunks():
+    full_layer = ToyMoeAttentionSplitLayer()
+    layer = ToyMoeAttentionSplitLayer()
+    layer.load_state_dict(full_layer.state_dict())
+    full_hidden_states = torch.randn(10, 2, 3, requires_grad=True)
+    hidden_states = full_hidden_states.detach().clone().requires_grad_(True)
+    recompute_phases = []
+
+    @contextmanager
+    def fake_te_recompute_context(*, recompute_phase):
+        recompute_phases.append(recompute_phase)
+        yield
+
+    full_output, _ = full_layer(full_hidden_states)
+    with patch(
+        "megatron.core.transformer.streambp._te_activation_recompute_context",
+        fake_te_recompute_context,
+    ):
+        output, _ = streambp_checkpoint_layer(
+            layer,
+            hidden_states,
+            chunk_size=4,
+            chunk_forward=False,
+            moe_mlp_chunks=2,
+            mhc_recompute_manager=None,
+        )
+
+        grad_output = torch.randn_like(output)
+        assert layer.no_grad_attention_chunks == [(0, 4), (4, 8), (8, 10)]
+        assert layer.no_grad_mlp_shapes == [(5, 2, 3), (5, 2, 3)]
+        assert torch.allclose(output, full_output)
+        full_output.backward(grad_output)
+        output.backward(grad_output)
+
+    assert layer.grad_attention_chunks == [(0, 4), (4, 8), (8, 10)]
+    assert layer.grad_mlp_shapes == [(5, 2, 3), (5, 2, 3)]
+    assert recompute_phases == [False, False, False, False, False, True, True, True, True, True]
+    assert torch.allclose(hidden_states.grad, full_hidden_states.grad)
+    assert torch.allclose(layer.weight.grad, full_layer.weight.grad)
+
+
+def test_streambp_moe_aux_replay_combines_full_counts_with_chunk_token_scale():
+    state = StreamBPMoeAuxState()
+    router = object()
+    first = StreamBPMoeAuxStats(
+        tokens_per_expert=torch.tensor([1.0, 2.0]),
+        local_num_tokens=torch.tensor(3.0),
+        total_num_tokens=torch.tensor(3.0),
+        seq_length=4,
+        bsz=1,
+        with_padding_mask=False,
+    )
+    second = StreamBPMoeAuxStats(
+        tokens_per_expert=torch.tensor([3.0, 5.0]),
+        local_num_tokens=torch.tensor(8.0),
+        total_num_tokens=torch.tensor(8.0),
+        seq_length=6,
+        bsz=1,
+        with_padding_mask=False,
+    )
+
+    state.record(router, "seq_aux_loss", first)
+    state.record(router, "seq_aux_loss", second)
+
+    summed = state.get(router, "seq_aux_loss")
+    assert torch.equal(summed.tokens_per_expert, torch.tensor([4.0, 7.0]))
+    assert summed.seq_length == 10
+
+    with replay_streambp_moe_aux_stats(state):
+        replay = current_streambp_moe_aux_replay()
+        replay_stats = replay.get(router, "seq_aux_loss")
+        assert torch.equal(replay_stats.tokens_per_expert, torch.tensor([4.0, 7.0]))
+        assert replay_stats.local_num_tokens.item() == 11.0
+        assert replay_stats.total_num_tokens.item() == 11.0
+        assert replay_stats.seq_length == 10
+
+    with replay_streambp_moe_aux_stats(state, chunk_index=0):
+        replay = current_streambp_moe_aux_replay()
+        replay_stats = replay.get(router, "seq_aux_loss")
+        assert torch.equal(replay_stats.tokens_per_expert, torch.tensor([4.0, 7.0]))
+        assert replay_stats.local_num_tokens.item() == 3.0
+        assert replay_stats.total_num_tokens.item() == 11.0
+        assert replay_stats.seq_length == 4
+
+    with replay_streambp_moe_aux_stats(state, chunk_index=1):
+        replay = current_streambp_moe_aux_replay()
+        replay_stats = replay.get(router, "seq_aux_loss")
+        assert torch.equal(replay_stats.tokens_per_expert, torch.tensor([4.0, 7.0]))
+        assert replay_stats.local_num_tokens.item() == 8.0
+        assert replay_stats.total_num_tokens.item() == 11.0
+        assert replay_stats.seq_length == 6
 
 
 def test_streambp_moe_hybrid_handles_full_replay_required_modes():
@@ -786,6 +883,8 @@ def test_streambp_packed_dsa_chunk_matches_full_attention(monkeypatch):
 def _build_moe_transformer_block_pair(
     moe_aux_loss_coeff: float = 0.0,
     moe_router_load_balancing_type: str = "aux_loss",
+    streambp_moe_chunk_forward: bool = True,
+    streambp_moe_mlp_chunks: int = 1,
 ):
     config_kwargs = dict(
         num_layers=1,
@@ -811,6 +910,8 @@ def _build_moe_transformer_block_pair(
         use_streambp=True,
         streambp_chunk_size=4,
         streambp_logits_chunk_size=4,
+        streambp_moe_chunk_forward=streambp_moe_chunk_forward,
+        streambp_moe_mlp_chunks=streambp_moe_mlp_chunks,
     )
     baseline = TransformerBlock(
         baseline_config, get_gpt_decoder_block_spec(baseline_config, False)
@@ -897,6 +998,23 @@ def test_streambp_moe_seq_aux_loss_chunked_matches_baseline_gradients():
         baseline, streambp = _build_moe_transformer_block_pair(
             moe_aux_loss_coeff=0.01,
             moe_router_load_balancing_type="seq_aux_loss",
+        )
+        _assert_matching_block_backward(baseline, streambp, with_padding_mask=False)
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_streambp_moe_seq_aux_loss_split_mlp_replay_matches_baseline_gradients():
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        torch.manual_seed(6812)
+        model_parallel_cuda_manual_seed(6812)
+        baseline, streambp = _build_moe_transformer_block_pair(
+            moe_aux_loss_coeff=0.01,
+            moe_router_load_balancing_type="seq_aux_loss",
+            streambp_moe_chunk_forward=False,
+            streambp_moe_mlp_chunks=2,
         )
         _assert_matching_block_backward(baseline, streambp, with_padding_mask=False)
     finally:

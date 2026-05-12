@@ -15,9 +15,14 @@ command -v tmux >/dev/null || {
 }
 
 SESSION="${SESSION:-deepseek_sft_real}"
+ATTACH="${ATTACH:-1}"
 if tmux has-session -t "$SESSION" 2>/dev/null; then
-    echo "tmux session '$SESSION' already exists; attaching." >&2
-    exec tmux attach-session -t "$SESSION"
+    if [[ "$ATTACH" == "1" ]]; then
+        echo "tmux session '$SESSION' already exists; attaching." >&2
+        exec tmux attach-session -t "$SESSION"
+    fi
+    echo "tmux session '$SESSION' already exists; leaving it running." >&2
+    exit 0
 fi
 
 TS="${TS:-$(date -u +%Y%m%d_%H%M%S)}"
@@ -39,8 +44,9 @@ TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-"$HOME/.cache/triton/deepseek_v32_reap_sft
 # 2x the 1B-token target: 61056 samples * 32768 tokens/sample ~= 2.0007B tokens.
 TRAIN_SAMPLES="${TRAIN_SAMPLES:-61056}"
 SAVE_INTERVAL="${SAVE_INTERVAL:-100}"
-DECODER_FIRST_PIPELINE_NUM_LAYERS="${DECODER_FIRST_PIPELINE_NUM_LAYERS:-17}"
-DECODER_LAST_PIPELINE_NUM_LAYERS="${DECODER_LAST_PIPELINE_NUM_LAYERS:-14}"
+DECODER_FIRST_PIPELINE_NUM_LAYERS="${DECODER_FIRST_PIPELINE_NUM_LAYERS:-16}"
+DECODER_LAST_PIPELINE_NUM_LAYERS="${DECODER_LAST_PIPELINE_NUM_LAYERS:-15}"
+PIPELINE_MODEL_PARALLEL_LAYOUT="${PIPELINE_MODEL_PARALLEL_LAYOUT:-Et*16|t*15|t*15|t*15L}"
 OVERLAP_PARAM_GATHER="${OVERLAP_PARAM_GATHER:-0}"
 # Megatron keeps checkpoints whose iteration is divisible by this value and
 # deletes the previous non-retained checkpoint after a new save. Pick a value
@@ -60,7 +66,11 @@ Save every:    $SAVE_INTERVAL updates
 Retention:     keep latest normal Megatron checkpoint only
 ZCC:           ENABLE_ZCC=${ENABLE_ZCC:-0} (last successful probe used 0)
 Param gather:  OVERLAP_PARAM_GATHER=$OVERLAP_PARAM_GATHER
-PP layers:     first=$DECODER_FIRST_PIPELINE_NUM_LAYERS middle=auto last=$DECODER_LAST_PIPELINE_NUM_LAYERS
+PP layout:     ${PIPELINE_MODEL_PARALLEL_LAYOUT:-first=$DECODER_FIRST_PIPELINE_NUM_LAYERS middle=auto last=$DECODER_LAST_PIPELINE_NUM_LAYERS}
+StreamBP MoE:  chunk_forward=${STREAMBP_MOE_CHUNK_FORWARD:-0} mlp_chunks=${STREAMBP_MOE_MLP_CHUNKS:-2}
+MoE aux coeff: ${MOE_AUX_LOSS_COEFF:-1e-4}
+MoE bias upd:  ${MOE_ROUTER_BIAS_UPDATE_RATE:-1e-3}
+MoE bias rule: ${MOE_ROUTER_EXPERT_BIAS_UPDATE_METHOD:-sign}
 Triton cache:  TRITON_CACHE_AUTOTUNING=1 TRITON_CACHE_DIR=$TRITON_CACHE_DIR
 EOF
 
@@ -103,6 +113,7 @@ export EP="${EP:-4}"
 export ETP="${ETP:-1}"
 export DECODER_FIRST_PIPELINE_NUM_LAYERS="${DECODER_FIRST_PIPELINE_NUM_LAYERS}"
 export DECODER_LAST_PIPELINE_NUM_LAYERS="${DECODER_LAST_PIPELINE_NUM_LAYERS}"
+export PIPELINE_MODEL_PARALLEL_LAYOUT="${PIPELINE_MODEL_PARALLEL_LAYOUT}"
 export SEQ_LENGTH="${SEQ_LENGTH:-32768}"
 export MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-2}"
 export GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-32}"
@@ -123,10 +134,18 @@ export OVERLAP_PARAM_GATHER="${OVERLAP_PARAM_GATHER}"
 export USE_STREAMBP="${USE_STREAMBP:-1}"
 export STREAMBP_CHUNK_SIZE="${STREAMBP_CHUNK_SIZE:-2048}"
 export STREAMBP_MOE_CHUNK_FORWARD="${STREAMBP_MOE_CHUNK_FORWARD:-0}"
+export STREAMBP_MOE_MLP_CHUNKS="${STREAMBP_MOE_MLP_CHUNKS:-2}"
+export MOE_AUX_LOSS_COEFF="${MOE_AUX_LOSS_COEFF:-1e-4}"
+export MOE_ROUTER_BIAS_UPDATE_RATE="${MOE_ROUTER_BIAS_UPDATE_RATE:-1e-3}"
+export MOE_ROUTER_EXPERT_BIAS_UPDATE_METHOD="${MOE_ROUTER_EXPERT_BIAS_UPDATE_METHOD:-sign}"
+export MOE_ROUTER_QUANTILE_BIAS_ITERS="${MOE_ROUTER_QUANTILE_BIAS_ITERS:-5}"
+export MOE_ROUTER_QUANTILE_BIAS_SYNC_SCORES="${MOE_ROUTER_QUANTILE_BIAS_SYNC_SCORES:-1}"
 export DSA_CHUNK_SIZE="${DSA_CHUNK_SIZE:-2048}"
 export DSA_INDEXER_TOPK="${DSA_INDEXER_TOPK:-2048}"
 export MEGATRON_DSA_TRITON_BF16_GRAD_ATOMICS="${MEGATRON_DSA_TRITON_BF16_GRAD_ATOMICS:-1}"
 export MEGATRON_DSA_TRITON_BWD_NUM_WARPS="${MEGATRON_DSA_TRITON_BWD_NUM_WARPS:-2}"
+export MEGATRON_FLASH_ADAMW_NVFP4_IMMEDIATE_CAST="${MEGATRON_FLASH_ADAMW_NVFP4_IMMEDIATE_CAST:-1}"
+export FLASH_ADAMW_ECO="${FLASH_ADAMW_ECO:-1}"
 export FLASH_ADAMW_COMPRESS_STATE_DICT="${FLASH_ADAMW_COMPRESS_STATE_DICT:-1}"
 export ENABLE_ZCC="${ENABLE_ZCC:-0}"
 export ZCC_RETAIN_LATEST="${ZCC_RETAIN_LATEST:-1}"
@@ -195,4 +214,8 @@ tmux split-window -v -t "$P0" "bash '$LOCAL_MONITOR'"
 tmux split-window -v -t "$P1" "bash '$REMOTE_MONITOR'"
 tmux select-layout -t "$SESSION:0" tiled >/dev/null
 tmux set-option -t "$SESSION" remain-on-exit on >/dev/null
-tmux attach-session -t "$SESSION"
+if [[ "$ATTACH" == "1" ]]; then
+    tmux attach-session -t "$SESSION"
+else
+    echo "tmux session '$SESSION' started. Attach with: tmux attach -t '$SESSION'"
+fi

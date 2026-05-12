@@ -2454,6 +2454,7 @@ def _add_network_size_args(parser):
         "streambp_logits_chunk_size",
         "streambp_chunk_forward",
         "streambp_moe_chunk_forward",
+        "streambp_moe_mlp_chunks",
         "streambp_skip_moe",
         "streambp_skip_dsa",
         "streambp_validate",
@@ -3418,7 +3419,16 @@ def _add_training_args(parser):
         help=(
             "Override StreamBP no-grad forward chunking for MoE layers. "
             "Unset inherits --streambp-chunk-forward. Disabling keeps attention chunked "
-            "and runs the MoE MLP once over the full sequence."
+            "and runs the MoE MLP in --streambp-moe-mlp-chunks large chunks."
+        ),
+    )
+    group.add_argument(
+        "--streambp-moe-mlp-chunks",
+        type=int,
+        default=int(os.getenv("MEGATRON_STREAMBP_MOE_MLP_CHUNKS", "1")),
+        help=(
+            "Split hybrid StreamBP MoE MLP replay into this many large chunks. "
+            "This reduces TE FP8/FP4 unpadding peak memory without fully chunking MoE replay."
         ),
     )
     group.add_argument(

@@ -169,8 +169,13 @@ class StreamBPMoeAuxState:
 
     def __init__(self) -> None:
         self._stats: dict[int, dict[str, StreamBPMoeAuxStats]] = {}
+        self._chunk_stats: dict[int, dict[str, list[StreamBPMoeAuxStats]]] = {}
+        self._replay_chunk_index: Optional[int] = None
 
     def record(self, router: Any, aux_loss_type: str, stats: StreamBPMoeAuxStats) -> None:
+        chunk_router_stats = self._chunk_stats.setdefault(id(router), {})
+        chunk_router_stats.setdefault(aux_loss_type, []).append(stats)
+
         router_stats = self._stats.setdefault(id(router), {})
         existing = router_stats.get(aux_loss_type)
         if existing is None:
@@ -188,10 +193,33 @@ class StreamBPMoeAuxState:
         )
 
     def get(self, router: Any, aux_loss_type: str) -> Optional[StreamBPMoeAuxStats]:
-        return self._stats.get(id(router), {}).get(aux_loss_type)
+        router_id = id(router)
+        full_stats = self._stats.get(router_id, {}).get(aux_loss_type)
+        if full_stats is None:
+            return None
+        if self._replay_chunk_index is None:
+            return full_stats
+
+        chunk_stats = self._chunk_stats.get(router_id, {}).get(aux_loss_type)
+        if chunk_stats is None:
+            return None
+        if self._replay_chunk_index >= len(chunk_stats):
+            raise ValueError(
+                f"Missing StreamBP MoE aux stats chunk {self._replay_chunk_index} "
+                f"for {aux_loss_type}; captured {len(chunk_stats)} chunks"
+            )
+        chunk = chunk_stats[self._replay_chunk_index]
+        return StreamBPMoeAuxStats(
+            tokens_per_expert=full_stats.tokens_per_expert,
+            local_num_tokens=chunk.local_num_tokens,
+            total_num_tokens=full_stats.total_num_tokens,
+            seq_length=chunk.seq_length,
+            bsz=full_stats.bsz,
+            with_padding_mask=full_stats.with_padding_mask,
+        )
 
     def has_router(self, router: Any) -> bool:
-        return id(router) in self._stats
+        return id(router) in self._stats or id(router) in self._chunk_stats
 
 
 _MOE_AUX_CAPTURE_STACK: list[StreamBPMoeAuxState] = []
@@ -210,17 +238,24 @@ def capture_streambp_moe_aux_stats() -> Iterator[StreamBPMoeAuxState]:
 
 
 @contextmanager
-def replay_streambp_moe_aux_stats(state: Optional[StreamBPMoeAuxState]) -> Iterator[None]:
+def replay_streambp_moe_aux_stats(
+    state: Optional[StreamBPMoeAuxState],
+    *,
+    chunk_index: Optional[int] = None,
+) -> Iterator[None]:
     if state is None:
         with nullcontext():
             yield
         return
+    previous_chunk_index = state._replay_chunk_index
+    state._replay_chunk_index = chunk_index
     _MOE_AUX_REPLAY_STACK.append(state)
     try:
         yield
     finally:
         popped = _MOE_AUX_REPLAY_STACK.pop()
         assert popped is state
+        state._replay_chunk_index = previous_chunk_index
 
 
 def current_streambp_moe_aux_capture() -> Optional[StreamBPMoeAuxState]:
@@ -246,6 +281,46 @@ def iter_streambp_chunks(seq_len: int, chunk_size: Optional[int]) -> list[ChunkR
     """Return sequence-major chunk ranges covering ``[0, seq_len)``."""
     size = resolve_streambp_chunk_size(seq_len, chunk_size)
     return [(start, min(start + size, seq_len)) for start in range(0, seq_len, size)]
+
+
+def iter_streambp_num_chunks(seq_len: int, num_chunks: int) -> list[ChunkRange]:
+    """Return ``num_chunks`` large contiguous sequence ranges."""
+    if seq_len <= 0:
+        raise ValueError(f"StreamBP requires positive sequence length, got {seq_len}")
+    if num_chunks <= 0:
+        raise ValueError(f"StreamBP chunk count must be positive, got {num_chunks}")
+    num_chunks = min(num_chunks, seq_len)
+    chunk_size = (seq_len + num_chunks - 1) // num_chunks
+    return [(start, min(start + chunk_size, seq_len)) for start in range(0, seq_len, chunk_size)]
+
+
+def _slice_padding_mask_for_sequence_chunk(
+    padding_mask: Optional[Tensor], start: int, end: int, seq_len: int
+) -> Optional[Tensor]:
+    if padding_mask is None:
+        return None
+    if padding_mask.dim() >= 2 and padding_mask.size(1) == seq_len:
+        return padding_mask[:, start:end]
+    return padding_mask
+
+
+def _concat_streambp_chunk_outputs(outputs: list[Any]) -> Any:
+    first = outputs[0]
+    if first is None:
+        return None
+    if torch.is_tensor(first):
+        return torch.cat(outputs, dim=0)
+    if isinstance(first, tuple):
+        return tuple(
+            _concat_streambp_chunk_outputs([output[i] for output in outputs])
+            for i in range(len(first))
+        )
+    if isinstance(first, list):
+        return [
+            _concat_streambp_chunk_outputs([output[i] for output in outputs])
+            for i in range(len(first))
+        ]
+    raise TypeError(f"Unsupported StreamBP chunk output type: {type(first)}")
 
 
 def validate_chunk_range(chunk_range: ChunkRange, seq_len: int) -> ChunkRange:
@@ -742,6 +817,7 @@ def _moe_chunk_attention_full_mlp_no_grad_forward(
     kwargs: dict[str, Any],
     *,
     context_factory: ContextFactory,
+    moe_mlp_chunks: int,
 ) -> Tensor:
     """Run chunked attention followed by one full-sequence MoE MLP no-grad forward.
 
@@ -788,13 +864,40 @@ def _moe_chunk_attention_full_mlp_no_grad_forward(
                 attention_outputs.append(attention_output)
 
         post_attention = torch.cat(attention_outputs, dim=0)
-        with _profile_streambp_chunk("streambp/no_grad_forward_moe_mlp_full"):
-            with _te_activation_recompute_context(recompute_phase=False):
-                return layer._forward_mlp(
-                    post_attention,
-                    call_kwargs.get("inference_context", None),
-                    padding_mask=call_kwargs.get("padding_mask", None),
-                )
+        # The full MLP input is now contiguous in post_attention. Drop the
+        # per-chunk tensor references before TE FP8 unpadding allocates its
+        # temporary full-token buffer.
+        attention_outputs.clear()
+        del attention_outputs, attention_output
+        if moe_mlp_chunks == 1:
+            with _profile_streambp_chunk("streambp/no_grad_forward_moe_mlp_full"):
+                with _te_activation_recompute_context(recompute_phase=False):
+                    return layer._forward_mlp(
+                        post_attention,
+                        call_kwargs.get("inference_context", None),
+                        padding_mask=call_kwargs.get("padding_mask", None),
+                    )
+
+        seq_len = post_attention.size(0)
+        padding_mask = call_kwargs.get("padding_mask", None)
+        mlp_outputs = []
+        for chunk_index, (start, end) in enumerate(
+            iter_streambp_num_chunks(seq_len, moe_mlp_chunks)
+        ):
+            with _profile_streambp_chunk(
+                f"streambp/no_grad_forward_moe_mlp_chunk/{chunk_index}"
+            ):
+                with _te_activation_recompute_context(recompute_phase=False):
+                    mlp_outputs.append(
+                        layer._forward_mlp(
+                            post_attention[start:end],
+                            call_kwargs.get("inference_context", None),
+                            padding_mask=_slice_padding_mask_for_sequence_chunk(
+                                padding_mask, start, end, seq_len
+                            ),
+                        )
+                    )
+        return _concat_streambp_chunk_outputs(mlp_outputs)
 
 
 def _moe_chunk_attention_full_mlp_backward(
@@ -805,6 +908,8 @@ def _moe_chunk_attention_full_mlp_backward(
     kwargs: dict[str, Any],
     *,
     context_factory: ContextFactory,
+    moe_mlp_chunks: int,
+    moe_aux_stats: Optional[StreamBPMoeAuxState],
 ) -> None:
     """Replay MoE backward with chunked attention and one full MoE MLP graph."""
     call_kwargs = dict(kwargs)
@@ -836,13 +941,49 @@ def _moe_chunk_attention_full_mlp_backward(
                 attention_outputs.append(attention_output)
 
         post_attention = torch.cat(attention_outputs, dim=0)
-        with _profile_streambp_chunk("streambp/backward_replay_moe_mlp_full"):
-            with _te_activation_recompute_context(recompute_phase=True):
-                output = layer._forward_mlp(
-                    post_attention,
-                    call_kwargs.get("inference_context", None),
-                    padding_mask=call_kwargs.get("padding_mask", None),
-                )
+        # Cat backward only needs split metadata and graph edges; the chunk
+        # output storages themselves can be released before the full MoE MLP
+        # replay reaches TE FP8 unpadding.
+        attention_outputs.clear()
+        del attention_outputs, attention_output
+        if moe_mlp_chunks == 1:
+            with _profile_streambp_chunk("streambp/backward_replay_moe_mlp_full"):
+                with (
+                    replay_streambp_moe_aux_stats(moe_aux_stats),
+                    _te_activation_recompute_context(recompute_phase=True),
+                ):
+                    output = layer._forward_mlp(
+                        post_attention,
+                        call_kwargs.get("inference_context", None),
+                        padding_mask=call_kwargs.get("padding_mask", None),
+                    )
+        else:
+            seq_len = post_attention.size(0)
+            padding_mask = call_kwargs.get("padding_mask", None)
+            mlp_outputs = []
+            for chunk_index, (start, end) in enumerate(
+                iter_streambp_num_chunks(seq_len, moe_mlp_chunks)
+            ):
+                with _profile_streambp_chunk(
+                    f"streambp/backward_replay_moe_mlp_chunk/{chunk_index}"
+                ):
+                    with (
+                        replay_streambp_moe_aux_stats(
+                            moe_aux_stats,
+                            chunk_index=chunk_index,
+                        ),
+                        _te_activation_recompute_context(recompute_phase=True),
+                    ):
+                        mlp_outputs.append(
+                            layer._forward_mlp(
+                                post_attention[start:end],
+                                call_kwargs.get("inference_context", None),
+                                padding_mask=_slice_padding_mask_for_sequence_chunk(
+                                    padding_mask, start, end, seq_len
+                                ),
+                            )
+                        )
+            output = _concat_streambp_chunk_outputs(mlp_outputs)
 
     torch.autograd.backward(output, grad_output)
 
@@ -872,6 +1013,7 @@ class _StreamBPLayerCheckpoint(torch.autograd.Function):
         grad_anchor: Tensor,
         chunk_size: Optional[int],
         chunk_forward: bool,
+        moe_mlp_chunks: int,
         layer: torch.nn.Module,
         context_factory: ContextFactory,
         kwargs: dict[str, Any],
@@ -880,6 +1022,7 @@ class _StreamBPLayerCheckpoint(torch.autograd.Function):
         ctx.layer = layer
         ctx.chunk_size = chunk_size
         ctx.chunk_forward = chunk_forward
+        ctx.moe_mlp_chunks = moe_mlp_chunks
         ctx.context_factory = context_factory
         ctx.kwargs = kwargs
         ctx.save_for_backward(hidden_states)
@@ -902,6 +1045,7 @@ class _StreamBPLayerCheckpoint(torch.autograd.Function):
                             chunks,
                             kwargs,
                             context_factory=context_factory,
+                            moe_mlp_chunks=moe_mlp_chunks,
                         )
                 ctx.moe_aux_stats = moe_aux_stats
                 return output
@@ -935,10 +1079,7 @@ class _StreamBPLayerCheckpoint(torch.autograd.Function):
             detached_hidden_states = hidden_states.detach().requires_grad_(
                 ctx.needs_input_grad[0]
             )
-            with (
-                torch.enable_grad(),
-                replay_streambp_moe_aux_stats(ctx.moe_aux_stats),
-            ):
+            with torch.enable_grad():
                 _moe_chunk_attention_full_mlp_backward(
                     ctx.layer,
                     detached_hidden_states,
@@ -946,19 +1087,18 @@ class _StreamBPLayerCheckpoint(torch.autograd.Function):
                     chunks,
                     ctx.kwargs,
                     context_factory=ctx.context_factory,
+                    moe_mlp_chunks=ctx.moe_mlp_chunks,
+                    moe_aux_stats=ctx.moe_aux_stats,
                 )
             hidden_grad = detached_hidden_states.grad if ctx.needs_input_grad[0] else None
-            return hidden_grad, None, None, None, None, None, None
+            return hidden_grad, None, None, None, None, None, None, None
 
         params = _unique_trainable_parameters(ctx.layer)
         marked = mark_streambp_pending_chunks(params, len(chunks))
 
         detached_hidden_states = hidden_states.detach().requires_grad_(ctx.needs_input_grad[0])
         try:
-            with (
-                torch.enable_grad(),
-                replay_streambp_moe_aux_stats(ctx.moe_aux_stats),
-            ):
+            with torch.enable_grad():
                 for chunk_range in chunks:
                     start, end = chunk_range
                     chunk_index = start // resolve_streambp_chunk_size(
@@ -967,20 +1107,24 @@ class _StreamBPLayerCheckpoint(torch.autograd.Function):
                     with _profile_streambp_chunk(
                         f"streambp/backward_replay_chunk/{chunk_index}"
                     ):
-                        chunk_output = _call_layer(
-                            ctx.layer,
-                            detached_hidden_states,
-                            ctx.kwargs,
-                            chunk_range=chunk_range,
-                            context_factory=ctx.context_factory,
-                            activation_recompute_phase=True,
-                        )
+                        with replay_streambp_moe_aux_stats(
+                            ctx.moe_aux_stats,
+                            chunk_index=chunk_index if ctx.moe_aux_stats is not None else None,
+                        ):
+                            chunk_output = _call_layer(
+                                ctx.layer,
+                                detached_hidden_states,
+                                ctx.kwargs,
+                                chunk_range=chunk_range,
+                                context_factory=ctx.context_factory,
+                                activation_recompute_phase=True,
+                            )
                         torch.autograd.backward(chunk_output, grad_output[start:end])
             hidden_grad = detached_hidden_states.grad if ctx.needs_input_grad[0] else None
         finally:
             clear_streambp_pending_chunks(marked)
 
-        return hidden_grad, None, None, None, None, None, None
+        return hidden_grad, None, None, None, None, None, None, None
 
 
 class _StreamBPFullLayerCheckpoint(torch.autograd.Function):
@@ -1043,6 +1187,7 @@ def streambp_checkpoint_layer(
     *,
     chunk_size: Optional[int],
     chunk_forward: bool = True,
+    moe_mlp_chunks: int = 1,
     context_factory: ContextFactory = None,
     full_replay: bool = False,
     **kwargs: Any,
@@ -1067,6 +1212,7 @@ def streambp_checkpoint_layer(
         _make_grad_anchor(hidden_states),
         chunk_size,
         chunk_forward,
+        moe_mlp_chunks,
         layer,
         context_factory,
         kwargs,

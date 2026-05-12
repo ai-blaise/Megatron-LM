@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import math
 from abc import ABC, abstractmethod
 from typing import Optional, Union
 
@@ -193,6 +194,21 @@ class TopKRouter(Router):
                     device=torch.cuda.current_device(),
                 ),
             )
+            if self.config.moe_router_expert_bias_update_method == "quantile":
+                self.register_buffer(
+                    'quantile_expert_bias_sum',
+                    torch.zeros(
+                        self.config.num_moe_experts,
+                        dtype=torch.float32,
+                        device=torch.cuda.current_device(),
+                    ),
+                    persistent=False,
+                )
+                self.register_buffer(
+                    'quantile_expert_bias_steps',
+                    torch.tensor(0.0, dtype=torch.float32, device=torch.cuda.current_device()),
+                    persistent=False,
+                )
         else:
             self.local_tokens_per_expert = None
             self.expert_bias = None
@@ -700,11 +716,93 @@ class TopKRouter(Router):
         Update expert bias and tokens_per_expert
         Prevent extra local tokens accumulation on evaluation or activation recomputation
         """
-        if self.enable_expert_bias and torch.is_grad_enabled():
+        if (
+            self.enable_expert_bias
+            and self.config.moe_router_expert_bias_update_method == "sign"
+            and torch.is_grad_enabled()
+        ):
             with torch.no_grad():
                 if padding_mask is not None:
-                    routing_map = routing_map & (~padding_mask)
+                    routing_map = routing_map & (~padding_mask).unsqueeze(-1)
                 self.local_tokens_per_expert += routing_map.sum(dim=0)
+
+    def _gather_valid_quantile_scores(
+        self, scores: torch.Tensor, padding_mask: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        """Collect valid router scores for Quantile Balancing."""
+        if padding_mask is not None:
+            valid_scores = scores[~padding_mask]
+        else:
+            valid_scores = scores
+        valid_scores = valid_scores.detach().to(torch.float32).contiguous()
+
+        group = self.tp_dp_cp_group if self.tp_dp_cp_group is not None else self.tp_cp_group
+        if (
+            not self.config.moe_router_quantile_bias_sync_scores
+            or group is None
+            or group.size() == 1
+        ):
+            return valid_scores
+
+        local_count = torch.tensor(
+            [valid_scores.shape[0]], dtype=torch.long, device=valid_scores.device
+        )
+        counts = [torch.empty_like(local_count) for _ in range(group.size())]
+        torch.distributed.all_gather(counts, local_count, group=group)
+        counts_tensor = torch.cat(counts)
+        max_count = int(counts_tensor.max().item())
+        if max_count == 0:
+            return valid_scores.new_empty((0, scores.shape[-1]), dtype=torch.float32)
+
+        padded_scores = valid_scores.new_full(
+            (max_count, scores.shape[-1]), float("-inf"), dtype=torch.float32
+        )
+        if valid_scores.shape[0] > 0:
+            padded_scores[: valid_scores.shape[0]].copy_(valid_scores)
+
+        gathered = [torch.empty_like(padded_scores) for _ in range(group.size())]
+        torch.distributed.all_gather(gathered, padded_scores, group=group)
+        return torch.cat(
+            [rank_scores[: int(count.item())] for rank_scores, count in zip(gathered, counts_tensor)],
+            dim=0,
+        )
+
+    def _apply_quantile_expert_bias(
+        self, logits: torch.Tensor, padding_mask: Optional[torch.Tensor] = None
+    ) -> None:
+        """Update expert bias with Quantile Balancing after routing used the old bias."""
+        if (
+            not self.enable_expert_bias
+            or self.config.moe_router_expert_bias_update_method != "quantile"
+            or not self.training
+            or not torch.is_grad_enabled()
+        ):
+            return
+
+        with torch.no_grad():
+            if self.score_function != "sigmoid":
+                raise ValueError("Quantile expert bias currently requires sigmoid router scores.")
+
+            scores = torch.sigmoid(logits.float())
+            valid_scores = self._gather_valid_quantile_scores(scores, padding_mask)
+            num_tokens, num_experts = valid_scores.shape
+            if num_tokens == 0:
+                return
+
+            alpha_rank = min(self.topk + 1, num_experts)
+            target_rank = int(math.floor(num_tokens * self.topk / num_experts))
+            target_rank = max(0, min(target_rank, num_tokens - 1))
+
+            # The article formulates routing as scores - beta. This codebase stores
+            # DeepSeek-style additive expert_bias, so expert_bias == -beta.
+            beta = -self.expert_bias.detach().float().view(1, num_experts)
+            for _ in range(self.config.moe_router_quantile_bias_iters):
+                alpha = torch.topk(valid_scores - beta, k=alpha_rank, dim=1).values[:, -1:]
+                beta = torch.topk(valid_scores - alpha, k=target_rank + 1, dim=0).values[-1:]
+
+            candidate_bias = (-beta.squeeze(0)).to(dtype=torch.float32)
+            self.quantile_expert_bias_sum += candidate_bias
+            self.quantile_expert_bias_steps += 1.0
 
     def routing(self, logits: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
         """Top-k routing function
@@ -746,6 +844,8 @@ class TopKRouter(Router):
                 fused=self.config.moe_router_fusion,
                 router_replay=self.router_replay,
             )
+
+        self._apply_quantile_expert_bias(logits, padding_mask=padding_mask)
 
         # Apply token dropping to probs and routing_map.
         if self.config.moe_expert_capacity_factor is not None:

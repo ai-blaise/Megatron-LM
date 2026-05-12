@@ -167,14 +167,16 @@ class SFTDataset(MegatronDataset):
         merged_conversations = self.dataset[int(self.indices[idx % len(self.indices)])]
         split_conversations = self._split_conversations(merged_conversations)
 
-        def extend_with_padding(tokens, targets, positions, pad_len):
+        def extend_with_padding(tokens, targets, positions, padding_mask, pad_len):
             tokens.extend([pad] * pad_len)
             targets.extend([pad] * pad_len)
             positions.extend(range(positions[-1]+1, positions[-1]+1+pad_len))
+            padding_mask.extend([True] * pad_len)
 
         pack_tokens = []
         pack_targets = []
         pack_positions = []
+        pack_padding_mask = []
         cu_seqlens = [0]
         eod = tokenizer.eod
         pad = tokenizer.pad
@@ -191,6 +193,7 @@ class SFTDataset(MegatronDataset):
 
             pack_tokens.extend(tokens_list)
             pack_targets.extend(targets_list)
+            pack_padding_mask.extend([False] * len(tokens_list))
 
             assert not self.config.reset_position_ids
             pack_positions.extend(range(len(tokens_list)))
@@ -199,7 +202,9 @@ class SFTDataset(MegatronDataset):
             mod_token_count = len(pack_tokens) % pad_granularity
             if mod_token_count != 0:
                 pad_len = pad_granularity - mod_token_count
-                extend_with_padding(pack_tokens, pack_targets, pack_positions, pad_len)
+                extend_with_padding(
+                    pack_tokens, pack_targets, pack_positions, pack_padding_mask, pad_len
+                )
 
             # TODO(duncan): Consider also padding to multiple of number of tokens here. This might
             # be needed for efficiency (and potentially set via command-line argument).
@@ -212,8 +217,10 @@ class SFTDataset(MegatronDataset):
                 max_body = pack_length
                 pack_tokens = pack_tokens[:max_body]
                 pack_targets = pack_targets[:max_body]
+                pack_padding_mask = pack_padding_mask[:max_body]
                 pack_tokens.append(pad)
                 pack_targets.append(pad)
+                pack_padding_mask.append(True)
                 pack_positions = pack_positions[:pack_length+1]
                 # Note len({pack_tokens, pack_targets, pack_positions}) should be pack_length + 1
                 cu_seqlens[-1] = len(pack_tokens) - 1
@@ -222,18 +229,22 @@ class SFTDataset(MegatronDataset):
         # Handle any necessary padding
         if len(pack_tokens) < pack_length + 1:  # +1 here to account for later alignment
             pad_len = pack_length + 1 - len(pack_tokens)
-            extend_with_padding(pack_tokens, pack_targets, pack_positions, pad_len)
+            extend_with_padding(
+                pack_tokens, pack_targets, pack_positions, pack_padding_mask, pad_len
+            )
             # Note len({pack_tokens, pack_targets, pack_positions}) should be pack_length + 1
             cu_seqlens[-1] = len(pack_tokens) - 1
 
         assert len(pack_tokens) == pack_length + 1
         assert len(pack_targets) == pack_length + 1
         assert len(pack_positions) == pack_length + 1
+        assert len(pack_padding_mask) == pack_length + 1
 
         # Align and convert to tensors
         input_ids    = torch.tensor(pack_tokens[:-1],  dtype=torch.int64)
         labels       = torch.tensor(pack_targets[1:], dtype=torch.int64)
         position_ids = torch.tensor(pack_positions[:-1], dtype=torch.int64)
+        padding_mask = torch.tensor(pack_padding_mask[:-1], dtype=torch.bool)
 
         # Loss mask.
         loss_mask = torch.ones(pack_length, dtype=torch.float32)
@@ -257,6 +268,7 @@ class SFTDataset(MegatronDataset):
             # 'attention_mask': attention_mask,  # PyTorch collate cannot handle NoneType
             'loss_mask': loss_mask,
             'position_ids': position_ids,
+            'padding_mask': padding_mask,
             'cu_seqlens': cu_seqlens,
             'max_seqlen': max_seqlen,
         }
@@ -407,13 +419,16 @@ class MockSFTDataset(SFTDataset):
             # Long sequences are truncated to pack_length tokens (including EOD).
             if len(tokens_list) >= pack_length + 1:
                 tokens_list = tokens_list[:pack_length - 1] + [eod]
+                padding_mask = [False] * pack_length
             # Pad to pack_length + 1 (offset by 1 for input/label split).
             pad_len = pack_length + 1 - len(tokens_list)
             if pad_len > 0:
+                padding_mask = [False] * len(tokens_list) + [True] * pad_len
                 tokens_list = tokens_list + [pad] * pad_len
             assert len(tokens_list) == pack_length + 1
             input_ids    = torch.tensor(tokens_list[:-1], dtype=torch.int64)
             labels       = torch.tensor(tokens_list[1:],  dtype=torch.int64)
+            padding_mask = torch.tensor(padding_mask[:-1], dtype=torch.bool)
             # Position IDs are sequential across the entire sequence including padding,
             # matching GPTDataset behavior for standard (non-packed) training.
             position_ids = torch.arange(pack_length, dtype=torch.int64)
@@ -424,19 +439,23 @@ class MockSFTDataset(SFTDataset):
                 'labels':       labels,
                 'loss_mask':    loss_mask,
                 'position_ids': position_ids,
+                'padding_mask': padding_mask,
             }
 
         # THD format (sequence packing) below.
-        def extend_with_padding(tokens, positions, pad_len):
+        def extend_with_padding(tokens, positions, padding_mask, pad_len):
             tokens.extend([pad] * pad_len)
             positions.extend(range(positions[-1] + 1, positions[-1] + 1 + pad_len))
+            padding_mask.extend([True] * pad_len)
 
         pack_tokens = list(tokens_list) + [pad]
+        pack_padding_mask = [False] * len(tokens_list) + [True]
         pack_positions = list(range(len(pack_tokens)))
 
         # Truncate if sequence exceeds pack_length + 1 (need +1 for shift).
         if len(pack_tokens) > pack_length + 1:
             pack_tokens = pack_tokens[:pack_length - 1] + [eod, pad]
+            pack_padding_mask = [False] * pack_length + [True]
             pack_positions = pack_positions[:pack_length + 1]
 
         # Pad to pad_granularity alignment (tp * cp * 2).
@@ -446,12 +465,13 @@ class MockSFTDataset(SFTDataset):
         mod_token_count = final_len % pad_granularity
         if mod_token_count != 0:
             pad_len = pad_granularity - mod_token_count
-            extend_with_padding(pack_tokens, pack_positions, pad_len)
+            extend_with_padding(pack_tokens, pack_positions, pack_padding_mask, pad_len)
 
         # Apply shift for next-token prediction.
         input_ids = torch.tensor(pack_tokens[:-1], dtype=torch.int64)
         labels = torch.tensor(pack_tokens[1:], dtype=torch.int64)
         position_ids = torch.tensor(pack_positions[:-1], dtype=torch.int64)
+        padding_mask = torch.tensor(pack_padding_mask[:-1], dtype=torch.bool)
 
         seq_len = len(input_ids)
         cu_seqlens = [0, seq_len]
@@ -468,6 +488,7 @@ class MockSFTDataset(SFTDataset):
             'labels': labels,
             'loss_mask': loss_mask,
             'position_ids': position_ids,
+            'padding_mask': padding_mask,
             'cu_seqlens': cu_seqlens,
             'max_seqlen': max_seqlen,
         }

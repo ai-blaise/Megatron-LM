@@ -469,10 +469,18 @@ class TransformerConfig(ModelParallelConfig):
     streambp_moe_chunk_forward: Optional[bool] = None
     """Optional MoE-specific override for streambp_chunk_forward.
 
-    None inherits streambp_chunk_forward. False keeps StreamBP's backward replay chunked and
-    runs the no-grad forward with chunked attention plus one full-sequence MoE MLP. This avoids
-    multiplying MoE dispatch collectives during the no-grad forward path without forcing DSA
-    attention into a full-sequence kernel shape.
+    None inherits streambp_chunk_forward. False keeps StreamBP's attention replay chunked and
+    runs the MoE MLP replay in streambp_moe_mlp_chunks large chunks. This avoids multiplying
+    MoE dispatch collectives by the attention chunk count without forcing DSA attention into a
+    full-sequence kernel shape.
+    """
+
+    streambp_moe_mlp_chunks: int = 1
+    """Number of large chunks for hybrid StreamBP MoE MLP replay.
+
+    This only applies when MoE StreamBP uses chunked attention with non-chunked forward replay.
+    Values greater than one split the MoE MLP replay to reduce TE FP8/FP4 unpadding peak memory
+    without using fully chunked MoE replay.
     """
 
     streambp_skip_moe: bool = False
@@ -798,6 +806,20 @@ class TransformerConfig(ModelParallelConfig):
     in a global batch, where the bias is increased for the experts with less assigned tokens
     and decreased for the experts with more assigned tokens.
     The default value 1e-3 is same as that used in DeepSeekV3."""
+
+    moe_router_expert_bias_update_method: Literal['sign', 'quantile'] = 'sign'
+    """Update rule for aux-loss-free expert bias routing.
+    - "sign": DeepSeek-style SignSGD update from per-expert token counts.
+    - "quantile": Quantile Balancing update from the current router score matrix.
+    """
+
+    moe_router_quantile_bias_iters: int = 5
+    """Number of alternating alpha/beta quantile iterations for Quantile Balancing."""
+
+    moe_router_quantile_bias_sync_scores: bool = True
+    """All-gather valid router scores across TP/CP/DP before Quantile Balancing.
+    Disable only for debugging local per-rank quantile behavior.
+    """
 
     moe_router_force_load_balancing: bool = False
     """[Experimental] Force load balancing with random logits for MoE router, supports naive topk 
@@ -1457,6 +1479,8 @@ class TransformerConfig(ModelParallelConfig):
                 and self.streambp_logits_chunk_size <= 0
             ):
                 raise ValueError("streambp_logits_chunk_size must be positive when set")
+            if self.streambp_moe_mlp_chunks <= 0:
+                raise ValueError("streambp_moe_mlp_chunks must be positive")
             if self.streambp_profile_limit <= 0:
                 raise ValueError("streambp_profile_limit must be positive")
 
@@ -1910,6 +1934,16 @@ class TransformerConfig(ModelParallelConfig):
                 "Expert bias for aux-loss-free routing only supports sigmoid score function."
                 "Please set --moe-router-score-function sigmoid for sigmoid score function."
             )
+        if (
+            self.moe_router_expert_bias_update_method == "quantile"
+            and not self.moe_router_enable_expert_bias
+        ):
+            raise ValueError(
+                "--moe-router-expert-bias-update-method quantile requires "
+                "--moe-router-enable-expert-bias."
+            )
+        if self.moe_router_quantile_bias_iters < 1:
+            raise ValueError("--moe-router-quantile-bias-iters must be >= 1.")
 
         if self.num_moe_experts and self.fp8:
             # TE version below 1.7.0 will raise Error when handle zeros tokens for expert

@@ -78,7 +78,7 @@ def _prepare_thd_packed_batch_for_tp_broadcast(batch):
     if max_seqlen is not None:
         batch['max_seqlen'] = max_seqlen.max().to(dtype=torch.int32).view(1)
 
-    for key in ('tokens', 'labels', 'loss_mask', 'position_ids'):
+    for key in ('tokens', 'labels', 'loss_mask', 'position_ids', 'padding_mask'):
         value = batch.get(key)
         if isinstance(value, torch.Tensor) and value.dim() == 2 and value.size(0) > 1:
             batch[key] = value.contiguous().view(1, -1)
@@ -582,6 +582,11 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
                 else data["attention_mask"].cuda(non_blocking=True)
             ),
             'position_ids': data["position_ids"].cuda(non_blocking=True),
+            'padding_mask': (
+                None
+                if "padding_mask" not in data
+                else data["padding_mask"].cuda(non_blocking=True)
+            ),
             'cu_seqlens': (
                 None
                 if "cu_seqlens" not in data
@@ -625,6 +630,7 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             _broadcast(batch['loss_mask'])
             _broadcast(batch['attention_mask'])
             _broadcast(batch['position_ids'])
+            _broadcast(batch['padding_mask'])
             _broadcast_cu_seqlens(batch['cu_seqlens'])
             _broadcast(batch['max_seqlen'])
             _broadcast(batch['local_cp_size'])
@@ -633,6 +639,7 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             _broadcast(batch['tokens'])
             _broadcast(batch['attention_mask'])
             _broadcast(batch['position_ids'])
+            _broadcast(batch['padding_mask'])
             _broadcast_cu_seqlens(batch['cu_seqlens'])
             _broadcast(batch['max_seqlen'])
 
@@ -643,6 +650,19 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             _broadcast(batch['labels'])
             _broadcast(batch['loss_mask'])
             _broadcast(batch['attention_mask'])
+            _broadcast(batch['padding_mask'])
+            _broadcast_cu_seqlens(batch['cu_seqlens'])
+            _broadcast(batch['max_seqlen'])
+
+        elif args.sft:
+            _broadcast(batch['padding_mask'])
+            _broadcast_cu_seqlens(batch['cu_seqlens'])
+            _broadcast(batch['max_seqlen'])
+            batch['tokens'] = None
+            batch['labels'] = None
+            batch['loss_mask'] = None
+            batch['attention_mask'] = None
+            batch['position_ids'] = None
 
     else:
         if args.hybrid_context_parallel:
@@ -683,6 +703,11 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             dtype=torch.int64,
             device=torch.cuda.current_device(),
         )
+        padding_mask = (
+            torch.empty(shape, dtype=torch.bool, device=torch.cuda.current_device())
+            if args.sft
+            else None
+        )
         cu_seqlens = None
         if args.hybrid_context_parallel or args.sft:
             max_seqlen = torch.empty(
@@ -720,6 +745,7 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             _broadcast(loss_mask)
             _broadcast(attention_mask)
             _broadcast(position_ids)
+            _broadcast(padding_mask)
             cu_seqlens = _broadcast_cu_seqlens()
             _broadcast(max_seqlen)
             _broadcast(local_cp_size)
@@ -731,6 +757,7 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             _broadcast(tokens)
             _broadcast(attention_mask)
             _broadcast(position_ids)
+            _broadcast(padding_mask)
             cu_seqlens = _broadcast_cu_seqlens()
             _broadcast(max_seqlen)
 
@@ -740,12 +767,24 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             # to broadcast tokens and position_ids to all of the tensor parallel ranks on the last stage.
             tokens = None
             position_ids = None
-            cu_seqlens = None
-            max_seqlen = None
 
             _broadcast(labels)
             _broadcast(loss_mask)
             _broadcast(attention_mask)
+            _broadcast(padding_mask)
+            cu_seqlens = _broadcast_cu_seqlens()
+            _broadcast(max_seqlen)
+
+        elif args.sft:
+            tokens = None
+            labels = None
+            loss_mask = None
+            attention_mask = None
+            position_ids = None
+
+            _broadcast(padding_mask)
+            cu_seqlens = _broadcast_cu_seqlens()
+            _broadcast(max_seqlen)
 
         batch = {
             'tokens': tokens,
@@ -753,6 +792,7 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             'loss_mask': loss_mask,
             'attention_mask': attention_mask,
             'position_ids': position_ids,
+            'padding_mask': padding_mask,
             'cu_seqlens': cu_seqlens,
             'max_seqlen': max_seqlen,
             'local_cp_size': local_cp_size,

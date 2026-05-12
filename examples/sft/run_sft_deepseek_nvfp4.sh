@@ -168,10 +168,17 @@ if [[ "${SEQUENCE_PARALLEL:-auto}" == "1" || ( "${SEQUENCE_PARALLEL:-auto}" == "
 fi
 
 if [[ "$PP" -gt 1 && -n "$DECODER_FIRST_PIPELINE_NUM_LAYERS" ]]; then
-    MODEL_PARALLEL_ARGS+=(--decoder-first-pipeline-num-layers "$DECODER_FIRST_PIPELINE_NUM_LAYERS")
+    if [[ -z "${PIPELINE_MODEL_PARALLEL_LAYOUT:-}" ]]; then
+        MODEL_PARALLEL_ARGS+=(--decoder-first-pipeline-num-layers "$DECODER_FIRST_PIPELINE_NUM_LAYERS")
+    fi
 fi
 if [[ "$PP" -gt 1 && -n "${DECODER_LAST_PIPELINE_NUM_LAYERS:-}" ]]; then
-    MODEL_PARALLEL_ARGS+=(--decoder-last-pipeline-num-layers "$DECODER_LAST_PIPELINE_NUM_LAYERS")
+    if [[ -z "${PIPELINE_MODEL_PARALLEL_LAYOUT:-}" ]]; then
+        MODEL_PARALLEL_ARGS+=(--decoder-last-pipeline-num-layers "$DECODER_LAST_PIPELINE_NUM_LAYERS")
+    fi
+fi
+if [[ "$PP" -gt 1 && -n "${PIPELINE_MODEL_PARALLEL_LAYOUT:-}" ]]; then
+    MODEL_PARALLEL_ARGS+=(--pipeline-model-parallel-layout "$PIPELINE_MODEL_PARALLEL_LAYOUT")
 fi
 
 # ======================
@@ -260,9 +267,11 @@ MOE_ARGS=(
     --moe-router-pre-softmax
     --moe-router-score-function sigmoid
     --moe-router-enable-expert-bias
-    --moe-router-bias-update-rate 1e-3
+    --moe-router-bias-update-rate "${MOE_ROUTER_BIAS_UPDATE_RATE:-1e-3}"
+    --moe-router-expert-bias-update-method "${MOE_ROUTER_EXPERT_BIAS_UPDATE_METHOD:-sign}"
+    --moe-router-quantile-bias-iters "${MOE_ROUTER_QUANTILE_BIAS_ITERS:-5}"
     --moe-router-dtype fp32
-    --moe-aux-loss-coeff 1e-4
+    --moe-aux-loss-coeff "${MOE_AUX_LOSS_COEFF:-1e-4}"
     --moe-token-dispatcher-type alltoall
 )
 
@@ -277,6 +286,9 @@ if [[ "${MOE_PER_LAYER_LOGGING:-1}" == "1" ]]; then
 fi
 if [[ "${MOE_ROUTER_PADDING_FOR_QUANTIZATION:-0}" == "1" ]]; then
     MOE_ARGS+=(--moe-router-padding-for-quantization)
+fi
+if [[ "${MOE_ROUTER_QUANTILE_BIAS_SYNC_SCORES:-1}" == "0" ]]; then
+    MOE_ARGS+=(--no-moe-router-quantile-bias-sync-scores)
 fi
 if [[ -n "${MOE_EXPERT_CAPACITY_FACTOR:-}" ]]; then
     MOE_ARGS+=(--moe-expert-capacity-factor "$MOE_EXPERT_CAPACITY_FACTOR")
@@ -349,11 +361,13 @@ TRAINING_ARGS=(
     --empty-unused-memory-level "${EMPTY_UNUSED_MEMORY_LEVEL:-1}"
     --rerun-mode "${RERUN_MODE:-disabled}"
     --optimizer flash_adamw
-    --flash-adamw-eco
     --use-distributed-optimizer
     --no-gradient-accumulation-fusion
 )
 
+if [[ "${FLASH_ADAMW_ECO:-1}" == "1" ]]; then
+    TRAINING_ARGS+=(--flash-adamw-eco)
+fi
 if [[ "${OVERLAP_GRAD_REDUCE:-1}" == "1" ]]; then
     TRAINING_ARGS+=(--overlap-grad-reduce)
 fi
@@ -393,6 +407,9 @@ if [[ "$USE_STREAMBP" == "1" ]]; then
         else
             STREAMBP_ARGS+=(--no-streambp-moe-chunk-forward)
         fi
+    fi
+    if [[ -n "${STREAMBP_MOE_MLP_CHUNKS:-}" ]]; then
+        STREAMBP_ARGS+=(--streambp-moe-mlp-chunks "$STREAMBP_MOE_MLP_CHUNKS")
     fi
     if [[ "${STREAMBP_SKIP_MOE:-0}" == "1" ]]; then
         STREAMBP_ARGS+=(--streambp-skip-moe)

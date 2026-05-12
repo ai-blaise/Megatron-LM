@@ -175,6 +175,99 @@ class TestTop2Router:
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_expert_bias_counts_ignore_padding_mask(self):
+        """Expert-bias load balancing should count real tokens only."""
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            num_moe_experts=4,
+            use_cpu_initialization=True,
+            moe_router_load_balancing_type="none",
+            moe_router_topk=2,
+            moe_aux_loss_coeff=0,
+            moe_router_score_function="sigmoid",
+            moe_router_enable_expert_bias=True,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            add_bias_linear=False,
+        )
+        submodules = get_gpt_layer_local_submodules(num_experts=4, moe_grouped_gemm=False)
+        layer = MoELayer(config, submodules.mlp.submodules).cuda()
+        router = cast(Router, layer.router)
+
+        seq_len = 8
+        batch_size = 2
+        hidden_states = torch.randn(
+            (seq_len, batch_size, config.hidden_size), device="cuda", dtype=torch.bfloat16
+        )
+        padding_mask = torch.zeros((seq_len, batch_size), dtype=torch.bool, device="cuda")
+        padding_mask[seq_len // 2 :, :] = True
+
+        _, routing_map = router(hidden_states, padding_mask=padding_mask)
+        expected = routing_map[~padding_mask.reshape(-1)].sum(dim=0).float()
+
+        torch.testing.assert_close(router.local_tokens_per_expert, expected)
+        assert router.local_tokens_per_expert.sum().item() == (seq_len // 2) * batch_size * 2
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_quantile_expert_bias_balances_valid_scores(self):
+        """Quantile bias should improve top-k balance without using padding rows."""
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            num_moe_experts=4,
+            use_cpu_initialization=True,
+            moe_router_load_balancing_type="none",
+            moe_router_topk=2,
+            moe_aux_loss_coeff=0,
+            moe_router_score_function="sigmoid",
+            moe_router_enable_expert_bias=True,
+            moe_router_expert_bias_update_method="quantile",
+            moe_router_quantile_bias_iters=5,
+            moe_router_quantile_bias_sync_scores=False,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            add_bias_linear=False,
+        )
+        submodules = get_gpt_layer_local_submodules(num_experts=4, moe_grouped_gemm=False)
+        layer = MoELayer(config, submodules.mlp.submodules).cuda()
+        router = cast(Router, layer.router)
+
+        torch.manual_seed(1234)
+        valid_logits = torch.randn(256, 4, device="cuda", dtype=torch.float32)
+        valid_logits += torch.tensor([3.0, 2.0, 1.0, 0.0], device="cuda")
+        padded_logits = torch.full((64, 4), 10.0, device="cuda", dtype=torch.float32)
+        logits = torch.cat([valid_logits, padded_logits], dim=0)
+        valid_scores = torch.sigmoid(valid_logits)
+        padding_mask = torch.cat(
+            [
+                torch.zeros(valid_scores.shape[0], dtype=torch.bool, device="cuda"),
+                torch.ones(padded_logits.shape[0], dtype=torch.bool, device="cuda"),
+            ]
+        )
+
+        initial_counts = torch.bincount(
+            torch.topk(valid_scores, k=2, dim=1).indices.reshape(-1), minlength=4
+        )
+        router._apply_quantile_expert_bias(logits, padding_mask=padding_mask)
+        assert router.quantile_expert_bias_steps.item() == 1.0
+        candidate_bias = router.quantile_expert_bias_sum / router.quantile_expert_bias_steps
+        balanced_counts = torch.bincount(
+            torch.topk(valid_scores + candidate_bias, k=2, dim=1).indices.reshape(-1),
+            minlength=4,
+        )
+        expected = valid_scores.shape[0] * 2 / 4
+
+        assert (balanced_counts.float() - expected).abs().max() < (
+            initial_counts.float() - expected
+        ).abs().max()
+        assert balanced_counts.sum().item() == valid_scores.shape[0] * 2
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_router_dtype(self):
         self.router = self.router.cuda()
         self.sequential_mlp = self.sequential_mlp.cuda()

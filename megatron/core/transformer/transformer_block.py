@@ -905,6 +905,20 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         #   is called here to be future-proof and corner-case-proof.
         hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
 
+        if (
+            padding_mask is not None
+            and self.config.sequence_parallel
+            and padding_mask.dim() == 2
+            and padding_mask.size(1) != hidden_states.size(0)
+        ):
+            padding_mask = (
+                tensor_parallel.scatter_to_sequence_parallel_region(
+                    padding_mask.transpose(0, 1).contiguous()
+                )
+                .transpose(0, 1)
+                .contiguous()
+            )
+
         # Expand hidden states for hyper connections at the start of the block
         # Only expand at the first PP stage; subsequent stages receive n-stream from previous stage
         if self.config.enable_hyper_connections and self.pre_process:
@@ -1033,6 +1047,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                                 hidden_states,
                                 chunk_size=self.config.streambp_chunk_size,
                                 chunk_forward=self._streambp_chunk_forward_for_mode(streambp_mode),
+                                moe_mlp_chunks=self.config.streambp_moe_mlp_chunks,
                                 context_factory=make_inner_quantization_context,
                                 full_replay=streambp_mode.startswith("full_replay"),
                                 attention_mask=attention_mask,

@@ -78,9 +78,9 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         )
 
     # TODO: this is pretty hacky, find a better way
-    if not is_first_or_last_pipeline_stage(vp_stage) and (
+    if not args.sft and not is_first_or_last_pipeline_stage(vp_stage) and (
     (not mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage))):
-        return None, None, None, None, None, None
+        return None, None, None, None, None, None, None
 
     # get batches based on the TP rank you are on
     batch = get_batch_on_this_tp_rank(
@@ -199,7 +199,15 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
     global stimer
     with stimer(bdata=True):
         vp_stage = get_attr_wrapped_model(model, "vp_stage")
-        tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params = get_batch(data_iterator, vp_stage)
+        (
+            tokens,
+            labels,
+            loss_mask,
+            attention_mask,
+            position_ids,
+            padding_mask,
+            packed_seq_params,
+        ) = get_batch(data_iterator, vp_stage)
     timers('batch-generator').stop()
 
     with stimer:
@@ -210,12 +218,23 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                 assert args.overlap_moe_expert_parallel_comm, \
                     "overlap_moe_expert_parallel_comm must be enabled to return the schedule plan"
                 schedule_plan = model.build_schedule_plan(
-                    tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask
+                    tokens,
+                    position_ids,
+                    attention_mask,
+                    labels=labels,
+                    loss_mask=loss_mask,
+                    padding_mask=padding_mask,
                 )
                 return schedule_plan, partial(loss_func, loss_mask, model=model)
             else:
                 output_tensor = model(
-                    tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask, packed_seq_params=packed_seq_params
+                    tokens,
+                    position_ids,
+                    attention_mask,
+                    labels=labels,
+                    loss_mask=loss_mask,
+                    packed_seq_params=packed_seq_params,
+                    padding_mask=padding_mask,
                 )
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
@@ -226,7 +245,8 @@ def is_dataset_built_on_rank(vp_stage=None):
     args = get_args()
     config = core_transformer_config_from_args(args)
     return (
-        is_first_or_last_pipeline_stage(vp_stage)
+        args.sft
+        or is_first_or_last_pipeline_stage(vp_stage)
         or mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage)
     ) and parallel_state.get_tensor_model_parallel_rank() == 0
 

@@ -283,6 +283,9 @@ def reset_model_temporary_tensors(config: TransformerConfig, model: List[torch.n
         for module in get_attr_wrapped_model(model_chunk, 'modules')():
             if config.moe_router_enable_expert_bias and hasattr(module, 'expert_bias'):
                 module.local_tokens_per_expert.zero_()
+                if hasattr(module, 'quantile_expert_bias_sum'):
+                    module.quantile_expert_bias_sum.zero_()
+                    module.quantile_expert_bias_steps.zero_()
             if (
                 config.moe_router_load_balancing_type == "global_aux_loss"
                 or "global_aux_loss" in config.moe_router_load_balancing_type
@@ -295,6 +298,45 @@ def _update_router_expert_bias(model: List[torch.nn.Module], config: Transformer
     Update the expert bias of the router for a global batch.
     This requires all-reduce of local_tokens_per_expert across TPxCPxDP ranks
     """
+    if config.moe_router_expert_bias_update_method == "quantile":
+        quantile_bias_sum_list = []
+        quantile_bias_steps_list = []
+        expert_bias_list = []
+        for model_chunk in model:
+            for module in get_attr_wrapped_model(model_chunk, 'modules')():
+                if (
+                    hasattr(module, 'quantile_expert_bias_sum')
+                    and hasattr(module, 'expert_bias')
+                    and module.training
+                ):
+                    quantile_bias_sum_list.append(module.quantile_expert_bias_sum)
+                    quantile_bias_steps_list.append(module.quantile_expert_bias_steps)
+                    expert_bias_list.append(module.expert_bias)
+        if len(expert_bias_list) == 0:
+            return
+
+        stacked_bias_sum = torch.stack(quantile_bias_sum_list, dim=0)
+        stacked_steps = torch.stack(quantile_bias_steps_list, dim=0).unsqueeze(-1)
+        group = parallel_state.get_tensor_and_data_parallel_group(with_context_parallel=True)
+        torch.distributed.all_reduce(stacked_bias_sum, group=group)
+        torch.distributed.all_reduce(stacked_steps, group=group)
+        updated_bias = stacked_bias_sum / stacked_steps.clamp_min(1.0)
+        has_updates = stacked_steps.squeeze(-1) > 0
+
+        for expert_bias, next_bias, has_update in zip(
+            expert_bias_list, updated_bias, has_updates
+        ):
+            if bool(has_update.item()):
+                expert_bias.copy_(next_bias.to(dtype=expert_bias.dtype))
+
+        for bias_sum, steps in zip(quantile_bias_sum_list, quantile_bias_steps_list):
+            bias_sum.zero_()
+            steps.zero_()
+        return
+
+    if config.moe_router_expert_bias_update_method != "sign":
+        return
+
     tokens_per_expert_list = []
     expert_bias_list = []
     for model_chunk in model:

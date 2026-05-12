@@ -705,7 +705,10 @@ def get_batch_on_this_rank_for_sequence_packing(
         mtp_on_this_rank (bool): Whether to use multi-token prediction.
         vp_stage (Optional[int]): The stage of the pipeline.
     Returns:
-        tuple of (tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params)
+        tuple of (
+            tokens, labels, loss_mask, attention_mask, position_ids, padding_mask,
+            packed_seq_params
+        )
     """
 
     if pg_collection is None:
@@ -853,4 +856,4 @@ def get_batch_on_this_rank_for_sequence_packing(
     )
 
     # "attention_mask" is not valid for sequence packing, so set it to None.
-    return tokens, labels, loss_mask, None, position_ids, packed_seq_params
+    return tokens, labels, loss_mask, None, position_ids, None, packed_seq_params

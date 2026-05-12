@@ -2289,7 +2289,7 @@ def get_thd_batch_on_this_cp_rank(
     if cu_seqlens_padded is None:
         cu_seqlens_padded = cu_seqlens
 
-    for key in ("tokens", "labels", "loss_mask", "position_ids"):
+    for key in ("tokens", "labels", "loss_mask", "position_ids", "padding_mask"):
         data = batch.get(key)
         if isinstance(data, torch.Tensor) and data.dim() == 2 and data.size(0) > 1:
             batch[key] = data.contiguous().view(1, -1)
@@ -2318,8 +2318,13 @@ def get_thd_batch_on_this_cp_rank(
             "Please update Transformer Engine to >= 1.10 to use "
             "Context Parallel with THD format data"
         )
+        token_axis_tensor = next(
+            data
+            for data in batch.values()
+            if isinstance(data, torch.Tensor) and data.dim() >= 2
+        )
         index = tex.thd_get_partitioned_indices(
-            cu_seqlens_padded, batch["tokens"].size(1), cp_size, cp_rank
+            cu_seqlens_padded, token_axis_tensor.size(1), cp_size, cp_rank
         )
         for key, data in batch.items():
             if key in {
