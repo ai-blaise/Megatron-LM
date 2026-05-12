@@ -16,6 +16,10 @@ from types import SimpleNamespace
 
 import torch.nn.functional as F
 
+from megatron.core.model_parallel_config import (
+    normalize_pipeline_parallel_schedule,
+    validate_pipeline_parallel_schedule,
+)
 from megatron.core.transformer import TransformerConfig, MLATransformerConfig
 from megatron.core.utils import get_torch_version, is_torch_min_version
 
@@ -38,7 +42,73 @@ str_dtype_to_torch = {
     "bfloat16" : torch.bfloat16
 }
 
+
+def _is_zero_bubble_schedule(args):
+    return getattr(args.model_parallel, "pipeline_parallel_schedule", "auto") in {
+        "zero_bubble",
+        "zero_bubble_v",
+    }
+
+
+def _is_derived_v_pipeline_schedule(args):
+    return getattr(args.model_parallel, "pipeline_parallel_schedule", "auto") in {
+        "dualpipe_v",
+        "zero_bubble_v",
+    }
+
+
+def _derive_zero_bubble_v_virtual_pipeline_args(args):
+    if (
+        getattr(args.model_parallel, "pipeline_parallel_schedule", "auto")
+        != "zero_bubble_v"
+    ):
+        return
+
+    assert args.model_parallel.pipeline_model_parallel_size > 1, \
+        'zero_bubble_v requires pipeline-model-parallel size greater than 1'
+    assert args.num_layers_per_virtual_pipeline_stage is None, \
+        'num_layers_per_virtual_pipeline_stage is derived by zero_bubble_v'
+
+    transformer_pp_size = args.model_parallel.transformer_pipeline_model_parallel_size
+    num_layers = args.language_model.num_layers
+    if getattr(args, "account_for_embedding_in_pipeline_split", False):
+        num_layers += 1
+    if getattr(args, "account_for_loss_in_pipeline_split", False):
+        num_layers += 1
+
+    assert num_layers % transformer_pp_size == 0, \
+        'number of layers should be divisible by the pipeline parallel size'
+    num_layers_per_pipeline_stage = num_layers // transformer_pp_size
+    assert num_layers_per_pipeline_stage % 2 == 0, \
+        'zero_bubble_v requires an even number of layers per physical pipeline stage'
+    args.model_parallel.virtual_pipeline_model_parallel_size = 2
+    args.num_layers_per_virtual_pipeline_stage = num_layers_per_pipeline_stage // 2
+
+
+def _validate_zero_bubble_schedule_args(args):
+    if not _is_zero_bubble_schedule(args):
+        return
+
+    schedule = args.model_parallel.pipeline_parallel_schedule
+    assert args.model_parallel.pipeline_model_parallel_size > 1, \
+        f'{schedule} requires pipeline-model-parallel size greater than 1'
+    assert args.untie_embeddings_and_output_weights, \
+        f'{schedule} currently requires untied embeddings and output weights'
+    assert not args.overlap_grad_reduce, \
+        f'{schedule} does not support overlap_grad_reduce'
+    assert not args.overlap_param_gather, \
+        f'{schedule} does not support overlap_param_gather'
+    if schedule == "zero_bubble_v":
+        assert args.model_parallel.virtual_pipeline_model_parallel_size == 2, \
+            'zero_bubble_v requires exactly two virtual pipeline stages'
+
+
 def validate_yaml(args, defaults={}):
+    if not hasattr(args.model_parallel, "pipeline_parallel_schedule"):
+        args.model_parallel.pipeline_parallel_schedule = "auto"
+    args.model_parallel.pipeline_parallel_schedule = normalize_pipeline_parallel_schedule(
+        args.model_parallel.pipeline_parallel_schedule
+    )
     
     # This is for legacy script env var setting
     if type(args.data_path) is str:
@@ -110,11 +180,19 @@ def validate_yaml(args, defaults={}):
                 args.global_batch_size), flush=True)
     assert args.global_batch_size > 0
 
+    _derive_zero_bubble_v_virtual_pipeline_args(args)
+
     # num_layers_per_virtual_pipeline_stage is not insde model parallel for checkpointing
-    if args.num_layers_per_virtual_pipeline_stage is not None:
-        assert args.model_parallel.pipeline_model_parallel_size > 2, \
-            'pipeline-model-parallel size should be greater than 2 with ' \
-            'interleaved schedule'
+    if args.model_parallel.pipeline_parallel_schedule == "zero_bubble_v":
+        pass
+    elif args.num_layers_per_virtual_pipeline_stage is not None:
+        if _is_derived_v_pipeline_schedule(args):
+            assert args.model_parallel.pipeline_model_parallel_size > 1, \
+                'dualpipe_v requires pipeline-model-parallel size greater than 1'
+        else:
+            assert args.model_parallel.pipeline_model_parallel_size > 2, \
+                'pipeline-model-parallel size should be greater than 2 with ' \
+                'interleaved schedule'
         assert args.language_model.num_layers % args.model_parallel.transformer_pipeline_model_parallel_size == 0, \
             'number of layers should be divisible by the pipeline parallel size'
         num_layers_per_pipeline_stage = args.language_model.num_layers // args.model_parallel.transformer_pipeline_model_parallel_size
@@ -123,12 +201,43 @@ def validate_yaml(args, defaults={}):
         args.model_parallel.virtual_pipeline_model_parallel_size = num_layers_per_pipeline_stage // \
             args.num_layers_per_virtual_pipeline_stage
     else:
-        args.model_parallel.virtual_pipeline_model_parallel_size = None
-        # Overlap P2P communication is disabled if not using the interleaved schedule.
-        args.model_parallel.overlap_p2p_comm = False
-        if args.rank == 0:
-            print('WARNING: Setting args.overlap_p2p_comm to False since non-interleaved '
-                  'schedule does not support overlapping p2p communication')
+        if _is_derived_v_pipeline_schedule(args):
+            args.model_parallel.virtual_pipeline_model_parallel_size = (
+                args.model_parallel.virtual_pipeline_model_parallel_size or 2
+            )
+        else:
+            args.model_parallel.virtual_pipeline_model_parallel_size = None
+            # Overlap P2P communication is disabled if not using the interleaved schedule.
+            args.model_parallel.overlap_p2p_comm = False
+            if args.rank == 0:
+                print('WARNING: Setting args.overlap_p2p_comm to False since non-interleaved '
+                      'schedule does not support overlapping p2p communication')
+
+    if args.model_parallel.pipeline_parallel_schedule == "dualpipe_v":
+        assert args.model_parallel.pipeline_model_parallel_size > 1, \
+            'dualpipe_v requires pipeline-model-parallel size greater than 1'
+        assert args.model_parallel.virtual_pipeline_model_parallel_size == 2, \
+            'dualpipe_v requires exactly two virtual pipeline stages'
+        assert args.untie_embeddings_and_output_weights, \
+            'dualpipe_v currently requires untied embeddings and output weights'
+        eval_iters = args.eval_iters
+        has_eval_iters = any(eval_iters) if isinstance(eval_iters, list) else bool(eval_iters)
+        has_training = (
+            not args.skip_train
+            and (bool(args.train_iters) or bool(args.train_samples))
+        )
+        assert not (has_training and (has_eval_iters or args.full_validation)), \
+            'dualpipe_v currently supports training-only runs or standalone ' \
+            '--skip-train evaluation runs, but not training and evaluation in ' \
+            'the same process'
+
+    _validate_zero_bubble_schedule_args(args)
+
+    args.model_parallel.pipeline_parallel_schedule = validate_pipeline_parallel_schedule(
+        getattr(args.model_parallel, "pipeline_parallel_schedule", "auto"),
+        args.model_parallel.pipeline_model_parallel_size,
+        args.model_parallel.virtual_pipeline_model_parallel_size,
+    )
 
     if args.overlap_param_gather:
         assert args.use_distributed_optimizer, \
@@ -376,7 +485,11 @@ def _check_arg_is_not_none(args, arg):
 
 def core_transformer_config_from_yaml(args, transfomer_key = "language_model"):    
     # Combine transfomer config with model parallel args
+    if not hasattr(args.model_parallel, "pipeline_parallel_schedule"):
+        args.model_parallel.pipeline_parallel_schedule = "auto"
     args = SimpleNamespace(**vars(getattr(args, transfomer_key)), **vars(args.model_parallel))
+    if not hasattr(args, "pipeline_parallel_schedule"):
+        args.pipeline_parallel_schedule = "auto"
     # Translate args to core transformer configuration
     kw_args = core_config_from_args(args, TransformerConfig)    
     
@@ -422,4 +535,3 @@ def load_yaml(yaml_path):
         # Add config location to namespace
         config_namespace.yaml_cfg = yaml_path
         return config_namespace
-

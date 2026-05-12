@@ -503,39 +503,72 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         if ctx.gradient_accumulation_fusion:
             weight.main_grad = main_grad
 
-        wgrad_compute = True
-        if grad_output_buffer is not None:
+        from megatron.core.zbpp_utils import WeightGradStore
+
+        defer_wgrad_compute = WeightGradStore.split_bw()
+
+        def pre_process(_grad_output, _input, async_op=True):
+            if ctx.sequence_parallel:
+                dim_size = list(_input.size())
+                dim_size[0] = dim_size[0] * tp_group.size()
+
+                all_gather_buffer = get_global_memory_buffer().get_tensor(
+                    dim_size, _input.dtype, "mpu"
+                )
+                gather_handle = dist_all_gather_func(
+                    all_gather_buffer, _input, group=tp_group, async_op=async_op
+                )
+                return _grad_output, all_gather_buffer, gather_handle
+            return _grad_output, _input, None
+
+        def prepare_for_wgrad_compute(_grad_output, _total_input, _handle):
+            if ctx.sequence_parallel and _handle is not None:
+                _handle.wait()
+            return prepare_input_tensors_for_wgrad_compute(_grad_output, _total_input)
+
+        def process_wgrad(_weight, _grad_output, _total_input, _handle):
+            _grad_output, _total_input = prepare_for_wgrad_compute(
+                _grad_output, _total_input, _handle
+            )
+            with torch.no_grad():
+                if hasattr(_weight, "__fsdp_param__"):
+                    _weight.main_grad = _weight.get_main_grad()
+                    torch.matmul(_grad_output.t(), _total_input, out=_weight.main_grad)
+                elif ctx.gradient_accumulation_fusion and _weight.main_grad.dtype == torch.float32:
+                    fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32(
+                        _total_input, _grad_output, _weight.main_grad
+                    )
+                elif ctx.gradient_accumulation_fusion and _weight.main_grad.dtype in (
+                    torch.float16,
+                    torch.bfloat16,
+                ):
+                    fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp16(
+                        _total_input, _grad_output, _weight.main_grad
+                    )
+                elif ctx.gradient_accumulation_fusion:
+                    raise RuntimeError("Unsupported gradient type for gradient accumulation fusion")
+                else:
+                    grad_weight = _grad_output.t().matmul(_total_input)
+                    main_grad = getattr(_weight, "main_grad", None)
+                    if main_grad is not None:
+                        main_grad.add_(grad_weight.to(dtype=main_grad.dtype))
+                    elif _weight.grad is None:
+                        _weight.grad = grad_weight.to(dtype=_weight.dtype)
+                    else:
+                        _weight.grad.add_(grad_weight.to(dtype=_weight.grad.dtype))
+
+        wgrad_compute = not defer_wgrad_compute
+        if grad_output_buffer is not None and wgrad_compute:
             if wgrad_deferral_limit == 0 or len(grad_output_buffer) < wgrad_deferral_limit:
                 grad_output_buffer.append(grad_output)
                 wgrad_compute = False
 
         if wgrad_compute:
-            if ctx.sequence_parallel:
-                dim_size = list(input.size())
-                dim_size[0] = dim_size[0] * tp_group.size()
-
-                all_gather_buffer = get_global_memory_buffer().get_tensor(
-                    dim_size, input.dtype, "mpu"
-                )
-                handle = dist_all_gather_func(
-                    all_gather_buffer, input, group=tp_group, async_op=True
-                )
-
-                # Here we rely on CUDA_DEVICE_MAX_CONNECTIONS=1 to ensure that the
-                # gather is scheduled before the input gradient computation
-                total_input = all_gather_buffer
-            else:
-                total_input = input
+            grad_output, total_input, handle = pre_process(grad_output, input, async_op=True)
         grad_input = grad_output.matmul(weight)
 
-        if ctx.sequence_parallel and wgrad_compute:
-            # pylint: disable=possibly-used-before-assignment
-            handle.wait()
-
         if wgrad_compute:
-            grad_output, total_input = prepare_input_tensors_for_wgrad_compute(
-                grad_output, total_input
-            )
+            grad_output, total_input = prepare_for_wgrad_compute(grad_output, total_input, handle)
 
         if ctx.allreduce_dgrad:
             # Asynchronous all-reduce
@@ -575,6 +608,12 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                         raise RuntimeError(
                             "Unsupported gradient type for gradient accumulation fusion"
                         )
+            elif defer_wgrad_compute:
+                WeightGradStore.put(
+                    weight,
+                    partial(pre_process, grad_output, input),
+                    partial(process_wgrad, weight),
+                )
 
             if hasattr(weight, "grad_added_to_main_grad"):
                 # When overlap_grad_reduce is True, need to ensure that backward hooks
@@ -609,7 +648,15 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             else:
                 grad_weight = None
         else:
-            grad_weight = grad_output.t().matmul(total_input)
+            if defer_wgrad_compute:
+                WeightGradStore.put(
+                    weight,
+                    partial(pre_process, grad_output, input),
+                    partial(process_wgrad, weight),
+                )
+                grad_weight = None
+            else:
+                grad_weight = grad_output.t().matmul(total_input)
         grad_bias = grad_output.sum(dim=0) if use_bias else None
 
         if ctx.sequence_parallel:

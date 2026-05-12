@@ -9,6 +9,93 @@ import torch
 from megatron.core.utils import experimental_api
 
 
+PipelineParallelSchedule = Literal[
+    "auto",
+    "1f1b",
+    "interleaved_1f1b",
+    "gpipe_fill_drain",
+    "zero_bubble",
+    "zero_bubble_v",
+    "dualpipe_v",
+]
+PIPELINE_PARALLEL_SCHEDULE_CHOICES = (
+    "auto",
+    "1f1b",
+    "interleaved_1f1b",
+    "gpipe_fill_drain",
+    "zero_bubble",
+    "zero_bubble_v",
+    "dualpipe_v",
+)
+_PIPELINE_PARALLEL_SCHEDULE_ALIASES = {
+    "default": "auto",
+    "non_interleaved_1f1b": "1f1b",
+    "non-interleaved-1f1b": "1f1b",
+    "interleaved-1f1b": "interleaved_1f1b",
+    "fill_drain": "gpipe_fill_drain",
+    "fill-drain": "gpipe_fill_drain",
+    "gpipe-fill-drain": "gpipe_fill_drain",
+    "zero-bubble": "zero_bubble",
+    "zerobubble": "zero_bubble",
+    "zb": "zero_bubble",
+    "zero-bubble-v": "zero_bubble_v",
+    "zerobubble-v": "zero_bubble_v",
+    "zerobubble_v": "zero_bubble_v",
+    "zbv": "zero_bubble_v",
+    "dualpipe-v": "dualpipe_v",
+    "dualpipev": "dualpipe_v",
+}
+_NON_INTERLEAVED_PIPELINE_PARALLEL_SCHEDULES = {
+    "1f1b",
+    "gpipe_fill_drain",
+    "zero_bubble",
+}
+_VIRTUAL_PIPELINE_PARALLEL_SCHEDULES = {
+    "interleaved_1f1b",
+    "zero_bubble_v",
+    "dualpipe_v",
+}
+
+
+def normalize_pipeline_parallel_schedule(schedule: Optional[str]) -> PipelineParallelSchedule:
+    """Normalize a pipeline parallel schedule selector to its canonical value."""
+    schedule = schedule or "auto"
+    normalized = schedule.strip().lower().replace("-", "_")
+    normalized = _PIPELINE_PARALLEL_SCHEDULE_ALIASES.get(normalized, normalized)
+    if normalized not in PIPELINE_PARALLEL_SCHEDULE_CHOICES:
+        raise ValueError(
+            f"Unknown pipeline parallel schedule {schedule!r}; expected one of "
+            f"{PIPELINE_PARALLEL_SCHEDULE_CHOICES}"
+        )
+    return normalized
+
+
+def validate_pipeline_parallel_schedule(
+    schedule: Optional[str],
+    pipeline_model_parallel_size: int,
+    virtual_pipeline_model_parallel_size: Optional[int],
+) -> PipelineParallelSchedule:
+    """Validate schedule compatibility with PP/VPP configuration."""
+    schedule = normalize_pipeline_parallel_schedule(schedule)
+    if schedule == "auto":
+        return schedule
+    if pipeline_model_parallel_size <= 1:
+        raise ValueError(f"{schedule} requires pipeline_model_parallel_size > 1")
+    if (
+        schedule in _NON_INTERLEAVED_PIPELINE_PARALLEL_SCHEDULES
+        and virtual_pipeline_model_parallel_size is not None
+    ):
+        raise ValueError(f"{schedule} requires virtual_pipeline_model_parallel_size to be None")
+    if schedule in _VIRTUAL_PIPELINE_PARALLEL_SCHEDULES:
+        if virtual_pipeline_model_parallel_size is None:
+            raise ValueError(f"{schedule} requires virtual_pipeline_model_parallel_size")
+        if schedule == "zero_bubble_v" and virtual_pipeline_model_parallel_size != 2:
+            raise ValueError(
+                "zero_bubble_v requires virtual_pipeline_model_parallel_size == 2"
+            )
+    return schedule
+
+
 @dataclass
 @experimental_api
 class ModelParallelConfig:
@@ -325,6 +412,21 @@ class ModelParallelConfig:
        Helps with saving memory, does nothing when pipeline parallel is not used.
     """
 
+    pipeline_parallel_schedule: PipelineParallelSchedule = field(
+        default="auto",
+        metadata={
+            "argparse_meta": {
+                "type": normalize_pipeline_parallel_schedule,
+                "choices": PIPELINE_PARALLEL_SCHEDULE_CHOICES,
+            }
+        },
+    )
+    """Pipeline parallel schedule selector. The default `auto` preserves legacy behavior:
+       no pipelining when PP is 1, non-interleaved 1F1B without VPP, and interleaved 1F1B
+       when VPP is configured. Explicit values select GPipe fill-drain, ZeroBubble,
+       ZeroBubble-V, or the conservative sequential DualPipeV V-topology runtime.
+    """
+
     defer_embedding_wgrad_compute: bool = False
     """If true, defers the embedding WGRAD GEMMs while pipeline flush is
        taking place enabling us to hide pipeline flush latency. Defaults to False.
@@ -424,6 +526,18 @@ class ModelParallelConfig:
                 raise ValueError(
                     "When using pipeline parallelism, pipeline_dtype must be specified"
                 )
+
+        self.pipeline_parallel_schedule = validate_pipeline_parallel_schedule(
+            self.pipeline_parallel_schedule,
+            self.pipeline_model_parallel_size,
+            self.virtual_pipeline_model_parallel_size,
+        )
+
+        if self.pipeline_parallel_schedule == "dualpipe_v":
+            if self.pipeline_model_parallel_size <= 1:
+                raise ValueError("DualPipeV requires pipeline_model_parallel_size > 1")
+            if self.virtual_pipeline_model_parallel_size != 2:
+                raise ValueError("DualPipeV requires virtual_pipeline_model_parallel_size == 2")
 
         if self.autocast_dtype is None:
             self.autocast_dtype = self.params_dtype
