@@ -2114,7 +2114,14 @@ def _add_spinquant_args(parser):
         "--dsa-indexcache-quant-enabled",
         action="store_true",
         default=False,
-        help="Enable fp8 e4m3 fake-quant on the DSA indexer K tensor.",
+        help="Backward-compatible alias for --dsa-indexcache-quantization fp8_e4m3.",
+    )
+    group.add_argument(
+        "--dsa-indexcache-quantization",
+        type=str,
+        default="disabled",
+        choices=["disabled", "fp8_e4m3", "nvfp4_e2m1_ue8m0"],
+        help="Quantization method for the DSA indexer K tensor.",
     )
     group.add_argument(
         "--dsa-indexcache-quant-eps",
@@ -2448,6 +2455,7 @@ def _add_network_size_args(parser):
         "turboquant_kv_preset",
         "turboquant_kv_seed",
         "dsa_indexcache_quant_enabled",
+        "dsa_indexcache_quantization",
         "dsa_indexcache_quant_eps",
         "use_streambp",
         "streambp_chunk_size",

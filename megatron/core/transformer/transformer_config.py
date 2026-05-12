@@ -671,7 +671,16 @@ class TransformerConfig(ModelParallelConfig):
     # IndexCache fp8 fake-quant on the DSA indexer K
     ####################
     dsa_indexcache_quant_enabled: bool = False
-    """Enable fp8 e4m3 fake-quant on the DSA indexer K tensor.
+    """Backward-compatible alias enabling fp8 e4m3 fake-quant on the DSA indexer K tensor.
+
+    Prefer ``dsa_indexcache_quantization`` for new configs."""
+
+    dsa_indexcache_quantization: str = "disabled"
+    """DSA IndexCache quantization method.
+
+    Supported values are ``disabled``, ``fp8_e4m3``, and
+    ``nvfp4_e2m1_ue8m0``. The legacy ``dsa_indexcache_quant_enabled`` flag
+    maps to ``fp8_e4m3`` when this field is left disabled.
 
     Mirrors the SGLang inference path
     (``optimization-playground/python/sglang/jit_kernel/csrc/nsa/fused_store_index_cache.cuh``)

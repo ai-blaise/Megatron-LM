@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Pure-PyTorch reference forward and backward for IndexCache fp8 fake-quant.
+"""Pure-PyTorch reference forward and backward for IndexCache fake-quant.
 
 The forward is a faithful port of SGLang's ``act_quant``
 (triton_kernel.py:_act_quant_kernel) followed by an immediate dequantize so
@@ -37,7 +37,12 @@ from __future__ import annotations
 
 import torch
 
-from megatron.core.quantization.indexcache.codec import IndexCacheConfig
+from megatron.core.quantization.indexcache.codec import (
+    INDEXCACHE_QUANT_DISABLED,
+    INDEXCACHE_QUANT_FP8,
+    INDEXCACHE_QUANT_NVFP4,
+    IndexCacheConfig,
+)
 
 
 def indexcache_forward(
@@ -46,12 +51,35 @@ def indexcache_forward(
     *,
     return_intermediates: bool = False,
 ):
-    """Apply fp8 e4m3 fake-quant per-token to a 2-D tensor [N, D].
+    """Apply the configured IndexCache fake-quant to a 2-D tensor [N, D].
 
     The output dtype matches ``x.dtype``. When the host has fp8 support this
     routes through ``torch.float8_e4m3fn``; otherwise the rounding is
     simulated in fp32 to keep CPU-only tests viable.
     """
+
+    if config.quantization == INDEXCACHE_QUANT_DISABLED:
+        if return_intermediates:
+            return x, {"quantization": INDEXCACHE_QUANT_DISABLED}
+        return x
+    if config.quantization == INDEXCACHE_QUANT_FP8:
+        return _indexcache_forward_fp8(
+            x, config, return_intermediates=return_intermediates
+        )
+    if config.quantization == INDEXCACHE_QUANT_NVFP4:
+        return _indexcache_forward_nvfp4(
+            x, config, return_intermediates=return_intermediates
+        )
+    raise ValueError(f"Unsupported IndexCache quantization {config.quantization!r}.")
+
+
+def _indexcache_forward_fp8(
+    x: torch.Tensor,
+    config: IndexCacheConfig,
+    *,
+    return_intermediates: bool = False,
+):
+    """Apply fp8 e4m3 fake-quant per-token to a 2-D tensor [N, D]."""
 
     if x.dim() != 2:
         raise ValueError(
@@ -104,6 +132,22 @@ def indexcache_backward(
     intermediates: dict,
     config: IndexCacheConfig,
 ) -> torch.Tensor:
+    """Closed-form gradient through the configured IndexCache fake-quant."""
+
+    if config.quantization == INDEXCACHE_QUANT_DISABLED:
+        return grad_y
+    if config.quantization == INDEXCACHE_QUANT_FP8:
+        return _indexcache_backward_fp8(grad_y, intermediates, config)
+    if config.quantization == INDEXCACHE_QUANT_NVFP4:
+        return _indexcache_backward_nvfp4(grad_y, intermediates, config)
+    raise ValueError(f"Unsupported IndexCache quantization {config.quantization!r}.")
+
+
+def _indexcache_backward_fp8(
+    grad_y: torch.Tensor,
+    intermediates: dict,
+    config: IndexCacheConfig,
+) -> torch.Tensor:
     """Closed-form gradient through the fp8 fake-quant.
 
     See the module docstring for the derivation.
@@ -137,6 +181,155 @@ def indexcache_backward(
     rank1.scatter_(-1, argmax[:, None], contrib[:, None])
 
     return (grad_direct + rank1).to(grad_y.dtype)
+
+
+def _indexcache_forward_nvfp4(
+    x: torch.Tensor,
+    config: IndexCacheConfig,
+    *,
+    return_intermediates: bool = False,
+):
+    """Apply OP-compatible NVFP4 E2M1/UE8M0 fake-quant to [N, 128].
+
+    Layout/maths match the latest optimization-playground forward:
+    128-dim rows split into four 32-dim groups, each with an unsigned E8M0
+    power-of-two scale for ``ceil(max(abs(x), eps) / 6)``. E2M1 values are
+    packed two nibbles per byte and the four scale exponents are packed into
+    one int32 word per row.
+    """
+
+    if x.dim() != 2:
+        raise ValueError(
+            "indexcache_forward expects [N, D]; got shape "
+            f"{tuple(x.shape)}. Reshape upstream."
+        )
+    if x.shape[-1] != config.nvfp4_head_dim:
+        raise ValueError(
+            "nvfp4_e2m1_ue8m0 IndexCache expects [N, 128]; got shape "
+            f"{tuple(x.shape)}."
+        )
+
+    orig_dtype = x.dtype
+    compute_dtype = (
+        x.dtype if x.dtype in (torch.float32, torch.float64) else torch.float32
+    )
+    xf = x.to(compute_dtype)
+    groups = xf.reshape(xf.shape[0], -1, config.nvfp4_group_size)
+    group_abs_max = groups.abs().amax(dim=-1)
+    scale_exp = _ceil_to_ue8m0_exp(
+        group_abs_max.clamp_min(config.eps) * config.fp4_max_inv
+    )
+    scale = _ue8m0_exp_to_float(scale_exp, dtype=compute_dtype)
+    scale_b = scale[..., None]
+
+    pre_clip = groups / scale_b
+    clipped = pre_clip.clamp(-config.fp4_max, config.fp4_max)
+    codes, q_e2m1 = _quantize_to_e2m1_codes_and_values(clipped)
+    q = (q_e2m1 * scale_b).reshape_as(xf).to(orig_dtype)
+
+    if return_intermediates:
+        clip_mask = (
+            (pre_clip >= -config.fp4_max) & (pre_clip <= config.fp4_max)
+        ).to(compute_dtype)
+        eps_active = (group_abs_max >= config.eps).to(compute_dtype)
+        argmax = groups.abs().argmax(dim=-1).to(torch.int32)
+        packed_values, packed_scales = _pack_nvfp4_values_and_scales(codes, scale_exp)
+        return q, {
+            "quantization": INDEXCACHE_QUANT_NVFP4,
+            "x_compute": xf,
+            "scale": scale,
+            "q_e2m1": q_e2m1.reshape_as(xf),
+            "clip_mask": clip_mask.reshape_as(xf),
+            "eps_active": eps_active,
+            "argmax": argmax,
+            "scale_exp": scale_exp,
+            "packed_values": packed_values,
+            "packed_scales": packed_scales,
+        }
+    return q
+
+
+def _indexcache_backward_nvfp4(
+    grad_y: torch.Tensor,
+    intermediates: dict,
+    config: IndexCacheConfig,
+) -> torch.Tensor:
+    """Closed-form STE gradient for NVFP4 E2M1/UE8M0 IndexCache."""
+
+    g = grad_y.to(intermediates["x_compute"].dtype)
+    xf = intermediates["x_compute"]
+    n = xf.shape[0]
+    groups = xf.reshape(n, -1, config.nvfp4_group_size)
+    g_groups = g.reshape_as(groups)
+    q_groups = intermediates["q_e2m1"].reshape_as(groups)
+    mask_groups = intermediates["clip_mask"].reshape_as(groups)
+    scale = intermediates["scale"]
+    eps_active = intermediates["eps_active"]
+    argmax = intermediates["argmax"].long()
+
+    grad_direct = g_groups * mask_groups
+    inner = (
+        g_groups * (q_groups - mask_groups * groups / scale[..., None])
+    ).sum(dim=-1)
+
+    sign_at_argmax = torch.gather(groups.sign(), -1, argmax.unsqueeze(-1)).squeeze(-1)
+    contrib = inner * sign_at_argmax * eps_active * config.fp4_max_inv
+    rank1 = torch.zeros_like(grad_direct)
+    rank1.scatter_(-1, argmax.unsqueeze(-1), contrib.unsqueeze(-1))
+
+    return (grad_direct + rank1).reshape_as(xf).to(grad_y.dtype)
+
+
+def _ceil_to_ue8m0_exp(x: torch.Tensor) -> torch.Tensor:
+    """Return UE8M0 exponent bytes for ceil-to-power-of-two scale values."""
+
+    x_f32 = x.abs().to(torch.float32)
+    bits = x_f32.contiguous().view(torch.int32)
+    exp = ((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0).to(torch.int32)
+    return exp.clamp(1, 254).to(torch.uint8)
+
+
+def _ue8m0_exp_to_float(exp: torch.Tensor, *, dtype: torch.dtype) -> torch.Tensor:
+    bits = exp.to(torch.int32) << 23
+    return bits.contiguous().view(torch.float32).to(dtype)
+
+
+def _quantize_to_e2m1_codes_and_values(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Round to signed E2M1 and return packed-format codes plus signed values."""
+
+    ax = x.abs().clamp_max(6.0)
+    idx = torch.zeros_like(ax, dtype=torch.uint8)
+    idx = torch.where(ax > 0.25, torch.ones_like(idx), idx)
+    idx = torch.where(ax >= 0.75, torch.full_like(idx, 2), idx)
+    idx = torch.where(ax > 1.25, torch.full_like(idx, 3), idx)
+    idx = torch.where(ax >= 1.75, torch.full_like(idx, 4), idx)
+    idx = torch.where(ax > 2.5, torch.full_like(idx, 5), idx)
+    idx = torch.where(ax >= 3.5, torch.full_like(idx, 6), idx)
+    idx = torch.where(ax > 5.0, torch.full_like(idx, 7), idx)
+
+    sign = (x < 0) & (idx != 0)
+    codes = idx | (sign.to(torch.uint8) << 3)
+
+    lut = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
+        dtype=x.dtype,
+        device=x.device,
+    )
+    values = lut[idx.long()]
+    values = torch.where(sign, -values, values)
+    return codes, values
+
+
+def _pack_nvfp4_values_and_scales(
+    codes: torch.Tensor, scale_exp: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    rows = codes.shape[0]
+    flat_codes = codes.reshape(rows, -1)
+    packed_values = (
+        (flat_codes[:, 0::2] & 0x0F) | ((flat_codes[:, 1::2] & 0x0F) << 4)
+    ).contiguous()
+    packed_scales = scale_exp.contiguous().view(torch.int32).reshape(rows)
+    return packed_values, packed_scales
 
 
 def _simulate_fp8_e4m3_rounding(x: torch.Tensor) -> torch.Tensor:
