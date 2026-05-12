@@ -14,6 +14,7 @@ except ImportError:
     HAVE_DTENSOR = False
 
 from megatron.core.pipeline_parallel.utils import (
+    get_pp_first_rank,
     get_pp_last_rank,
     is_pp_first_stage,
     is_pp_last_stage,
@@ -230,7 +231,12 @@ def _allreduce_embedding_grad(
         and torch.distributed.get_rank() in torch.distributed.get_process_group_ranks(embd_group)
     ):
 
-        if is_pp_first_stage(pp_group):
+        is_zero_bubble_v = (
+            getattr(config, "pipeline_parallel_schedule", "auto") == "zero_bubble_v"
+        )
+        if is_zero_bubble_v:
+            model_module = model[0]
+        elif is_pp_first_stage(pp_group):
             model_module = model[0]
         elif is_pp_last_stage(pp_group):
             model_module = model[-1]
@@ -490,8 +496,11 @@ def finalize_model_grads(
         # the number of tokens is only present on the last stage, so broadcast it
         # to the other ranks in the pipeline parallel group.
         assert not isinstance(pp_group, list)
-        last_rank = get_pp_last_rank(pp_group)
-        torch.distributed.broadcast(num_tokens, src=last_rank, group=pp_group)
+        if getattr(config, "pipeline_parallel_schedule", "auto") == "zero_bubble_v":
+            token_count_rank = get_pp_first_rank(pp_group)
+        else:
+            token_count_rank = get_pp_last_rank(pp_group)
+        torch.distributed.broadcast(num_tokens, src=token_count_rank, group=pp_group)
 
         # all-reduce across DP ranks.
         torch.distributed.all_reduce(num_tokens, group=dp_cp_group)

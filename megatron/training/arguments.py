@@ -15,6 +15,10 @@ import torch.nn.functional as F
 from packaging.version import Version as PkgVersion
 
 from megatron.core.dist_checkpointing.validation import StrictHandling
+from megatron.core.model_parallel_config import (
+    normalize_pipeline_parallel_schedule,
+    validate_pipeline_parallel_schedule,
+)
 from megatron.core.rerun_state_machine import RerunStateMachine
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.transformer.pipeline_parallel_layer_layout import (
@@ -330,6 +334,101 @@ def tuple_type(x):
         return x
     assert isinstance(x, str)
     return tuple(int(i) for i in x.strip("()").split(","))
+
+
+def _validate_pipeline_parallel_schedule_args(args):
+    args.pipeline_parallel_schedule = validate_pipeline_parallel_schedule(
+        getattr(args, "pipeline_parallel_schedule", "auto"),
+        args.pipeline_model_parallel_size,
+        args.virtual_pipeline_model_parallel_size,
+    )
+
+
+def _is_zero_bubble_schedule(args):
+    return getattr(args, "pipeline_parallel_schedule", "auto") in {
+        "zero_bubble",
+        "zero_bubble_v",
+    }
+
+
+def _is_derived_v_pipeline_schedule(args):
+    return getattr(args, "pipeline_parallel_schedule", "auto") in {
+        "dualpipe_v",
+        "zero_bubble_v",
+    }
+
+
+def _derive_zero_bubble_v_virtual_pipeline_args(args):
+    if getattr(args, "pipeline_parallel_schedule", "auto") != "zero_bubble_v":
+        return
+
+    assert args.pipeline_model_parallel_layout is None, (
+        "--pipeline-parallel-schedule zero_bubble_v derives the V-shaped virtual "
+        "pipeline layout and does not support --pipeline-model-parallel-layout"
+    )
+    assert args.num_layers_per_virtual_pipeline_stage is None, (
+        "--pipeline-parallel-schedule zero_bubble_v derives "
+        "--num-layers-per-virtual-pipeline-stage"
+    )
+    assert args.num_virtual_stages_per_pipeline_rank is None, (
+        "--pipeline-parallel-schedule zero_bubble_v derives "
+        "--num-virtual-stages-per-pipeline-rank"
+    )
+    assert args.pipeline_model_parallel_size > 1, (
+        "--pipeline-parallel-schedule zero_bubble_v requires "
+        "--pipeline-model-parallel-size > 1"
+    )
+    assert args.num_layers is not None, (
+        "--pipeline-parallel-schedule zero_bubble_v requires --num-layers"
+    )
+
+    num_layers = args.num_layers
+    if args.account_for_embedding_in_pipeline_split:
+        num_layers += 1
+    if args.account_for_loss_in_pipeline_split:
+        num_layers += 1
+
+    assert num_layers % args.transformer_pipeline_model_parallel_size == 0, (
+        "Number of layers should be divisible by the pipeline-model-parallel size"
+    )
+    num_layers_per_pipeline_stage = (
+        num_layers // args.transformer_pipeline_model_parallel_size
+    )
+    assert num_layers_per_pipeline_stage % 2 == 0, (
+        "--pipeline-parallel-schedule zero_bubble_v requires an even number "
+        "of layers per physical pipeline stage"
+    )
+    args.virtual_pipeline_model_parallel_size = 2
+    args.num_layers_per_virtual_pipeline_stage = (
+        num_layers_per_pipeline_stage // 2
+    )
+
+
+def _validate_zero_bubble_schedule_args(args):
+    if not _is_zero_bubble_schedule(args):
+        return
+
+    assert args.pipeline_model_parallel_size > 1, (
+        f"--pipeline-parallel-schedule {args.pipeline_parallel_schedule} requires "
+        "--pipeline-model-parallel-size > 1"
+    )
+    assert args.untie_embeddings_and_output_weights, (
+        f"--pipeline-parallel-schedule {args.pipeline_parallel_schedule} currently "
+        "requires --untie-embeddings-and-output-weights"
+    )
+    assert not args.overlap_grad_reduce, (
+        f"--pipeline-parallel-schedule {args.pipeline_parallel_schedule} does not "
+        "support --overlap-grad-reduce"
+    )
+    assert not args.overlap_param_gather, (
+        f"--pipeline-parallel-schedule {args.pipeline_parallel_schedule} does not "
+        "support --overlap-param-gather"
+    )
+    if args.pipeline_parallel_schedule == "zero_bubble_v":
+        assert args.virtual_pipeline_model_parallel_size == 2, (
+            "--pipeline-parallel-schedule zero_bubble_v requires exactly two "
+            "virtual pipeline stages"
+        )
 
 
 def validate_args(args, defaults={}):
@@ -769,6 +868,10 @@ def validate_args(args, defaults={}):
         f"{args.pipeline_model_parallel_layout=}."
     )
 
+    args.pipeline_parallel_schedule = normalize_pipeline_parallel_schedule(
+        getattr(args, "pipeline_parallel_schedule", "auto")
+    )
+    _derive_zero_bubble_v_virtual_pipeline_args(args)
     if args.pipeline_model_parallel_layout is not None:
         # Parse the input flattened layout to a list and get the vpp size.
         # We will validate the layout more carefully in the TransformerConfig constructor.
@@ -785,6 +888,8 @@ def validate_args(args, defaults={}):
         )
         if args.virtual_pipeline_model_parallel_size == 1:
             args.virtual_pipeline_model_parallel_size = None
+    elif args.pipeline_parallel_schedule == "zero_bubble_v":
+        pass
     elif (
         args.num_layers_per_virtual_pipeline_stage is not None
         or args.num_virtual_stages_per_pipeline_rank is not None
@@ -832,30 +937,69 @@ def validate_args(args, defaults={}):
         if args.virtual_pipeline_model_parallel_size == 1:
             args.virtual_pipeline_model_parallel_size = None
     else:
-        args.virtual_pipeline_model_parallel_size = None
+        if _is_derived_v_pipeline_schedule(args):
+            args.virtual_pipeline_model_parallel_size = (
+                args.virtual_pipeline_model_parallel_size or 2
+            )
+        else:
+            args.virtual_pipeline_model_parallel_size = None
 
-        if (
-            args.decoder_first_pipeline_num_layers is None
-            and args.decoder_last_pipeline_num_layers is None
-        ):
-            # Divisibility check not applicable for T5 models which specify encoder_num_layers
-            # and decoder_num_layers.
-            if args.num_layers is not None:
-                num_layers = args.num_layers
+            if (
+                args.decoder_first_pipeline_num_layers is None
+                and args.decoder_last_pipeline_num_layers is None
+            ):
+                # Divisibility check not applicable for T5 models which specify encoder_num_layers
+                # and decoder_num_layers.
+                if args.num_layers is not None:
+                    num_layers = args.num_layers
 
-                if args.account_for_embedding_in_pipeline_split:
-                    num_layers += 1
+                    if args.account_for_embedding_in_pipeline_split:
+                        num_layers += 1
 
-                if args.account_for_loss_in_pipeline_split:
-                    num_layers += 1
+                    if args.account_for_loss_in_pipeline_split:
+                        num_layers += 1
 
-                assert (
-                    num_layers % args.transformer_pipeline_model_parallel_size == 0
-                ), (
-                    "Number of layers should be divisible by the pipeline-model-parallel size"
-                )
+                    assert (
+                        num_layers % args.transformer_pipeline_model_parallel_size == 0
+                    ), (
+                        "Number of layers should be divisible by the pipeline-model-parallel size"
+                    )
 
-    if args.virtual_pipeline_model_parallel_size is not None:
+    if args.pipeline_parallel_schedule == "dualpipe_v":
+        assert args.pipeline_model_parallel_size > 1, (
+            "--pipeline-parallel-schedule dualpipe_v requires "
+            "--pipeline-model-parallel-size > 1"
+        )
+        assert args.virtual_pipeline_model_parallel_size == 2, (
+            "--pipeline-parallel-schedule dualpipe_v requires exactly two virtual "
+            "pipeline stages; set --num-virtual-stages-per-pipeline-rank 2"
+        )
+        assert args.untie_embeddings_and_output_weights, (
+            "--pipeline-parallel-schedule dualpipe_v currently requires "
+            "--untie-embeddings-and-output-weights"
+        )
+        eval_iters = args.eval_iters
+        has_eval_iters = (
+            any(eval_iters) if isinstance(eval_iters, list) else bool(eval_iters)
+        )
+        has_training = (
+            not args.skip_train
+            and (bool(args.train_iters) or bool(args.train_samples))
+        )
+        assert not (has_training and (has_eval_iters or args.full_validation)), (
+            "--pipeline-parallel-schedule dualpipe_v currently supports "
+            "training-only runs or standalone --skip-train evaluation runs, "
+            "but not training and evaluation in the same process. Set "
+            "--eval-iters 0 for training gates or use --skip-train for "
+            "evaluation."
+        )
+
+    _validate_zero_bubble_schedule_args(args)
+
+    if (
+        args.virtual_pipeline_model_parallel_size is not None
+        and not _is_derived_v_pipeline_schedule(args)
+    ):
         if args.overlap_p2p_comm:
             assert args.pipeline_model_parallel_size > 1, (
                 "When interleaved schedule is used, pipeline-model-parallel size "
@@ -878,6 +1022,8 @@ def validate_args(args, defaults={}):
                 "since non-interleaved schedule does not support overlapping p2p communication "
                 "and aligned param AG"
             )
+
+    _validate_pipeline_parallel_schedule_args(args)
 
     print_rank_0(
         f"Number of virtual stages per pipeline stage: {args.virtual_pipeline_model_parallel_size}"

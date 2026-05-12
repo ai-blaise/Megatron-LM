@@ -19,6 +19,8 @@ context_parallel
 custom_fsdp
 dist_optimizer
 optimizer_cpu_offload
+gpipe_fill_drain
+zero_bubble_pipeline_parallel
 pipeline_parallel_layout
 streambp
 tokenizers

@@ -536,8 +536,15 @@ def default_embedding_ranks(pp_ranks):
     For most models, these are the first and last pipeline stages."""
     if len(pp_ranks) == 1:
         return [pp_ranks[0]]
-    else:
-        return [pp_ranks[0], pp_ranks[-1]]
+    try:
+        from megatron.training import get_args
+
+        if getattr(get_args(), "pipeline_parallel_schedule", "auto") == "zero_bubble_v":
+            return [pp_ranks[0]]
+    except (AssertionError, RuntimeError):
+        pass
+
+    return [pp_ranks[0], pp_ranks[-1]]
 
 
 def default_position_embedding_ranks(pp_ranks):
