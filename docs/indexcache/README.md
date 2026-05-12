@@ -161,6 +161,18 @@ parallelism strategy that doesn't split that dim:
 | NVFP4 analytic backward vs independent STE oracle | fp64 precision |
 | NVFP4 analytic backward vs `torch.autograd` STE-detach oracle | fp64 precision |
 | H200 CUDA behavior | NVFP4 extension symbols build; direct execution rejects with SM100+ guard |
+| Blackwell CUDA behavior | SM103 forward/backward executable path passes 56 fp32/bf16 cases across rows 1..8192 |
+
+The May 2026 Blackwell pass ran on a 2x B300 SXM6 node. The CUDA path matched
+the Python/oracle layout exactly for the forward and packed values/scales. The
+largest observed backward deltas were `2.384e-7` for fp32 and `2.441e-4` for
+bf16, consistent with output dtype rounding. CUDA-event timings for 8192 rows
+were about `9.16 us` forward, `8.19 us` backward, and `17.34 us` combined for
+bf16. IKP identified forward load/reduce and scale/argmax work as the main
+per-warp regions, and backward load plus inner reduction as the main regions.
+Warp-local argmax and lane-0 metadata-broadcast variants were correct but did
+not improve the 8192-row path, so the baseline kernels remain the selected
+implementation.
 
 ## Override note (DeepSeek-V3.2-REAP target)
 
