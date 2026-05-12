@@ -668,7 +668,7 @@ class TransformerConfig(ModelParallelConfig):
 
 
     ####################
-    # IndexCache fp8 fake-quant on the DSA indexer K
+    # IndexCache fake-quant on the DSA indexer K
     ####################
     dsa_indexcache_quant_enabled: bool = False
     """Backward-compatible alias enabling fp8 e4m3 fake-quant on the DSA indexer K tensor.
@@ -691,7 +691,7 @@ class TransformerConfig(ModelParallelConfig):
 
     dsa_indexcache_quant_eps: float = 1e-4
     """Epsilon used to clamp the per-token absolute max before computing the
-    fp8 scale. Matches the SGLang reference (1e-4)."""
+    IndexCache scale. Matches the SGLang reference (1e-4)."""
 
 
     ####################

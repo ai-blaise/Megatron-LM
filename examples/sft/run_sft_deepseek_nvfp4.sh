@@ -324,7 +324,7 @@ fi
 INDEXCACHE_ARGS=()
 if [[ "${INDEXCACHE:-1}" == "1" ]]; then
     INDEXCACHE_ARGS+=(
-        --dsa-indexcache-quant-enabled
+        --dsa-indexcache-quantization "${DSA_INDEXCACHE_QUANTIZATION:-fp8_e4m3}"
         --dsa-indexcache-quant-eps "${DSA_INDEXCACHE_QUANT_EPS:-1e-4}"
     )
 fi

@@ -235,6 +235,20 @@ def _nvfp4_backward_oracle(grad_y: torch.Tensor, intermediates: dict, cfg: Index
     return (direct + rank).reshape_as(x).to(grad_y.dtype)
 
 
+def _nvfp4_ste_autograd_forward(x: torch.Tensor, cfg: IndexCacheConfig) -> torch.Tensor:
+    groups = x.view(x.shape[0], 4, 32)
+    scale_base = groups.abs().amax(dim=-1).clamp_min(cfg.eps) / 6.0
+    scale_exp = _ceil_to_ue8m0_exp(scale_base)
+    scale_quant = _ue8m0_exp_to_float(scale_exp, x.dtype)
+    scale = (scale_quant - scale_base).detach() + scale_base
+    pre_clip = groups / scale.unsqueeze(-1)
+    clipped = pre_clip.clamp(-6.0, 6.0)
+    codes = _quantize_to_e2m1_codes(clipped)
+    q = _e2m1_codes_to_values(codes, x.dtype)
+    ste = (q - clipped).detach() + clipped
+    return (ste * scale.unsqueeze(-1)).reshape_as(x)
+
+
 def test_disabled_indexcache_is_noop():
     cfg = build_indexcache_config(quantization=INDEXCACHE_QUANT_DISABLED)
     x = torch.randn(2, HEAD_DIM, requires_grad=True)
@@ -302,6 +316,25 @@ def test_nvfp4_backward_matches_ste_oracle(case):
     if case == "tie_argmax":
         assert intermediates["argmax"][0, 0].item() == 0
         assert intermediates["argmax"][0, 1].item() == 0
+
+
+def test_nvfp4_backward_matches_torch_autograd_ste():
+    cfg = _make_nvfp4_cfg()
+    torch.manual_seed(11)
+    x = torch.randn(4, HEAD_DIM, dtype=torch.float64) * 0.5
+    x[0, 0:32] = torch.linspace(-7.5, 8.0, 32, dtype=x.dtype)
+    x[1].fill_(cfg.eps * 0.25)
+    upstream = torch.randn_like(x)
+
+    x_ad = x.clone().requires_grad_(True)
+    y_ad = _nvfp4_ste_autograd_forward(x_ad, cfg)
+    (y_ad * upstream).sum().backward()
+
+    y_ref, intermediates = indexcache_forward(x, cfg, return_intermediates=True)
+    g_ref = indexcache_backward(upstream, intermediates, cfg)
+
+    torch.testing.assert_close(y_ref, y_ad.detach(), rtol=0, atol=0)
+    torch.testing.assert_close(g_ref, x_ad.grad, rtol=1e-7, atol=1e-7)
 
 
 def test_nvfp4_autograd_shape_and_dtype_preserves():
