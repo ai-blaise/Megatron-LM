@@ -101,7 +101,9 @@ class IndexCacheKVFn(torch.autograd.Function):
             )
             ctx.cuda_path = True
             ctx.cuda_quantization = INDEXCACHE_QUANT_NVFP4
-            ctx.save_for_backward(flat, scale, q_e2m1, clip_mask, argmax, eps_active)
+            ctx.save_for_backward(
+                flat, scale, packed_values, clip_mask, argmax, eps_active
+            )
         else:
             out, intermediates = indexcache_forward(
                 flat, config, return_intermediates=True
@@ -145,11 +147,20 @@ class IndexCacheKVFn(torch.autograd.Function):
                     grad_x, config.fp8_max,
                 )
             elif ctx.cuda_quantization == INDEXCACHE_QUANT_NVFP4:
-                x_flat, scale, q_e2m1, clip_mask, argmax, eps_active = ctx.saved_tensors
+                x_flat, scale, packed_values, clip_mask, argmax, eps_active = (
+                    ctx.saved_tensors
+                )
                 grad_x = torch.empty_like(x_flat)
-                ext.indexcache_nvfp4_bwd(
-                    grad_flat, x_flat, scale, q_e2m1, clip_mask, argmax, eps_active,
-                    grad_x, config.fp4_max,
+                ext.indexcache_nvfp4_bwd_packed(
+                    grad_flat,
+                    x_flat,
+                    scale,
+                    packed_values,
+                    clip_mask,
+                    argmax,
+                    eps_active,
+                    grad_x,
+                    config.fp4_max,
                 )
             else:
                 raise RuntimeError(

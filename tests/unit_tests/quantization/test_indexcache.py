@@ -397,6 +397,60 @@ def test_nvfp4_non_blackwell_cuda_uses_reference_fallback(monkeypatch):
     assert torch.isfinite(x.grad.float()).all().item()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_nvfp4_blackwell_cuda_packed_backward_matches_reference():
+    if torch.cuda.get_device_capability() < (10, 0):
+        pytest.skip("NVFP4 packed CUDA backward requires Blackwell.")
+
+    from megatron.core.quantization.indexcache.kernels.build import get_ext
+
+    cfg = _make_nvfp4_cfg()
+    ext = get_ext()
+    for dtype in [torch.float32, torch.bfloat16]:
+        gen = torch.Generator(device="cuda")
+        gen.manual_seed(20260512)
+        x = (
+            torch.randn((4, HEAD_DIM), device="cuda", dtype=torch.float32, generator=gen)
+            * 0.65
+        )
+        x[0].zero_()
+        x[1, 0] = 2.0
+        x[1, 7] = -2.0
+        x[1, 32] = -3.0
+        x[1, 33] = 3.0
+        gy = torch.randn((4, HEAD_DIM), device="cuda", dtype=torch.float32, generator=gen)
+        x = x.to(dtype).contiguous()
+        gy = gy.to(dtype).contiguous()
+
+        ref_y, ref_inter = indexcache_forward(x, cfg, return_intermediates=True)
+        ref_gx = indexcache_backward(gy, ref_inter, cfg)
+
+        out = torch.empty_like(x)
+        scale = torch.empty((4, 4), device="cuda", dtype=torch.float32)
+        q = torch.empty((4, HEAD_DIM), device="cuda", dtype=torch.float32)
+        mask = torch.empty((4, HEAD_DIM), device="cuda", dtype=torch.uint8)
+        argmax = torch.empty((4, 4), device="cuda", dtype=torch.int32)
+        eps_active = torch.empty((4, 4), device="cuda", dtype=torch.uint8)
+        packed_values = torch.empty((4, 64), device="cuda", dtype=torch.uint8)
+        packed_scales = torch.empty((4,), device="cuda", dtype=torch.int32)
+        gx = torch.empty_like(x)
+
+        ext.indexcache_nvfp4_fwd(
+            x, out, scale, q, mask, argmax, eps_active,
+            packed_values, packed_scales, cfg.eps,
+        )
+        ext.indexcache_nvfp4_bwd_packed(
+            gy, x, scale, packed_values, mask, argmax, eps_active, gx, cfg.fp4_max,
+        )
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(out, ref_y, rtol=0, atol=0)
+        if dtype is torch.float32:
+            torch.testing.assert_close(gx, ref_gx, rtol=1e-6, atol=1e-6)
+        else:
+            torch.testing.assert_close(gx.float(), ref_gx.float(), rtol=1e-2, atol=1e-3)
+
+
 @pytest.mark.skipif(not hasattr(torch, "float8_e4m3fn"), reason="fp8 unavailable")
 def test_parity_with_sglang_act_quant_math():
     """Match the SGLang Triton _act_quant_kernel formula at the cast level.

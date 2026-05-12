@@ -174,6 +174,18 @@ Warp-local argmax and lane-0 metadata-broadcast variants were correct but did
 not improve the 8192-row path, so the baseline kernels remain the selected
 implementation.
 
+The backward CUDA path now exposes a packed-value variant used by the autograd
+wrapper. It decodes `packed_values[N, 64]` instead of saving and loading
+`q_e2m1[N, 128]` as fp32, reducing the NVFP4 backward saved quantized-value
+state from 512 bytes/row to 64 bytes/row. On the same B300, paired CUDA-event
+timings showed this as a latency tie rather than a speedup at the target 8192
+rows: bf16 q-path backward `8.1999 us` vs packed backward `8.2005 us`; fp32
+q-path `8.2011 us` vs packed `8.2000 us`. IKP showed the packed decode moves
+work from the inner-reduce region into the load/decode region, leaving total
+per-warp bf16 time effectively flat (`1.3202 us` baseline vs `1.3203 us`
+packed). The change is kept for training memory footprint, not for raw kernel
+latency.
+
 ## Override note (DeepSeek-V3.2-REAP target)
 
 The published checkpoint
