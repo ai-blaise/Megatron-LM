@@ -14,7 +14,7 @@ command -v tmux >/dev/null || {
     exit 1
 }
 
-SESSION="${SESSION:-deepseek_sft_real}"
+SESSION="${SESSION:-corsaire_1_research_preview}"
 ATTACH="${ATTACH:-1}"
 if tmux has-session -t "$SESSION" 2>/dev/null; then
     if [[ "$ATTACH" == "1" ]]; then
@@ -26,7 +26,7 @@ if tmux has-session -t "$SESSION" 2>/dev/null; then
 fi
 
 TS="${TS:-$(date -u +%Y%m%d_%H%M%S)}"
-RUN_NAME="${WANDB_EXP_NAME:-deepseek-v32-reap-sft-10b-${TS}}"
+RUN_NAME="${WANDB_EXP_NAME:-corsaire-1-research-preview}"
 LOG_DIR="${LOG_DIR:-"$HOME/logs"}"
 LOG0="$LOG_DIR/${RUN_NAME}_node0.log"
 LOG1="$LOG_DIR/${RUN_NAME}_node1.log"
@@ -52,8 +52,8 @@ PP="${PP:-4}"
 CP="${CP:-1}"
 EP="${EP:-4}"
 ETP="${ETP:-1}"
-MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-2}"
-GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-32}"
+MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-4}"
+GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-128}"
 WORLD_SIZE=$((NNODES * GPUS_PER_NODE))
 DENSE_MODEL_PARALLEL_SIZE=$((TP * PP * CP))
 EXPERT_MODEL_PIPELINE_PARALLEL_SIZE=$((ETP * EP * PP))
@@ -74,15 +74,15 @@ fi
 GRAD_ACCUM_STEPS=$((GLOBAL_BATCH_SIZE / (MICRO_BATCH_SIZE * DP)))
 
 # Full visible Blaise SFT mix target: 753,531 rows rounded down to a full
-# GBS=32 update. This runs the local combined JSONL once without dataset loops.
+# GBS=128 update. This runs the local combined JSONL once without dataset loops.
 DATA_PATH="${DATA_PATH:-"$HOME/data/sft/blaise-sft-training-mix/blaise-sft-training-mix-full.jsonl"}"
-TRAIN_SAMPLES="${TRAIN_SAMPLES:-753504}"
+TRAIN_SAMPLES="${TRAIN_SAMPLES:-753408}"
 LR_DECAY_SAMPLES="${LR_DECAY_SAMPLES:-$TRAIN_SAMPLES}"
 LR_WARMUP_SAMPLES="${LR_WARMUP_SAMPLES:-31616}"
 SAVE_INTERVAL="${SAVE_INTERVAL:-50}"
-DECODER_FIRST_PIPELINE_NUM_LAYERS="${DECODER_FIRST_PIPELINE_NUM_LAYERS:-17}"
-DECODER_LAST_PIPELINE_NUM_LAYERS="${DECODER_LAST_PIPELINE_NUM_LAYERS:-14}"
-PIPELINE_MODEL_PARALLEL_LAYOUT="${PIPELINE_MODEL_PARALLEL_LAYOUT:-Et*17|t*15|t*15|t*14L}"
+DECODER_FIRST_PIPELINE_NUM_LAYERS="${DECODER_FIRST_PIPELINE_NUM_LAYERS:-16}"
+DECODER_LAST_PIPELINE_NUM_LAYERS="${DECODER_LAST_PIPELINE_NUM_LAYERS:-15}"
+PIPELINE_MODEL_PARALLEL_LAYOUT="${PIPELINE_MODEL_PARALLEL_LAYOUT:-Et*8|t*8|t*8|t*8|t*8|t*7|t*7|t*7L}"
 OVERLAP_PARAM_GATHER="${OVERLAP_PARAM_GATHER:-0}"
 # Megatron keeps checkpoints whose iteration is divisible by this value and
 # deletes the previous non-retained checkpoint after a new save. Pick a value
@@ -110,6 +110,7 @@ Param gather:  OVERLAP_PARAM_GATHER=$OVERLAP_PARAM_GATHER
 PP layout:     ${PIPELINE_MODEL_PARALLEL_LAYOUT:-first=$DECODER_FIRST_PIPELINE_NUM_LAYERS middle=auto last=$DECODER_LAST_PIPELINE_NUM_LAYERS}
 StreamBP MoE:  chunk_forward=${STREAMBP_MOE_CHUNK_FORWARD:-0} mlp_chunks=${STREAMBP_MOE_MLP_CHUNKS:-2}
 Quant stack:   spinquant=${SPINQUANT:-1} higgs=${USE_HIGGS:-1} turboquant=${TURBOQUANT:-0} indexcache=${INDEXCACHE:-1} indexcache_hisa=${DSA_INDEXCACHE_HISA:-1}
+DSA fused:     triton=${MEGATRON_DSA_TRITON:-1} triton_indexer=${MEGATRON_DSA_TRITON_INDEXER:-1} streaming_topk=${MEGATRON_DSA_STREAMING_INDEXER_TOPK:-1} hisa_slot_group=${MEGATRON_HISA_CANDIDATE_SLOT_GROUP:-8} hisa_target_triton=${MEGATRON_HISA_TARGET_TRITON:-1} hisa_target_block_k=${MEGATRON_HISA_TARGET_BLOCK_K:-64} bwd_warps=${MEGATRON_DSA_TRITON_BWD_NUM_WARPS:-2}
 MoE LB type:   ${MOE_ROUTER_LOAD_BALANCING_TYPE:-seq_aux_loss}
 MoE aux coeff: ${MOE_AUX_LOSS_COEFF:-1e-4}
 MoE bias upd:  ${MOE_ROUTER_BIAS_UPDATE_RATE:-1e-3}
@@ -171,8 +172,18 @@ if [[ "${SYNC_LOAD_CKPT_METADATA:-1}" == "1" ]]; then
 fi
 
 if [[ "${SYNC_REMOTE:-1}" == "1" ]]; then
+    UPSTREAM_REF=""
+    CURRENT_BRANCH="$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+    if [[ -n "$CURRENT_BRANCH" ]] && git rev-parse --verify --quiet "origin/$CURRENT_BRANCH" >/dev/null; then
+        UPSTREAM_REF="origin/$CURRENT_BRANCH"
+    elif git rev-parse --verify --quiet origin/dev-sft >/dev/null; then
+        UPSTREAM_REF="origin/dev-sft"
+    fi
     mapfile -t SYNC_FILES < <(
         {
+            if [[ -n "$UPSTREAM_REF" ]]; then
+                git diff --name-only "$UPSTREAM_REF..HEAD"
+            fi
             git diff --name-only
             git diff --name-only --cached
             git ls-files --others --exclude-standard
@@ -263,10 +274,20 @@ export MOE_ROUTER_EXPERT_BIAS_UPDATE_METHOD="${MOE_ROUTER_EXPERT_BIAS_UPDATE_MET
 export MOE_ROUTER_QUANTILE_BIAS_ITERS="${MOE_ROUTER_QUANTILE_BIAS_ITERS:-5}"
 export MOE_ROUTER_QUANTILE_BIAS_SYNC_SCORES="${MOE_ROUTER_QUANTILE_BIAS_SYNC_SCORES:-1}"
 export DSA_CHUNK_SIZE="${DSA_CHUNK_SIZE:-2048}"
-export DSA_INDEXER_TOPK="${DSA_INDEXER_TOPK:-2048}"
+export DSA_INDEXER_TOPK="${DSA_INDEXER_TOPK:-1024}"
 export DSA_INDEXER_LOSS_COEFF="${DSA_INDEXER_LOSS_COEFF:-0.01}"
+export MEGATRON_DSA_TRITON="${MEGATRON_DSA_TRITON:-1}"
+export MEGATRON_DSA_TRITON_INDEXER="${MEGATRON_DSA_TRITON_INDEXER:-1}"
+export MEGATRON_DSA_STREAMING_INDEXER_TOPK="${MEGATRON_DSA_STREAMING_INDEXER_TOPK:-1}"
+export MEGATRON_DSA_INDEXER_KEY_BLOCK_SIZE="${MEGATRON_DSA_INDEXER_KEY_BLOCK_SIZE:-4096}"
+export MEGATRON_DSA_SORT_TOPK_INDICES="${MEGATRON_DSA_SORT_TOPK_INDICES:-0}"
+export MEGATRON_DSA_COMPACT_TOPK_INDICES="${MEGATRON_DSA_COMPACT_TOPK_INDICES:-0}"
 export MEGATRON_DSA_TRITON_BF16_GRAD_ATOMICS="${MEGATRON_DSA_TRITON_BF16_GRAD_ATOMICS:-1}"
 export MEGATRON_DSA_TRITON_BWD_NUM_WARPS="${MEGATRON_DSA_TRITON_BWD_NUM_WARPS:-2}"
+export MEGATRON_HISA_CANDIDATE_SLOT_GROUP="${MEGATRON_HISA_CANDIDATE_SLOT_GROUP:-8}"
+export MEGATRON_HISA_TARGET_TRITON="${MEGATRON_HISA_TARGET_TRITON:-1}"
+export MEGATRON_HISA_TARGET_BLOCK_K="${MEGATRON_HISA_TARGET_BLOCK_K:-64}"
+export MEGATRON_HISA_TARGET_ROW_CHUNK="${MEGATRON_HISA_TARGET_ROW_CHUNK:-128}"
 export MEGATRON_FLASH_ADAMW_NVFP4_IMMEDIATE_CAST="${MEGATRON_FLASH_ADAMW_NVFP4_IMMEDIATE_CAST:-1}"
 export FLASH_ADAMW_ECO="${FLASH_ADAMW_ECO:-1}"
 export FLASH_ADAMW_ECO_LR_FLOOR="${FLASH_ADAMW_ECO_LR_FLOOR:-base}"

@@ -3,6 +3,7 @@
 """Input/output checkpointing."""
 
 import contextlib
+import json
 import os
 import random
 import shutil
@@ -468,6 +469,163 @@ def save_grads(save_dir, state_dict, iteration, grad_label):
                  f"from iteration {iteration:7d}")
 
 
+def _json_safe(value):
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    return str(value)
+
+
+def _flatten_data_paths(value):
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple)):
+        paths = []
+        for item in value:
+            if isinstance(item, str) and (
+                item.startswith("/")
+                or item.endswith((".json", ".jsonl", ".arrow", ".parquet"))
+                or os.path.exists(item)
+            ):
+                paths.append(item)
+        return paths
+    return []
+
+
+def _local_path_metadata(path):
+    metadata = {
+        "path": path,
+        "exists": os.path.exists(path),
+    }
+    if os.path.exists(path):
+        stat = os.stat(path)
+        metadata.update(
+            {
+                "size_bytes": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+            }
+        )
+
+    offsets_path = f"{path}.offsets.npy"
+    metadata["offsets_path"] = offsets_path
+    metadata["offsets_exists"] = os.path.exists(offsets_path)
+    if os.path.exists(offsets_path):
+        try:
+            offsets = np.load(offsets_path, mmap_mode="r")
+            metadata["offsets_count"] = int(offsets.shape[0])
+        except Exception as exc:  # pragma: no cover - diagnostic only.
+            metadata["offsets_error"] = repr(exc)
+    return metadata
+
+
+def _build_data_consumption_manifest(args, iteration, save_dir, release=False):
+    consumed = int(getattr(args, "consumed_train_samples", 0) or 0)
+    seq_length = int(getattr(args, "seq_length", 0) or 0)
+    global_batch_size = int(getattr(args, "global_batch_size", 0) or 0)
+    micro_batch_size = int(getattr(args, "micro_batch_size", 0) or 0)
+    data_parallel_size = int(getattr(args, "data_parallel_size", 0) or 0)
+
+    data_paths = []
+    for attr in ("data_path", "train_data_path"):
+        data_paths.extend(_flatten_data_paths(getattr(args, attr, None)))
+    # Preserve order while removing duplicates.
+    data_paths = list(dict.fromkeys(data_paths))
+
+    datasets = []
+    split = getattr(args, "split", None)
+    dataloader_type = getattr(args, "dataloader_type", None)
+    for path in data_paths:
+        dataset_metadata = _local_path_metadata(path)
+        offsets_count = dataset_metadata.get("offsets_count")
+        row_consumption = {
+            "mapping": "sft_sample_index_to_raw_row",
+            "sample_index_range": [0, consumed],
+            "note": (
+                "SFTDataset reads raw row train_ds.indices[sample_idx % len(indices)]. "
+                "With --split 100,0,0 and dataloader_type=single this is the committed "
+                "sequential JSONL row prefix at checkpoint time."
+            ),
+        }
+        if offsets_count is not None and split == "100,0,0" and dataloader_type == "single":
+            full_passes, prefix_rows = divmod(consumed, offsets_count) if offsets_count else (0, 0)
+            row_consumption.update(
+                {
+                    "mapping": "sequential_jsonl_prefix",
+                    "dataset_rows": offsets_count,
+                    "full_dataset_passes": int(full_passes),
+                    "prefix_rows_in_current_pass": int(prefix_rows),
+                    "raw_row_ranges_current_pass": [[0, int(prefix_rows)]],
+                    "next_raw_row_id": int(prefix_rows),
+                    "looped_dataset": bool(full_passes),
+                }
+            )
+            if not full_passes:
+                row_consumption["raw_row_ranges_total"] = [[0, int(prefix_rows)]]
+        datasets.append({**dataset_metadata, "committed_rows": row_consumption})
+
+    checkpoint_dir = get_checkpoint_name(save_dir, iteration, release=release, return_base_dir=True)
+    return {
+        "schema_version": 1,
+        "generated_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "checkpoint": {
+            "iteration": int(iteration),
+            "directory": checkpoint_dir,
+            "release": bool(release),
+        },
+        "training_progress": {
+            "consumed_train_samples": consumed,
+            "global_batch_size": global_batch_size,
+            "micro_batch_size": micro_batch_size,
+            "data_parallel_size": data_parallel_size,
+            "seq_length": seq_length,
+            "approx_consumed_tokens": consumed * seq_length,
+            "train_samples": _json_safe(getattr(args, "train_samples", None)),
+        },
+        "data_config": {
+            "dataloader_type": dataloader_type,
+            "split": split,
+            "seed": _json_safe(getattr(args, "seed", None)),
+            "data_path": _json_safe(getattr(args, "data_path", None)),
+            "train_data_path": _json_safe(getattr(args, "train_data_path", None)),
+            "valid_data_path": _json_safe(getattr(args, "valid_data_path", None)),
+            "test_data_path": _json_safe(getattr(args, "test_data_path", None)),
+        },
+        "datasets": datasets,
+        "semantics": {
+            "tracked_rows": "optimizer_committed",
+            "crash_mid_update": (
+                "Rows fetched for an unfinished update are intentionally not marked consumed; "
+                "this manifest describes the latest checkpoint's committed optimizer state."
+            ),
+        },
+    }
+
+
+def write_data_consumption_manifest(args, iteration, save_dir, release=False):
+    manifest = _build_data_consumption_manifest(args, iteration, save_dir, release=release)
+    checkpoint_dir = manifest["checkpoint"]["directory"]
+    manifest_paths = [
+        os.path.join(checkpoint_dir, "data_manifest.json"),
+        os.path.join(save_dir, "latest_data_manifest.json"),
+    ]
+    for manifest_path in manifest_paths:
+        ensure_directory_exists(manifest_path)
+        tmp_path = f"{manifest_path}.tmp.{os.getpid()}"
+        with open(tmp_path, "w", encoding="utf-8") as manifest_file:
+            json.dump(manifest, manifest_file, indent=2, sort_keys=True)
+            manifest_file.write("\n")
+        os.replace(tmp_path, manifest_path)
+    print_rank_0(
+        f"  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}] wrote data consumption "
+        f"manifest for iteration {int(iteration):7d}"
+    )
+
+
 def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far,
                     checkpointing_context=None, pipeline_rank=None, expert_rank=None, tensor_rank=None, pipeline_parallel=None, expert_parallel=None, non_persistent_ckpt=False,
                     train_data_iterator=None, preprocess_common_state_dict_fn = None, release=False, tp_group: Optional[torch.distributed.ProcessGroup] = None, pp_group: Optional[torch.distributed.ProcessGroup] = None, dp_cp_group: Optional[torch.distributed.ProcessGroup] = None):
@@ -739,6 +897,13 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                              f"checkpoint from iteration {int(iteration):7d} to {args.save} "
                              f"[ t {tensor_rank_to_print}/{mpu.get_tensor_model_parallel_world_size()}, "
                              f"p {pipeline_rank_to_print}/{mpu.get_pipeline_model_parallel_world_size()} ]")
+                try:
+                    write_data_consumption_manifest(args, iteration, save_dir, release=release)
+                except Exception as e:
+                    print_rank_0(
+                        f'  encountered exception "{e}" when trying to write data consumption '
+                        f'manifest for iteration {iteration:7d} at {save_dir}'
+                    )
                 if args.log_progress and args.async_save:
                     append_to_progress_log(f'Saved async checkpoint\tIteration: {iteration}',
                                            barrier=False)

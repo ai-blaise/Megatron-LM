@@ -46,6 +46,10 @@ export MEGATRON_DSA_SORT_TOPK_INDICES="${MEGATRON_DSA_SORT_TOPK_INDICES:-0}"
 export MEGATRON_DSA_COMPACT_TOPK_INDICES="${MEGATRON_DSA_COMPACT_TOPK_INDICES:-0}"
 export MEGATRON_DSA_TRITON_BF16_GRAD_ATOMICS="${MEGATRON_DSA_TRITON_BF16_GRAD_ATOMICS:-1}"
 export MEGATRON_DSA_TRITON_BWD_NUM_WARPS="${MEGATRON_DSA_TRITON_BWD_NUM_WARPS:-2}"
+export MEGATRON_HISA_CANDIDATE_SLOT_GROUP="${MEGATRON_HISA_CANDIDATE_SLOT_GROUP:-8}"
+export MEGATRON_HISA_TARGET_TRITON="${MEGATRON_HISA_TARGET_TRITON:-1}"
+export MEGATRON_HISA_TARGET_BLOCK_K="${MEGATRON_HISA_TARGET_BLOCK_K:-64}"
+export MEGATRON_HISA_TARGET_ROW_CHUNK="${MEGATRON_HISA_TARGET_ROW_CHUNK:-128}"
 export MEGATRON_WEIGHTED_SWIGLU_FUSER="${MEGATRON_WEIGHTED_SWIGLU_FUSER:-eager}"
 export MEGATRON_FLASH_ADAMW_NVFP4_IMMEDIATE_CAST="${MEGATRON_FLASH_ADAMW_NVFP4_IMMEDIATE_CAST:-1}"
 DISTRIBUTED_TIMEOUT_MINUTES="${DISTRIBUTED_TIMEOUT_MINUTES:-60}"
@@ -155,6 +159,10 @@ if [[ -z "${DECODER_FIRST_PIPELINE_NUM_LAYERS:-}" ]]; then
     fi
 fi
 
+if [[ "$PP" -eq 4 && -z "${PIPELINE_MODEL_PARALLEL_LAYOUT:-}" && -z "${NUM_LAYERS_PER_VIRTUAL_PIPELINE_STAGE:-}" && -z "${NUM_VIRTUAL_STAGES_PER_PIPELINE_RANK:-}" ]]; then
+    PIPELINE_MODEL_PARALLEL_LAYOUT="Et*8|t*8|t*8|t*8|t*8|t*7|t*7|t*7L"
+fi
+
 MODEL_PARALLEL_ARGS=(
     --tensor-model-parallel-size "$TP"
     --pipeline-model-parallel-size "$PP"
@@ -259,7 +267,7 @@ DSA_ARGS=(
     --experimental-attention-variant dsa
     --dsa-indexer-n-heads 64
     --dsa-indexer-head-dim 128
-    --dsa-indexer-topk "${DSA_INDEXER_TOPK:-2048}"
+    --dsa-indexer-topk "${DSA_INDEXER_TOPK:-1024}"
     --dsa-indexer-loss-coeff "${DSA_INDEXER_LOSS_COEFF:-0.01}"
     --dsa-chunk-size "$DSA_CHUNK_SIZE"
 )
@@ -381,8 +389,8 @@ fi
 # Training
 # ======================
 TRAINING_ARGS=(
-    --micro-batch-size "${MICRO_BATCH_SIZE:-1}"
-    --global-batch-size "${GLOBAL_BATCH_SIZE:-16}"
+    --micro-batch-size "${MICRO_BATCH_SIZE:-4}"
+    --global-batch-size "${GLOBAL_BATCH_SIZE:-128}"
     --train-samples "${TRAIN_SAMPLES:-32000000}"
     --lr-decay-samples "${LR_DECAY_SAMPLES:-31968645}"
     --lr-warmup-samples "${LR_WARMUP_SAMPLES:-31348}"

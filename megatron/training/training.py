@@ -1814,15 +1814,18 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         else:
             modelopt_adjust_tensor_shapes_fn = None
 
+        sft_packed_pipeline = (
+            args.sft
+            and not args.hybrid_context_parallel
+            and args.pipeline_model_parallel_size > 1
+            and not args.overlap_moe_expert_parallel_comm
+        )
+        sft_packed_interleaved_pipeline = (
+            sft_packed_pipeline and args.virtual_pipeline_model_parallel_size is not None
+        )
         sft_packed_adjust_tensor_shapes_fn = (
             _adjust_tensor_shapes_for_sft_packed
-            if (
-                args.sft
-                and not args.hybrid_context_parallel
-                and args.pipeline_model_parallel_size > 1
-                and args.virtual_pipeline_model_parallel_size is None
-                and not args.overlap_moe_expert_parallel_comm
-            )
+            if sft_packed_pipeline and not sft_packed_interleaved_pipeline
             else None
         )
         adjust_tensor_shapes_fn = _compose_tensor_shapes_adjust_fns(
@@ -1905,14 +1908,27 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         # Forward pass.
         if save_dgrads_in_this_iteration:
             enable_dgrad_logging(model, args.save)
+        schedule_seq_length = args.seq_length
+        schedule_decoder_seq_length = args.decoder_seq_length
+        schedule_micro_batch_size = args.micro_batch_size
+        if sft_packed_interleaved_pipeline:
+            # Interleaved pipeline schedules do not accept adjust_tensor_shapes_fn.
+            # Packed SFT microbatches are already flattened to a singleton-batch
+            # THD stream before model forward, so pass the schedule the equivalent
+            # pipeline activation shape directly.
+            schedule_seq_length = args.seq_length * args.micro_batch_size
+            schedule_micro_batch_size = 1
+            if schedule_decoder_seq_length is not None:
+                schedule_decoder_seq_length = schedule_decoder_seq_length * args.micro_batch_size
+
         losses_reduced = forward_backward_func(
             forward_step_func=forward_step_func,
             data_iterator=data_iterator,
             model=model,
             num_microbatches=num_microbatches,
-            seq_length=args.seq_length,
-            micro_batch_size=args.micro_batch_size,
-            decoder_seq_length=args.decoder_seq_length,
+            seq_length=schedule_seq_length,
+            micro_batch_size=schedule_micro_batch_size,
+            decoder_seq_length=schedule_decoder_seq_length,
             forward_only=False,
             adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
             force_all_reduce=save_wgrads_in_this_iteration,

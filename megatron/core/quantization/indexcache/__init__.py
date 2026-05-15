@@ -36,6 +36,7 @@ from megatron.core.quantization.indexcache.hisa import (
     IndexCacheHISAConfig,
     hisa_block_topk_counts,
     indexcache_hisa_topk,
+    indexcache_hisa_topk_with_scores,
 )
 
 __all__ = [
@@ -54,5 +55,6 @@ __all__ = [
     "build_indexcache_config",
     "hisa_block_topk_counts",
     "indexcache_hisa_topk",
+    "indexcache_hisa_topk_with_scores",
     "resolve_indexcache_quantization",
 ]

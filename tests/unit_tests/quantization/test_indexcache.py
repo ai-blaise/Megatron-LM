@@ -36,8 +36,10 @@ from megatron.core.quantization.indexcache import (  # noqa: E402
     build_indexcache_config,
     hisa_block_topk_counts,
     indexcache_hisa_topk,
+    indexcache_hisa_topk_with_scores,
     resolve_indexcache_quantization,
 )
+from megatron.core.extensions.hisa_indexer.reference import hisa_forward_reference  # noqa: E402
 from megatron.core.quantization.indexcache.reference import (  # noqa: E402
     indexcache_backward,
     indexcache_forward,
@@ -485,6 +487,274 @@ def test_hisa_4to1_pads_when_candidate_pool_is_smaller_than_topk():
     assert int((selected < 0).sum().item()) == 1024
 
 
+def test_hisa_optimized_with_scores_matches_reference_selection(monkeypatch):
+    config = IndexCacheHISAConfig(
+        enabled=True,
+        block_size=4,
+        compression_ratio=2.0,
+        forced_boundary_blocks=("first", "last"),
+    )
+    torch.manual_seed(20260515)
+    sq, bsz, heads, context_len, topk = 3, 2, 2, 24, 5
+    q = torch.randn(sq, bsz, heads, HEAD_DIM, requires_grad=True)
+    k = torch.randn(context_len, bsz, HEAD_DIM, requires_grad=True)
+    weights = (torch.rand(sq, bsz, heads) + 0.1).requires_grad_()
+
+    fast = indexcache_hisa_topk_with_scores(
+        q,
+        weights,
+        k,
+        topk,
+        config=config,
+        q_start=0,
+        is_causal=False,
+        mask=None,
+        query_positions=None,
+        key_positions=None,
+        return_scores=True,
+    )
+    assert fast is not None
+    fast_indices, fast_scores = fast
+    assert fast_scores is not None
+
+    q_flat = q.transpose(0, 1).reshape(bsz * sq, heads, HEAD_DIM).detach()
+    w_flat = weights.transpose(0, 1).reshape(bsz * sq, heads).detach()
+    prefix_lens = torch.full((bsz * sq,), context_len, dtype=torch.long)
+    token_to_batch = torch.repeat_interleave(torch.arange(bsz), sq)
+    ref_indices, _ = hisa_forward_reference(
+        q_flat,
+        [k[:, batch_idx].detach() for batch_idx in range(bsz)],
+        w_flat,
+        prefix_lens,
+        token_to_batch,
+        block_size=config.block_size,
+        compression_ratio=config.compression_ratio,
+        topk_tokens=topk,
+        fallback_to_dense_if_short=False,
+        forced_boundary_blocks=config.forced_boundary_blocks,
+    )
+    assert ref_indices is not None
+
+    fast_flat = fast_indices.reshape(bsz * sq, topk)
+    for row in range(bsz * sq):
+        torch.testing.assert_close(
+            fast_flat[row].sort().values.cpu(),
+            ref_indices[row].long().sort().values.cpu(),
+        )
+        batch_idx = row // sq
+        q_row = q_flat[row]
+        w_row = w_flat[row]
+        selected_k = k[:, batch_idx].detach().index_select(0, fast_flat[row].cpu())
+        expected_scores = (
+            torch.relu((q_row.unsqueeze(0) * selected_k.unsqueeze(1)).sum(-1)) * w_row
+        ).sum(-1)
+        torch.testing.assert_close(
+            fast_scores[row].detach().cpu(),
+            expected_scores.cpu(),
+            rtol=1e-5,
+            atol=1e-5,
+        )
+
+    fast_scores.sum().backward()
+    for tensor in (q, k, weights):
+        assert tensor.grad is not None
+        assert torch.isfinite(tensor.grad.float()).all().item()
+        assert tensor.grad.float().abs().sum().item() > 0
+
+
+def test_hisa_candidate_slot_grouping_is_exact(monkeypatch):
+    config = IndexCacheHISAConfig(
+        enabled=True,
+        block_size=8,
+        compression_ratio=2.0,
+        forced_boundary_blocks=("first", "last"),
+    )
+    torch.manual_seed(20260517)
+    sq, bsz, heads, context_len, topk = 5, 1, 3, 96, 12
+    q = torch.randn(sq, bsz, heads, HEAD_DIM)
+    k = torch.randn(context_len, bsz, HEAD_DIM)
+    weights = torch.rand(sq, bsz, heads) + 0.1
+
+    grouped = {}
+    for slot_group in (1, 2, 4, 8):
+        monkeypatch.setenv("MEGATRON_HISA_CANDIDATE_SLOT_GROUP", str(slot_group))
+        result = indexcache_hisa_topk_with_scores(
+            q,
+            weights,
+            k,
+            topk,
+            config=config,
+            q_start=0,
+            is_causal=False,
+            mask=None,
+            query_positions=None,
+            key_positions=None,
+            return_scores=True,
+        )
+        assert result is not None
+        grouped[slot_group] = result
+
+    base_indices, base_scores = grouped[1]
+    for slot_group in (2, 4, 8):
+        indices, scores = grouped[slot_group]
+        torch.testing.assert_close(
+            indices.reshape(-1, topk).sort(dim=-1).values,
+            base_indices.reshape(-1, topk).sort(dim=-1).values,
+        )
+        for row in range(sq * bsz):
+            base_order = base_indices.reshape(-1, topk)[row]
+            row_indices = indices.reshape(-1, topk)[row]
+            base_lookup = {
+                int(idx.item()): base_scores[row, pos].item()
+                for pos, idx in enumerate(base_order)
+            }
+            expected = torch.tensor(
+                [base_lookup[int(idx.item())] for idx in row_indices],
+                dtype=scores.dtype,
+                device=scores.device,
+            )
+            torch.testing.assert_close(scores[row], expected, rtol=1e-5, atol=1e-5)
+
+
+def test_hisa_candidate_slot_grouping_is_exact_for_causal_prefix(monkeypatch):
+    config = IndexCacheHISAConfig(
+        enabled=True,
+        block_size=8,
+        compression_ratio=2.0,
+        forced_boundary_blocks=("first", "last"),
+    )
+    torch.manual_seed(20260518)
+    sq, bsz, heads, context_len, topk, q_start = 5, 1, 3, 128, 12, 72
+    q = torch.randn(sq, bsz, heads, HEAD_DIM)
+    k = torch.randn(context_len, bsz, HEAD_DIM)
+    weights = torch.rand(sq, bsz, heads) + 0.1
+
+    monkeypatch.setenv("MEGATRON_HISA_CANDIDATE_SLOT_GROUP", "8")
+    fast = indexcache_hisa_topk_with_scores(
+        q,
+        weights,
+        k,
+        topk,
+        config=config,
+        q_start=q_start,
+        is_causal=True,
+        mask=None,
+        query_positions=None,
+        key_positions=None,
+        return_scores=True,
+    )
+    assert fast is not None
+    fast_indices, fast_scores = fast
+    assert fast_scores is not None
+
+    q_flat = q.transpose(0, 1).reshape(bsz * sq, heads, HEAD_DIM).detach()
+    w_flat = weights.transpose(0, 1).reshape(bsz * sq, heads).detach()
+    prefix_lens = torch.arange(q_start + 1, q_start + sq + 1, dtype=torch.long)
+    token_to_batch = torch.zeros(sq, dtype=torch.long)
+    ref_indices, _ = hisa_forward_reference(
+        q_flat,
+        [k[:, 0].detach()],
+        w_flat,
+        prefix_lens,
+        token_to_batch,
+        block_size=config.block_size,
+        compression_ratio=config.compression_ratio,
+        topk_tokens=topk,
+        fallback_to_dense_if_short=False,
+        forced_boundary_blocks=config.forced_boundary_blocks,
+    )
+    assert ref_indices is not None
+    fast_flat = fast_indices.reshape(sq, topk)
+    for row in range(sq):
+        torch.testing.assert_close(
+            fast_flat[row].sort().values.cpu(),
+            ref_indices[row].long().sort().values.cpu(),
+        )
+        assert int(fast_flat[row].max().item()) < q_start + row + 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_hisa_cuda_selector_matches_reference_selection(monkeypatch):
+    if torch.cuda.get_device_capability() < (10, 0):
+        pytest.skip("HISA CUDA selector is intended for Blackwell+.")
+
+    import megatron.core.quantization.indexcache.hisa as hisa_module
+
+    ext = hisa_module._try_load_hisa_cuda_ext()
+    if ext is None or not hasattr(ext, "hisa_selector_fwd"):
+        pytest.skip("HISA CUDA selector extension unavailable.")
+    monkeypatch.setenv("MEGATRON_HISA_SELECTOR_CUDA", "1")
+
+    config = IndexCacheHISAConfig(
+        enabled=True,
+        block_size=4,
+        compression_ratio=2.0,
+        forced_boundary_blocks=("first", "last"),
+    )
+    torch.manual_seed(20260516)
+    sq, heads, context_len, topk = 8, 4, 32, 4
+    q = torch.randn(sq, heads, HEAD_DIM, device="cuda")
+    k = torch.randn(context_len, HEAD_DIM, device="cuda")
+    weights = torch.rand(sq, heads, device="cuda") + 0.1
+    q_start = 20
+    prefix_lens = torch.arange(q_start + 1, q_start + sq + 1, device="cuda").clamp(
+        0, context_len
+    )
+    row_block_counts = torch.div(
+        prefix_lens + config.block_size - 1,
+        config.block_size,
+        rounding_mode="floor",
+    ).to(torch.int32)
+    block_topk_counts, effective_block_topk = hisa_block_topk_counts(
+        row_block_counts,
+        block_size=config.block_size,
+        topk_tokens=topk,
+        compression_ratio=config.compression_ratio,
+    )
+
+    got = hisa_module._indexcache_hisa_topk_cuda_for_batch(
+        q,
+        weights,
+        k,
+        topk,
+        config=config,
+        prefix_lens=prefix_lens,
+        block_topk_counts=block_topk_counts,
+        effective_block_topk=effective_block_topk,
+        return_scores=True,
+    )
+    assert got is not None
+    got_indices, got_scores = got
+
+    ref_indices, _ = hisa_forward_reference(
+        q.detach(),
+        [k.detach()],
+        weights.detach(),
+        prefix_lens,
+        torch.zeros(sq, device="cuda", dtype=torch.long),
+        block_size=config.block_size,
+        compression_ratio=config.compression_ratio,
+        topk_tokens=topk,
+        fallback_to_dense_if_short=False,
+        forced_boundary_blocks=config.forced_boundary_blocks,
+    )
+    assert ref_indices is not None
+    for row in range(sq):
+        torch.testing.assert_close(
+            got_indices[row].sort().values.cpu(),
+            ref_indices[row].long().sort().values.cpu(),
+        )
+
+    selected_k = k.index_select(0, got_indices.clamp_min(0).reshape(-1)).view(
+        sq, topk, HEAD_DIM
+    )
+    expected_scores = (
+        torch.relu((q.unsqueeze(1) * selected_k.unsqueeze(2)).sum(-1))
+        * weights.unsqueeze(1)
+    ).sum(-1)
+    torch.testing.assert_close(got_scores, expected_scores, rtol=1e-5, atol=1e-5)
+
+
 def test_chunked_dsa_forward_masks_padded_hisa_candidates(monkeypatch):
     import megatron.core.transformer.experimental_attention_variant.dsa as dsa_module
 
@@ -671,6 +941,99 @@ def test_chunked_dsa_hisa_path_backpropagates_attention_grads():
         assert tensor.grad.float().abs().sum().item() > 0
 
 
+def test_hisa_attention_target_probs_row_chunk_matches_full(monkeypatch):
+    import megatron.core.transformer.experimental_attention_variant.dsa as dsa_module
+
+    torch.manual_seed(20260515)
+    q_len, bsz, num_heads, head_dim, topk = 5, 2, 3, 4, 6
+    query = torch.randn(q_len, bsz, num_heads, head_dim, dtype=torch.bfloat16)
+    key = torch.randn(11, bsz, num_heads, head_dim, dtype=torch.bfloat16)
+    topk_indices = torch.tensor(
+        [
+            [
+                [0, 1, 2, 3, -1, -1],
+                [1, 3, 5, 7, 9, -1],
+                [2, 4, 6, 8, 10, -1],
+                [0, 2, 4, 6, 8, 10],
+                [1, 2, 3, 4, 5, 6],
+            ],
+            [
+                [10, 8, 6, 4, 2, 0],
+                [9, 7, 5, 3, 1, -1],
+                [8, 7, 6, 5, -1, -1],
+                [3, 4, 5, 6, 7, 8],
+                [0, 2, 4, 6, 8, 10],
+            ],
+        ],
+        dtype=torch.long,
+    )
+    softmax_scale = 0.25
+
+    def full_reference():
+        attention_scores = torch.empty((bsz * q_len, topk, num_heads), dtype=torch.float32)
+        for batch_idx in range(bsz):
+            selected = topk_indices[batch_idx]
+            valid = selected >= 0
+            safe_selected = selected.clamp_min(0)
+            selected_key = key[:, batch_idx].float().index_select(0, safe_selected.reshape(-1))
+            selected_key = selected_key.view(q_len, topk, num_heads, head_dim)
+            scores = (
+                torch.einsum("qhd,qkhd->qkh", query[:, batch_idx].float(), selected_key)
+                * softmax_scale
+            )
+            attention_scores[batch_idx * q_len : (batch_idx + 1) * q_len] = scores.masked_fill(
+                ~valid.unsqueeze(-1), float("-inf")
+            )
+        probs = torch.softmax(attention_scores, dim=1, dtype=torch.float32).sum(dim=2)
+        return probs / probs.sum(dim=-1, keepdim=True).clamp_min(1e-20)
+
+    monkeypatch.setenv("MEGATRON_HISA_TARGET_ROW_CHUNK", "2")
+    got = dsa_module._hisa_attention_target_probs(
+        query, key, topk_indices, softmax_scale=softmax_scale, tp_group=None
+    )
+    torch.testing.assert_close(got, full_reference())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_hisa_attention_target_probs_triton_matches_full(monkeypatch):
+    import megatron.core.transformer.experimental_attention_variant.dsa as dsa_module
+
+    torch.manual_seed(20260516)
+    q_len, bsz, num_heads, head_dim, topk = 7, 2, 5, 16, 9
+    query = torch.randn(q_len, bsz, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    key = torch.randn(19, bsz, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    topk_indices = torch.randint(0, key.shape[0], (bsz, q_len, topk), device="cuda")
+    topk_indices[:, 1::3, -2:] = -1
+    softmax_scale = 0.125
+
+    def full_reference():
+        attention_scores = torch.empty(
+            (bsz * q_len, topk, num_heads), device="cuda", dtype=torch.float32
+        )
+        for batch_idx in range(bsz):
+            selected = topk_indices[batch_idx]
+            valid = selected >= 0
+            safe_selected = selected.clamp_min(0)
+            selected_key = key[:, batch_idx].float().index_select(0, safe_selected.reshape(-1))
+            selected_key = selected_key.view(q_len, topk, num_heads, head_dim)
+            scores = (
+                torch.einsum("qhd,qkhd->qkh", query[:, batch_idx].float(), selected_key)
+                * softmax_scale
+            )
+            attention_scores[batch_idx * q_len : (batch_idx + 1) * q_len] = scores.masked_fill(
+                ~valid.unsqueeze(-1), float("-inf")
+            )
+        probs = torch.softmax(attention_scores, dim=1, dtype=torch.float32).sum(dim=2)
+        return probs / probs.sum(dim=-1, keepdim=True).clamp_min(1e-20)
+
+    monkeypatch.setenv("MEGATRON_HISA_TARGET_TRITON", "1")
+    monkeypatch.setenv("MEGATRON_HISA_TARGET_BLOCK_K", "4")
+    got = dsa_module._hisa_attention_target_probs(
+        query, key, topk_indices, softmax_scale=softmax_scale, tp_group=None
+    )
+    torch.testing.assert_close(got, full_reference(), rtol=1e-4, atol=1e-5)
+
+
 def test_chunked_dsa_hisa_with_indexer_loss_backpropagates_indexer_grads(monkeypatch):
     import megatron.core.transformer.experimental_attention_variant.dsa as dsa_module
 
@@ -748,7 +1111,10 @@ def test_nvfp4_blackwell_cuda_packed_backward_matches_reference():
     from megatron.core.quantization.indexcache.kernels.build import get_ext
 
     cfg = _make_nvfp4_cfg()
-    ext = get_ext()
+    try:
+        ext = get_ext()
+    except Exception as exc:
+        pytest.skip(f"NVFP4 CUDA extension unavailable: {exc}")
     for dtype in [torch.float32, torch.bfloat16]:
         gen = torch.Generator(device="cuda")
         gen.manual_seed(20260512)

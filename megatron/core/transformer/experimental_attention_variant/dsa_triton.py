@@ -33,6 +33,8 @@ _DSA_TRITON_INDEXER_BLOCK_Q_ENV = "MEGATRON_DSA_TRITON_INDEXER_BLOCK_Q"
 _DSA_TRITON_INDEXER_BLOCK_K_ENV = "MEGATRON_DSA_TRITON_INDEXER_BLOCK_K"
 _DSA_TRITON_BF16_GRAD_ATOMICS_ENV = "MEGATRON_DSA_TRITON_BF16_GRAD_ATOMICS"
 _DSA_TRITON_BWD_NUM_WARPS_ENV = "MEGATRON_DSA_TRITON_BWD_NUM_WARPS"
+_HISA_TARGET_TRITON_ENV = "MEGATRON_HISA_TARGET_TRITON"
+_HISA_TARGET_BLOCK_K_ENV = "MEGATRON_HISA_TARGET_BLOCK_K"
 
 
 def _env_enabled() -> bool:
@@ -42,6 +44,11 @@ def _env_enabled() -> bool:
 
 def _indexer_env_enabled() -> bool:
     raw = os.getenv(_DSA_TRITON_INDEXER_ENV, "1").strip().lower()
+    return raw not in {"0", "false", "off", "no"}
+
+
+def _hisa_target_env_enabled() -> bool:
+    raw = os.getenv(_HISA_TARGET_TRITON_ENV, "1").strip().lower()
     return raw not in {"0", "false", "off", "no"}
 
 
@@ -70,6 +77,10 @@ def _forward_block_k(topk: int) -> int:
 
 def _backward_block_k(topk: int) -> int:
     return _block_k_from_env(_DSA_TRITON_BLOCK_K_BWD_ENV, topk, large_topk_default=64)
+
+
+def _hisa_target_block_k(topk: int) -> int:
+    return _block_k_from_env(_HISA_TARGET_BLOCK_K_ENV, topk, large_topk_default=64)
 
 
 def _sparse_block_q() -> int:
@@ -316,6 +327,258 @@ def dsa_indexer_scores_triton(
     return scores
 
 
+def is_hisa_attention_target_probs_triton_supported(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    topk_indices: torch.Tensor,
+) -> bool:
+    """Return whether the fused HISA target-probability kernel can handle this call."""
+
+    if not (_env_enabled() and _hisa_target_env_enabled()) or not HAVE_TRITON:
+        return False
+    if not (query.is_cuda and key.is_cuda and topk_indices.is_cuda):
+        return False
+    if query.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+        return False
+    if key.dtype != query.dtype:
+        return False
+    if topk_indices.dtype not in (torch.int16, torch.int32, torch.int64):
+        return False
+    if query.dim() != 4 or key.dim() != 4 or topk_indices.dim() != 3:
+        return False
+    if query.size(1) != key.size(1) or query.size(2) != key.size(2):
+        return False
+    if query.size(3) != key.size(3):
+        return False
+    if topk_indices.size(0) != query.size(1) or topk_indices.size(1) != query.size(0):
+        return False
+    if query.size(0) <= 0 or key.size(0) <= 0 or topk_indices.size(-1) <= 0:
+        return False
+    if query.size(2) <= 0 or query.size(2) > 256:
+        return False
+    if query.size(3) <= 0 or query.size(3) > 256:
+        return False
+    if topk_indices.size(-1) > key.size(0):
+        return False
+    return True
+
+
+@triton.jit
+def _hisa_target_lse_kernel(
+    query_ptr,
+    key_ptr,
+    topk_ptr,
+    lse_ptr,
+    softmax_scale,
+    topk_count: tl.constexpr,
+    head_dim: tl.constexpr,
+    num_heads: tl.constexpr,
+    q_stride_s: tl.constexpr,
+    q_stride_b: tl.constexpr,
+    q_stride_h: tl.constexpr,
+    q_stride_d: tl.constexpr,
+    k_stride_s: tl.constexpr,
+    k_stride_b: tl.constexpr,
+    k_stride_h: tl.constexpr,
+    k_stride_d: tl.constexpr,
+    topk_stride_b: tl.constexpr,
+    topk_stride_s: tl.constexpr,
+    topk_stride_k: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    q_idx = tl.program_id(0)
+    batch_idx = tl.program_id(1)
+    head_idx = tl.program_id(2)
+
+    d_offsets = tl.arange(0, BLOCK_D)
+    topk_offsets = tl.arange(0, BLOCK_K)
+    query = tl.load(
+        query_ptr
+        + q_idx * q_stride_s
+        + batch_idx * q_stride_b
+        + head_idx * q_stride_h
+        + d_offsets * q_stride_d,
+        mask=d_offsets < head_dim,
+        other=0.0,
+    ).to(tl.float32)
+
+    m_i = tl.full((), -float("inf"), tl.float32)
+    l_i = tl.full((), 0.0, tl.float32)
+    for topk_start in tl.range(0, topk_count, BLOCK_K):
+        k_offsets = topk_start + topk_offsets
+        valid_topk = k_offsets < topk_count
+        selected = tl.load(
+            topk_ptr
+            + batch_idx * topk_stride_b
+            + q_idx * topk_stride_s
+            + k_offsets * topk_stride_k,
+            mask=valid_topk,
+            other=0,
+        ).to(tl.int64)
+        selected_valid = selected >= 0
+        safe_selected = tl.maximum(selected, 0)
+        key = tl.load(
+            key_ptr
+            + safe_selected[:, None] * k_stride_s
+            + batch_idx * k_stride_b
+            + head_idx * k_stride_h
+            + d_offsets[None, :] * k_stride_d,
+            mask=valid_topk[:, None] & selected_valid[:, None] & (d_offsets[None, :] < head_dim),
+            other=0.0,
+        ).to(tl.float32)
+        scores = tl.sum(key * query[None, :], axis=1) * softmax_scale
+        scores = tl.where(valid_topk & selected_valid, scores, -float("inf"))
+
+        block_m = tl.max(scores, axis=0)
+        m_new = tl.maximum(m_i, block_m)
+        l_i = l_i * tl.exp(m_i - m_new) + tl.sum(tl.exp(scores - m_new), axis=0)
+        m_i = m_new
+
+    row = batch_idx * tl.num_programs(0) + q_idx
+    tl.store(lse_ptr + row * num_heads + head_idx, m_i + tl.log(l_i))
+
+
+@triton.jit
+def _hisa_target_probs_kernel(
+    query_ptr,
+    key_ptr,
+    topk_ptr,
+    lse_ptr,
+    out_ptr,
+    softmax_scale,
+    topk_count: tl.constexpr,
+    head_dim: tl.constexpr,
+    num_heads: tl.constexpr,
+    q_stride_s: tl.constexpr,
+    q_stride_b: tl.constexpr,
+    q_stride_h: tl.constexpr,
+    q_stride_d: tl.constexpr,
+    k_stride_s: tl.constexpr,
+    k_stride_b: tl.constexpr,
+    k_stride_h: tl.constexpr,
+    k_stride_d: tl.constexpr,
+    topk_stride_b: tl.constexpr,
+    topk_stride_s: tl.constexpr,
+    topk_stride_k: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    q_idx = tl.program_id(0)
+    batch_idx = tl.program_id(1)
+    topk_block = tl.program_id(2)
+
+    d_offsets = tl.arange(0, BLOCK_D)
+    topk_offsets = topk_block * BLOCK_K + tl.arange(0, BLOCK_K)
+    valid_topk = topk_offsets < topk_count
+    selected = tl.load(
+        topk_ptr
+        + batch_idx * topk_stride_b
+        + q_idx * topk_stride_s
+        + topk_offsets * topk_stride_k,
+        mask=valid_topk,
+        other=0,
+    ).to(tl.int64)
+    selected_valid = selected >= 0
+    safe_selected = tl.maximum(selected, 0)
+
+    row = batch_idx * tl.num_programs(0) + q_idx
+    prob_sum = tl.zeros((BLOCK_K,), tl.float32)
+    for head_idx in tl.range(0, num_heads):
+        query = tl.load(
+            query_ptr
+            + q_idx * q_stride_s
+            + batch_idx * q_stride_b
+            + head_idx * q_stride_h
+            + d_offsets * q_stride_d,
+            mask=d_offsets < head_dim,
+            other=0.0,
+        ).to(tl.float32)
+        key = tl.load(
+            key_ptr
+            + safe_selected[:, None] * k_stride_s
+            + batch_idx * k_stride_b
+            + head_idx * k_stride_h
+            + d_offsets[None, :] * k_stride_d,
+            mask=valid_topk[:, None] & selected_valid[:, None] & (d_offsets[None, :] < head_dim),
+            other=0.0,
+        ).to(tl.float32)
+        scores = tl.sum(key * query[None, :], axis=1) * softmax_scale
+        scores = tl.where(valid_topk & selected_valid, scores, -float("inf"))
+        row_lse = tl.load(lse_ptr + row * num_heads + head_idx).to(tl.float32)
+        probs = tl.exp(scores - row_lse)
+        prob_sum += tl.where(valid_topk & selected_valid, probs, 0.0)
+
+    tl.store(out_ptr + row * topk_count + topk_offsets, prob_sum, mask=valid_topk)
+
+
+def hisa_attention_target_probs_triton(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    topk_indices: torch.Tensor,
+    softmax_scale: float,
+) -> torch.Tensor:
+    """Fused HISA target probability construction over selected top-k attention keys."""
+
+    q_len, bsz, num_heads, head_dim = query.shape
+    topk_count = topk_indices.shape[-1]
+    lse = torch.empty((bsz * q_len, num_heads), device=query.device, dtype=torch.float32)
+    out = torch.empty((bsz * q_len, topk_count), device=query.device, dtype=torch.float32)
+    block_k = _hisa_target_block_k(topk_count)
+    block_d = triton.next_power_of_2(head_dim)
+
+    _hisa_target_lse_kernel[(q_len, bsz, num_heads)](
+        query,
+        key,
+        topk_indices,
+        lse,
+        float(softmax_scale),
+        topk_count,
+        head_dim,
+        num_heads,
+        query.stride(0),
+        query.stride(1),
+        query.stride(2),
+        query.stride(3),
+        key.stride(0),
+        key.stride(1),
+        key.stride(2),
+        key.stride(3),
+        topk_indices.stride(0),
+        topk_indices.stride(1),
+        topk_indices.stride(2),
+        BLOCK_K=block_k,
+        BLOCK_D=block_d,
+        num_warps=4,
+    )
+    _hisa_target_probs_kernel[(q_len, bsz, triton.cdiv(topk_count, block_k))](
+        query,
+        key,
+        topk_indices,
+        lse,
+        out,
+        float(softmax_scale),
+        topk_count,
+        head_dim,
+        num_heads,
+        query.stride(0),
+        query.stride(1),
+        query.stride(2),
+        query.stride(3),
+        key.stride(0),
+        key.stride(1),
+        key.stride(2),
+        key.stride(3),
+        topk_indices.stride(0),
+        topk_indices.stride(1),
+        topk_indices.stride(2),
+        BLOCK_K=block_k,
+        BLOCK_D=block_d,
+        num_warps=4,
+    )
+    return out
+
+
 def is_sparse_dsa_triton_supported(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -424,15 +687,31 @@ def _sparse_dsa_forward_kernel(
             mask=q_valid[:, None] & valid_topk[None, :],
             other=0,
         ).to(tl.int64)
+        selected_valid = selected >= 0
+        safe_selected = tl.maximum(selected, 0)
         if HAS_POSITIONS:
-            selected_abs = tl.load(key_pos_ptr + selected, mask=q_valid[:, None] & valid_topk[None, :], other=0)
-            valid = q_valid[:, None] & valid_topk[None, :] & (selected_abs <= q_abs[:, None])
+            selected_abs = tl.load(
+                key_pos_ptr + safe_selected,
+                mask=q_valid[:, None] & valid_topk[None, :] & selected_valid,
+                other=0,
+            )
+            valid = (
+                q_valid[:, None]
+                & valid_topk[None, :]
+                & selected_valid
+                & (selected_abs <= q_abs[:, None])
+            )
         else:
-            valid = q_valid[:, None] & valid_topk[None, :] & (selected <= q_abs[:, None])
+            valid = (
+                q_valid[:, None]
+                & valid_topk[None, :]
+                & selected_valid
+                & (selected <= q_abs[:, None])
+            )
 
         key_ptrs = (
             key_ptr
-            + (selected[:, :, None] * num_heads + head_idx) * head_dim
+            + (safe_selected[:, :, None] * num_heads + head_idx) * head_dim
             + qd_offsets[None, None, :]
         )
         key = tl.load(
@@ -450,7 +729,7 @@ def _sparse_dsa_forward_kernel(
 
         value_ptrs = (
             value_ptr
-            + (selected[:, :, None] * num_heads + head_idx) * value_dim
+            + (safe_selected[:, :, None] * num_heads + head_idx) * value_dim
             + vd_offsets[None, None, :]
         )
         value = tl.load(
@@ -539,15 +818,31 @@ def _sparse_dsa_backward_kernel(
             mask=q_valid[:, None] & valid_topk[None, :],
             other=0,
         ).to(tl.int64)
+        selected_valid = selected >= 0
+        safe_selected = tl.maximum(selected, 0)
         if HAS_POSITIONS:
-            selected_abs = tl.load(key_pos_ptr + selected, mask=q_valid[:, None] & valid_topk[None, :], other=0)
-            valid = q_valid[:, None] & valid_topk[None, :] & (selected_abs <= q_abs[:, None])
+            selected_abs = tl.load(
+                key_pos_ptr + safe_selected,
+                mask=q_valid[:, None] & valid_topk[None, :] & selected_valid,
+                other=0,
+            )
+            valid = (
+                q_valid[:, None]
+                & valid_topk[None, :]
+                & selected_valid
+                & (selected_abs <= q_abs[:, None])
+            )
         else:
-            valid = q_valid[:, None] & valid_topk[None, :] & (selected <= q_abs[:, None])
+            valid = (
+                q_valid[:, None]
+                & valid_topk[None, :]
+                & selected_valid
+                & (selected <= q_abs[:, None])
+            )
 
         key_ptrs = (
             key_ptr
-            + (selected[:, :, None] * num_heads + head_idx) * head_dim
+            + (safe_selected[:, :, None] * num_heads + head_idx) * head_dim
             + qd_offsets[None, None, :]
         )
         key = tl.load(
@@ -562,7 +857,7 @@ def _sparse_dsa_backward_kernel(
 
         value_ptrs = (
             value_ptr
-            + (selected[:, :, None] * num_heads + head_idx) * value_dim
+            + (safe_selected[:, :, None] * num_heads + head_idx) * value_dim
             + vd_offsets[None, None, :]
         )
         value = tl.load(
@@ -577,7 +872,7 @@ def _sparse_dsa_backward_kernel(
 
         tl.atomic_add(
             grad_key_ptr
-            + (selected[:, :, None] * num_heads + head_idx) * head_dim
+            + (safe_selected[:, :, None] * num_heads + head_idx) * head_dim
             + qd_offsets[None, None, :],
             ds[:, :, None] * query[:, None, :],
             sem="relaxed",
@@ -585,7 +880,7 @@ def _sparse_dsa_backward_kernel(
         )
         tl.atomic_add(
             grad_value_ptr
-            + (selected[:, :, None] * num_heads + head_idx) * value_dim
+            + (safe_selected[:, :, None] * num_heads + head_idx) * value_dim
             + vd_offsets[None, None, :],
             probs[:, :, None] * grad_output[:, None, :],
             sem="relaxed",

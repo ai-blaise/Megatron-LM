@@ -29,7 +29,7 @@ def _try_load_cuda_ext():
         from megatron.core.quantization.indexcache.kernels.build import get_ext
 
         return get_ext()
-    except (ImportError, RuntimeError):
+    except (ImportError, RuntimeError, OSError):
         return None
 
 

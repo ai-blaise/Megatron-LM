@@ -34,6 +34,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa_triton import 
     sparse_dsa_attention_triton,
 )
 from megatron.core.transformer.transformer_config import MLATransformerConfig
+from megatron.core.quantization.indexcache import IndexCacheHISAConfig, indexcache_hisa_topk
 from tests.unit_tests.test_utilities import Utils
 
 try:
@@ -697,6 +698,337 @@ class TestSparseDSATritonAttention:
         assert torch.allclose(query_fused.grad, reference_grads[0], atol=8e-2, rtol=8e-2)
         assert torch.allclose(key_fused.grad, reference_grads[1], atol=8e-2, rtol=8e-2)
         assert torch.allclose(value_fused.grad, reference_grads[2], atol=8e-2, rtol=8e-2)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_triton_path_masks_padded_topk_indices(self, monkeypatch):
+        torch.manual_seed(20260516)
+        seqlen = 16
+        q_len = 4
+        num_heads = 2
+        qk_head_dim = 64
+        value_head_dim = 64
+        topk = 8
+        softmax_scale = qk_head_dim**-0.5
+
+        query = torch.randn(
+            q_len,
+            1,
+            num_heads,
+            qk_head_dim,
+            device="cuda",
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        key = torch.randn(
+            seqlen,
+            1,
+            num_heads,
+            qk_head_dim,
+            device="cuda",
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        value = torch.randn(
+            seqlen,
+            1,
+            num_heads,
+            value_head_dim,
+            device="cuda",
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        topk_indices = torch.tensor(
+            [
+                [
+                    [0, -1, -1, -1, -1, -1, -1, -1],
+                    [0, 1, -1, -1, -1, -1, -1, -1],
+                    [0, 2, 1, -1, -1, -1, -1, -1],
+                    [3, 2, 1, 0, -1, -1, -1, -1],
+                ]
+            ],
+            device="cuda",
+            dtype=torch.long,
+        )
+        grad_output = torch.randn(
+            q_len, 1, num_heads * value_head_dim, device="cuda", dtype=torch.bfloat16
+        )
+
+        reference = _sparse_dsa_attention_chunk(
+            query,
+            key,
+            value,
+            topk_indices,
+            softmax_scale,
+            mask=None,
+            q_start=0,
+            is_causal=True,
+        )
+        (reference * grad_output).sum().backward()
+        reference_grads = (
+            query.grad.detach().clone(),
+            key.grad.detach().clone(),
+            value.grad.detach().clone(),
+        )
+
+        query_fused = query.detach().clone().requires_grad_(True)
+        key_fused = key.detach().clone().requires_grad_(True)
+        value_fused = value.detach().clone().requires_grad_(True)
+
+        monkeypatch.setenv("MEGATRON_DSA_TRITON", "1")
+        assert is_sparse_dsa_triton_supported(
+            query_fused, key_fused, value_fused, topk_indices, mask=None, is_causal=True
+        )
+        fused = sparse_dsa_attention_triton(
+            query_fused,
+            key_fused,
+            value_fused,
+            topk_indices,
+            softmax_scale,
+        )
+        (fused * grad_output).sum().backward()
+
+        assert torch.allclose(fused, reference, atol=8e-2, rtol=8e-2)
+        assert torch.allclose(query_fused.grad, reference_grads[0], atol=8e-2, rtol=8e-2)
+        assert torch.allclose(key_fused.grad, reference_grads[1], atol=8e-2, rtol=8e-2)
+        assert torch.allclose(value_fused.grad, reference_grads[2], atol=8e-2, rtol=8e-2)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_hisa_dispatches_to_triton_with_padded_candidates_and_indexer_loss(
+        self, monkeypatch
+    ):
+        import megatron.core.transformer.experimental_attention_variant.dsa as dsa_module
+
+        class _ProcessGroup:
+            def size(self):
+                return 1
+
+        class _ProcessGroups:
+            tp = _ProcessGroup()
+
+        torch.manual_seed(20260515)
+        seqlen = 64
+        q_len = 8
+        index_heads = 2
+        index_dim = 32
+        num_heads = 2
+        qk_head_dim = 64
+        value_head_dim = 64
+        topk = 48
+        softmax_scale = qk_head_dim**-0.5
+        hisa_config = IndexCacheHISAConfig(
+            enabled=True,
+            block_size=16,
+            compression_ratio=4.0,
+            fallback_to_dense_if_short=False,
+        )
+
+        q = torch.randn(
+            q_len,
+            1,
+            index_heads,
+            index_dim,
+            device="cuda",
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        index_k = torch.randn(
+            seqlen, 1, index_dim, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        weights = (
+            torch.rand(q_len, 1, index_heads, device="cuda", dtype=torch.bfloat16) + 0.1
+        ).requires_grad_()
+        query = torch.randn(
+            q_len,
+            1,
+            num_heads,
+            qk_head_dim,
+            device="cuda",
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        key = torch.randn(
+            seqlen,
+            1,
+            num_heads,
+            qk_head_dim,
+            device="cuda",
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        value = torch.randn(
+            seqlen,
+            1,
+            num_heads,
+            value_head_dim,
+            device="cuda",
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+
+        selected = indexcache_hisa_topk(
+            q.detach(),
+            weights.detach(),
+            index_k.detach(),
+            topk,
+            config=hisa_config,
+            q_start=0,
+            is_causal=True,
+            mask=None,
+            query_positions=None,
+            key_positions=None,
+        )
+        assert selected is not None
+        assert bool((selected < 0).any().item())
+        assert is_sparse_dsa_triton_supported(query, key, value, selected, None, True)
+
+        def fail_fallback(*_args, **_kwargs):
+            raise AssertionError("HISA DSA must use the fused Triton selected-attention path")
+
+        def fail_dense_indexer(*_args, **_kwargs):
+            raise AssertionError("HISA indexer training must not use dense index-score KL")
+
+        monkeypatch.setattr(dsa_module, "_sparse_dsa_attention_chunk", fail_fallback)
+        monkeypatch.setattr(dsa_module, "_compute_index_scores", fail_dense_indexer)
+        monkeypatch.setenv("MEGATRON_DSA_TRITON", "1")
+
+        output, indexer_loss = dsa_module.chunked_dsa_forward(
+            q,
+            index_k,
+            weights,
+            query,
+            key,
+            value,
+            softmax_scale=softmax_scale,
+            topk=topk,
+            mask=None,
+            is_causal=True,
+            loss_coeff=0.1,
+            sparse_loss=True,
+            pg_collection=_ProcessGroups(),
+            chunk_size=q_len,
+            indexcache_hisa_config=hisa_config,
+        )
+        assert indexer_loss is not None
+        assert torch.isfinite(output.float()).all().item()
+        (output.float().square().mean() + indexer_loss).backward()
+        for tensor in (q, index_k, weights):
+            assert tensor.grad is not None
+            assert torch.isfinite(tensor.grad.float()).all().item()
+        for tensor in (query, key, value):
+            assert tensor.grad is not None
+            assert torch.isfinite(tensor.grad.float()).all().item()
+            assert tensor.grad.float().abs().sum().item() > 0
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_hisa_indexer_loss_supports_streambp_positions(self, monkeypatch):
+        import megatron.core.transformer.experimental_attention_variant.dsa as dsa_module
+
+        class _ProcessGroup:
+            def size(self):
+                return 1
+
+        class _ProcessGroups:
+            tp = _ProcessGroup()
+
+        torch.manual_seed(20260517)
+        seqlen = 256
+        q_len = 8
+        index_heads = 2
+        index_dim = 32
+        num_heads = 2
+        qk_head_dim = 64
+        value_head_dim = 64
+        topk = 48
+        q_offset = 248
+        softmax_scale = qk_head_dim**-0.5
+        hisa_config = IndexCacheHISAConfig(
+            enabled=True,
+            block_size=16,
+            compression_ratio=4.0,
+            fallback_to_dense_if_short=False,
+        )
+
+        q = torch.randn(
+            q_len,
+            1,
+            index_heads,
+            index_dim,
+            device="cuda",
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        index_k = torch.randn(
+            seqlen, 1, index_dim, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        weights = (
+            torch.rand(q_len, 1, index_heads, device="cuda", dtype=torch.bfloat16) + 0.1
+        ).requires_grad_()
+        query = torch.randn(
+            q_len,
+            1,
+            num_heads,
+            qk_head_dim,
+            device="cuda",
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        key = torch.randn(
+            seqlen,
+            1,
+            num_heads,
+            qk_head_dim,
+            device="cuda",
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        value = torch.randn(
+            seqlen,
+            1,
+            num_heads,
+            value_head_dim,
+            device="cuda",
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        query_positions = torch.arange(q_offset, q_offset + q_len, device="cuda")
+        key_positions = torch.arange(seqlen, device="cuda")
+
+        def fail_fallback(*_args, **_kwargs):
+            raise AssertionError("StreamBP-position HISA must use fused Triton DSA")
+
+        def fail_dense_indexer(*_args, **_kwargs):
+            raise AssertionError("StreamBP-position HISA must not use dense index-score KL")
+
+        monkeypatch.setattr(dsa_module, "_sparse_dsa_attention_chunk", fail_fallback)
+        monkeypatch.setattr(dsa_module, "_compute_index_scores", fail_dense_indexer)
+        monkeypatch.setenv("MEGATRON_DSA_TRITON", "1")
+
+        output, indexer_loss = dsa_module.chunked_dsa_forward(
+            q,
+            index_k,
+            weights,
+            query,
+            key,
+            value,
+            softmax_scale=softmax_scale,
+            topk=topk,
+            mask=None,
+            is_causal=True,
+            loss_coeff=0.1,
+            sparse_loss=True,
+            pg_collection=_ProcessGroups(),
+            chunk_size=q_len,
+            query_positions=query_positions,
+            key_positions=key_positions,
+            indexcache_hisa_config=hisa_config,
+        )
+        assert indexer_loss is not None
+        assert torch.isfinite(output.float()).all().item()
+        (output.float().square().mean() + indexer_loss).backward()
+        for tensor in (q, index_k, weights, query, key, value):
+            assert tensor.grad is not None
+            assert torch.isfinite(tensor.grad.float()).all().item()
+            assert tensor.grad.float().abs().sum().item() > 0
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize(

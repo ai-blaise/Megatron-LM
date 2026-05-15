@@ -23,7 +23,7 @@ def _try_load_cuda_ext():
         from megatron.core.extensions.hisa_indexer.kernels.build import get_ext
 
         return get_ext()
-    except ImportError:
+    except Exception:
         return None
 
 

@@ -1155,6 +1155,21 @@ def validate_args(args, defaults={}):
         if args.spinquant_a_bits < 16 and not args.fp4:
             raise ValueError("SpinQuant A<16 validation requires --fp4-format for activation FP4.")
 
+    if args.dsa_indexcache_quantization != "disabled":
+        # Keep the legacy boolean as an actual "IndexCache is enabled" signal
+        # for logs and downstream config consumers. Method selection still
+        # comes from dsa_indexcache_quantization.
+        args.dsa_indexcache_quant_enabled = True
+
+    if (
+        args.dsa_indexcache_hisa_enabled
+        and args.dsa_indexcache_quantization != "nvfp4_e2m1_ue8m0"
+    ):
+        raise ValueError(
+            "--dsa-indexcache-hisa-enabled requires "
+            "--dsa-indexcache-quantization nvfp4_e2m1_ue8m0."
+        )
+
     if (
         args.fp8_recipe == "mxfp8"
         and args.transformer_impl == "inference_optimized"

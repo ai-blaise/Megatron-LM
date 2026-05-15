@@ -29,6 +29,7 @@ def _build_ext():
 
     sources = [
         str(_CSRC / "pybind.cpp"),
+        str(_CSRC / "hisa_selector_fwd.cu"),
         str(_CSRC / "hisa_score_bwd.cu"),
     ]
     fused_path = _CSRC / "hisa_score_bwd_fused.cu"
