@@ -898,11 +898,24 @@ class DSAIndexer(MegatronModule):
         self.softmax_scale: float = self.index_head_dim**-0.5
 
         self.indexcache_config = None
-        if getattr(self.config, "dsa_indexcache_quant_enabled", False):
-            from megatron.core.quantization.indexcache import build_indexcache_config
+        indexcache_quantization = getattr(
+            self.config, "dsa_indexcache_quantization", "disabled"
+        )
+        indexcache_quantization_enabled = getattr(
+            self.config, "dsa_indexcache_quant_enabled", False
+        )
+        if indexcache_quantization_enabled or indexcache_quantization != "disabled":
+            from megatron.core.quantization.indexcache import (
+                build_indexcache_config,
+                resolve_indexcache_quantization,
+            )
 
             self.indexcache_config = build_indexcache_config(
-                eps=getattr(self.config, "dsa_indexcache_quant_eps", 1e-4)
+                eps=getattr(self.config, "dsa_indexcache_quant_eps", 1e-4),
+                quantization=resolve_indexcache_quantization(
+                    quantization=indexcache_quantization,
+                    quant_enabled=indexcache_quantization_enabled,
+                ),
             )
 
         if pg_collection is None:
@@ -1090,7 +1103,7 @@ class DSAIndexer(MegatronModule):
             q = q[:orig_seqlen]
             k = k[:orig_seqlen]
 
-        # IndexCache fp8 fake-quant on the post-rotation indexer K. K only —
+        # IndexCache fake-quant on the post-rotation indexer K. K only —
         # SGLang's reference quantizes the indexer key cache, not the query.
         if self.indexcache_config is not None:
             from megatron.core.quantization.indexcache import apply_indexcache_kv

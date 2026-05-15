@@ -1344,14 +1344,22 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         ):
             model = []
             vp_size = args.virtual_pipeline_model_parallel_size
+            v_first_last_on_rank_zero = getattr(
+                args, "pipeline_parallel_schedule", "auto"
+            ) in {"dualpipe_v", "zero_bubble_v"}
+            pp_rank = get_pg_rank(pg_collection.pp)
             for i in range(vp_size):
                 # Set pre_process and post_process only after virtual rank is set.
-                pre_process = is_pp_first_stage(pg_collection.pp) and is_vp_first_stage(
-                    vp_stage=i, vp_size=vp_size
-                )
-                post_process = is_pp_last_stage(pg_collection.pp) and is_vp_last_stage(
-                    vp_stage=i, vp_size=vp_size
-                )
+                if v_first_last_on_rank_zero:
+                    pre_process = pp_rank == 0 and i == 0
+                    post_process = pp_rank == 0 and i == 1
+                else:
+                    pre_process = is_pp_first_stage(pg_collection.pp) and is_vp_first_stage(
+                        vp_stage=i, vp_size=vp_size
+                    )
+                    post_process = is_pp_last_stage(pg_collection.pp) and is_vp_last_stage(
+                        vp_stage=i, vp_size=vp_size
+                    )
                 this_model = model_provider_func(
                     pre_process=pre_process,
                     post_process=post_process,
@@ -2035,7 +2043,14 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     if args.empty_unused_memory_level >= 2:
         torch.cuda.empty_cache()
 
-    if mpu.is_pipeline_last_stage(ignore_virtual=True):
+    is_loss_pipeline_stage = mpu.is_pipeline_last_stage(ignore_virtual=True)
+    if getattr(args, "pipeline_parallel_schedule", "auto") in {
+        "dualpipe_v",
+        "zero_bubble_v",
+    }:
+        is_loss_pipeline_stage = mpu.get_pipeline_model_parallel_rank() == 0
+
+    if is_loss_pipeline_stage:
         # Average loss across microbatches.
         loss_reduced = {}
 
@@ -2069,6 +2084,16 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             seqlen_squared_sum_this_global_batch,
         )
     return {}, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, num_zeros_in_grad, log_max_attention_logit, seqlen_sum_this_global_batch, seqlen_squared_sum_this_global_batch
+
+
+def _print_pipeline_schedule_training_log(args, log_string):
+    if getattr(args, "pipeline_parallel_schedule", "auto") in {
+        "dualpipe_v",
+        "zero_bubble_v",
+    }:
+        print_rank_0(log_string)
+    else:
+        print_rank_last(log_string)
 
 
 def training_log(
@@ -2398,7 +2423,7 @@ def training_log(
             total_loss_dict[advanced_iters_key] = 0
             total_loss_dict[skipped_iters_key] = 0
             total_loss_dict[nan_iters_key] = 0
-        print_rank_last(log_string)
+        _print_pipeline_schedule_training_log(args, log_string)
         reported_memory_in_this_iteration = False
         if report_memory_flag:
             # Report memory after optimizer state has been initialized.
@@ -2937,7 +2962,9 @@ def train(
     eval_duration = 0.0
     eval_iterations = 0
     # Wrap forward_backward_func for Full iteration CUDA graph
-    forward_backward_func = get_forward_backward_func()
+    forward_backward_func = get_forward_backward_func(
+        pipeline_parallel_schedule=getattr(args, "pipeline_parallel_schedule", "auto")
+    )
     if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in args.cuda_graph_scope:
         forward_backward_func = FullCudaGraphWrapper(forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps)
 
@@ -3437,7 +3464,9 @@ def evaluate(
     # make validation batch size independent from training batch size
     eval_batch_size = args.global_batch_size
     eval_num_microbatches = eval_batch_size // (args.micro_batch_size * args.data_parallel_size)
-    forward_backward_func = get_forward_backward_func()
+    forward_backward_func = get_forward_backward_func(
+        pipeline_parallel_schedule=getattr(args, "pipeline_parallel_schedule", "auto")
+    )
     if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in args.cuda_graph_scope:
         forward_backward_func = FullCudaGraphWrapper(forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps)
 
@@ -3506,7 +3535,14 @@ def evaluate(
             if args.empty_unused_memory_level >= 1:
                 torch.cuda.empty_cache()
 
-            if mpu.is_pipeline_last_stage(ignore_virtual=True):
+            is_loss_pipeline_stage = mpu.is_pipeline_last_stage(ignore_virtual=True)
+            if getattr(args, "pipeline_parallel_schedule", "auto") in {
+                "dualpipe_v",
+                "zero_bubble_v",
+            }:
+                is_loss_pipeline_stage = mpu.get_pipeline_model_parallel_rank() == 0
+
+            if is_loss_pipeline_stage:
                 # Reduce across processes.
                 for key in loss_dicts[0].keys():
                     if key not in total_loss_dict:

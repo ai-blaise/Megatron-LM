@@ -676,10 +676,43 @@ class TransformerConfig(ModelParallelConfig):
 
 
     ####################
-    # IndexCache fp8 fake-quant on the DSA indexer K
+    # HIGGS 2-bit dense MLA-latent KV
+    ####################
+    enable_higgs_dense_2bit_kv_cache: bool = False
+    """Enable 2-bit HIGGS fake-quant on the MLA latent KV during training.
+
+    HIGGS (``arXiv:2501.19392``) compresses the 512-dim MLA latent with a
+    single orthonormal block-Hadamard rotation, an fp16 per-token block
+    scale, and a 4-bit index per pair into the public AquaKV EDEN2-16
+    codebook (2 bits per scalar). Slot layout is 258 B / token vs the
+    274 B / token of 2.5-bit TurboQuant. The op is per-token-local on the
+    post-projection latent (kv_lora_rank dimension) and is safe under
+    TP/SP/CP/EP. RoPE features pass through unchanged. Frozen buffers
+    (the EDEN2-16 codebook and its per-codeword squared norms) are public
+    constants so every rank constructs identical state without collective
+    communication.
+
+    Mutually exclusive with ``turboquant_kv_enabled``; only one fake-quant
+    scheme acts on the dense MLA KV at a time."""
+
+    higgs_kv_preset: str = "dense_2bit"
+    """Quantizer preset. Currently only ``dense_2bit`` is supported."""
+
+
+    ####################
+    # IndexCache fake-quant on the DSA indexer K
     ####################
     dsa_indexcache_quant_enabled: bool = False
-    """Enable fp8 e4m3 fake-quant on the DSA indexer K tensor.
+    """Backward-compatible alias enabling fp8 e4m3 fake-quant on the DSA indexer K tensor.
+
+    Prefer ``dsa_indexcache_quantization`` for new configs."""
+
+    dsa_indexcache_quantization: str = "disabled"
+    """DSA IndexCache quantization method.
+
+    Supported values are ``disabled``, ``fp8_e4m3``, and
+    ``nvfp4_e2m1_ue8m0``. The legacy ``dsa_indexcache_quant_enabled`` flag
+    maps to ``fp8_e4m3`` when this field is left disabled.
 
     Mirrors the SGLang inference path
     (``optimization-playground/python/sglang/jit_kernel/csrc/nsa/fused_store_index_cache.cuh``)
@@ -690,7 +723,7 @@ class TransformerConfig(ModelParallelConfig):
 
     dsa_indexcache_quant_eps: float = 1e-4
     """Epsilon used to clamp the per-token absolute max before computing the
-    fp8 scale. Matches the SGLang reference (1e-4)."""
+    IndexCache scale. Matches the SGLang reference (1e-4)."""
 
 
     ####################

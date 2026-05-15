@@ -29,6 +29,8 @@ def _build_ext():
         str(_CSRC / "pybind.cpp"),
         str(_CSRC / "indexcache_fwd.cu"),
         str(_CSRC / "indexcache_bwd.cu"),
+        str(_CSRC / "indexcache_nvfp4_fwd.cu"),
+        str(_CSRC / "indexcache_nvfp4_bwd.cu"),
     ]
 
     return load(

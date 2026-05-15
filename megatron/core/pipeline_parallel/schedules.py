@@ -9,6 +9,7 @@ import torch
 from torch.autograd.variable import Variable
 
 from megatron.core import parallel_state
+from megatron.core.model_parallel_config import normalize_pipeline_parallel_schedule
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
@@ -37,13 +38,18 @@ from .combined_1f1b import (
     combined_1f1b_schedule_for_interleaved_pipelining,
     combined_1f1b_schedule_for_no_pipelining,
 )
+from .dualpipe_v_schedule import validate_dualpipe_v_config
 from .hybrid_cp_schedule import hybrid_context_parallel_forward_backward
 
 # Types
 Shape = Union[List[int], torch.Size]
 
 
-def get_forward_backward_func(pp_size: Optional[int] = None, vp_size: Optional[int] = None):
+def get_forward_backward_func(
+    pp_size: Optional[int] = None,
+    vp_size: Optional[int] = None,
+    pipeline_parallel_schedule: Optional[str] = None,
+):
     """Retrieves the appropriate forward_backward function given the
     configuration of parallel_state.
 
@@ -136,11 +142,46 @@ def get_forward_backward_func(pp_size: Optional[int] = None, vp_size: Optional[i
         vp_size (Optional[int]): Virtual pipeline model parallel size to use.
             If both pp_size and vp_size are None, both values fall back to parallel_state.
             Otherwise, provided values are used as-is and None is treated as an explicit input.
+        pipeline_parallel_schedule (Optional[str]): Pipeline schedule selector. ``None`` and
+            ``auto`` preserve legacy behavior. Explicit schedule names select GPipe fill-drain,
+            the conservative sequential DualPipeV V-topology runtime, or another configured
+            runtime-backed schedule.
 
     """
+    schedule = normalize_pipeline_parallel_schedule(pipeline_parallel_schedule)
+
     if pp_size is None and vp_size is None:
         pp_size = parallel_state.get_pipeline_model_parallel_world_size()
         vp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()
+
+    if pp_size <= 1:
+        if schedule in {"gpipe_fill_drain", "dualpipe_v", "zero_bubble", "zero_bubble_v"}:
+            raise ValueError(f"{schedule} requires pipeline_model_parallel_size > 1")
+        return forward_backward_no_pipelining
+
+    if schedule == "gpipe_fill_drain":
+        if vp_size is not None:
+            raise ValueError("gpipe_fill_drain does not support virtual pipeline stages")
+        return forward_backward_pipelining_with_fill_drain
+
+    if schedule == "dualpipe_v":
+        validate_dualpipe_v_config(pp_size, vp_size, num_microbatches=None)
+        return forward_backward_pipelining_with_dualpipe_v
+
+    if schedule in {"zero_bubble", "zero_bubble_v"}:
+        from megatron.core.pipeline_parallel.zerobubble.runtime import (
+            forward_backward_pipelining_with_zero_bubble,
+            forward_backward_pipelining_with_zero_bubble_v,
+        )
+
+        if schedule == "zero_bubble":
+            return forward_backward_pipelining_with_zero_bubble
+        return forward_backward_pipelining_with_zero_bubble_v
+
+    if schedule == "1f1b" and vp_size is not None:
+        raise ValueError("1f1b requires virtual_pipeline_model_parallel_size to be None")
+    if schedule == "interleaved_1f1b" and vp_size is None:
+        raise ValueError("interleaved_1f1b requires virtual_pipeline_model_parallel_size")
 
     if pp_size > 1:
         if vp_size is not None:
@@ -2094,6 +2135,363 @@ def forward_backward_pipelining_with_interleaving(
     return forward_data_store
 
 
+def _as_tensor_list(tensors):
+    if tensors is None:
+        return []
+    if isinstance(tensors, list):
+        return [tensor for tensor in tensors if tensor is not None]
+    return [tensors]
+
+
+def _detach_pipeline_tensors(tensors):
+    if isinstance(tensors, list):
+        return [
+            tensor.detach().requires_grad_() if tensor is not None else None for tensor in tensors
+        ]
+    if tensors is None:
+        return None
+    return tensors.detach().requires_grad_()
+
+
+def forward_backward_pipelining_with_dualpipe_v(
+    *,
+    forward_step_func,
+    data_iterator: Union[Iterator, List[Iterator]],
+    model: Union[torch.nn.Module, List[torch.nn.Module]],
+    num_microbatches: int,
+    seq_length: int,
+    micro_batch_size: int,
+    decoder_seq_length: Optional[int] = None,
+    forward_only: bool = False,
+    collect_non_loss_data: bool = False,
+    first_val_step: Optional[bool] = None,
+    adjust_tensor_shapes_fn: Optional[Callable] = None,
+    p2p_communicator: Optional[P2PCommunicator] = None,
+    pg_collection: Optional[ProcessGroupCollection] = None,
+    force_all_reduce: Optional[bool] = False,
+):
+    """Run the conservative sequential DualPipeV V-topology schedule.
+
+    This production baseline preserves the V-shaped rank mapping and direct P2P data path
+    without claiming overlapped zero-bubble timing.
+    """
+
+    assert isinstance(model, list), "DualPipeV expected two model chunks"
+    assert len(model) == 2, "DualPipeV requires exactly two virtual pipeline stages"
+    assert isinstance(
+        data_iterator, list
+    ), "DualPipeV expected each virtual pipeline stage to have a data iterator"
+    assert len(data_iterator) == 2, "DualPipeV requires two data iterators"
+    assert adjust_tensor_shapes_fn is None, "DualPipeV does not support adjust_tensor_shapes_fn"
+
+    config = get_model_config(model[0])
+    if config.overlap_p2p_comm:
+        raise ValueError("DualPipeV does not support overlap_p2p_comm")
+    if config.overlap_moe_expert_parallel_comm:
+        raise ValueError("DualPipeV does not support overlap_moe_expert_parallel_comm")
+    if config.variable_seq_lengths:
+        raise ValueError("DualPipeV does not support variable sequence lengths")
+    if getattr(config, "mtp_standalone", False):
+        raise ValueError("DualPipeV does not support standalone MTP pipeline shape exchange")
+    if config.use_ring_exchange_p2p:
+        raise ValueError("DualPipeV uses direct batch_isend_irecv P2P, not ring_exchange")
+    if config.pipeline_dtype is None:
+        raise RuntimeError("pipeline_dtype must be provided for DualPipeV")
+
+    if p2p_communicator is None and pg_collection is None:
+        p2p_communicator = P2PCommunicator(
+            pp_group=parallel_state.get_pipeline_model_parallel_group(), config=config
+        )
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        cp_group = parallel_state.get_context_parallel_group()
+        embd_group = parallel_state.get_embedding_group(check_initialized=False)
+        pp_group = parallel_state.get_pipeline_model_parallel_group()
+        pos_emb_group = parallel_state.get_position_embedding_group(check_initialized=False)
+
+        pg_collection = ProcessGroupCollection()
+        pg_collection.tp = tp_group
+        pg_collection.cp = cp_group
+        pg_collection.embd = embd_group
+        pg_collection.pos_embd = pos_emb_group
+        pg_collection.pp = pp_group
+        pg_collection.dp_cp = parallel_state.get_data_parallel_group(
+            with_context_parallel=True, partial_data_parallel=False
+        )
+    elif p2p_communicator is not None and pg_collection is not None:
+        assert hasattr(p2p_communicator, 'config'), "p2p_communicator must have a config"
+        assert hasattr(pg_collection, 'tp'), "pg_collection must have a tp_group"
+        assert hasattr(pg_collection, 'cp'), "pg_collection must have a cp_group"
+        assert hasattr(pg_collection, 'embd'), "pg_collection must have a embd group"
+        assert hasattr(pg_collection, 'pos_embd'), "pg_collection must have a pos_embd group"
+        assert hasattr(pg_collection, 'pp'), "pg_collection must have a pp_group"
+        assert hasattr(pg_collection, 'dp_cp'), "pg_collection must have a dp_cp_group"
+        tp_group = pg_collection.tp
+        cp_group = pg_collection.cp
+    else:
+        raise ValueError(
+            "Invalid combination of p2p_communicator, pg_collection "
+            "provide none or provide all the process groups"
+        )
+
+    pp_group = p2p_communicator.pp_group
+    pipeline_parallel_size = pp_group.size()
+    pipeline_parallel_rank = pp_group.rank()
+    validate_dualpipe_v_config(
+        pipeline_parallel_size, config.virtual_pipeline_model_parallel_size, num_microbatches
+    )
+
+    if config.timers is not None:
+        config.timers('forward-backward', log_level=1).start(barrier=config.barrier_with_L1_time)
+
+    is_dualpipe_v_last_stage = pipeline_parallel_rank == 0
+    if config.finalize_model_grads_func is not None and not forward_only:
+        embedding_module = clear_embedding_activation_buffer(
+            config, model, is_dualpipe_v_last_stage
+        )
+
+    no_sync_func = config.no_sync_func
+    if isinstance(no_sync_func, list):
+
+        def multi_no_sync():
+            stack = contextlib.ExitStack()
+            for model_chunk_no_sync_func in config.no_sync_func:
+                stack.enter_context(model_chunk_no_sync_func())
+            return stack
+
+        no_sync_func = multi_no_sync
+    if no_sync_func is None:
+        no_sync_func = contextlib.nullcontext
+
+    if config.grad_sync_func is not None and not isinstance(config.grad_sync_func, list):
+        config.grad_sync_func = [config.grad_sync_func for _ in model]
+    if config.param_sync_func is not None and not isinstance(config.param_sync_func, list):
+        config.param_sync_func = [config.param_sync_func for _ in model]
+
+    grad_sync_func, param_sync_func = None, None
+    if forward_only:
+        grad_sync_func, param_sync_func = config.grad_sync_func, config.param_sync_func
+        config.grad_sync_func, config.param_sync_func = None, None
+
+    no_sync_context = None
+
+    def disable_grad_sync():
+        nonlocal no_sync_context
+        if no_sync_context is None:
+            no_sync_context = no_sync_func()
+            no_sync_context.__enter__()
+
+    def enable_grad_sync():
+        nonlocal no_sync_context
+        if no_sync_context is not None:
+            no_sync_context.__exit__(None, None, None)
+            no_sync_context = None
+
+    disable_grad_sync()
+
+    if config.param_sync_func is not None:
+        for model_chunk_id in range(2):
+            config.param_sync_func[model_chunk_id](model[model_chunk_id].parameters())
+
+    model_type = get_model_type(model[0])
+    hidden_dim = config.hidden_size
+    if getattr(config, 'enable_hyper_connections', False) and pipeline_parallel_size > 1:
+        hidden_dim = config.hidden_size * getattr(config, 'num_residual_streams', 1)
+
+    tensor_shape = [seq_length, micro_batch_size, hidden_dim]
+    tensor_shape[0] = tensor_shape[0] // cp_group.size()
+    if config.sequence_parallel:
+        tensor_shape[0] = tensor_shape[0] // tp_group.size()
+
+    forward_data_store = []
+    total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
+    input_tensors = [[], []]
+    output_tensors = [[], []]
+    input_tensor_grads = [[], []]
+    output_tensor_grads = [[], []]
+    current_f_chunk_id = [0, 0]
+    current_b_chunk_id = [0, 0]
+    comm_ops = []
+    to_deallocate = []
+
+    def commit_and_wait_comm():
+        nonlocal comm_ops, to_deallocate
+        if not comm_ops:
+            return
+        reqs = torch.distributed.batch_isend_irecv(comm_ops)
+        for req in reqs:
+            req.wait()
+        comm_ops = []
+        for tensor in to_deallocate:
+            deallocate_output_tensor(tensor, config.deallocate_pipeline_outputs)
+        to_deallocate = []
+
+    def queue_recv(peer_rank):
+        tensor = torch.empty(
+            tensor_shape,
+            requires_grad=True,
+            device=torch.cuda.current_device(),
+            dtype=config.pipeline_dtype,
+        )
+        comm_ops.append(
+            torch.distributed.P2POp(torch.distributed.irecv, tensor, peer_rank, pp_group)
+        )
+        return tensor
+
+    def queue_send(tensors, peer_rank, deallocate=False):
+        for tensor in _as_tensor_list(tensors):
+            comm_ops.append(
+                torch.distributed.P2POp(torch.distributed.isend, tensor, peer_rank, pp_group)
+            )
+            if deallocate:
+                to_deallocate.append(tensor)
+
+    def forward_compute_phase(phase):
+        nonlocal total_num_tokens
+        chunk_id = current_f_chunk_id[phase]
+        current_f_chunk_id[phase] += 1
+        if phase == 0 and pipeline_parallel_rank == 0 and len(input_tensors[phase]) <= chunk_id:
+            input_tensors[phase].append(None)
+        input_tensor = input_tensors[phase][chunk_id]
+        is_last_stage = phase == 1 and pipeline_parallel_rank == 0
+        output_tensor, num_tokens = forward_step(
+            forward_step_func,
+            data_iterator[phase],
+            model[phase],
+            num_microbatches,
+            input_tensor,
+            forward_data_store,
+            config,
+            cp_group_size=pg_collection.cp.size(),
+            collect_non_loss_data=collect_non_loss_data,
+            is_first_microbatch=check_first_val_step(
+                first_val_step, forward_only, chunk_id == 0
+            ),
+            current_microbatch=chunk_id,
+            vp_stage=phase,
+            is_last_stage=is_last_stage,
+        )
+        total_num_tokens += num_tokens
+        output_tensors[phase].append(output_tensor)
+        if phase == 0 and pipeline_parallel_rank == pipeline_parallel_size - 1:
+            input_tensors[1].append(_detach_pipeline_tensors(output_tensor))
+            if not forward_only:
+                for tensor in _as_tensor_list(output_tensor):
+                    deallocate_output_tensor(tensor, config.deallocate_pipeline_outputs)
+
+    def backward_compute_phase(phase):
+        if forward_only:
+            return
+        chunk_id = current_b_chunk_id[phase]
+        current_b_chunk_id[phase] += 1
+        if (
+            phase == 1
+            and pipeline_parallel_rank == 0
+            and len(output_tensor_grads[phase]) <= chunk_id
+        ):
+            output_tensor_grads[phase].append(None)
+        input_tensor = input_tensors[phase][chunk_id]
+        output_tensor = output_tensors[phase][chunk_id]
+        output_tensor_grad = output_tensor_grads[phase][chunk_id]
+        input_tensor_grad = backward_step(
+            input_tensor, output_tensor, output_tensor_grad, model_type, config
+        )
+        if phase == 1 and pipeline_parallel_rank == pipeline_parallel_size - 1:
+            output_tensor_grads[0].append(input_tensor_grad)
+        else:
+            input_tensor_grads[phase].append(input_tensor_grad)
+
+    rank = pipeline_parallel_rank
+    pp_size = pipeline_parallel_size
+
+    def forward_microbatch():
+        if rank == 0:
+            forward_compute_phase(0)
+        for edge_rank in range(pp_size - 1):
+            if rank == edge_rank:
+                queue_send(
+                    output_tensors[0][-1],
+                    p2p_communicator.next_rank,
+                    deallocate=not forward_only,
+                )
+            elif rank == edge_rank + 1:
+                input_tensors[0].append(queue_recv(p2p_communicator.prev_rank))
+            commit_and_wait_comm()
+            if rank == edge_rank + 1:
+                forward_compute_phase(0)
+
+        if rank == pp_size - 1:
+            forward_compute_phase(1)
+        for edge_rank in range(pp_size - 1, 0, -1):
+            if rank == edge_rank:
+                queue_send(
+                    output_tensors[1][-1],
+                    p2p_communicator.prev_rank,
+                    deallocate=not forward_only,
+                )
+            elif rank == edge_rank - 1:
+                input_tensors[1].append(queue_recv(p2p_communicator.next_rank))
+            commit_and_wait_comm()
+            if rank == edge_rank - 1:
+                forward_compute_phase(1)
+
+    def backward_microbatch():
+        if rank == 0:
+            backward_compute_phase(1)
+        for edge_rank in range(pp_size - 1):
+            if rank == edge_rank:
+                queue_send(input_tensor_grads[1][-1], p2p_communicator.next_rank)
+            elif rank == edge_rank + 1:
+                output_tensor_grads[1].append(queue_recv(p2p_communicator.prev_rank))
+            commit_and_wait_comm()
+            if rank == edge_rank + 1:
+                backward_compute_phase(1)
+
+        if rank == pp_size - 1:
+            backward_compute_phase(0)
+        for edge_rank in range(pp_size - 1, 0, -1):
+            if rank == edge_rank:
+                queue_send(input_tensor_grads[0][-1], p2p_communicator.prev_rank)
+            elif rank == edge_rank - 1:
+                output_tensor_grads[0].append(queue_recv(p2p_communicator.next_rank))
+            commit_and_wait_comm()
+            if rank == edge_rank - 1:
+                backward_compute_phase(0)
+
+    for _ in range(num_microbatches):
+        forward_microbatch()
+        if not forward_only:
+            backward_microbatch()
+
+    enable_grad_sync()
+    if not forward_only and config.grad_sync_func is not None:
+        for model_chunk_id in range(2):
+            config.grad_sync_func[model_chunk_id](model[model_chunk_id].parameters())
+
+    if config.finalize_model_grads_func is not None and not forward_only:
+        finish_embedding_wgrad_compute(config, embedding_module, is_dualpipe_v_last_stage, tp_group)
+        config.finalize_model_grads_func(
+            model,
+            total_num_tokens if config.calculate_per_token_loss else None,
+            pg_collection=pg_collection,
+            force_all_reduce=force_all_reduce,
+        )
+
+    if not forward_only and config.fine_grained_activation_offloading:
+        off_interface.reset()
+    if forward_only:
+        config.grad_sync_func, config.param_sync_func = grad_sync_func, param_sync_func
+    if config.timers is not None:
+        config.timers('forward-backward').stop()
+    if (
+        hasattr(config, 'cuda_graph_impl')
+        and config.cuda_graph_impl == "local"
+        and CudaGraphScope.full_iteration not in config.cuda_graph_scope
+    ):
+        create_cudagraphs()
+
+    return forward_data_store
+
+
 def get_tensor_shapes(
     *,
     seq_length: int,
@@ -2489,6 +2887,244 @@ def forward_backward_pipelining_without_interleaving(
         # Finalize model grads (perform full grad all-reduce / reduce-scatter for
         # data parallelism, layernorm all-reduce for sequence parallelism, and
         # embedding all-reduce for pipeline parallelism).
+        config.finalize_model_grads_func(
+            [model],
+            total_num_tokens if config.calculate_per_token_loss else None,
+            pg_collection=pg_collection,
+            force_all_reduce=force_all_reduce,
+        )
+
+    if not forward_only and config.fine_grained_activation_offloading:
+        off_interface.reset()
+
+    if config.timers is not None:
+        config.timers('forward-backward').stop()
+
+    if (
+        hasattr(config, 'cuda_graph_impl')
+        and config.cuda_graph_impl == "local"
+        and CudaGraphScope.full_iteration not in config.cuda_graph_scope
+    ):
+        create_cudagraphs()
+
+    return forward_data_store
+
+
+def forward_backward_pipelining_with_fill_drain(
+    *,
+    forward_step_func,
+    data_iterator: Union[Iterator, List[Iterator]],
+    model: Union[torch.nn.Module, List[torch.nn.Module]],
+    num_microbatches: int,
+    seq_length: int,
+    micro_batch_size: int,
+    decoder_seq_length: Optional[int] = None,
+    forward_only: bool = False,
+    collect_non_loss_data: bool = False,
+    first_val_step: Optional[bool] = None,
+    adjust_tensor_shapes_fn: Optional[Callable] = None,
+    p2p_communicator: Optional[P2PCommunicator] = None,
+    pg_collection: Optional[ProcessGroupCollection] = None,
+    force_all_reduce: Optional[bool] = False,
+):
+    """Run a GPipe-style fill-drain pipeline schedule.
+
+    This schedule sends every microbatch forward through the pipeline before
+    draining backward in reverse microbatch order. It intentionally supports
+    only non-interleaved pipeline parallelism.
+    """
+
+    if isinstance(model, list):
+        assert len(model) == 1, "fill-drain pipeline schedule does not support model chunking"
+        model = model[0]
+    if isinstance(data_iterator, list):
+        assert (
+            len(data_iterator) == 1
+        ), "fill-drain pipeline schedule does not support model chunking"
+        data_iterator = data_iterator[0]
+
+    config = get_model_config(model)
+    if config.overlap_p2p_comm:
+        raise ValueError(
+            "fill-drain pipeline schedule does not support overlapping p2p communication"
+        )
+
+    if p2p_communicator is None and pg_collection is None:
+        p2p_communicator = P2PCommunicator(
+            pp_group=parallel_state.get_pipeline_model_parallel_group(), config=config
+        )
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        cp_group = parallel_state.get_context_parallel_group()
+        embd_group = parallel_state.get_embedding_group(check_initialized=False)
+        pos_emb_group = parallel_state.get_position_embedding_group(check_initialized=False)
+        pp_group = parallel_state.get_pipeline_model_parallel_group()
+
+        pg_collection = ProcessGroupCollection()
+        pg_collection.tp = tp_group
+        pg_collection.pp = pp_group
+        pg_collection.embd = embd_group
+        pg_collection.pos_embd = pos_emb_group
+        pg_collection.cp = cp_group
+        pg_collection.dp_cp = parallel_state.get_data_parallel_group(
+            with_context_parallel=True, partial_data_parallel=False
+        )
+    elif p2p_communicator is not None and pg_collection is not None:
+        assert hasattr(p2p_communicator, 'config'), "p2p_communicator must have a config"
+        assert hasattr(pg_collection, 'tp'), "pg_collection must have tp_group"
+        assert hasattr(pg_collection, 'cp'), "pg_collection must have cp_group"
+        assert hasattr(pg_collection, 'embd'), (
+            "pg_collection must have a embd. In previous version, it is used default "
+            "`parallel_state.default_embedding_ranks` to create the process group. "
+            " If you are using the default process group, please use "
+            " `parallel_state.get_embedding_group()` "
+            "If you don't need embd_group, you need to explicitly set it to None."
+        )
+        assert hasattr(pg_collection, 'pos_embd'), (
+            "pg_collection must have a pos_embd. In previous version, it is used default "
+            "`parallel_state.default_position_embedding_ranks` to create the process group. "
+            " If you are using the default process group, please use  "
+            " `parallel_state.get_position_embedding_group()` "
+            "If you don't need pos_embd_group, you need to explicitly set it to None."
+        )
+        assert hasattr(pg_collection, 'pp'), "pg_collection must have pp_group"
+        assert hasattr(pg_collection, 'dp_cp'), "pg_collection must have dp_cp_group"
+        tp_group = pg_collection.tp
+        cp_group = pg_collection.cp
+    else:
+        raise ValueError(
+            "Invalid combination of p2p_communicator, pg_collection "
+            "provide none or provide all the process groups"
+        )
+
+    if config.finalize_model_grads_func is not None and not forward_only:
+        embedding_module = clear_embedding_activation_buffer(
+            config, model, is_pp_last_stage(p2p_communicator.pp_group)
+        )
+
+    if config.timers is not None:
+        config.timers('forward-backward', log_level=1).start(barrier=config.barrier_with_L1_time)
+
+    no_sync_func = config.no_sync_func
+    if no_sync_func is None:
+        no_sync_func = contextlib.nullcontext
+    no_sync_context = None
+
+    def disable_grad_sync():
+        """Disable asynchronous grad reductions."""
+        nonlocal no_sync_context
+        if no_sync_context is None:
+            no_sync_context = no_sync_func()
+            no_sync_context.__enter__()
+
+    def enable_grad_sync():
+        """Enable asynchronous grad reductions."""
+        nonlocal no_sync_context
+        if no_sync_context is not None:
+            no_sync_context.__exit__(None, None, None)
+            no_sync_context = None
+
+    disable_grad_sync()
+
+    max_outstanding_backprops = None
+    if config.num_microbatches_with_partial_activation_checkpoints is not None:
+        max_outstanding_backprops = num_microbatches
+
+    model_type = get_model_type(model)
+    rank = p2p_communicator.pp_group.rank()
+    recv_tensor_shapes = get_tensor_shapes(
+        seq_length=seq_length,
+        micro_batch_size=micro_batch_size,
+        decoder_seq_length=decoder_seq_length,
+        config=config,
+        tp_group=tp_group,
+        cp_group=cp_group,
+        pp_group=p2p_communicator.pp_group,
+        is_recv=True,
+    )
+    send_tensor_shapes = get_tensor_shapes(
+        seq_length=seq_length,
+        micro_batch_size=micro_batch_size,
+        decoder_seq_length=decoder_seq_length,
+        config=config,
+        tp_group=tp_group,
+        cp_group=cp_group,
+        pp_group=p2p_communicator.pp_group,
+        is_recv=False,
+    )
+    if adjust_tensor_shapes_fn is not None:
+        recv_tensor_shapes, send_tensor_shapes = adjust_tensor_shapes_fn(
+            recv_tensor_shapes, send_tensor_shapes
+        )
+
+    input_tensors = [] if not forward_only else None
+    output_tensors = [] if not forward_only else None
+    total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
+    forward_data_store = []
+
+    for microbatch_id in range(num_microbatches):
+        if max_outstanding_backprops is not None:
+            checkpoint_activations_microbatch = (
+                microbatch_id % max_outstanding_backprops
+                >= config.num_microbatches_with_partial_activation_checkpoints
+            )
+        else:
+            checkpoint_activations_microbatch = None
+
+        input_tensor = p2p_communicator.recv_forward(
+            recv_tensor_shapes, is_pp_first_stage(p2p_communicator.pp_group)
+        )
+        output_tensor, num_tokens = forward_step(
+            forward_step_func,
+            data_iterator,
+            model,
+            num_microbatches,
+            input_tensor,
+            forward_data_store,
+            config,
+            cp_group_size=pg_collection.cp.size(),
+            collect_non_loss_data=collect_non_loss_data,
+            checkpoint_activations_microbatch=checkpoint_activations_microbatch,
+            is_first_microbatch=check_first_val_step(
+                first_val_step, forward_only, microbatch_id == 0
+            ),
+            current_microbatch=microbatch_id,
+            is_last_stage=is_pp_last_stage(p2p_communicator.pp_group),
+        )
+        p2p_communicator.send_forward(output_tensor, is_pp_last_stage(p2p_communicator.pp_group))
+        total_num_tokens += num_tokens
+
+        if not forward_only:
+            input_tensors.append(input_tensor)
+            output_tensors.append(output_tensor)
+            deallocate_output_tensor(output_tensor[0], config.deallocate_pipeline_outputs)
+
+    if not forward_only:
+        for microbatch_id in reversed(range(num_microbatches)):
+            if microbatch_id == 0:
+                if config.grad_sync_func is None or rank == 0:
+                    enable_grad_sync()
+
+            input_tensor = input_tensors.pop()
+            output_tensor = output_tensors.pop()
+            output_tensor_grad = p2p_communicator.recv_backward(
+                send_tensor_shapes, is_pp_last_stage(p2p_communicator.pp_group)
+            )
+            input_tensor_grad = backward_step(
+                input_tensor, output_tensor, output_tensor_grad, model_type, config
+            )
+            p2p_communicator.send_backward(
+                input_tensor_grad, is_pp_first_stage(p2p_communicator.pp_group)
+            )
+
+        if no_sync_context is not None:
+            enable_grad_sync()
+            if config.grad_sync_func is not None:
+                config.grad_sync_func(model.parameters())
+
+    if config.finalize_model_grads_func is not None and not forward_only:
+        finish_embedding_wgrad_compute(
+            config, embedding_module, is_pp_last_stage(p2p_communicator.pp_group), tp_group
+        )
         config.finalize_model_grads_func(
             [model],
             total_num_tokens if config.calculate_per_token_loss else None,

@@ -12,6 +12,7 @@ import megatron.core.pipeline_parallel.schedules as schedule
 from megatron.core import ModelParallelConfig
 from megatron.core.distributed.finalize_model_grads import finalize_model_grads
 from megatron.core.hyper_comm_grid import HyperCommGrid
+from megatron.core.model_parallel_config import normalize_pipeline_parallel_schedule
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -70,6 +71,41 @@ def test_get_forward_backward_func():
         == schedule.forward_backward_pipelining_with_interleaving
     )
     Utils.destroy_model_parallel()
+
+
+def test_get_forward_backward_func_with_gpipe_fill_drain_selector():
+    assert (
+        schedule.get_forward_backward_func(
+            pp_size=2, vp_size=None, pipeline_parallel_schedule="gpipe-fill-drain"
+        )
+        == schedule.forward_backward_pipelining_with_fill_drain
+    )
+
+    with pytest.raises(ValueError, match="does not support virtual pipeline stages"):
+        schedule.get_forward_backward_func(
+            pp_size=2, vp_size=2, pipeline_parallel_schedule="gpipe_fill_drain"
+        )
+
+    with pytest.raises(ValueError, match="requires pipeline_model_parallel_size > 1"):
+        schedule.get_forward_backward_func(
+            pp_size=1, vp_size=None, pipeline_parallel_schedule="gpipe_fill_drain"
+        )
+
+
+def test_pipeline_parallel_schedule_normalizes_gpipe_alias():
+    assert normalize_pipeline_parallel_schedule("gpipe-fill-drain") == "gpipe_fill_drain"
+
+
+def test_model_parallel_config_rejects_gpipe_with_virtual_stages():
+    with pytest.raises(
+        ValueError, match="requires virtual_pipeline_model_parallel_size to be None"
+    ):
+        ModelParallelConfig(
+            pipeline_model_parallel_size=2,
+            pipeline_dtype=torch.float,
+            virtual_pipeline_model_parallel_size=2,
+            pipeline_parallel_schedule="gpipe_fill_drain",
+        )
 
 
 def test_deallocate_output_tensor():

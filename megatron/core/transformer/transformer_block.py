@@ -34,6 +34,7 @@ from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
     BaseTransformerLayer,
+    get_dualpipe_v_layer_pp_rank,
     get_transformer_layer_offset,
 )
 from megatron.core.transformer.utils import sharded_state_dict_default
@@ -96,19 +97,22 @@ def get_num_layers_to_build(
     Returns:
         int: The number of layers to be built for the current pipeline stage.
     """
-    # If we have a custom PP layout, straightforwardly
-    # return the number of decoders in the layout array.
-    if config.pipeline_model_parallel_layout is not None:
-        return config.pipeline_model_parallel_layout.get_num_layers_to_build(
-            layer_type=LayerType.decoder, vp_stage=vp_stage
-        )
-
     # Fallback for legacy tests.
     if pp_rank is None:
         pp_rank = parallel_state.get_pipeline_model_parallel_rank()
 
     is_first_pp_stage = pp_rank == 0
     is_last_pp_stage = pp_rank == config.pipeline_model_parallel_size - 1
+    if config.pipeline_parallel_schedule == "dualpipe_v" and vp_stage == 1:
+        is_last_pp_stage = pp_rank == 0
+    layer_pp_rank = get_dualpipe_v_layer_pp_rank(config, vp_stage, pp_rank)
+
+    # If we have a custom PP layout, straightforwardly
+    # return the number of decoders in the layout array.
+    if config.pipeline_model_parallel_layout is not None:
+        return config.pipeline_model_parallel_layout.get_num_layers_to_build(
+            layer_type=LayerType.decoder, vp_stage=vp_stage, pp_rank=layer_pp_rank
+        )
 
     if (
         config.num_layers_in_first_pipeline_stage is not None
@@ -149,10 +153,13 @@ def get_num_layers_to_build(
         # of layers for all virtual pipeline parallel stages within the first (last) pipeline
         # parallel stage.
 
-        if is_first_pp_stage and config.num_layers_in_first_pipeline_stage is not None:
+        if layer_pp_rank == 0 and config.num_layers_in_first_pipeline_stage is not None:
             num_layers_per_pipeline_rank = config.num_layers_in_first_pipeline_stage
 
-        if is_last_pp_stage and config.num_layers_in_last_pipeline_stage is not None:
+        if (
+            layer_pp_rank == config.pipeline_model_parallel_size - 1
+            and config.num_layers_in_last_pipeline_stage is not None
+        ):
             num_layers_per_pipeline_rank = config.num_layers_in_last_pipeline_stage
     else:
         # Include the embedding layer and loss layer into pipeline parallelism partition

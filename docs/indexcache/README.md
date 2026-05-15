@@ -1,11 +1,20 @@
-# IndexCache fp8 fake-quant for the DSA indexer (Megatron-LM)
+# IndexCache fake-quant for the DSA indexer (Megatron-LM)
 
-This package adds an in-place fp8 e4m3 fake-quant on the post-rotation DSA
-indexer K tensor. It is a direct port of the forward kernel in
-`optimization-playground/python/sglang/jit_kernel/csrc/nsa/fused_store_index_cache.cuh`
-(plus its Triton fallback at `python/sglang/srt/layers/attention/nsa/triton_kernel.py`)
-and adds a new analytic backward kernel so the op can be used during training —
-the SGLang reference is forward-only.
+This package adds selected fake-quant methods on the post-rotation DSA
+indexer K tensor:
+
+* `fp8_e4m3`, the original IndexerK8 path.
+* `nvfp4_e2m1_ue8m0`, matching the Blackwell NVFP4 IndexCache layout in
+  `optimization-playground`.
+
+The FP8 path is a direct port of the forward kernel in
+`optimization-playground/python/sglang/jit_kernel/csrc/nsa/fused_store_index_cache.cuh`.
+The NVFP4 path matches
+`optimization-playground/python/sglang/jit_kernel/csrc/nsa/nvfp4_indexer_quant.cuh`:
+128-dim indexer rows split into four 32-dim groups, packed E2M1 values, and a
+single packed UE8M0 scale word per row. Megatron adds analytic backward paths
+so both methods can be used during training; the SGLang references are
+forward-only.
 
 The op is the kernel-level half of the THUDM/IndexCache feature; the
 **cross-layer index reuse** (skip_topk) half is a follow-up — it needs the
@@ -13,7 +22,8 @@ surrounding decoder-loop to thread `topk_indices` through layers.
 
 ## What it does
 
-For each token in the indexer K of shape `[seq, batch, index_head_dim=128]`:
+For each token in the indexer K of shape `[seq, batch, index_head_dim=128]`,
+FP8 computes:
 
 ```
 abs_max = max_lane(|x|)
@@ -28,6 +38,20 @@ fp8 index, the saturating-clip mask, the per-row scale, the per-row argmax
 of |x|, and an eps-active flag so the backward kernel can skip recomputing
 them.
 
+NVFP4 computes the same fake-quant round trip with four independent groups:
+
+```
+group_abs_max = max_group(|x|)              # four groups of 32 dims
+scale         = ceil_ue8m0(max(group_abs_max, eps) / 6)
+q_e2m1        = round_e2m1(clamp(x / scale, ±6))
+y             = q_e2m1 * scale
+```
+
+For layout parity with optimization-playground, the reference path also
+materializes `packed_values[N, 64]` and `packed_scales[N]`, where the four
+UE8M0 exponents are packed into one int32. The CUDA training path saves the
+dequantized E2M1 values needed by the backward.
+
 ## Backward (new — SGLang is forward-only)
 
 ```
@@ -41,12 +65,15 @@ update that lives only on the argmax-of-|x| coordinate of each row — it
 captures the dependency of `scale` on the row's max-magnitude lane. Verified
 against `torch.autograd` on the STE-detach forward to fp64 precision.
 
+For NVFP4 the same formula is applied independently to each 32-dim group with
+`fp4_max=6`, producing four rank updates per row.
+
 ## Files
 
 ```
 megatron/core/quantization/indexcache/
 ├── __init__.py            public API
-├── codec.py               IndexCacheConfig + INDEXCACHE_FP8_MAX
+├── codec.py               IndexCacheConfig + method constants
 ├── reference.py           pure-PyTorch fwd/bwd (gradcheck oracle)
 ├── autograd.py            torch.autograd.Function dispatching to CUDA or ref
 └── kernels/
@@ -54,8 +81,10 @@ megatron/core/quantization/indexcache/
     ├── build.py           torch.utils.cpp_extension JIT build
     └── csrc/
         ├── indexcache.cuh         shared device utils (warp/block reduces)
-        ├── indexcache_fwd.cu      forward kernel (port of SGLang)
-        ├── indexcache_bwd.cu      backward kernel (new)
+        ├── indexcache_fwd.cu      FP8 forward kernel
+        ├── indexcache_bwd.cu      FP8 backward kernel
+        ├── indexcache_nvfp4_fwd.cu
+        ├── indexcache_nvfp4_bwd.cu
         └── pybind.cpp             pybind11 entry points
 ```
 
@@ -69,6 +98,11 @@ from megatron.core.quantization.indexcache import (
 
 cfg = build_indexcache_config(eps=1e-4)
 y = apply_indexcache_kv(x, cfg)  # x: [..., 128]; y same shape & dtype
+
+nvfp4_cfg = build_indexcache_config(
+    eps=1e-4,
+    quantization="nvfp4_e2m1_ue8m0",
+)
 ```
 
 ## Configuration
@@ -77,6 +111,7 @@ Two new `TransformerConfig` fields:
 
 ```python
 dsa_indexcache_quant_enabled: bool = False
+dsa_indexcache_quantization: str = "disabled"
 dsa_indexcache_quant_eps: float = 1e-4
 ```
 
@@ -84,11 +119,16 @@ CLI flags:
 
 ```
 --dsa-indexcache-quant-enabled
+--dsa-indexcache-quantization {disabled,fp8_e4m3,nvfp4_e2m1_ue8m0}
 --dsa-indexcache-quant-eps 1e-4
 ```
 
+`--dsa-indexcache-quant-enabled` is retained as a backward-compatible alias
+for `--dsa-indexcache-quantization fp8_e4m3`. New configs should use the
+explicit method selector.
+
 The DSA hook lives at
-`megatron/core/transformer/experimental_attention_variant/dsa.py:881` —
+`megatron/core/transformer/experimental_attention_variant/dsa.py` —
 immediately after `rotate_activation(k)`. K only is quantized. Q stays at
 full precision (matches the SGLang reference; the bandwidth cost is on the
 K-side cache, and Q is recomputed per query anyway).
@@ -96,11 +136,9 @@ K-side cache, and Q is recomputed per query anyway).
 ## Composes with TurboQuant
 
 The dense MLA latent path (`kv_lora_rank=512`) is TurboQuant 2.5-bit; the
-indexer K path (`index_head_dim=128`) is IndexCache fp8. The two paths share
-no tensors. They share the `fast_hadamard_transform` library only because
-the DSA indexer applies a Hadamard rotation before scoring. Convergence
-under both ops simultaneously is verified within ±2% of the no-quant
-baseline at 200 steps on a target-shape mini config.
+indexer K path (`index_head_dim=128`) is IndexCache FP8 or NVFP4. The two
+paths share no tensors. They share the `fast_hadamard_transform` library only
+because the DSA indexer applies a Hadamard rotation before scoring.
 
 ## Parallelism
 
@@ -113,19 +151,40 @@ parallelism strategy that doesn't split that dim:
 | **TP** | The hook sits on the `[seq, batch, index_head_dim]` tensor that the indexer owns end-to-end on each rank — no cross-rank reduction needed. |
 | **EP** | Indexer is independent of MoE FFN. |
 
-Bit-exact across ranks for both forward and backward
-(`test_indexcache_parallelism.py` analog).
-
 ## Verification
 
 | Test | Result |
 |---|---|
-| Reference forward parity vs SGLang `act_quant` Triton math | bit-identical fp32 |
-| Analytic backward vs `torch.autograd` (STE-detach oracle) | < 2e-7 abs in fp64 |
-| CUDA forward vs reference (B200) | 0.0 abs (bit-exact) |
-| CUDA backward vs reference (B200) | 3.3e-7 abs (machine precision) |
-| Parallelism (sharded vs unsharded fwd+bwd, 2-rank) | bit-exact (0 diff) |
-| 200-step convergence with TurboQuant + IndexCache both on | -1.45% vs baseline |
+| FP8 reference forward parity vs SGLang `act_quant` math | bit-identical fp32 |
+| FP8 analytic backward vs `torch.autograd` STE-detach oracle | fp64 precision |
+| NVFP4 packed values/scales vs OP-compatible Python oracle | exact |
+| NVFP4 analytic backward vs independent STE oracle | fp64 precision |
+| NVFP4 analytic backward vs `torch.autograd` STE-detach oracle | fp64 precision |
+| H200 CUDA behavior | NVFP4 extension symbols build; direct execution rejects with SM100+ guard |
+| Blackwell CUDA behavior | SM103 forward/backward executable path passes 56 fp32/bf16 cases across rows 1..8192 |
+
+The May 2026 Blackwell pass ran on a 2x B300 SXM6 node. The CUDA path matched
+the Python/oracle layout exactly for the forward and packed values/scales. The
+largest observed backward deltas were `2.384e-7` for fp32 and `2.441e-4` for
+bf16, consistent with output dtype rounding. CUDA-event timings for 8192 rows
+were about `9.16 us` forward, `8.19 us` backward, and `17.34 us` combined for
+bf16. IKP identified forward load/reduce and scale/argmax work as the main
+per-warp regions, and backward load plus inner reduction as the main regions.
+Warp-local argmax and lane-0 metadata-broadcast variants were correct but did
+not improve the 8192-row path, so the baseline kernels remain the selected
+implementation.
+
+The backward CUDA path now exposes a packed-value variant used by the autograd
+wrapper. It decodes `packed_values[N, 64]` instead of saving and loading
+`q_e2m1[N, 128]` as fp32, reducing the NVFP4 backward saved quantized-value
+state from 512 bytes/row to 64 bytes/row. On the same B300, paired CUDA-event
+timings showed this as a latency tie rather than a speedup at the target 8192
+rows: bf16 q-path backward `8.1999 us` vs packed backward `8.2005 us`; fp32
+q-path `8.2011 us` vs packed `8.2000 us`. IKP showed the packed decode moves
+work from the inner-reduce region into the load/decode region, leaving total
+per-warp bf16 time effectively flat (`1.3202 us` baseline vs `1.3203 us`
+packed). The change is kept for training memory footprint, not for raw kernel
+latency.
 
 ## Override note (DeepSeek-V3.2-REAP target)
 
@@ -133,7 +192,11 @@ The published checkpoint
 `BlaiseAI/DeepSeek-V3.2-REAP-345B-NVFP4-W4A4KV4-IndexerK8-FP8-GatedNorm-G1`
 encodes `IndexerK8` — exactly the fp8 e4m3 scheme this op implements. To
 finetune under that regime, enable both `--turboquant-kv-enabled` and
-`--dsa-indexcache-quant-enabled` in the SFT script.
+`--dsa-indexcache-quantization fp8_e4m3` in the SFT script.
+
+The NVFP4 indexer path is available for experiments with
+`DSA_INDEXCACHE_QUANTIZATION=nvfp4_e2m1_ue8m0`. Its CUDA path is Blackwell
+gated; H200 validation covers reference correctness and guard behavior only.
 
 ## Followups (not in this PR)
 

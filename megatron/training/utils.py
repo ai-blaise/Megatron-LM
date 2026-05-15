@@ -473,9 +473,47 @@ def print_rank_last(message):
         print(message, flush=True)
 
 
+def _is_dualpipe_v_schedule(args):
+    return getattr(args, "pipeline_parallel_schedule", "auto") == "dualpipe_v"
+
+
+def _is_zero_bubble_v_schedule(args):
+    return getattr(args, "pipeline_parallel_schedule", "auto") == "zero_bubble_v"
+
+
+def _is_rank_zero_v_schedule(args):
+    return _is_dualpipe_v_schedule(args) or _is_zero_bubble_v_schedule(args)
+
+
+def _rank_zero_v_stage(vp_stage=None):
+    if vp_stage is not None:
+        return vp_stage
+    return mpu.get_virtual_pipeline_model_parallel_rank()
+
+
+def _is_rank_zero_v_first_stage(args, vp_stage=None):
+    if not _is_rank_zero_v_schedule(args):
+        return False
+    stage = _rank_zero_v_stage(vp_stage)
+    return mpu.get_pipeline_model_parallel_rank() == 0 and stage in (None, 0)
+
+
+def _is_rank_zero_v_last_stage(args, vp_stage=None):
+    if not _is_rank_zero_v_schedule(args):
+        return False
+    stage = _rank_zero_v_stage(vp_stage)
+    return mpu.get_pipeline_model_parallel_rank() == 0 and stage in (None, 1)
+
+
 def is_first_or_last_pipeline_stage(vp_stage):
     """Return True if on first or last pipeline stage, taking into account virtual
     pipeline parallelism."""
+    args = get_args()
+    if _is_rank_zero_v_schedule(args):
+        return _is_rank_zero_v_first_stage(args, vp_stage) or _is_rank_zero_v_last_stage(
+            args, vp_stage
+        )
+
     ignore_virtual = True
     if vp_stage is not None:
         ignore_virtual = False
@@ -556,9 +594,22 @@ def get_blend_and_blend_per_split(args):
     return blend, blend_per_split
 
 
-def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
+def get_batch_on_this_tp_rank(
+    data_iterator, mtp_on_this_rank: bool = False, vp_stage: int | None = None
+):
 
     args = get_args()
+    rank_zero_v = _is_rank_zero_v_schedule(args)
+    is_first_stage = (
+        _is_rank_zero_v_first_stage(args, vp_stage)
+        if rank_zero_v
+        else mpu.is_pipeline_first_stage()
+    )
+    is_last_stage = (
+        _is_rank_zero_v_last_stage(args, vp_stage)
+        if rank_zero_v
+        else mpu.is_pipeline_last_stage()
+    )
 
     def _broadcast(item):
         if item is not None:
@@ -635,34 +686,43 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             _broadcast(batch['max_seqlen'])
             _broadcast(batch['local_cp_size'])
 
-        elif mpu.is_pipeline_first_stage():
-            _broadcast(batch['tokens'])
-            _broadcast(batch['attention_mask'])
-            _broadcast(batch['position_ids'])
-            _broadcast(batch['padding_mask'])
-            _broadcast_cu_seqlens(batch['cu_seqlens'])
-            _broadcast(batch['max_seqlen'])
+        else:
+            if is_first_stage:
+                if not is_last_stage:
+                    batch['labels'] = None
+                    batch['loss_mask'] = None
 
-        elif mpu.is_pipeline_last_stage():
-            # Multi-Token Prediction (MTP) layers need tokens and position_ids to calculate embedding.
-            # Currently the Multi-Token Prediction (MTP) layers is fixed on the last stage, so we need
-            # to broadcast tokens and position_ids to all of the tensor parallel ranks on the last stage.
-            _broadcast(batch['labels'])
-            _broadcast(batch['loss_mask'])
-            _broadcast(batch['attention_mask'])
-            _broadcast(batch['padding_mask'])
-            _broadcast_cu_seqlens(batch['cu_seqlens'])
-            _broadcast(batch['max_seqlen'])
+                _broadcast(batch['tokens'])
+                _broadcast(batch['attention_mask'])
+                _broadcast(batch['position_ids'])
+                _broadcast(batch['padding_mask'])
+                _broadcast_cu_seqlens(batch['cu_seqlens'])
+                _broadcast(batch['max_seqlen'])
 
-        elif args.sft:
-            _broadcast(batch['padding_mask'])
-            _broadcast_cu_seqlens(batch['cu_seqlens'])
-            _broadcast(batch['max_seqlen'])
-            batch['tokens'] = None
-            batch['labels'] = None
-            batch['loss_mask'] = None
-            batch['attention_mask'] = None
-            batch['position_ids'] = None
+            if is_last_stage:
+                # Multi-Token Prediction (MTP) layers need tokens and position_ids to calculate embedding.
+                # Currently the Multi-Token Prediction (MTP) layers is fixed on the last stage, so we need
+                # to broadcast tokens and position_ids to all of the tensor parallel ranks on the last stage.
+                if not is_first_stage:
+                    batch['tokens'] = None
+                    batch['position_ids'] = None
+
+                _broadcast(batch['labels'])
+                _broadcast(batch['loss_mask'])
+                _broadcast(batch['attention_mask'])
+                _broadcast(batch['padding_mask'])
+                _broadcast_cu_seqlens(batch['cu_seqlens'])
+                _broadcast(batch['max_seqlen'])
+
+            if args.sft and not is_first_stage and not is_last_stage:
+                _broadcast(batch['padding_mask'])
+                _broadcast_cu_seqlens(batch['cu_seqlens'])
+                _broadcast(batch['max_seqlen'])
+                batch['tokens'] = None
+                batch['labels'] = None
+                batch['loss_mask'] = None
+                batch['attention_mask'] = None
+                batch['position_ids'] = None
 
     else:
         if args.hybrid_context_parallel:
@@ -750,41 +810,44 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             _broadcast(max_seqlen)
             _broadcast(local_cp_size)
 
-        elif mpu.is_pipeline_first_stage():
-            labels = None
-            loss_mask = None
+        else:
+            if is_first_stage:
+                if not is_last_stage:
+                    labels = None
+                    loss_mask = None
 
-            _broadcast(tokens)
-            _broadcast(attention_mask)
-            _broadcast(position_ids)
-            _broadcast(padding_mask)
-            cu_seqlens = _broadcast_cu_seqlens()
-            _broadcast(max_seqlen)
+                _broadcast(tokens)
+                _broadcast(attention_mask)
+                _broadcast(position_ids)
+                _broadcast(padding_mask)
+                cu_seqlens = _broadcast_cu_seqlens()
+                _broadcast(max_seqlen)
 
-        elif mpu.is_pipeline_last_stage():
-            # Multi-Token Prediction (MTP) layers need tokens and position_ids to calculate embedding.
-            # Currently the Multi-Token Prediction (MTP) layers is fixed on the last stage, so we need
-            # to broadcast tokens and position_ids to all of the tensor parallel ranks on the last stage.
-            tokens = None
-            position_ids = None
+            if is_last_stage:
+                # Multi-Token Prediction (MTP) layers need tokens and position_ids to calculate embedding.
+                # Currently the Multi-Token Prediction (MTP) layers is fixed on the last stage, so we need
+                # to broadcast tokens and position_ids to all of the tensor parallel ranks on the last stage.
+                if not is_first_stage:
+                    tokens = None
+                    position_ids = None
 
-            _broadcast(labels)
-            _broadcast(loss_mask)
-            _broadcast(attention_mask)
-            _broadcast(padding_mask)
-            cu_seqlens = _broadcast_cu_seqlens()
-            _broadcast(max_seqlen)
+                _broadcast(labels)
+                _broadcast(loss_mask)
+                _broadcast(attention_mask)
+                _broadcast(padding_mask)
+                cu_seqlens = _broadcast_cu_seqlens()
+                _broadcast(max_seqlen)
 
-        elif args.sft:
-            tokens = None
-            labels = None
-            loss_mask = None
-            attention_mask = None
-            position_ids = None
+            if args.sft and not is_first_stage and not is_last_stage:
+                tokens = None
+                labels = None
+                loss_mask = None
+                attention_mask = None
+                position_ids = None
 
-            _broadcast(padding_mask)
-            cu_seqlens = _broadcast_cu_seqlens()
-            _broadcast(max_seqlen)
+                _broadcast(padding_mask)
+                cu_seqlens = _broadcast_cu_seqlens()
+                _broadcast(max_seqlen)
 
         batch = {
             'tokens': tokens,

@@ -52,6 +52,19 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def get_dualpipe_v_layer_pp_rank(
+    config: TransformerConfig, vp_stage: Optional[int], pp_rank: int
+) -> int:
+    """Map the physical pipeline rank to the layer-layout rank for DualPipeV."""
+    if (
+        config.pipeline_parallel_schedule == "dualpipe_v"
+        and config.virtual_pipeline_model_parallel_size == 2
+        and vp_stage == 1
+    ):
+        return config.pipeline_model_parallel_size - pp_rank - 1
+    return pp_rank
+
+
 def get_transformer_layer_offset(
     config: TransformerConfig, vp_stage: Optional[int] = None, pp_rank: Optional[int] = None
 ):
@@ -60,12 +73,13 @@ def get_transformer_layer_offset(
         pp_rank = parallel_state.get_pipeline_model_parallel_rank()
 
     is_first_pp_stage = pp_rank == 0
+    layer_pp_rank = get_dualpipe_v_layer_pp_rank(config, vp_stage, pp_rank)
 
     if config.pipeline_model_parallel_size > 1:
 
         if config.pipeline_model_parallel_layout:
             offset = config.pipeline_model_parallel_layout.get_layer_offset(
-                layer_type=LayerType.decoder, vp_stage=vp_stage
+                layer_type=LayerType.decoder, vp_stage=vp_stage, pp_rank=layer_pp_rank
             )
         elif (
             config.num_layers_in_first_pipeline_stage is not None
@@ -106,7 +120,9 @@ def get_transformer_layer_offset(
             )
 
             middle_pipeline_rank = (
-                pp_rank if config.num_layers_in_first_pipeline_stage is None else pp_rank - 1
+                layer_pp_rank
+                if config.num_layers_in_first_pipeline_stage is None
+                else layer_pp_rank - 1
             )
 
             if (vp_size := config.virtual_pipeline_model_parallel_size) is not None:
@@ -142,7 +158,7 @@ def get_transformer_layer_offset(
                 )
 
                 # Calculate the layer offset with interleaved uneven pipeline parallelism
-                if pp_rank == 0:
+                if layer_pp_rank == 0:
                     offset = vp_stage * total_virtual_chunks
                 else:
                     offset = (
@@ -160,7 +176,7 @@ def get_transformer_layer_offset(
                 else:
                     num_layers_per_pipeline_rank = 0
 
-                if pp_rank == 0:
+                if layer_pp_rank == 0:
                     offset = 0
                 else:
                     offset = (
@@ -189,7 +205,9 @@ def get_transformer_layer_offset(
 
                 num_layers_per_virtual_rank = num_layers_per_pipeline_rank // vp_size
                 total_virtual_chunks = num_layers // vp_size
-                offset = vp_stage * total_virtual_chunks + (pp_rank * num_layers_per_virtual_rank)
+                offset = vp_stage * total_virtual_chunks + (
+                    layer_pp_rank * num_layers_per_virtual_rank
+                )
 
                 # Reduce the offset of embedding layer from the total layer number
                 if config.account_for_embedding_in_pipeline_split and not (
@@ -197,7 +215,7 @@ def get_transformer_layer_offset(
                 ):
                     offset -= 1
             else:
-                offset = pp_rank * num_layers_per_pipeline_rank
+                offset = layer_pp_rank * num_layers_per_pipeline_rank
 
                 # Reduce the offset of embedding layer from the total layer number
                 if config.account_for_embedding_in_pipeline_split and not (
