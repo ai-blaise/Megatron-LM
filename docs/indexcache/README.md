@@ -74,6 +74,7 @@ For NVFP4 the same formula is applied independently to each 32-dim group with
 megatron/core/quantization/indexcache/
 ├── __init__.py            public API
 ├── codec.py               IndexCacheConfig + method constants
+├── hisa.py                opt-in HISA 4:1 forward selector
 ├── reference.py           pure-PyTorch fwd/bwd (gradcheck oracle)
 ├── autograd.py            torch.autograd.Function dispatching to CUDA or ref
 └── kernels/
@@ -113,6 +114,10 @@ Two new `TransformerConfig` fields:
 dsa_indexcache_quant_enabled: bool = False
 dsa_indexcache_quantization: str = "disabled"
 dsa_indexcache_quant_eps: float = 1e-4
+dsa_indexcache_hisa_enabled: bool = False
+dsa_indexcache_hisa_block_size: int = 128
+dsa_indexcache_hisa_block_topk: int = 64
+dsa_indexcache_hisa_compression_ratio: float = 4.0
 ```
 
 CLI flags:
@@ -121,6 +126,10 @@ CLI flags:
 --dsa-indexcache-quant-enabled
 --dsa-indexcache-quantization {disabled,fp8_e4m3,nvfp4_e2m1_ue8m0}
 --dsa-indexcache-quant-eps 1e-4
+--dsa-indexcache-hisa-enabled
+--dsa-indexcache-hisa-block-size 128
+--dsa-indexcache-hisa-block-topk 64
+--dsa-indexcache-hisa-compression-ratio 4.0
 ```
 
 `--dsa-indexcache-quant-enabled` is retained as a backward-compatible alias
@@ -132,6 +141,57 @@ The DSA hook lives at
 immediately after `rotate_activation(k)`. K only is quantized. Q stays at
 full precision (matches the SGLang reference; the bandwidth cost is on the
 K-side cache, and Q is recomputed per query anyway).
+
+## NVFP4 IndexCache + HISA 4:1 selector
+
+HISA is a configurable selector on top of NVFP4 IndexCache, not a replacement.
+Ordinary NVFP4 IndexCache remains the default unless
+`--dsa-indexcache-hisa-enabled` is set or the Hugging Face config explicitly
+selects it. The selector is valid only with
+`--dsa-indexcache-quantization nvfp4_e2m1_ue8m0`.
+
+The strict 4:1 contract is:
+
+- Logical block size `B=128`.
+- Eligible block count `M=ceil(t / B)`.
+- Selected block count `m=ceil(M / compression_ratio)`, capped by `M`.
+- If the selected candidate pool has fewer entries than `index_topk`, the
+  sparse DSA path consumes the shorter candidate set via padded indices.
+- `compression_ratio=4.0` gives the accepted 4:1 mode.
+- The first and last eligible blocks are forced into the selected block set.
+  The old `last_minus_one`/`block_count-2` boundary heuristic is not part of
+  the default 4:1 path.
+- If `t <= index_topk`, top-k selection falls back to ordinary NVFP4
+  IndexCache without HISA.
+- With indexer loss enabled, HISA still supplies the selected token set for the
+  sparse attention path, while the KL objective keeps exact full-candidate
+  indexer scores so training semantics remain unchanged.
+
+Hugging Face model-card config path:
+
+```json
+{
+  "quantization_config": {
+    "indexer_quantization": {
+      "quant_method": "nvfp4_e2m1_ue8m0",
+      "hisa": {
+        "enabled": true,
+        "mode": "indexcache-hisa",
+        "block_size": 128,
+        "block_topk": 64,
+        "compression_ratio": 4.0,
+        "execution_mode": "optimized"
+      }
+    }
+  }
+}
+```
+
+The converter consumes that block from
+`quantization_config.indexer_quantization.hisa`. CLI/config values remain the
+runtime source of truth after conversion. The SFT script keeps HISA off by
+default; set `DSA_INDEXCACHE_QUANTIZATION=nvfp4_e2m1_ue8m0` and
+`DSA_INDEXCACHE_HISA=1` to enable the 4:1 selector.
 
 ## Composes with TurboQuant
 
@@ -160,6 +220,8 @@ parallelism strategy that doesn't split that dim:
 | NVFP4 packed values/scales vs OP-compatible Python oracle | exact |
 | NVFP4 analytic backward vs independent STE oracle | fp64 precision |
 | NVFP4 analytic backward vs `torch.autograd` STE-detach oracle | fp64 precision |
+| HISA 4:1 block budget and short-context fallback | exact CPU unit tests |
+| HISA 4:1 map-all candidate path at 8192/2048 | exact CPU unit tests |
 | H200 CUDA behavior | NVFP4 extension symbols build; direct execution rejects with SM100+ guard |
 | Blackwell CUDA behavior | SM103 forward/backward executable path passes 56 fp32/bf16 cases across rows 1..8192 |
 

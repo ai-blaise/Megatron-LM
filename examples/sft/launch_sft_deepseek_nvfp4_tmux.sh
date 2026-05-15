@@ -26,11 +26,16 @@ if tmux has-session -t "$SESSION" 2>/dev/null; then
 fi
 
 TS="${TS:-$(date -u +%Y%m%d_%H%M%S)}"
-RUN_NAME="${WANDB_EXP_NAME:-deepseek-v32-reap-sft-2b-${TS}}"
+RUN_NAME="${WANDB_EXP_NAME:-deepseek-v32-reap-sft-10b-${TS}}"
 LOG_DIR="${LOG_DIR:-"$HOME/logs"}"
 LOG0="$LOG_DIR/${RUN_NAME}_node0.log"
 LOG1="$LOG_DIR/${RUN_NAME}_node1.log"
 mkdir -p "$LOG_DIR"
+
+MODEL_ID="${MODEL_ID:-BlaiseAI/DeepSeek-V3.2-REAP-345B-SpinQuant-ActKV-NVFP4}"
+TOKENIZER_MODEL="${TOKENIZER_MODEL:-$MODEL_ID}"
+LOAD_CKPT="${LOAD_CKPT:-"$HOME/checkpoints/deepseek_v32_reap_spinquant_actkv_nvfp4_megatron"}"
+SAVE_CKPT="${SAVE_CKPT:-"$HOME/checkpoints/sft_deepseek_v32_reap_spinquant_actkv_nvfp4"}"
 
 REMOTE_HOST="${REMOTE_HOST:-sjpat@10.180.0.45}"
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/google_compute_engine}"
@@ -40,13 +45,44 @@ REMOTE_RUNNER="/tmp/${RUN_NAME}_node1.sh"
 MASTER_ADDR="${MASTER_ADDR:-10.200.0.21}"
 MASTER_PORT="${MASTER_PORT:-29673}"
 TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-"$HOME/.cache/triton/deepseek_v32_reap_sft"}"
+NNODES="${NNODES:-2}"
+GPUS_PER_NODE="${GPUS_PER_NODE:-8}"
+TP="${TP:-4}"
+PP="${PP:-4}"
+CP="${CP:-1}"
+EP="${EP:-4}"
+ETP="${ETP:-1}"
+MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-2}"
+GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-32}"
+WORLD_SIZE=$((NNODES * GPUS_PER_NODE))
+DENSE_MODEL_PARALLEL_SIZE=$((TP * PP * CP))
+EXPERT_MODEL_PIPELINE_PARALLEL_SIZE=$((ETP * EP * PP))
+if (( WORLD_SIZE % DENSE_MODEL_PARALLEL_SIZE != 0 )); then
+    echo "world_size=$WORLD_SIZE must be divisible by TP*PP*CP=$DENSE_MODEL_PARALLEL_SIZE" >&2
+    exit 1
+fi
+if (( WORLD_SIZE % EXPERT_MODEL_PIPELINE_PARALLEL_SIZE != 0 )); then
+    echo "world_size=$WORLD_SIZE must be divisible by ETP*EP*PP=$EXPERT_MODEL_PIPELINE_PARALLEL_SIZE" >&2
+    exit 1
+fi
+DP=$((WORLD_SIZE / DENSE_MODEL_PARALLEL_SIZE))
+EXPERT_DP=$((WORLD_SIZE / EXPERT_MODEL_PIPELINE_PARALLEL_SIZE))
+if (( GLOBAL_BATCH_SIZE % (MICRO_BATCH_SIZE * DP) != 0 )); then
+    echo "GLOBAL_BATCH_SIZE=$GLOBAL_BATCH_SIZE must be divisible by MICRO_BATCH_SIZE*DP=$((MICRO_BATCH_SIZE * DP))" >&2
+    exit 1
+fi
+GRAD_ACCUM_STEPS=$((GLOBAL_BATCH_SIZE / (MICRO_BATCH_SIZE * DP)))
 
-# 2x the 1B-token target: 61056 samples * 32768 tokens/sample ~= 2.0007B tokens.
-TRAIN_SAMPLES="${TRAIN_SAMPLES:-61056}"
-SAVE_INTERVAL="${SAVE_INTERVAL:-100}"
-DECODER_FIRST_PIPELINE_NUM_LAYERS="${DECODER_FIRST_PIPELINE_NUM_LAYERS:-16}"
-DECODER_LAST_PIPELINE_NUM_LAYERS="${DECODER_LAST_PIPELINE_NUM_LAYERS:-15}"
-PIPELINE_MODEL_PARALLEL_LAYOUT="${PIPELINE_MODEL_PARALLEL_LAYOUT:-Et*16|t*15|t*15|t*15L}"
+# Full visible Blaise SFT mix target: 753,531 rows rounded down to a full
+# GBS=32 update. This runs the local combined JSONL once without dataset loops.
+DATA_PATH="${DATA_PATH:-"$HOME/data/sft/blaise-sft-training-mix/blaise-sft-training-mix-full.jsonl"}"
+TRAIN_SAMPLES="${TRAIN_SAMPLES:-753504}"
+LR_DECAY_SAMPLES="${LR_DECAY_SAMPLES:-$TRAIN_SAMPLES}"
+LR_WARMUP_SAMPLES="${LR_WARMUP_SAMPLES:-31616}"
+SAVE_INTERVAL="${SAVE_INTERVAL:-50}"
+DECODER_FIRST_PIPELINE_NUM_LAYERS="${DECODER_FIRST_PIPELINE_NUM_LAYERS:-17}"
+DECODER_LAST_PIPELINE_NUM_LAYERS="${DECODER_LAST_PIPELINE_NUM_LAYERS:-14}"
+PIPELINE_MODEL_PARALLEL_LAYOUT="${PIPELINE_MODEL_PARALLEL_LAYOUT:-Et*17|t*15|t*15|t*14L}"
 OVERLAP_PARAM_GATHER="${OVERLAP_PARAM_GATHER:-0}"
 # Megatron keeps checkpoints whose iteration is divisible by this value and
 # deletes the previous non-retained checkpoint after a new save. Pick a value
@@ -61,21 +97,78 @@ cat <<EOF
 Run name:      $RUN_NAME
 Node 0 log:    $LOG0
 Node 1 log:    $LOG1
+Load ckpt:     $LOAD_CKPT
+Save ckpt:     $SAVE_CKPT
 Train samples: $TRAIN_SAMPLES
+World shape:   nodes=$NNODES gpus_per_node=$GPUS_PER_NODE world=$WORLD_SIZE
+Parallelism:   TP=$TP PP=$PP CP=$CP DP=$DP EP=$EP ETP=$ETP expert_DP=$EXPERT_DP
+Batches:       MBS=$MICRO_BATCH_SIZE GBS=$GLOBAL_BATCH_SIZE grad_accum=$GRAD_ACCUM_STEPS
 Save every:    $SAVE_INTERVAL updates
 Retention:     keep latest normal Megatron checkpoint only
-ZCC:           ENABLE_ZCC=${ENABLE_ZCC:-0} (last successful probe used 0)
+ZCC:           ENABLE_ZCC=${ENABLE_ZCC:-1} durable_interval=${ZCC_DURABLE_INTERVAL:-50} retain_latest=${ZCC_RETAIN_LATEST:-1}
 Param gather:  OVERLAP_PARAM_GATHER=$OVERLAP_PARAM_GATHER
 PP layout:     ${PIPELINE_MODEL_PARALLEL_LAYOUT:-first=$DECODER_FIRST_PIPELINE_NUM_LAYERS middle=auto last=$DECODER_LAST_PIPELINE_NUM_LAYERS}
 StreamBP MoE:  chunk_forward=${STREAMBP_MOE_CHUNK_FORWARD:-0} mlp_chunks=${STREAMBP_MOE_MLP_CHUNKS:-2}
-Quant stack:   spinquant=${SPINQUANT:-1} turboquant=${TURBOQUANT:-1} indexcache=${INDEXCACHE:-1}
+Quant stack:   spinquant=${SPINQUANT:-1} higgs=${USE_HIGGS:-1} turboquant=${TURBOQUANT:-0} indexcache=${INDEXCACHE:-1} indexcache_hisa=${DSA_INDEXCACHE_HISA:-1}
 MoE LB type:   ${MOE_ROUTER_LOAD_BALANCING_TYPE:-seq_aux_loss}
 MoE aux coeff: ${MOE_AUX_LOSS_COEFF:-1e-4}
 MoE bias upd:  ${MOE_ROUTER_BIAS_UPDATE_RATE:-1e-3}
 MoE bias rule: ${MOE_ROUTER_EXPERT_BIAS_UPDATE_METHOD:-sign}
 ECO:           enabled=${FLASH_ADAMW_ECO:-1} lr_floor=${FLASH_ADAMW_ECO_LR_FLOOR:-base} projection=${FLASH_ADAMW_ECO_PROJECTION:-gain}
 Triton cache:  TRITON_CACHE_AUTOTUNING=1 TRITON_CACHE_DIR=$TRITON_CACHE_DIR
+HF upload:     enabled=${HF_UPLOAD_CHECKPOINTS:-1} interval=${HF_UPLOAD_INTERVAL:-100} repo=${HF_REPO_ID:-BlaiseAI/corsaire-1-research-preview} retain=${HF_UPLOAD_RETAIN:-2}
 EOF
+
+if [[ "${DRY_RUN:-0}" == "1" ]]; then
+    echo "DRY_RUN=1 set; not syncing, creating tmux panes, or launching training."
+    exit 0
+fi
+
+sync_load_checkpoint_metadata() {
+    local tracker="$LOAD_CKPT/latest_checkpointed_iteration.txt"
+    if [[ ! -f "$tracker" ]]; then
+        echo "missing load checkpoint tracker: $tracker" >&2
+        exit 1
+    fi
+
+    local iteration
+    iteration="$(<"$tracker")"
+    local iter_dir
+    if [[ "$iteration" == "release" ]]; then
+        iter_dir="release"
+    else
+        iter_dir="$(printf 'iter_%07d' "$iteration")"
+    fi
+
+    local rel_files=(
+        "latest_checkpointed_iteration.txt"
+        "latest_train_state.pt"
+        "$iter_dir/.metadata"
+        "$iter_dir/common.pt"
+        "$iter_dir/metadata.json"
+        "$iter_dir/train_state.pt"
+        "$iter_dir/run_config.yaml"
+    )
+
+    local rel
+    for rel in "${rel_files[@]}"; do
+        if [[ ! -f "$LOAD_CKPT/$rel" ]]; then
+            echo "missing load checkpoint metadata file: $LOAD_CKPT/$rel" >&2
+            exit 1
+        fi
+    done
+
+    echo "Syncing load checkpoint metadata/common files to $REMOTE_HOST ..."
+    ssh -i "$SSH_KEY" "$REMOTE_HOST" "mkdir -p '$LOAD_CKPT/$iter_dir'"
+    tar -C "$LOAD_CKPT" -cf - "${rel_files[@]}" | ssh -i "$SSH_KEY" "$REMOTE_HOST" \
+        "tar -C '$LOAD_CKPT' -xf -"
+    ssh -i "$SSH_KEY" "$REMOTE_HOST" \
+        "test -f '$LOAD_CKPT/latest_checkpointed_iteration.txt' && test -f '$LOAD_CKPT/$iter_dir/.metadata' && test -f '$LOAD_CKPT/$iter_dir/common.pt'"
+}
+
+if [[ "${SYNC_LOAD_CKPT_METADATA:-1}" == "1" ]]; then
+    sync_load_checkpoint_metadata
+fi
 
 if [[ "${SYNC_REMOTE:-1}" == "1" ]]; then
     mapfile -t SYNC_FILES < <(
@@ -101,25 +194,33 @@ export CXX="${CXX:-/usr/bin/g++}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export TRITON_CACHE_AUTOTUNING="${TRITON_CACHE_AUTOTUNING:-1}"
 export TRITON_CACHE_DIR="${TRITON_CACHE_DIR}"
-export NNODES="${NNODES:-2}"
-export GPUS_PER_NODE="${GPUS_PER_NODE:-8}"
+export MODEL_ID="${MODEL_ID}"
+export TOKENIZER_MODEL="${TOKENIZER_MODEL}"
+export LOAD_CKPT="${LOAD_CKPT}"
+export SAVE_CKPT="${SAVE_CKPT}"
+export DATA_PATH="${DATA_PATH}"
+export NNODES="${NNODES}"
+export GPUS_PER_NODE="${GPUS_PER_NODE}"
 export MASTER_ADDR="${MASTER_ADDR}"
 export MASTER_PORT="${MASTER_PORT}"
 export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-gpu}"
 export NCCL_IB_HCA="${NCCL_IB_HCA:-mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7}"
 export NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-0}"
 export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
-export TP="${TP:-4}"
-export PP="${PP:-4}"
-export CP="${CP:-1}"
-export EP="${EP:-4}"
-export ETP="${ETP:-1}"
+export TP="${TP}"
+export PP="${PP}"
+export CP="${CP}"
+export EP="${EP}"
+export ETP="${ETP}"
 export DECODER_FIRST_PIPELINE_NUM_LAYERS="${DECODER_FIRST_PIPELINE_NUM_LAYERS}"
 export DECODER_LAST_PIPELINE_NUM_LAYERS="${DECODER_LAST_PIPELINE_NUM_LAYERS}"
 export PIPELINE_MODEL_PARALLEL_LAYOUT="${PIPELINE_MODEL_PARALLEL_LAYOUT}"
+export PIPELINE_PARALLEL_SCHEDULE="${PIPELINE_PARALLEL_SCHEDULE:-}"
+export NUM_LAYERS_PER_VIRTUAL_PIPELINE_STAGE="${NUM_LAYERS_PER_VIRTUAL_PIPELINE_STAGE:-}"
+export NUM_VIRTUAL_STAGES_PER_PIPELINE_RANK="${NUM_VIRTUAL_STAGES_PER_PIPELINE_RANK:-}"
 export SEQ_LENGTH="${SEQ_LENGTH:-32768}"
-export MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-2}"
-export GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-32}"
+export MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE}"
+export GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE}"
 export GRAD_REDUCE_IN_BF16="${GRAD_REDUCE_IN_BF16:-1}"
 export DISTRIBUTED_TIMEOUT_MINUTES="${DISTRIBUTED_TIMEOUT_MINUTES:-120}"
 export WANDB_ENTITY="${WANDB_ENTITY:-blaise-ai}"
@@ -128,6 +229,9 @@ export WANDB_EXP_NAME="${RUN_NAME}"
 export LOG_MEMORY_INTERVAL="${LOG_MEMORY_INTERVAL:-10}"
 export LOG_NUM_ZEROS_IN_GRAD="${LOG_NUM_ZEROS_IN_GRAD:-1}"
 export TRAIN_SAMPLES="${TRAIN_SAMPLES}"
+export LR_DECAY_SAMPLES="${LR_DECAY_SAMPLES}"
+export LR_WARMUP_SAMPLES="${LR_WARMUP_SAMPLES}"
+export NUM_WORKERS="${NUM_WORKERS:-8}"
 export SAVE_INTERVAL="${SAVE_INTERVAL}"
 export SAVE_RETAIN_INTERVAL="${SAVE_RETAIN_INTERVAL}"
 export DISABLE_SAVE="${DISABLE_SAVE:-0}"
@@ -142,8 +246,16 @@ export STREAMBP_CHUNK_SIZE="${STREAMBP_CHUNK_SIZE:-2048}"
 export STREAMBP_MOE_CHUNK_FORWARD="${STREAMBP_MOE_CHUNK_FORWARD:-0}"
 export STREAMBP_MOE_MLP_CHUNKS="${STREAMBP_MOE_MLP_CHUNKS:-2}"
 export SPINQUANT="${SPINQUANT:-1}"
-export TURBOQUANT="${TURBOQUANT:-1}"
+export TURBOQUANT="${TURBOQUANT:-0}"
+export USE_HIGGS="${USE_HIGGS:-1}"
+export HIGGS_KV_PRESET="${HIGGS_KV_PRESET:-dense_2bit}"
 export INDEXCACHE="${INDEXCACHE:-1}"
+export DSA_INDEXCACHE_QUANTIZATION="${DSA_INDEXCACHE_QUANTIZATION:-nvfp4_e2m1_ue8m0}"
+export DSA_INDEXCACHE_QUANT_EPS="${DSA_INDEXCACHE_QUANT_EPS:-1e-4}"
+export DSA_INDEXCACHE_HISA="${DSA_INDEXCACHE_HISA:-1}"
+export DSA_INDEXCACHE_HISA_BLOCK_SIZE="${DSA_INDEXCACHE_HISA_BLOCK_SIZE:-128}"
+export DSA_INDEXCACHE_HISA_BLOCK_TOPK="${DSA_INDEXCACHE_HISA_BLOCK_TOPK:-64}"
+export DSA_INDEXCACHE_HISA_COMPRESSION_RATIO="${DSA_INDEXCACHE_HISA_COMPRESSION_RATIO:-4.0}"
 export MOE_ROUTER_LOAD_BALANCING_TYPE="${MOE_ROUTER_LOAD_BALANCING_TYPE:-seq_aux_loss}"
 export MOE_AUX_LOSS_COEFF="${MOE_AUX_LOSS_COEFF:-1e-4}"
 export MOE_ROUTER_BIAS_UPDATE_RATE="${MOE_ROUTER_BIAS_UPDATE_RATE:-1e-3}"
@@ -151,7 +263,7 @@ export MOE_ROUTER_EXPERT_BIAS_UPDATE_METHOD="${MOE_ROUTER_EXPERT_BIAS_UPDATE_MET
 export MOE_ROUTER_QUANTILE_BIAS_ITERS="${MOE_ROUTER_QUANTILE_BIAS_ITERS:-5}"
 export MOE_ROUTER_QUANTILE_BIAS_SYNC_SCORES="${MOE_ROUTER_QUANTILE_BIAS_SYNC_SCORES:-1}"
 export DSA_CHUNK_SIZE="${DSA_CHUNK_SIZE:-2048}"
-export DSA_INDEXER_TOPK="${DSA_INDEXER_TOPK:-1024}"
+export DSA_INDEXER_TOPK="${DSA_INDEXER_TOPK:-2048}"
 export DSA_INDEXER_LOSS_COEFF="${DSA_INDEXER_LOSS_COEFF:-0.01}"
 export MEGATRON_DSA_TRITON_BF16_GRAD_ATOMICS="${MEGATRON_DSA_TRITON_BF16_GRAD_ATOMICS:-1}"
 export MEGATRON_DSA_TRITON_BWD_NUM_WARPS="${MEGATRON_DSA_TRITON_BWD_NUM_WARPS:-2}"
@@ -163,7 +275,12 @@ export FLASH_ADAMW_ECO_PROJECTION_SCALE_BUDGET="${FLASH_ADAMW_ECO_PROJECTION_SCA
 export FLASH_ADAMW_ECO_PROJECTION_GAIN_BUDGET="${FLASH_ADAMW_ECO_PROJECTION_GAIN_BUDGET:-0.25}"
 export FLASH_ADAMW_ECO_PROJECTION_STEPS="${FLASH_ADAMW_ECO_PROJECTION_STEPS:-16}"
 export FLASH_ADAMW_COMPRESS_STATE_DICT="${FLASH_ADAMW_COMPRESS_STATE_DICT:-1}"
-export ENABLE_ZCC="${ENABLE_ZCC:-0}"
+export ENABLE_ZCC="${ENABLE_ZCC:-1}"
+export ZCC_FLASH_DEVICE="${ZCC_FLASH_DEVICE:-/dev/shm/megatron_zcc/$RUN_NAME}"
+export ZCC_WORKERS_NUM="${ZCC_WORKERS_NUM:-8}"
+export ZCC_DURABLE_INTERVAL="${ZCC_DURABLE_INTERVAL:-50}"
+export ZCC_DURABLE_DIR="${ZCC_DURABLE_DIR:-$SAVE_CKPT/zcc/$RUN_NAME}"
+export ZCC_COMPRESS="${ZCC_COMPRESS:-zstd:1}"
 export ZCC_RETAIN_LATEST="${ZCC_RETAIN_LATEST:-1}"
 export MEGATRON_NUMERIC_DEBUG="${MEGATRON_NUMERIC_DEBUG:-0}"
 export MEGATRON_NUMERIC_DEBUG_RANKS="${MEGATRON_NUMERIC_DEBUG_RANKS:-all}"
@@ -236,6 +353,14 @@ export MEGATRON_GRAD_OWNERSHIP_FIRST_N="${MEGATRON_GRAD_OWNERSHIP_FIRST_N:-8}"
 export MEGATRON_GRAD_OWNERSHIP_INTERVAL="${MEGATRON_GRAD_OWNERSHIP_INTERVAL:-1}"
 export MEGATRON_GRAD_OWNERSHIP_TOP_OWNERS="${MEGATRON_GRAD_OWNERSHIP_TOP_OWNERS:-32}"
 export MEGATRON_GRAD_OWNERSHIP_TOP_PARAMS="${MEGATRON_GRAD_OWNERSHIP_TOP_PARAMS:-0}"
+export HF_UPLOAD_CHECKPOINTS="${HF_UPLOAD_CHECKPOINTS:-1}"
+export HF_REPO_ID="${HF_REPO_ID:-BlaiseAI/corsaire-1-research-preview}"
+export HF_UPLOAD_FOLDER_PREFIX="${HF_UPLOAD_FOLDER_PREFIX:-corsaire-1-research-preview}"
+export HF_UPLOAD_INTERVAL="${HF_UPLOAD_INTERVAL:-100}"
+export HF_UPLOAD_RETAIN="${HF_UPLOAD_RETAIN:-2}"
+export HF_UPLOAD_STABLE_SECONDS="${HF_UPLOAD_STABLE_SECONDS:-180}"
+export HF_UPLOAD_POLL_SECONDS="${HF_UPLOAD_POLL_SECONDS:-60}"
+export HF_UPLOAD_PRIVATE="${HF_UPLOAD_PRIVATE:-1}"
 export NODE_RANK="$node_rank"
 mkdir -p "\$TRITON_CACHE_DIR"
 EOF
@@ -252,6 +377,24 @@ REMOTE_MONITOR="$LOG_DIR/${RUN_NAME}_node1_gpu_monitor.sh"
     echo 'set -euo pipefail'
     write_env_block 0
     echo "cd '$MEGATRON_DIR'"
+    echo "if [[ \"\$HF_UPLOAD_CHECKPOINTS\" == \"1\" ]]; then"
+    echo "  mkdir -p '$LOG_DIR'"
+    echo "  HF_PRIVATE_ARG=(); [[ \"\$HF_UPLOAD_PRIVATE\" == \"1\" ]] && HF_PRIVATE_ARG=(--private)"
+    echo "  uv run --no-sync python tools/upload_mcore_checkpoints_to_hf.py \\"
+    echo "    --checkpoint-root \"\$SAVE_CKPT\" \\"
+    echo "    --repo-id \"\$HF_REPO_ID\" \\"
+    echo "    --folder-prefix \"\$HF_UPLOAD_FOLDER_PREFIX\" \\"
+    echo "    --node-name node0 \\"
+    echo "    --shard-start 0 --shard-end 7 \\"
+    echo "    --upload-interval \"\$HF_UPLOAD_INTERVAL\" \\"
+    echo "    --retain \"\$HF_UPLOAD_RETAIN\" \\"
+    echo "    --stable-seconds \"\$HF_UPLOAD_STABLE_SECONDS\" \\"
+    echo "    --poll-seconds \"\$HF_UPLOAD_POLL_SECONDS\" \\"
+    echo "    --delete-before-upload \\"
+    echo "    \"\${HF_PRIVATE_ARG[@]}\" > '$LOG_DIR/${RUN_NAME}_hf_upload_node0.log' 2>&1 &"
+    echo "  HF_UPLOAD_PID=\$!"
+    echo "  trap 'kill \"\$HF_UPLOAD_PID\" 2>/dev/null || true' EXIT"
+    echo "fi"
     echo "echo '[node0] starting $RUN_NAME at '\"\$(date -u +%Y-%m-%dT%H:%M:%SZ)\""
     echo "examples/sft/run_sft_deepseek_nvfp4.sh 2>&1 | tee '$LOG0'"
 } > "$NODE0_RUNNER"
@@ -261,6 +404,24 @@ REMOTE_MONITOR="$LOG_DIR/${RUN_NAME}_node1_gpu_monitor.sh"
     echo 'set -euo pipefail'
     write_env_block 1
     echo "cd '$REMOTE_MEGATRON_DIR'"
+    echo "if [[ \"\$HF_UPLOAD_CHECKPOINTS\" == \"1\" ]]; then"
+    echo "  mkdir -p '$LOG_DIR'"
+    echo "  HF_PRIVATE_ARG=(); [[ \"\$HF_UPLOAD_PRIVATE\" == \"1\" ]] && HF_PRIVATE_ARG=(--private)"
+    echo "  uv run --no-sync python tools/upload_mcore_checkpoints_to_hf.py \\"
+    echo "    --checkpoint-root \"\$SAVE_CKPT\" \\"
+    echo "    --repo-id \"\$HF_REPO_ID\" \\"
+    echo "    --folder-prefix \"\$HF_UPLOAD_FOLDER_PREFIX\" \\"
+    echo "    --node-name node1 \\"
+    echo "    --shard-start 8 --shard-end 15 \\"
+    echo "    --upload-interval \"\$HF_UPLOAD_INTERVAL\" \\"
+    echo "    --retain \"\$HF_UPLOAD_RETAIN\" \\"
+    echo "    --stable-seconds \"\$HF_UPLOAD_STABLE_SECONDS\" \\"
+    echo "    --poll-seconds \"\$HF_UPLOAD_POLL_SECONDS\" \\"
+    echo "    --delete-before-upload \\"
+    echo "    \"\${HF_PRIVATE_ARG[@]}\" > '$LOG_DIR/${RUN_NAME}_hf_upload_node1.log' 2>&1 &"
+    echo "  HF_UPLOAD_PID=\$!"
+    echo "  trap 'kill \"\$HF_UPLOAD_PID\" 2>/dev/null || true' EXIT"
+    echo "fi"
     echo "echo '[node1] starting $RUN_NAME at '\"\$(date -u +%Y-%m-%dT%H:%M:%SZ)\""
     echo "examples/sft/run_sft_deepseek_nvfp4.sh"
 } > "$NODE1_LOCAL_RUNNER"

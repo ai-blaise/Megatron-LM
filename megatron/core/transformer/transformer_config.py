@@ -725,6 +725,26 @@ class TransformerConfig(ModelParallelConfig):
     """Epsilon used to clamp the per-token absolute max before computing the
     IndexCache scale. Matches the SGLang reference (1e-4)."""
 
+    dsa_indexcache_hisa_enabled: bool = False
+    """Enable the opt-in HISA selector for NVFP4 IndexCache DSA top-k.
+
+    Ordinary IndexCache remains the default. This path is only valid with
+    ``dsa_indexcache_quantization="nvfp4_e2m1_ue8m0"`` and changes the forward
+    index set selection, not the IndexCache quantization itself."""
+
+    dsa_indexcache_hisa_block_size: int = 128
+    """Logical HISA block size. The accepted NVFP4 IndexCache path uses B=128."""
+
+    dsa_indexcache_hisa_block_topk: int = 64
+    """Fixed HISA block budget used only when the compression ratio is zero."""
+
+    dsa_indexcache_hisa_compression_ratio: float = 4.0
+    """Dynamic HISA compression ratio.
+
+    With the default 4.0, the selected block count is ``ceil(M / 4)`` capped by
+    the eligible block count. Contexts with ``t <= index_topk`` fall back to
+    ordinary NVFP4 IndexCache selection."""
+
 
     ####################
     # MoE related
@@ -1444,6 +1464,40 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.dsa_chunk_size <= 0:
             raise ValueError("dsa_chunk_size must be positive")
+
+        # HIGGS and TurboQuant both act on the dense MLA latent KV; running both
+        # at once would apply two fake-quant schemes back-to-back to the same
+        # tensor, which is not a meaningful configuration. Surface this loudly
+        # at config-validate time rather than letting it silently double-quant.
+        if self.turboquant_kv_enabled and self.enable_higgs_dense_2bit_kv_cache:
+            raise ValueError(
+                "turboquant_kv_enabled and enable_higgs_dense_2bit_kv_cache are "
+                "mutually exclusive: both act on the dense MLA latent KV. "
+                "Pick one fake-quant scheme."
+            )
+
+        if self.enable_higgs_dense_2bit_kv_cache:
+            valid_presets = {"dense_2bit"}
+            if self.higgs_kv_preset not in valid_presets:
+                raise ValueError(
+                    f"Unknown HIGGS preset {self.higgs_kv_preset!r}; "
+                    f"expected one of {sorted(valid_presets)}."
+                )
+
+        if self.dsa_indexcache_hisa_enabled:
+            if self.dsa_indexcache_quantization != "nvfp4_e2m1_ue8m0":
+                raise ValueError(
+                    "dsa_indexcache_hisa_enabled requires "
+                    "dsa_indexcache_quantization='nvfp4_e2m1_ue8m0'."
+                )
+            if self.dsa_indexcache_hisa_block_size <= 0:
+                raise ValueError("dsa_indexcache_hisa_block_size must be positive")
+            if self.dsa_indexcache_hisa_block_topk <= 0:
+                raise ValueError("dsa_indexcache_hisa_block_topk must be positive")
+            if self.dsa_indexcache_hisa_compression_ratio < 0:
+                raise ValueError(
+                    "dsa_indexcache_hisa_compression_ratio must be non-negative"
+                )
 
         if self.cpu_offloading and self.recompute_granularity is not None:
             raise ValueError(

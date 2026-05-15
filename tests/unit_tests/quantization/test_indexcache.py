@@ -3,7 +3,7 @@
 """Tests for IndexCache fake-quant.
 
 Covers:
-  * FP8 forward output shape, finiteness, and error vs the unquantized input
+  * FP8 forward output shape, finiteness, and quantization-error bounds
   * eps clamp on all-zero rows
   * FP8 analytic backward vs torch.autograd on the STE-detach forward (the same
     trick we used for TurboQuant — finite differences cannot validate STE on
@@ -31,8 +31,11 @@ from megatron.core.quantization.indexcache import (  # noqa: E402
     INDEXCACHE_QUANT_FP8,
     INDEXCACHE_QUANT_NVFP4,
     IndexCacheConfig,
+    IndexCacheHISAConfig,
     apply_indexcache_kv,
     build_indexcache_config,
+    hisa_block_topk_counts,
+    indexcache_hisa_topk,
     resolve_indexcache_quantization,
 )
 from megatron.core.quantization.indexcache.reference import (  # noqa: E402
@@ -113,8 +116,8 @@ def _ste_autograd_forward(x: torch.Tensor, cfg: IndexCacheConfig) -> torch.Tenso
     """Differentiable forward whose autograd matches our analytic backward.
 
     Uses ``(quantized - x_clip).detach() + x_clip`` to route gradient through
-    the unquantized clipped input while the forward output equals the
-    quantized value. Same idiom we used for TurboQuant's STE oracle.
+    the clipped pre-quant value while the forward output equals the quantized
+    value. Same idiom we used for TurboQuant's STE oracle.
     """
 
     abs_max = x.abs().amax(dim=-1)
@@ -375,6 +378,346 @@ def test_indexcache_config_and_cli_selection():
         quantization=args.dsa_indexcache_quantization,
         quant_enabled=args.dsa_indexcache_quant_enabled,
     ) == INDEXCACHE_QUANT_FP8
+
+    args = parser.parse_args(
+        [
+            "--dsa-indexcache-quantization",
+            INDEXCACHE_QUANT_NVFP4,
+            "--dsa-indexcache-hisa-enabled",
+            "--dsa-indexcache-hisa-compression-ratio",
+            "4.0",
+        ]
+    )
+    assert args.dsa_indexcache_quantization == INDEXCACHE_QUANT_NVFP4
+    assert args.dsa_indexcache_hisa_enabled
+    assert args.dsa_indexcache_hisa_block_size == 128
+    assert args.dsa_indexcache_hisa_compression_ratio == 4.0
+
+
+def test_hisa_4to1_dynamic_block_budget():
+    block_counts = torch.tensor([1, 2, 16, 64, 128, 256, 512], dtype=torch.int32)
+    selected, max_selected = hisa_block_topk_counts(
+        block_counts,
+        block_size=128,
+        topk_tokens=2048,
+        compression_ratio=4.0,
+    )
+    assert selected.tolist() == [1, 1, 4, 16, 32, 64, 128]
+    assert max_selected == 128
+
+
+def test_hisa_falls_back_when_context_fits_topk():
+    config = IndexCacheHISAConfig(enabled=True, compression_ratio=4.0)
+    q = torch.randn(1, 1, 2, HEAD_DIM)
+    k = torch.randn(2048, 1, HEAD_DIM)
+    weights = torch.ones(1, 1, 2)
+    assert (
+        indexcache_hisa_topk(
+            q,
+            weights,
+            k,
+            2048,
+            config=config,
+            q_start=0,
+            is_causal=False,
+            mask=None,
+            query_positions=None,
+            key_positions=None,
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("context_len,topk", [(4096, 1024), (8192, 2048)])
+def test_hisa_4to1_map_all_candidate_pool(context_len: int, topk: int):
+    config = IndexCacheHISAConfig(enabled=True, compression_ratio=4.0)
+    torch.manual_seed(17)
+    q = torch.randn(1, 1, 2, HEAD_DIM)
+    k = torch.randn(context_len, 1, HEAD_DIM)
+    weights = torch.ones(1, 1, 2)
+    selected_topk = indexcache_hisa_topk(
+        q,
+        weights,
+        k,
+        topk,
+        config=config,
+        q_start=0,
+        is_causal=False,
+        mask=None,
+        query_positions=None,
+        key_positions=None,
+    )
+    assert selected_topk is not None
+    assert selected_topk.shape == (1, 1, topk)
+    selected = selected_topk[0, 0]
+    assert selected.unique().numel() == topk
+    assert int(selected.min().item()) >= 0
+    assert int(selected.max().item()) < context_len
+    assert bool((selected < 128).any().item())
+    assert bool((selected >= context_len - 128).any().item())
+
+
+def test_hisa_4to1_pads_when_candidate_pool_is_smaller_than_topk():
+    config = IndexCacheHISAConfig(enabled=True, compression_ratio=4.0)
+    torch.manual_seed(18)
+    q = torch.randn(1, 1, 2, HEAD_DIM)
+    k = torch.randn(4096, 1, HEAD_DIM)
+    weights = torch.ones(1, 1, 2)
+    topk = indexcache_hisa_topk(
+        q,
+        weights,
+        k,
+        2048,
+        config=config,
+        q_start=0,
+        is_causal=False,
+        mask=None,
+        query_positions=None,
+        key_positions=None,
+    )
+    assert topk is not None
+    assert topk.shape == (1, 1, 2048)
+    selected = topk[0, 0]
+    valid = selected[selected >= 0]
+    assert valid.unique().numel() == 1024
+    assert int(valid.min().item()) >= 0
+    assert int(valid.max().item()) < 4096
+    assert int((selected < 0).sum().item()) == 1024
+
+
+def test_chunked_dsa_forward_masks_padded_hisa_candidates(monkeypatch):
+    import megatron.core.transformer.experimental_attention_variant.dsa as dsa_module
+
+    torch.manual_seed(19)
+    q = torch.randn(1, 1, 2, HEAD_DIM)
+    index_k = torch.randn(4, 1, HEAD_DIM)
+    weights = torch.ones(1, 1, 2)
+    query = torch.randn(1, 1, 1, 8)
+    key = torch.randn(4, 1, 1, 8)
+    value = torch.randn(4, 1, 1, 8)
+
+    expected = dsa_module._sparse_dsa_attention_chunk(
+        query,
+        key,
+        value,
+        torch.tensor([[[0, 1]]], dtype=torch.long),
+        1.0,
+        mask=None,
+        q_start=0,
+        is_causal=False,
+    )
+
+    def fake_hisa_topk(*_args, **_kwargs):
+        return torch.tensor([[[0, 1, -1, -1]]], dtype=torch.long)
+
+    monkeypatch.setattr(dsa_module, "indexcache_hisa_topk", fake_hisa_topk)
+    got, _ = dsa_module.chunked_dsa_forward(
+        q,
+        index_k,
+        weights,
+        query,
+        key,
+        value,
+        softmax_scale=1.0,
+        topk=4,
+        mask=None,
+        is_causal=False,
+        loss_coeff=0.0,
+        sparse_loss=False,
+        pg_collection=None,
+        chunk_size=1,
+        indexcache_hisa_config=IndexCacheHISAConfig(enabled=True),
+    )
+    torch.testing.assert_close(got, expected)
+
+
+def test_chunked_dsa_forward_dispatches_hisa_selector(monkeypatch):
+    import megatron.core.transformer.experimental_attention_variant.dsa as dsa_module
+
+    calls = []
+
+    def fake_hisa_topk(q, weights, k, topk, **kwargs):
+        calls.append(kwargs["config"])
+        sq = q.shape[0]
+        bsz = q.shape[1]
+        return torch.arange(topk, device=q.device).view(1, 1, topk).expand(bsz, sq, topk)
+
+    monkeypatch.setattr(dsa_module, "indexcache_hisa_topk", fake_hisa_topk)
+
+    q = torch.randn(2, 1, 2, HEAD_DIM)
+    index_k = torch.randn(8, 1, HEAD_DIM)
+    weights = torch.ones(2, 1, 2)
+    query = torch.randn(2, 1, 1, 8)
+    key = torch.randn(8, 1, 1, 8)
+    value = torch.randn(8, 1, 1, 8)
+    output, indexer_loss = dsa_module.chunked_dsa_forward(
+        q,
+        index_k,
+        weights,
+        query,
+        key,
+        value,
+        softmax_scale=1.0,
+        topk=4,
+        mask=None,
+        is_causal=False,
+        loss_coeff=0.0,
+        sparse_loss=False,
+        pg_collection=None,
+        chunk_size=2,
+        indexcache_hisa_config=IndexCacheHISAConfig(enabled=True),
+    )
+    assert calls and calls[0].enabled
+    assert output.shape == (2, 1, 8)
+    assert indexer_loss is None
+
+
+def test_chunked_dsa_hisa_short_context_matches_ordinary_nvfp4_indexcache(monkeypatch):
+    import megatron.core.transformer.experimental_attention_variant.dsa as dsa_module
+
+    monkeypatch.setenv("MEGATRON_DSA_STREAMING_INDEXER_TOPK", "0")
+    torch.manual_seed(21)
+    q = torch.randn(2, 1, 2, HEAD_DIM)
+    raw_index_k = torch.randn(8, 1, HEAD_DIM)
+    index_k = apply_indexcache_kv(raw_index_k.reshape(-1, HEAD_DIM), _make_nvfp4_cfg())
+    index_k = index_k.reshape_as(raw_index_k).detach()
+    weights = torch.ones(2, 1, 2)
+    query = torch.randn(2, 1, 1, 8)
+    key = torch.randn(8, 1, 1, 8)
+    value = torch.randn(8, 1, 1, 8)
+
+    ordinary_output, ordinary_loss = dsa_module.chunked_dsa_forward(
+        q,
+        index_k,
+        weights,
+        query,
+        key,
+        value,
+        softmax_scale=1.0,
+        topk=8,
+        mask=None,
+        is_causal=False,
+        loss_coeff=0.0,
+        sparse_loss=False,
+        pg_collection=None,
+        chunk_size=2,
+        indexcache_hisa_config=None,
+    )
+    hisa_output, hisa_loss = dsa_module.chunked_dsa_forward(
+        q,
+        index_k,
+        weights,
+        query,
+        key,
+        value,
+        softmax_scale=1.0,
+        topk=8,
+        mask=None,
+        is_causal=False,
+        loss_coeff=0.0,
+        sparse_loss=False,
+        pg_collection=None,
+        chunk_size=2,
+        indexcache_hisa_config=IndexCacheHISAConfig(
+            enabled=True,
+            block_size=4,
+            compression_ratio=4.0,
+        ),
+    )
+
+    assert ordinary_loss is None
+    assert hisa_loss is None
+    torch.testing.assert_close(hisa_output, ordinary_output)
+
+
+def test_chunked_dsa_hisa_path_backpropagates_attention_grads():
+    import megatron.core.transformer.experimental_attention_variant.dsa as dsa_module
+
+    torch.manual_seed(20260513)
+    q = torch.randn(2, 1, 2, HEAD_DIM)
+    index_k = torch.randn(32, 1, HEAD_DIM)
+    weights = torch.ones(2, 1, 2)
+    query = torch.randn(2, 1, 1, 8, requires_grad=True)
+    key = torch.randn(32, 1, 1, 8, requires_grad=True)
+    value = torch.randn(32, 1, 1, 8, requires_grad=True)
+
+    output, indexer_loss = dsa_module.chunked_dsa_forward(
+        q,
+        index_k,
+        weights,
+        query,
+        key,
+        value,
+        softmax_scale=1.0,
+        topk=4,
+        mask=None,
+        is_causal=False,
+        loss_coeff=0.0,
+        sparse_loss=False,
+        pg_collection=None,
+        chunk_size=2,
+        indexcache_hisa_config=IndexCacheHISAConfig(
+            enabled=True,
+            block_size=4,
+            compression_ratio=4.0,
+        ),
+    )
+    assert indexer_loss is None
+    assert output.shape == (2, 1, 8)
+    output.float().square().sum().backward()
+    for tensor in (query, key, value):
+        assert tensor.grad is not None
+        assert torch.isfinite(tensor.grad.float()).all().item()
+        assert tensor.grad.float().abs().sum().item() > 0
+
+
+def test_chunked_dsa_hisa_with_indexer_loss_backpropagates_indexer_grads(monkeypatch):
+    import megatron.core.transformer.experimental_attention_variant.dsa as dsa_module
+
+    class _ProcessGroup:
+        def size(self):
+            return 1
+
+    class _ProcessGroups:
+        tp = _ProcessGroup()
+
+    def fake_hisa_topk(*_args, **_kwargs):
+        return torch.tensor([[[0, 1, -1, -1]]], dtype=torch.long)
+
+    monkeypatch.setattr(dsa_module, "indexcache_hisa_topk", fake_hisa_topk)
+
+    torch.manual_seed(20)
+    q = torch.randn(1, 1, 2, HEAD_DIM, requires_grad=True)
+    index_k = torch.randn(4, 1, HEAD_DIM, requires_grad=True)
+    weights = (torch.rand(1, 1, 2) + 0.1).requires_grad_()
+    query = torch.randn(1, 1, 1, 8, requires_grad=True)
+    key = torch.randn(4, 1, 1, 8, requires_grad=True)
+    value = torch.randn(4, 1, 1, 8, requires_grad=True)
+
+    output, indexer_loss = dsa_module.chunked_dsa_forward(
+        q,
+        index_k,
+        weights,
+        query,
+        key,
+        value,
+        softmax_scale=1.0,
+        topk=4,
+        mask=None,
+        is_causal=False,
+        loss_coeff=0.1,
+        sparse_loss=False,
+        pg_collection=_ProcessGroups(),
+        chunk_size=1,
+        indexcache_hisa_config=IndexCacheHISAConfig(enabled=True),
+    )
+
+    assert indexer_loss is not None
+    (output.float().sum() + indexer_loss).backward()
+    for tensor in (q, index_k, weights):
+        assert tensor.grad is not None
+        assert torch.isfinite(tensor.grad.float()).all().item()
+        assert tensor.grad.float().abs().sum().item() > 0
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

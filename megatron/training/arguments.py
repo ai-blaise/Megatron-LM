@@ -2291,6 +2291,30 @@ def _add_spinquant_args(parser):
         default=1e-4,
         help="Epsilon clamp on per-token abs-max before scale derivation (matches SGLang).",
     )
+    group.add_argument(
+        "--dsa-indexcache-hisa-enabled",
+        action="store_true",
+        default=False,
+        help="Enable opt-in HISA top-k selection for NVFP4 IndexCache.",
+    )
+    group.add_argument(
+        "--dsa-indexcache-hisa-block-size",
+        type=int,
+        default=128,
+        help="HISA block size for NVFP4 IndexCache selection.",
+    )
+    group.add_argument(
+        "--dsa-indexcache-hisa-block-topk",
+        type=int,
+        default=64,
+        help="Fixed HISA block budget when compression ratio is zero.",
+    )
+    group.add_argument(
+        "--dsa-indexcache-hisa-compression-ratio",
+        type=float,
+        default=4.0,
+        help="Dynamic HISA compression ratio. The accepted NVFP4 path uses 4.0.",
+    )
     return parser
 
 
@@ -2621,6 +2645,10 @@ def _add_network_size_args(parser):
         "dsa_indexcache_quant_enabled",
         "dsa_indexcache_quantization",
         "dsa_indexcache_quant_eps",
+        "dsa_indexcache_hisa_enabled",
+        "dsa_indexcache_hisa_block_size",
+        "dsa_indexcache_hisa_block_topk",
+        "dsa_indexcache_hisa_compression_ratio",
         "use_streambp",
         "streambp_chunk_size",
         "streambp_logits_chunk_size",

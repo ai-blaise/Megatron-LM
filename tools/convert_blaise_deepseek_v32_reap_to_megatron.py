@@ -46,9 +46,10 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
     get_transformer_block_with_experimental_attention_variant_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.quantization.indexcache import INDEXCACHE_QUANT_NVFP4
 
 
-DEFAULT_MODEL_ID = "BlaiseAI/DeepSeek-V3.2-REAP-345B-NVFP4-W4A4KV4-IndexerK8-FP8-GatedNorm-G1"
+DEFAULT_MODEL_ID = "BlaiseAI/DeepSeek-V3.2-REAP-345B-SpinQuant-ActKV-NVFP4"
 E2M1_VALUES = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
 
 
@@ -321,9 +322,27 @@ class CompressedNvfp4StateSource(StateSource):
 class BlaiseDeepSeekV32ReapBridge(DeepSeekV3Bridge):
     """Bridge for the Blaise REAP DeepSeek-V3.2 DSA/G1/GatedNorm checkpoint."""
 
+    @staticmethod
+    def _get_hf_indexer_quantization(hf_config):
+        quant_config = getattr(hf_config, "quantization_config", None)
+        if not isinstance(quant_config, dict):
+            return None
+        indexer_config = quant_config.get("indexer_quantization")
+        return indexer_config if isinstance(indexer_config, dict) else None
+
+    @staticmethod
+    def _get_hf_kv_cache_scheme(hf_config):
+        quant_config = getattr(hf_config, "quantization_config", None)
+        if not isinstance(quant_config, dict):
+            return None
+        kv_cache_scheme = quant_config.get("kv_cache_scheme")
+        return kv_cache_scheme if isinstance(kv_cache_scheme, dict) else None
+
     def provider_bridge(self, hf_pretrained: PreTrainedCausalLM) -> MLAModelProvider:
         provider = super().provider_bridge(hf_pretrained)
         hf_config = hf_pretrained.config
+        hf_indexer_quantization = self._get_hf_indexer_quantization(hf_config)
+        hf_kv_cache_scheme = self._get_hf_kv_cache_scheme(hf_config)
 
         provider.transformer_layer_spec = get_transformer_block_with_experimental_attention_variant_spec
         provider.normalization = "RMSNorm"
@@ -338,6 +357,38 @@ class BlaiseDeepSeekV32ReapBridge(DeepSeekV3Bridge):
         provider.dsa_indexer_topk = getattr(hf_config, "index_topk", 2048)
         provider.dsa_indexer_loss_coeff = getattr(self, "dsa_indexer_loss_coeff", 0.01)
         provider.dsa_indexer_use_sparse_loss = getattr(self, "dsa_indexer_use_sparse_loss", False)
+        if hf_indexer_quantization is not None:
+            quant_method = hf_indexer_quantization.get("quant_method")
+            if quant_method:
+                provider.dsa_indexcache_quantization = str(quant_method)
+            hisa_config = hf_indexer_quantization.get("hisa")
+            if isinstance(hisa_config, dict) and bool(hisa_config.get("enabled", False)):
+                hisa_mode = hisa_config.get("mode", "indexcache-hisa")
+                if hisa_mode != "indexcache-hisa":
+                    raise ValueError(f"Unsupported IndexCache HISA mode {hisa_mode!r}.")
+                if provider.dsa_indexcache_quantization != INDEXCACHE_QUANT_NVFP4:
+                    raise ValueError(
+                        "HF IndexCache HISA config requires "
+                        "quant_method='nvfp4_e2m1_ue8m0'."
+                    )
+                provider.dsa_indexcache_hisa_enabled = True
+                provider.dsa_indexcache_hisa_block_size = int(
+                    hisa_config.get("block_size", 128)
+                )
+                provider.dsa_indexcache_hisa_block_topk = int(
+                    hisa_config.get("block_topk", 64)
+                )
+                provider.dsa_indexcache_hisa_compression_ratio = float(
+                    hisa_config.get("compression_ratio", 4.0)
+                )
+        if hf_kv_cache_scheme is not None:
+            quant_method = hf_kv_cache_scheme.get("quant_method")
+            if quant_method == "higgs_dense_2bit":
+                provider.enable_higgs_dense_2bit_kv_cache = True
+                provider.higgs_kv_preset = "dense_2bit"
+                provider.turboquant_kv_enabled = False
+            elif quant_method:
+                raise ValueError(f"Unsupported HF KV cache quantization method {quant_method!r}.")
 
         provider.attention_output_gate = bool(getattr(hf_config, "attention_output_gate", True))
         provider.gated_norm = bool(getattr(hf_config, "gated_norm", True))
@@ -349,6 +400,9 @@ class BlaiseDeepSeekV32ReapBridge(DeepSeekV3Bridge):
         provider.seq_length = getattr(self, "seq_length", 32768)
         provider.num_layers_in_first_pipeline_stage = getattr(
             self, "num_layers_in_first_pipeline_stage", None
+        )
+        provider.num_layers_in_last_pipeline_stage = getattr(
+            self, "num_layers_in_last_pipeline_stage", None
         )
 
         provider.tensor_model_parallel_size = getattr(self, "tensor_model_parallel_size", 1)
@@ -479,7 +533,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hf-model-id", default=os.environ.get("MODEL_ID", DEFAULT_MODEL_ID))
     parser.add_argument(
         "--output",
-        default=os.environ.get("LOAD_CKPT", str(Path.home() / "checkpoints/deepseek_v32_reap_megatron")),
+        default=os.environ.get(
+            "LOAD_CKPT",
+            str(Path.home() / "checkpoints/deepseek_v32_reap_spinquant_actkv_nvfp4_megatron"),
+        ),
     )
     parser.add_argument("--seq-length", type=int, default=int(os.environ.get("SEQ_LENGTH", "32768")))
     parser.add_argument("--tp", type=int, default=int(os.environ.get("TP", "4")))
@@ -490,7 +547,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--decoder-first-pipeline-num-layers",
         type=int,
-        default=int(os.environ.get("DECODER_FIRST_PIPELINE_NUM_LAYERS", "31")),
+        default=int(os.environ.get("DECODER_FIRST_PIPELINE_NUM_LAYERS", "17")),
+    )
+    parser.add_argument(
+        "--decoder-last-pipeline-num-layers",
+        type=int,
+        default=int(os.environ.get("DECODER_LAST_PIPELINE_NUM_LAYERS", "14")),
     )
     parser.add_argument("--dsa-indexer-loss-coeff", type=float, default=float(os.environ.get("DSA_INDEXER_LOSS_COEFF", "0.01")))
     parser.add_argument("--dequant-dtype", default=os.environ.get("DEQUANT_DTYPE", "bf16"))
@@ -515,6 +577,9 @@ def configure_model_bridge(model_bridge: MegatronModelBridge, args: argparse.Nam
     model_bridge.dsa_indexer_loss_coeff = args.dsa_indexer_loss_coeff
     model_bridge.num_layers_in_first_pipeline_stage = (
         args.decoder_first_pipeline_num_layers if args.pp > 1 else None
+    )
+    model_bridge.num_layers_in_last_pipeline_stage = (
+        args.decoder_last_pipeline_num_layers if args.pp > 1 else None
     )
 
 

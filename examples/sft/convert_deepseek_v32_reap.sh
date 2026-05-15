@@ -19,8 +19,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MEGATRON_DIR="${MEGATRON_DIR:-"${SCRIPT_DIR}/../.."}"
 cd "$MEGATRON_DIR"
 
-MODEL_ID="${MODEL_ID:-BlaiseAI/DeepSeek-V3.2-REAP-345B-NVFP4-W4A4KV4-IndexerK8-FP8-GatedNorm-G1}"
-LOAD_CKPT="${LOAD_CKPT:-"$HOME/checkpoints/deepseek_v32_reap_megatron"}"
+MODEL_ID="${MODEL_ID:-BlaiseAI/DeepSeek-V3.2-REAP-345B-SpinQuant-ActKV-NVFP4}"
+LOAD_CKPT="${LOAD_CKPT:-"$HOME/checkpoints/deepseek_v32_reap_spinquant_actkv_nvfp4_megatron"}"
 
 GPUS_PER_NODE="${GPUS_PER_NODE:-8}"
 NNODES="${SLURM_NNODES:-${NNODES:-2}}"
@@ -33,12 +33,13 @@ MASTER_ADDR="${MASTER_ADDR:-localhost}"
 MASTER_PORT="${MASTER_PORT:-29501}"
 
 TP="${TP:-4}"
-PP="${PP:-2}"
+PP="${PP:-4}"
 CP="${CP:-1}"
 EP="${EP:-4}"
 ETP="${ETP:-1}"
 SEQ_LENGTH="${SEQ_LENGTH:-32768}"
-DECODER_FIRST_PIPELINE_NUM_LAYERS="${DECODER_FIRST_PIPELINE_NUM_LAYERS:-31}"
+DECODER_FIRST_PIPELINE_NUM_LAYERS="${DECODER_FIRST_PIPELINE_NUM_LAYERS:-17}"
+DECODER_LAST_PIPELINE_NUM_LAYERS="${DECODER_LAST_PIPELINE_NUM_LAYERS:-14}"
 
 CMD=(
     uv run --no-sync torchrun
@@ -57,6 +58,7 @@ CMD=(
     --ep "$EP"
     --etp "$ETP"
     --decoder-first-pipeline-num-layers "$DECODER_FIRST_PIPELINE_NUM_LAYERS"
+    --decoder-last-pipeline-num-layers "$DECODER_LAST_PIPELINE_NUM_LAYERS"
 )
 
 if [[ "${METADATA_ONLY:-0}" == "1" ]]; then

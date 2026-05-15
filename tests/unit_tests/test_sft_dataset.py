@@ -5,6 +5,7 @@
 import pytest
 import os
 import sys
+import json
 from types import SimpleNamespace
 
 # Add parent directory to path for imports
@@ -49,6 +50,41 @@ class TestSFTLowLevelDataset:
         assert "content" in sample[0], "Missing content in first message"
         assert "content" in sample[1], "Missing content in second message"
         assert "content" in sample[2], "Missing content in third message"
+
+    def test_jsonl_synthesizes_missing_assistant_tool_calls(self, tmp_path):
+        """Tool result rows without assistant tool_calls should not crash tokenization."""
+        jsonl_path = tmp_path / "tool_rows.jsonl"
+        row = {
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "search",
+                        "description": "Search the web.",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+            "messages": [
+                {"role": "system", "content": "use tools"},
+                {"role": "user", "content": "find it"},
+                {"role": "assistant", "content": ""},
+                {"role": "tool", "content": json.dumps({"query": "first"})},
+                {"role": "tool", "content": json.dumps({"query": "second"})},
+                {"role": "assistant", "content": "done"},
+            ],
+        }
+        jsonl_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+        sample = SFTLowLevelDataset(str(jsonl_path))[0]
+
+        assert sample[0]["tools"][0]["function"]["name"] == "search"
+        assert sample[2]["role"] == "assistant"
+        assert len(sample[2]["tool_calls"]) == 2
+        assert sample[2]["tool_calls"][0]["function"]["name"] == "search"
+        assert json.loads(sample[2]["tool_calls"][0]["function"]["arguments"]) == {
+            "query": "first"
+        }
 
 
 class _FakeTokenizer:

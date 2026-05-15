@@ -28,6 +28,11 @@ from megatron.core.transformer.experimental_attention_variant.dsa_triton import 
     is_sparse_dsa_triton_supported,
     sparse_dsa_attention_triton,
 )
+from megatron.core.quantization.indexcache import (
+    INDEXCACHE_QUANT_NVFP4,
+    IndexCacheHISAConfig,
+    indexcache_hisa_topk,
+)
 
 try:
     from fast_hadamard_transform import hadamard_transform
@@ -898,6 +903,7 @@ class DSAIndexer(MegatronModule):
         self.softmax_scale: float = self.index_head_dim**-0.5
 
         self.indexcache_config = None
+        self.indexcache_hisa_config = None
         indexcache_quantization = getattr(
             self.config, "dsa_indexcache_quantization", "disabled"
         )
@@ -915,6 +921,23 @@ class DSAIndexer(MegatronModule):
                 quantization=resolve_indexcache_quantization(
                     quantization=indexcache_quantization,
                     quant_enabled=indexcache_quantization_enabled,
+                ),
+            )
+        if getattr(self.config, "dsa_indexcache_hisa_enabled", False):
+            if (
+                self.indexcache_config is None
+                or self.indexcache_config.quantization != INDEXCACHE_QUANT_NVFP4
+            ):
+                raise ValueError(
+                    "dsa_indexcache_hisa_enabled requires "
+                    "dsa_indexcache_quantization='nvfp4_e2m1_ue8m0'."
+                )
+            self.indexcache_hisa_config = IndexCacheHISAConfig(
+                enabled=True,
+                block_size=int(getattr(self.config, "dsa_indexcache_hisa_block_size", 128)),
+                block_topk=int(getattr(self.config, "dsa_indexcache_hisa_block_topk", 64)),
+                compression_ratio=float(
+                    getattr(self.config, "dsa_indexcache_hisa_compression_ratio", 4.0)
                 ),
             )
 
@@ -1400,12 +1423,14 @@ def _sparse_dsa_attention_chunk(
 
     for batch_idx in range(bsz):
         selected_positions = topk_indices[batch_idx]
+        valid_selected = selected_positions >= 0
+        gather_positions = selected_positions.clamp_min(0)
         query_batch = query[:, batch_idx]
         key_batch = key[:, batch_idx]
         score_blocks = []
         for topk_start in range(0, topk_k, topk_block_size):
             topk_end = min(topk_start + topk_block_size, topk_k)
-            block_positions = selected_positions[:, topk_start:topk_end]
+            block_positions = gather_positions[:, topk_start:topk_end]
             block_index = block_positions.reshape(-1)
             key_block = key_batch.index_select(0, block_index)
             key_block = key_block.view(q_len, topk_end - topk_start, num_heads, head_dim)
@@ -1420,7 +1445,7 @@ def _sparse_dsa_attention_chunk(
                     raise ValueError("query_positions and key_positions must be provided together")
                 q_pos = query_positions.to(device=query.device).unsqueeze(1)
                 selected_abs_positions = key_positions.to(device=query.device).index_select(
-                    0, selected_positions.reshape(-1).long()
+                    0, gather_positions.reshape(-1).long()
                 )
                 selected_abs_positions = selected_abs_positions.view_as(selected_positions)
                 invalid = selected_abs_positions > q_pos
@@ -1430,14 +1455,17 @@ def _sparse_dsa_attention_chunk(
             attention_scores = attention_scores.masked_fill(invalid.unsqueeze(-1), float("-inf"))
         elif mask is not None:
             if mask.dim() == 2:
-                selected_mask = mask[q_start : q_start + q_len, :].gather(1, selected_positions)
+                selected_mask = mask[q_start : q_start + q_len, :].gather(1, gather_positions)
             elif mask.dim() == 3:
                 selected_mask = mask[batch_idx, q_start : q_start + q_len, :].gather(
-                    1, selected_positions
+                    1, gather_positions
                 )
             else:
                 raise ValueError(f"DSA mask must be 2D or 3D, got shape {tuple(mask.shape)}")
             attention_scores = attention_scores + selected_mask.unsqueeze(-1)
+        attention_scores = attention_scores.masked_fill(
+            (~valid_selected).unsqueeze(-1), float("-inf")
+        )
 
         attention_probs = torch.softmax(attention_scores, dim=1, dtype=torch.float32).to(
             value.dtype
@@ -1448,7 +1476,7 @@ def _sparse_dsa_attention_chunk(
         output_batch = None
         for topk_start in range(0, topk_k, topk_block_size):
             topk_end = min(topk_start + topk_block_size, topk_k)
-            block_positions = selected_positions[:, topk_start:topk_end]
+            block_positions = gather_positions[:, topk_start:topk_end]
             block_index = block_positions.reshape(-1)
             selected_value = value_batch.index_select(0, block_index)
             selected_value = selected_value.view(
@@ -1482,6 +1510,7 @@ def chunked_dsa_forward(
     chunk_size: int,
     query_positions: Optional[torch.Tensor] = None,
     key_positions: Optional[torch.Tensor] = None,
+    indexcache_hisa_config: Optional[IndexCacheHISAConfig] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     sq, bsz, num_heads, head_dim = query.size()
     sk = key.size(0)
@@ -1491,6 +1520,7 @@ def chunked_dsa_forward(
     use_streaming_indexer_topk = loss_coeff <= 0 and _env_flag_enabled(
         _DSA_STREAMING_INDEXER_TOPK_ENV, "1"
     )
+    use_indexcache_hisa_topk = indexcache_hisa_config is not None
     index_scores_buffer = None
     topk_values_buffer = None
     topk_indices_buffer = None
@@ -1506,7 +1536,38 @@ def chunked_dsa_forward(
             None if query_positions is None else query_positions[q_start:q_end]
         )
 
-        if use_streaming_indexer_topk:
+        topk_indices = None
+        index_scores = None
+        if use_indexcache_hisa_topk:
+            topk_indices = indexcache_hisa_topk(
+                q_chunk,
+                weights_chunk,
+                k,
+                topk,
+                config=indexcache_hisa_config,
+                q_start=q_start,
+                is_causal=is_causal,
+                mask=mask,
+                query_positions=query_positions_chunk,
+                key_positions=key_positions,
+            )
+
+        if topk_indices is not None:
+            if loss_coeff > 0:
+                index_scores = _compute_index_scores(q_chunk, weights_chunk, k)
+                index_scores = _apply_dsa_score_mask(
+                    index_scores,
+                    mask,
+                    q_start,
+                    q_end,
+                    sk,
+                    is_causal,
+                    query_positions=query_positions_chunk,
+                    key_positions=key_positions,
+                )
+            else:
+                index_scores = None
+        elif use_streaming_indexer_topk:
             if is_dsa_indexer_scores_triton_supported(
                 q_chunk,
                 weights_chunk,
@@ -1576,7 +1637,9 @@ def chunked_dsa_forward(
             topk_k = min(topk, sk)
             topk_indices = index_scores.topk(topk_k, dim=-1, sorted=False)[1]
 
-        if use_triton_attention is None:
+        if use_indexcache_hisa_topk:
+            use_triton_attention = False
+        elif use_triton_attention is None:
             use_triton_attention = is_sparse_dsa_triton_supported(
                 query_chunk,
                 key,
@@ -1587,6 +1650,8 @@ def chunked_dsa_forward(
                 query_positions=query_positions_chunk,
                 key_positions=key_positions,
             )
+        if bool((topk_indices < 0).any().item()):
+            use_triton_attention = False
 
         if loss_coeff > 0:
             loss_index_scores = index_scores
@@ -1990,6 +2055,7 @@ class DSAttention(MegatronModule):
             chunk_size,
             query_positions=query_positions,
             key_positions=key_positions,
+            indexcache_hisa_config=self.indexer.indexcache_hisa_config,
         )
         if indexer_loss is not None:
             DSAIndexerLossLoggingHelper.save_loss_to_tracker(

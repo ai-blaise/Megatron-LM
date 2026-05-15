@@ -19,6 +19,122 @@ from megatron.core.datasets.utils import Split
 IGNORE_INDEX = -100
 
 
+def _json_loads_maybe(value: Any, default: Any = None) -> Any:
+    if value is None:
+        return default
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return default
+    return value
+
+
+def _json_dumps(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _normalize_tools(tools: Any) -> List[Dict[str, Any]]:
+    parsed = _json_loads_maybe(tools, [])
+    return parsed if isinstance(parsed, list) else []
+
+
+def _default_tool_name(tools: Any) -> str:
+    parsed_tools = _normalize_tools(tools)
+    if parsed_tools:
+        first = parsed_tools[0]
+        if isinstance(first, dict):
+            function = first.get("function", first)
+            if isinstance(function, dict) and function.get("name"):
+                return function["name"]
+    return "web-search"
+
+
+def _tool_query(tool_content: Any) -> str:
+    parsed = _json_loads_maybe(tool_content)
+    if isinstance(parsed, dict):
+        query = parsed.get("query")
+        if query is not None:
+            return str(query)
+    return ""
+
+
+def _synthetic_tool_call(tool_name: str, query: str, row_idx: int, call_idx: int) -> Dict[str, Any]:
+    return {
+        "id": f"call_{row_idx}_{call_idx}",
+        "type": "function",
+        "function": {
+            "name": tool_name,
+            "arguments": _json_dumps({"query": query}),
+        },
+    }
+
+
+def _normalize_sft_messages(item: Dict[str, Any], row_idx: int) -> Optional[List[Dict[str, Any]]]:
+    """Normalize common OpenAI-style tool traces for the DeepSeek SFT tokenizer."""
+    messages = item.get("messages", item.get("conversations"))
+    if not isinstance(messages, list):
+        return messages
+
+    tools = _normalize_tools(item.get("tools"))
+    tool_name = _default_tool_name(tools)
+    output: List[Dict[str, Any]] = []
+    synthetic_call_idx = 0
+
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            return messages
+
+        role = (message.get("role") or "").lower()
+        content = message.get("content") or ""
+
+        if role == "system":
+            normalized = dict(message)
+            normalized["role"] = "system"
+            normalized["content"] = content
+            if tools and not normalized.get("tools"):
+                normalized["tools"] = tools
+            output.append(normalized)
+            continue
+
+        if role == "assistant":
+            normalized = dict(message)
+            normalized["role"] = "assistant"
+            normalized["content"] = content
+            if not normalized.get("tool_calls"):
+                tool_calls = []
+                lookahead = index + 1
+                while lookahead < len(messages) and (messages[lookahead].get("role") or "").lower() == "tool":
+                    synthetic_call_idx += 1
+                    tool_calls.append(
+                        _synthetic_tool_call(
+                            tool_name,
+                            _tool_query(messages[lookahead].get("content") or ""),
+                            row_idx,
+                            synthetic_call_idx,
+                        )
+                    )
+                    lookahead += 1
+                if tool_calls:
+                    normalized["tool_calls"] = tool_calls
+            output.append(normalized)
+            continue
+
+        if role == "tool":
+            output.append({"role": "tool", "content": content})
+            continue
+
+        normalized = dict(message)
+        normalized["role"] = role
+        normalized["content"] = content
+        output.append(normalized)
+
+    if output and output[0].get("role") != "system" and tools:
+        output.insert(0, {"role": "system", "content": "", "tools": tools})
+
+    return output
+
+
 class SFTLowLevelDataset:
     """The low-level dataset loading jsonl data for SFT
 
@@ -96,7 +212,7 @@ class SFTLowLevelDataset:
             item = json.loads(dataset_file.readline())
         else:
             item = self.dataset[idx]
-        return item.get("messages", item.get("conversations"))
+        return _normalize_sft_messages(item, int(idx))
 
 
 class SFTDataset(MegatronDataset):

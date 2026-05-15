@@ -98,11 +98,11 @@ if [[ -z "${CXX:-}" && -x /usr/bin/g++ ]]; then
     export CXX=/usr/bin/g++
 fi
 
-MODEL_ID="${MODEL_ID:-BlaiseAI/DeepSeek-V3.2-REAP-345B-NVFP4-W4A4KV4-IndexerK8-FP8-GatedNorm-G1}"
+MODEL_ID="${MODEL_ID:-BlaiseAI/DeepSeek-V3.2-REAP-345B-SpinQuant-ActKV-NVFP4}"
 TOKENIZER_MODEL="${TOKENIZER_MODEL:-$MODEL_ID}"
 
-LOAD_CKPT="${LOAD_CKPT:-"$HOME/checkpoints/deepseek_v32_reap_megatron"}"
-SAVE_CKPT="${SAVE_CKPT:-"$HOME/checkpoints/sft_deepseek_v32_reap_nvfp4"}"
+LOAD_CKPT="${LOAD_CKPT:-"$HOME/checkpoints/deepseek_v32_reap_spinquant_actkv_nvfp4_megatron"}"
+SAVE_CKPT="${SAVE_CKPT:-"$HOME/checkpoints/sft_deepseek_v32_reap_spinquant_actkv_nvfp4"}"
 DATA_PATH="${DATA_PATH:-"$HOME/data/sft/blaise-sft-training-mix/nemotron-full-family.jsonl"}"
 TENSORBOARD_LOGS_PATH="${TENSORBOARD_LOGS_PATH:-"$HOME/tensorboard_logs/sft_deepseek_v32_reap_nvfp4"}"
 
@@ -259,7 +259,7 @@ DSA_ARGS=(
     --experimental-attention-variant dsa
     --dsa-indexer-n-heads 64
     --dsa-indexer-head-dim 128
-    --dsa-indexer-topk "${DSA_INDEXER_TOPK:-1024}"
+    --dsa-indexer-topk "${DSA_INDEXER_TOPK:-2048}"
     --dsa-indexer-loss-coeff "${DSA_INDEXER_LOSS_COEFF:-0.01}"
     --dsa-chunk-size "$DSA_CHUNK_SIZE"
 )
@@ -338,7 +338,10 @@ if [[ "${SPINQUANT:-1}" == "1" ]]; then
 fi
 
 TURBOQUANT_ARGS=()
-if [[ "${TURBOQUANT:-1}" == "1" ]]; then
+if [[ -z "${TURBOQUANT+x}" && "${USE_HIGGS:-0}" == "1" ]]; then
+    TURBOQUANT=0
+fi
+if [[ "${TURBOQUANT:-0}" == "1" ]]; then
     TURBOQUANT_ARGS+=(
         --turboquant-kv-enabled
         --turboquant-kv-preset "${TURBOQUANT_KV_PRESET:-latent_2p5bit_nc}"
@@ -346,12 +349,32 @@ if [[ "${TURBOQUANT:-1}" == "1" ]]; then
     )
 fi
 
+HIGGS_ARGS=()
+if [[ "${USE_HIGGS:-0}" == "1" ]]; then
+    HIGGS_ARGS+=(
+        --enable-higgs-dense-2bit-kv-cache
+        --higgs-kv-preset "${HIGGS_KV_PRESET:-dense_2bit}"
+    )
+fi
+
 INDEXCACHE_ARGS=()
 if [[ "${INDEXCACHE:-1}" == "1" ]]; then
+    INDEXCACHE_QUANT_METHOD="${DSA_INDEXCACHE_QUANTIZATION:-fp8_e4m3}"
+    if [[ "${DSA_INDEXCACHE_HISA:-0}" == "1" && -z "${DSA_INDEXCACHE_QUANTIZATION:-}" ]]; then
+        INDEXCACHE_QUANT_METHOD="nvfp4_e2m1_ue8m0"
+    fi
     INDEXCACHE_ARGS+=(
-        --dsa-indexcache-quantization "${DSA_INDEXCACHE_QUANTIZATION:-fp8_e4m3}"
+        --dsa-indexcache-quantization "${INDEXCACHE_QUANT_METHOD}"
         --dsa-indexcache-quant-eps "${DSA_INDEXCACHE_QUANT_EPS:-1e-4}"
     )
+    if [[ "${DSA_INDEXCACHE_HISA:-0}" == "1" ]]; then
+        INDEXCACHE_ARGS+=(
+            --dsa-indexcache-hisa-enabled
+            --dsa-indexcache-hisa-block-size "${DSA_INDEXCACHE_HISA_BLOCK_SIZE:-128}"
+            --dsa-indexcache-hisa-block-topk "${DSA_INDEXCACHE_HISA_BLOCK_TOPK:-64}"
+            --dsa-indexcache-hisa-compression-ratio "${DSA_INDEXCACHE_HISA_COMPRESSION_RATIO:-4.0}"
+        )
+    fi
 fi
 
 # ======================
@@ -460,6 +483,7 @@ ZCC_ARGS=()
 if [[ "${ENABLE_ZCC:-0}" == "1" ]]; then
     ZCC_ARGS+=(
         --enable-zero-cost-checkpoint
+        --zcc-workers-num "${ZCC_WORKERS_NUM:-1}"
         --zcc-flash-device "${ZCC_FLASH_DEVICE:-/dev/shm/megatron_zcc}"
         --zcc-durable-interval "${ZCC_DURABLE_INTERVAL:-10}"
         --zcc-compress "${ZCC_COMPRESS:-zstd:1}"
@@ -645,6 +669,7 @@ CMD=(
     "${DTYPE_ARGS[@]}"
     "${SPINQUANT_ARGS[@]}"
     "${TURBOQUANT_ARGS[@]}"
+    "${HIGGS_ARGS[@]}"
     "${INDEXCACHE_ARGS[@]}"
     "${SFT_ARGS[@]}"
     "${TOKENIZER_ARGS[@]}"

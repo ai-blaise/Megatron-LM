@@ -32,6 +32,11 @@ from megatron.core.quantization.indexcache.autograd import (
     IndexCacheKVFn,
     apply_indexcache_kv,
 )
+from megatron.core.quantization.indexcache.hisa import (
+    IndexCacheHISAConfig,
+    hisa_block_topk_counts,
+    indexcache_hisa_topk,
+)
 
 __all__ = [
     "INDEXCACHE_FP8_MAX",
@@ -43,8 +48,11 @@ __all__ = [
     "INDEXCACHE_QUANT_NVFP4",
     "INDEXCACHE_QUANTIZATION_CHOICES",
     "IndexCacheConfig",
+    "IndexCacheHISAConfig",
     "IndexCacheKVFn",
     "apply_indexcache_kv",
     "build_indexcache_config",
+    "hisa_block_topk_counts",
+    "indexcache_hisa_topk",
     "resolve_indexcache_quantization",
 ]
