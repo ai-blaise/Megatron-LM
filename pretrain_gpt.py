@@ -64,6 +64,10 @@ except ImportError:
 stimer = StragglerDetector()
 
 
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "").lower() in ("1", "true", "yes", "on")
+
+
 def get_batch(data_iterator, vp_stage: Optional[int] = None):
     """Generate a batch."""
     args = get_args()
@@ -130,10 +134,18 @@ def loss_func(
             the data parallel ranks
     """
     args = get_args()
+    numeric_debug = None
+    if _env_flag("MEGATRON_NUMERIC_DEBUG_LOSS"):
+        from megatron.core import numeric_debug as _numeric_debug
+
+        numeric_debug = _numeric_debug
 
     if has_nvidia_modelopt and getattr(args, 'modelopt_enabled', False):  # [ModelOpt]
         loss, num_tokens, report = loss_func_modelopt(loss_mask, output_tensor, model=model)
     else:
+        if numeric_debug is not None:
+            numeric_debug.log_tensor("loss.output_tensor.raw", output_tensor, event="loss.output")
+            numeric_debug.log_tensor("loss.loss_mask.raw", loss_mask, event="loss.mask")
         losses = output_tensor.view(-1).float()
         loss_mask = loss_mask.view(-1).float()
         loss = torch.sum(losses * loss_mask)
@@ -149,6 +161,14 @@ def loss_func(
                 [dsa_indexer_loss.clone().detach().view(1), num_tokens.view(1)]
             )
             report["total loss"] = torch.cat([loss.clone().detach().view(1), num_tokens.view(1)])
+            if numeric_debug is not None:
+                numeric_debug.log_tensor(
+                    "loss.dsa_indexer_loss", dsa_indexer_loss, event="loss.dsa"
+                )
+
+    if numeric_debug is not None:
+        numeric_debug.log_tensor("loss.scalar", loss, force=not torch.isfinite(loss).item())
+        numeric_debug.log_tensor("loss.num_tokens", num_tokens, event="loss.tokens")
 
     # Check individual rank losses are not NaN prior to DP all-reduce.
     rerun_state_machine = get_rerun_state_machine()
@@ -194,6 +214,11 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
     """
     args = get_args()
     timers = get_timers()
+    numeric_debug = None
+    if _env_flag("MEGATRON_NUMERIC_DEBUG_BATCH") or _env_flag("MEGATRON_NUMERIC_DEBUG"):
+        from megatron.core import numeric_debug as _numeric_debug
+
+        numeric_debug = _numeric_debug
 
     # Get the batch.
     timers('batch-generator', log_level=2).start()
@@ -210,6 +235,14 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
             packed_seq_params,
         ) = get_batch(data_iterator, vp_stage)
     timers('batch-generator').stop()
+
+    if numeric_debug is not None and _env_flag("MEGATRON_NUMERIC_DEBUG_BATCH"):
+        numeric_debug.set_context(phase="forward_step.batch")
+        numeric_debug.log_tensor("batch.tokens", tokens, event="batch.tokens")
+        numeric_debug.log_tensor("batch.labels", labels, event="batch.labels")
+        numeric_debug.log_tensor("batch.loss_mask", loss_mask, event="batch.loss_mask")
+        numeric_debug.log_tensor("batch.position_ids", position_ids, event="batch.position_ids")
+        numeric_debug.log_tensor("batch.padding_mask", padding_mask, event="batch.padding_mask")
 
     with stimer:
         if args.use_legacy_models:

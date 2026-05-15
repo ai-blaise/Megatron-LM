@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import math
+import os
 from abc import ABC, abstractmethod
 from typing import Optional, Union
 
@@ -917,6 +918,23 @@ class TopKRouter(Router):
 
         # Optionally apply expert bias
         self._apply_expert_bias(routing_map, padding_mask=padding_mask)
+
+        if os.getenv("MEGATRON_NUMERIC_DEBUG_ROUTER", "").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
+            from megatron.core import numeric_debug
+
+            numeric_debug.log_router_stats(
+                layer_number=self.layer_number,
+                logits=logits,
+                probs=probs,
+                routing_map=routing_map,
+                expert_bias=self.expert_bias,
+                padding_mask=padding_mask,
+            )
 
         return probs, routing_map
 

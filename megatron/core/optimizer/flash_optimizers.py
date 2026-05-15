@@ -528,6 +528,24 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
 
         self._fused = fused
         self._eco = eco
+        self._eco_lr_floor = os.environ.get("FLASH_ADAMW_ECO_LR_FLOOR", "off").lower()
+        self._eco_projection = os.environ.get("FLASH_ADAMW_ECO_PROJECTION", "off").lower()
+        self._eco_projection_scale_budget = float(
+            os.environ.get("FLASH_ADAMW_ECO_PROJECTION_SCALE_BUDGET", "2.0")
+        )
+        self._eco_projection_gain_budget = float(
+            os.environ.get("FLASH_ADAMW_ECO_PROJECTION_GAIN_BUDGET", "0.25")
+        )
+        self._eco_projection_steps = int(
+            os.environ.get("FLASH_ADAMW_ECO_PROJECTION_STEPS", "16")
+        )
+        if self._eco_projection not in ("off", "none", "0", "gain"):
+            raise ValueError(
+                "FLASH_ADAMW_ECO_PROJECTION must be one of off, none, 0, or gain; "
+                f"got {self._eco_projection!r}"
+            )
+        if self._eco_projection_steps < 1:
+            raise ValueError("FLASH_ADAMW_ECO_PROJECTION_STEPS must be >= 1")
 
         self._quantize = quantize
         self._master_bytewidth = master_bytewidth
@@ -597,6 +615,11 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
             "compress_state_dict": self._compress_state_dict,
             "check_numerics": self._check_numerics,
             "gradient_release": self._gradient_release,
+            "eco_lr_floor": self._eco_lr_floor,
+            "eco_projection": self._eco_projection,
+            "eco_projection_scale_budget": self._eco_projection_scale_budget,
+            "eco_projection_gain_budget": self._eco_projection_gain_budget,
+            "eco_projection_steps": self._eco_projection_steps,
         }
         for key, value in flash_config.items():
             header += f"    {key}: {value}\n"
@@ -1079,6 +1102,34 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
 
     def _min_step_size_relative_to_lr(self) -> float:
         return 1.0  # true for LION and SignSGD; too large for most subclasses
+
+    def _effective_eco_lr(self, hparams: dict[str, Any], lr: float) -> float:
+        floor = self._eco_lr_floor
+        if floor in ("", "0", "off", "none", "false"):
+            return lr
+        if floor in ("base", "initial", "post_warmup", "post-warmup"):
+            floor_lr = float(hparams.get("initial_lr", lr))
+        else:
+            try:
+                floor_lr = float(floor)
+            except ValueError as exc:
+                raise ValueError(
+                    "FLASH_ADAMW_ECO_LR_FLOOR must be off, base, initial, "
+                    f"post_warmup, or a numeric LR floor; got {floor!r}"
+                ) from exc
+        return max(lr, floor_lr)
+
+    def _adam_eco_scalar(self, hparams: dict[str, Any], step_int: int) -> float:
+        lr = float(hparams["lr"])
+        if not self._eco or lr == 0.0 or step_int < 1:
+            return 0.0
+        beta1 = float(hparams["betas"][0])
+        bc1 = 1.0 - beta1**step_int
+        effective_lr = self._effective_eco_lr(hparams, lr)
+        return (bc1 / effective_lr) * (1.0 - 1.0 / beta1)
+
+    def _eco_projection_mode_id(self) -> int:
+        return 1 if self._eco_projection == "gain" else 0
 
     def get_fp32_model_state_dict(
         self,
@@ -1995,14 +2046,7 @@ class FlashAdam(FlashOptimizer):
             param_state["step"] += 1
             step_int = int(param_state["step"].item())
 
-            # ECO scalar for Adam: (1-β₁^t)/η * (1-1/β₁)
-            # Skip ECO injection when lr=0 (e.g. during warmup start) to avoid
-            # division by zero.
-            bc1 = 1 - beta1**step_int
-            if self._eco and lr != 0.0:
-                eco_scalar = (bc1 / lr) * (1.0 - 1.0 / beta1)
-            else:
-                eco_scalar = 0.0
+            eco_scalar = self._adam_eco_scalar(hparams, step_int)
 
             return _fused_adam_step(
                 mom=exp_avg.kernel_tensor,
@@ -2077,8 +2121,10 @@ class FlashAdam(FlashOptimizer):
         # ECO: inject quantization error into first moment
         if self._eco:
             quant_error = param_f32 - param.to(dtype=torch.float32)
-            eco_scalar = (bias_correction1 / lr) * (1.0 - 1.0 / beta1)
-            exp_avg_f32.add_(eco_scalar * denom * quant_error)
+            step_int = int(step.item())
+            eco_scalar = self._adam_eco_scalar(hparams, step_int)
+            if eco_scalar != 0.0:
+                exp_avg_f32.add_(eco_scalar * denom * quant_error)
 
         # Update state tensors
         exp_avg.set_data(exp_avg_f32)
@@ -2140,10 +2186,29 @@ class FlashAdam(FlashOptimizer):
         if "step" not in param_state:
             param_state["step"] = torch.zeros(1, dtype=torch.int32, device="cpu")
 
-        # Grab grad (already shard-sized, attached by distrib_optimizer).
+        # Grab grad.  DistributedOptimizer normally attaches a shard-sized
+        # decoupled_grad.  For the pure-NVFP4 transient-master path we can
+        # also reconstruct the same shard directly from param.main_grad; keep
+        # both visible to numeric-debug so alias/lifetime bugs are diagnosable.
+        p_grad_source = "decoupled_grad"
         p_grad = getattr(p, "decoupled_grad", None)
         if p_grad is None:
+            p_grad_source = "grad"
             p_grad = p.grad
+        main_grad_shard = None
+        raw_main_grad = getattr(p, "main_grad", None)
+        if raw_main_grad is not None:
+            raw_main_grad_local = self._get_local_tensor(raw_main_grad)
+            main_grad_shard = raw_main_grad_local.view(-1)[
+                shard_offset : shard_offset + shard_size
+            ]
+        if (
+            main_grad_shard is not None
+            and os.getenv("MEGATRON_FLASH_ADAMW_NVFP4_USE_MAIN_GRAD", "").lower()
+            in ("1", "true", "yes", "on")
+        ):
+            p_grad_source = "main_grad_shard"
+            p_grad = main_grad_shard
         if p_grad is None:
             return
         grad_local = self._get_local_tensor(p_grad)
@@ -2177,6 +2242,139 @@ class FlashAdam(FlashOptimizer):
         param_state["step"] += 1
         step_int = int(param_state["step"].item())
 
+        numeric_debug = None
+        flashopt_log_event = False
+        flashopt_check_all = False
+        flashopt_check_precast = False
+        flashopt_abort_bad = False
+        if os.getenv("MEGATRON_NUMERIC_DEBUG_FLASHOPT", "").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
+            from megatron.core import numeric_debug as _numeric_debug
+
+            if _numeric_debug.rank_allowed_for("FLASHOPT") and _numeric_debug.active_for("FLASHOPT"):
+                numeric_debug = _numeric_debug
+                flashopt_log_event = numeric_debug.event_allowed(
+                    "flashopt.nvfp4_adam",
+                    limit=int(os.getenv("MEGATRON_NUMERIC_DEBUG_FLASHOPT_ADAM_LIMIT", "32")),
+                )
+                flashopt_check_all = os.getenv(
+                    "MEGATRON_NUMERIC_DEBUG_FLASHOPT_CHECK_ALL", ""
+                ).lower() in ("1", "true", "yes", "on")
+                flashopt_check_precast = os.getenv(
+                    "MEGATRON_NUMERIC_DEBUG_FLASHOPT_CHECK_PRECAST", ""
+                ).lower() in ("1", "true", "yes", "on")
+                flashopt_abort_bad = os.getenv(
+                    "MEGATRON_NUMERIC_DEBUG_FLASHOPT_ABORT",
+                    os.getenv("MEGATRON_NUMERIC_DEBUG_ABORT_ON_NONFINITE", "0"),
+                ).lower() in ("1", "true", "yes", "on")
+
+        debug_param_name = getattr(p, "_numeric_debug_name", "<unnamed>")
+
+        def _log_flashopt_tensor(
+            label: str,
+            tensor: torch.Tensor,
+            *,
+            force: bool = False,
+            full_finite: bool | None = None,
+            enabled: bool = True,
+            abort: bool = True,
+        ) -> None:
+            if numeric_debug is None or not enabled:
+                return
+            bad = numeric_debug.log_tensor(
+                f"flashopt.nvfp4_adam.{label}",
+                tensor,
+                force=force,
+                periodic=False,
+                full_finite=full_finite,
+            )
+            if bad and flashopt_abort_bad and abort:
+                raise RuntimeError(
+                    "FlashAdamW numeric debug found nonfinite "
+                    f"{label} for {debug_param_name} at step {step_int}"
+                )
+
+        if numeric_debug is not None and (flashopt_log_event or flashopt_check_all):
+            if flashopt_log_event:
+                def _ptr(tensor: torch.Tensor | None) -> str:
+                    if tensor is None:
+                        return "none"
+                    try:
+                        local = self._get_local_tensor(tensor)
+                        return (
+                            f"shape={tuple(local.shape)} dtype={local.dtype} "
+                            f"stride={tuple(local.stride())} "
+                            f"storage_offset={local.storage_offset()} "
+                            f"data_ptr={local.data_ptr()} "
+                            f"contiguous={local.is_contiguous()}"
+                        )
+                    except Exception as exc:
+                        return f"meta_error={exc}"
+
+                numeric_debug.log_line(
+                    "flashopt.nvfp4_adam",
+                    "before_adam "
+                    f"name={debug_param_name} step={step_int} lr={lr:.9e} "
+                    f"grad_source={p_grad_source} "
+                    f"shard_offset={int(shard_offset)} shard_size={int(shard_size)} "
+                    f"param_shape={tuple(p.shape)} grad_shape={tuple(grad_local.shape)} "
+                    f"quantized_state={exp_avg.is_quantized()} "
+                    f"main_grad={_ptr(raw_main_grad)} "
+                    f"main_grad_shard={_ptr(main_grad_shard)} "
+                    f"decoupled_grad={_ptr(getattr(p, 'decoupled_grad', None))} "
+                    f"grad={_ptr(getattr(p, 'grad', None))}",
+                    force=True,
+                )
+            _log_flashopt_tensor(
+                "grad.before_adam",
+                grad_local,
+                force=flashopt_log_event,
+                full_finite=True,
+                enabled=flashopt_log_event or flashopt_check_precast,
+                abort=False,
+            )
+            grad_bad = (
+                numeric_debug.tensor_stats(grad_local, full_finite=True)
+                if flashopt_abort_bad
+                else None
+            )
+            if main_grad_shard is not None:
+                _log_flashopt_tensor(
+                    "main_grad_shard.before_adam",
+                    main_grad_shard,
+                    force=flashopt_log_event,
+                    full_finite=True,
+                    enabled=flashopt_log_event or flashopt_check_precast,
+                )
+            _log_flashopt_tensor(
+                "master_shard.before_adam",
+                bf16_shard,
+                force=flashopt_log_event,
+                full_finite=flashopt_check_precast,
+                enabled=flashopt_log_event or flashopt_check_precast,
+            )
+            _log_flashopt_tensor(
+                "mom_scales.before_adam",
+                exp_avg.kernel_scales_or_self,
+                force=flashopt_log_event,
+                full_finite=True,
+            )
+            _log_flashopt_tensor(
+                "var_scales.before_adam",
+                exp_avg_sq.kernel_scales_or_self,
+                force=flashopt_log_event,
+                full_finite=True,
+            )
+            if grad_bad is not None and not grad_bad.get("all_finite", True):
+                raise RuntimeError(
+                    "FlashAdamW numeric debug found nonfinite "
+                    f"grad.before_adam for {debug_param_name} at step {step_int}"
+                )
+
         # Run fused Adam step on the BF16 shard (in-kernel ECO disabled —
         # NVFP4 error is injected post-cast by distrib_optimizer).
         _fused_adam_step(
@@ -2198,6 +2396,33 @@ class FlashAdam(FlashOptimizer):
             eco=False,
             eco_scalar=0.0,
         )
+
+        if numeric_debug is not None and (flashopt_log_event or flashopt_check_all):
+            if flashopt_log_event:
+                numeric_debug.log_line(
+                    "flashopt.nvfp4_adam",
+                    f"after_adam name={debug_param_name} step={step_int}",
+                    force=True,
+                )
+            _log_flashopt_tensor(
+                "master_shard.after_adam",
+                bf16_shard,
+                force=flashopt_log_event,
+                full_finite=flashopt_check_precast,
+                enabled=flashopt_log_event or flashopt_check_precast,
+            )
+            _log_flashopt_tensor(
+                "mom_scales.after_adam",
+                exp_avg.kernel_scales_or_self,
+                force=flashopt_log_event,
+                full_finite=True,
+            )
+            _log_flashopt_tensor(
+                "var_scales.after_adam",
+                exp_avg_sq.kernel_scales_or_self,
+                force=flashopt_log_event,
+                full_finite=True,
+            )
 
         # For very large NVFP4 models the default distributed-optimizer handoff
         # retains every updated shard until all params have stepped, which can
@@ -2282,14 +2507,67 @@ class FlashAdam(FlashOptimizer):
         if step_int < 1:
             return
 
-        # ECO scalar: α = ((1-β₁^t) / η) · (1 - 1/β₁)
-        bc1 = 1.0 - beta1**step_int
-        eco_scalar = (bc1 / lr) * (1.0 - 1.0 / beta1)
+        eco_scalar = self._adam_eco_scalar(group, step_int)
         bc2 = 1.0 - beta2**step_int
 
         exp_avg = param_state["exp_avg"]
         exp_avg_sq = param_state["exp_avg_sq"]
 
+        numeric_debug = None
+        log_flashopt_debug = False
+        if os.getenv("MEGATRON_NUMERIC_DEBUG_FLASHOPT", "").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
+            from megatron.core import numeric_debug as _numeric_debug
+
+            numeric_debug = _numeric_debug
+            log_flashopt_debug = numeric_debug.rank_allowed_for("FLASHOPT") and numeric_debug.event_allowed(
+                "flashopt.eco",
+                limit=int(os.getenv("MEGATRON_NUMERIC_DEBUG_FLASHOPT_LIMIT", "32")),
+            )
+            if log_flashopt_debug:
+                force_debug = os.getenv("MEGATRON_NUMERIC_DEBUG_FLASHOPT_FORCE", "").lower() in (
+                    "1",
+                    "true",
+                    "yes",
+                )
+                numeric_debug.log_line(
+                    "flashopt.eco",
+                    "pre_kernel "
+                    f"step={step_int} lr={lr:.9e} eco_scalar={eco_scalar:.9e} "
+                    f"bc2={bc2:.9e} eps={eps:.3e} "
+                    f"param_shape={tuple(param.shape)} pre_cast_shape={tuple(pre_cast.shape)} "
+                    f"projection={self._eco_projection} "
+                    f"scale_budget={self._eco_projection_scale_budget:.6f} "
+                    f"gain_budget={self._eco_projection_gain_budget:.6f} "
+                    f"projection_steps={self._eco_projection_steps}",
+                    force=True,
+                )
+                numeric_debug.log_tensor("flashopt.eco.pre_cast", pre_cast, force=force_debug)
+                numeric_debug.log_tensor("flashopt.eco.post_cast", post_cast, force=force_debug)
+                if os.getenv("MEGATRON_NUMERIC_DEBUG_FLASHOPT_DELTA", "").lower() in (
+                    "1",
+                    "true",
+                    "yes",
+                ):
+                    numeric_debug.log_tensor(
+                        "flashopt.eco.post_minus_pre",
+                        post_cast.float() - pre_cast.float(),
+                        force=force_debug,
+                    )
+                numeric_debug.log_tensor(
+                    "flashopt.eco.mom_scales.pre",
+                    exp_avg.kernel_scales_or_self,
+                    force=force_debug,
+                )
+                numeric_debug.log_tensor(
+                    "flashopt.eco.var_scales.pre",
+                    exp_avg_sq.kernel_scales_or_self,
+                    force=force_debug,
+                )
 
         _fused_eco_inject(
             mom=exp_avg.kernel_tensor,
@@ -2302,7 +2580,22 @@ class FlashAdam(FlashOptimizer):
             eps=eps,
             bc2=bc2,
             quantize_optim_states=exp_avg.is_quantized(),
+            projection_mode=self._eco_projection_mode_id(),
+            projection_scale_budget=self._eco_projection_scale_budget,
+            projection_gain_budget=self._eco_projection_gain_budget,
+            projection_steps=self._eco_projection_steps,
         )
+        if numeric_debug is not None and log_flashopt_debug:
+            numeric_debug.log_tensor(
+                "flashopt.eco.mom_scales.post",
+                exp_avg.kernel_scales_or_self,
+                force=True,
+            )
+            numeric_debug.log_tensor(
+                "flashopt.eco.var_scales.post",
+                exp_avg_sq.kernel_scales_or_self,
+                force=True,
+            )
 
     def inject_eco_error_from_nvfp4(
         self,
@@ -2338,14 +2631,70 @@ class FlashAdam(FlashOptimizer):
         if step_int < 1:
             return
 
-        # ECO scalar: α = ((1-β₁^t) / η) · (1 - 1/β₁)
-        bc1 = 1.0 - beta1**step_int
-        eco_scalar = (bc1 / lr) * (1.0 - 1.0 / beta1)
+        eco_scalar = self._adam_eco_scalar(group, step_int)
         bc2 = 1.0 - beta2**step_int
 
         exp_avg = param_state["exp_avg"]
         exp_avg_sq = param_state["exp_avg_sq"]
 
+        numeric_debug = None
+        log_flashopt_debug = False
+        if os.getenv("MEGATRON_NUMERIC_DEBUG_FLASHOPT", "").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
+            from megatron.core import numeric_debug as _numeric_debug
+
+            numeric_debug = _numeric_debug
+            log_flashopt_debug = numeric_debug.rank_allowed_for("FLASHOPT") and numeric_debug.event_allowed(
+                "flashopt.eco_nvfp4",
+                limit=int(os.getenv("MEGATRON_NUMERIC_DEBUG_FLASHOPT_LIMIT", "32")),
+            )
+            if log_flashopt_debug:
+                force_debug = os.getenv("MEGATRON_NUMERIC_DEBUG_FLASHOPT_FORCE", "").lower() in (
+                    "1",
+                    "true",
+                    "yes",
+                )
+                abort_bad = os.getenv(
+                    "MEGATRON_NUMERIC_DEBUG_FLASHOPT_ABORT",
+                    os.getenv("MEGATRON_NUMERIC_DEBUG_ABORT_ON_NONFINITE", "0"),
+                ).lower() in ("1", "true", "yes", "on")
+                param_name = getattr(param, "_numeric_debug_name", "<unnamed>")
+                numeric_debug.log_line(
+                    "flashopt.eco_nvfp4",
+                    "pre_kernel "
+                    f"name={param_name} step={step_int} lr={lr:.9e} eco_scalar={eco_scalar:.9e} "
+                    f"bc2={bc2:.9e} eps={eps:.3e} shard_offset={int(shard_offset)} "
+                    f"param_shape={tuple(param.shape)} pre_cast_shape={tuple(pre_cast.shape)} "
+                    f"projection={self._eco_projection} "
+                    f"scale_budget={self._eco_projection_scale_budget:.6f} "
+                    f"gain_budget={self._eco_projection_gain_budget:.6f} "
+                    f"projection_steps={self._eco_projection_steps}",
+                    force=True,
+                )
+                bad = numeric_debug.log_tensor(
+                    "flashopt.eco_nvfp4.pre_cast", pre_cast, force=force_debug
+                )
+                bad = numeric_debug.log_tensor(
+                    "flashopt.eco_nvfp4.mom_scales.pre",
+                    exp_avg.kernel_scales_or_self,
+                    force=force_debug,
+                    full_finite=True,
+                ) or bad
+                bad = numeric_debug.log_tensor(
+                    "flashopt.eco_nvfp4.var_scales.pre",
+                    exp_avg_sq.kernel_scales_or_self,
+                    force=force_debug,
+                    full_finite=True,
+                ) or bad
+                if bad and abort_bad:
+                    raise RuntimeError(
+                        "FlashAdamW numeric debug found nonfinite ECO input "
+                        f"for {param_name} at step {step_int}"
+                    )
         _fused_eco_inject_from_nvfp4_rowwise(
             mom=exp_avg.kernel_tensor,
             mom_scales_f16=exp_avg.kernel_scales_or_self,
@@ -2358,7 +2707,29 @@ class FlashAdam(FlashOptimizer):
             eps=eps,
             bc2=bc2,
             quantize_optim_states=exp_avg.is_quantized(),
+            projection_mode=self._eco_projection_mode_id(),
+            projection_scale_budget=self._eco_projection_scale_budget,
+            projection_gain_budget=self._eco_projection_gain_budget,
+            projection_steps=self._eco_projection_steps,
         )
+        if numeric_debug is not None and log_flashopt_debug:
+            bad = numeric_debug.log_tensor(
+                "flashopt.eco_nvfp4.mom_scales.post",
+                exp_avg.kernel_scales_or_self,
+                force=True,
+                full_finite=True,
+            )
+            bad = numeric_debug.log_tensor(
+                "flashopt.eco_nvfp4.var_scales.post",
+                exp_avg_sq.kernel_scales_or_self,
+                force=True,
+                full_finite=True,
+            ) or bad
+            if bad and abort_bad:
+                raise RuntimeError(
+                    "FlashAdamW numeric debug found nonfinite ECO output "
+                    f"for {param_name} at step {step_int}"
+                )
 
 
 class FlashAdamW(FlashAdam):
@@ -2851,6 +3222,10 @@ def _fused_eco_inject(
     bc2: float,
     quantize_optim_states: bool,
     group_size: int = 32,
+    projection_mode: int = 0,
+    projection_scale_budget: float = 2.0,
+    projection_gain_budget: float = 0.25,
+    projection_steps: int = 16,
 ) -> None:
     """Fused ECO error injection for an external (NVFP4) quantization error.
 
@@ -2907,10 +3282,14 @@ def _fused_eco_inject(
         eps,
         bc2,
         inv_sqrt_bc2,
+        projection_scale_budget,
+        projection_gain_budget,
         GROUP_SIZE=group_size,
         PARAM_DTYPE=_TORCH_DTYPE_TO_TRITON_DTYPE[pre_cast.dtype],
         PARAM_DTYPE_KEY=str(pre_cast.dtype),
         QUANTIZE_OPTIM_STATES=quantize_optim_states,
+        ECO_PROJECTION_MODE=projection_mode,
+        PROJECTION_STEPS=projection_steps,
     )
 
 
@@ -2924,7 +3303,13 @@ def _fused_eco_inject(
     # GROUP_SIZE is constant across the live training path (always 32). Key
     # on the dynamic shape and the two compile-time switches that change
     # which code paths the kernel emits.
-    key=["N", "QUANTIZE_OPTIM_STATES", "PARAM_DTYPE_KEY"],
+    key=[
+        "N",
+        "QUANTIZE_OPTIM_STATES",
+        "PARAM_DTYPE_KEY",
+        "ECO_PROJECTION_MODE",
+        "PROJECTION_STEPS",
+    ],
     # The kernel does an in-place RMW on the momentum buffer (and its
     # scales). Without ``restore_value`` Triton would invoke the kernel
     # once per config during the autotune sweep, applying the inject
@@ -2949,10 +3334,14 @@ def _triton_eco_inject_kernel(
     eps: float,
     bc2: float,
     inv_sqrt_bc2: float,
+    projection_scale_budget: float,
+    projection_gain_budget: float,
     GROUP_SIZE: tl.constexpr,
     PARAM_DTYPE: tl.constexpr,
     PARAM_DTYPE_KEY: tl.constexpr,
     QUANTIZE_OPTIM_STATES: tl.constexpr,
+    ECO_PROJECTION_MODE: tl.constexpr,
+    PROJECTION_STEPS: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
 ):
     """Single-kernel ECO injection for externally-computed quantization error.
@@ -3033,8 +3422,59 @@ def _triton_eco_inject_kernel(
         else:
             denom = tl.sqrt(var_f32 / bc2) + eps
 
-        # Inject: m += α · denom · e
-        mom_f32 = mom_f32 + eco_scalar * denom * error
+        # Inject: m += α · denom · e. When requested, project the injection
+        # to the largest per-group fraction the softsign INT8 carrier can
+        # store without large signed-gain distortion or scale inflation.
+        delta = eco_scalar * denom * error
+        if QUANTIZE_OPTIM_STATES and ECO_PROJECTION_MODE == 1:
+            mom_groups = mom_f32.reshape((num_groups_per_block, GROUP_SIZE))
+            delta_groups = delta.reshape((num_groups_per_block, GROUP_SIZE))
+            denom_groups = denom.reshape((num_groups_per_block, GROUP_SIZE))
+            chosen = tl.zeros((num_groups_per_block,), dtype=tl.float32)
+            found = chosen > 0.0
+            old_scales = tl.maximum(mom_scales.to(tl.float32), 1e-12)
+
+            for idx in tl.static_range(0, PROJECTION_STEPS):
+                frac = 1.0 - (idx / PROJECTION_STEPS)
+                target_delta = delta_groups * frac
+                target_replay = target_delta / denom_groups
+                target_energy = tl.sum(target_replay * target_replay, axis=1)
+                candidate_groups = mom_groups + target_delta
+                candidate_absmaxs = tl.maximum(
+                    tl.max(tl.abs(candidate_groups), axis=1), 1e-12
+                )
+                candidate_normalized = candidate_groups / candidate_absmaxs[:, None]
+                candidate_transformed = (
+                    2.0
+                    * candidate_normalized
+                    / (1.0 + tl.abs(candidate_normalized))
+                )
+                candidate_out = candidate_transformed * 127.0
+                candidate_i8 = tl.floor(candidate_out + 0.5).to(tl.float32)
+                candidate_unpacked = candidate_i8 / 127.0
+                candidate_recovered = candidate_unpacked / (
+                    2.0 - tl.abs(candidate_unpacked)
+                )
+                candidate_q = candidate_recovered * candidate_absmaxs[:, None]
+                stored_delta = candidate_q - mom_groups
+                stored_replay = stored_delta / denom_groups
+                gain = (
+                    tl.sum(stored_replay * target_replay, axis=1)
+                    / tl.maximum(target_energy, 1e-30)
+                )
+                scale_inflation = candidate_absmaxs / old_scales
+                ok = (
+                    (target_energy > 1e-30)
+                    & (scale_inflation <= projection_scale_budget)
+                    & (tl.abs(gain - 1.0) <= projection_gain_budget)
+                )
+                take = ok & ~found
+                chosen = tl.where(take, frac, chosen)
+                found = found | ok
+
+            delta = (delta_groups * chosen[:, None]).reshape((BLOCK_SIZE_N,))
+
+        mom_f32 = mom_f32 + delta
 
         # Quantize mom back to int8 + scales (matches _triton_adam_kernel)
         if QUANTIZE_OPTIM_STATES:
@@ -3068,6 +3508,10 @@ def _fused_eco_inject_from_nvfp4_rowwise(
     bc2: float,
     quantize_optim_states: bool,
     group_size: int = 32,
+    projection_mode: int = 0,
+    projection_scale_budget: float = 2.0,
+    projection_gain_budget: float = 0.25,
+    projection_steps: int = 16,
 ) -> None:
     """Fused ECO injection that decodes rowwise NVFP4 post-cast values inline."""
     N = pre_cast.numel()
@@ -3103,10 +3547,14 @@ def _fused_eco_inject_from_nvfp4_rowwise(
         eps,
         bc2,
         inv_sqrt_bc2,
+        projection_scale_budget,
+        projection_gain_budget,
         GROUP_SIZE=group_size,
         PARAM_DTYPE=_TORCH_DTYPE_TO_TRITON_DTYPE[pre_cast.dtype],
         PARAM_DTYPE_KEY=str(pre_cast.dtype),
         QUANTIZE_OPTIM_STATES=quantize_optim_states,
+        ECO_PROJECTION_MODE=projection_mode,
+        PROJECTION_STEPS=projection_steps,
         BLOCK_SIZE_N=block_size,
     )
 
@@ -3174,10 +3622,14 @@ def _triton_eco_inject_nvfp4_rowwise_kernel(
     eps: float,
     bc2: float,
     inv_sqrt_bc2: float,
+    projection_scale_budget: float,
+    projection_gain_budget: float,
     GROUP_SIZE: tl.constexpr,
     PARAM_DTYPE: tl.constexpr,
     PARAM_DTYPE_KEY: tl.constexpr,
     QUANTIZE_OPTIM_STATES: tl.constexpr,
+    ECO_PROJECTION_MODE: tl.constexpr,
+    PROJECTION_STEPS: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
 ):
     """ECO inject with post-cast values decoded from rowwise NVFP4 storage."""
@@ -3254,7 +3706,56 @@ def _triton_eco_inject_nvfp4_rowwise_kernel(
         else:
             denom = tl.sqrt(var_f32 / bc2) + eps
 
-        mom_f32 = mom_f32 + eco_scalar * denom * error
+        delta = eco_scalar * denom * error
+        if QUANTIZE_OPTIM_STATES and ECO_PROJECTION_MODE == 1:
+            mom_groups = mom_f32.reshape((num_groups_per_block, GROUP_SIZE))
+            delta_groups = delta.reshape((num_groups_per_block, GROUP_SIZE))
+            denom_groups = denom.reshape((num_groups_per_block, GROUP_SIZE))
+            chosen = tl.zeros((num_groups_per_block,), dtype=tl.float32)
+            found = chosen > 0.0
+            old_scales = tl.maximum(mom_scales.to(tl.float32), 1e-12)
+
+            for idx in tl.static_range(0, PROJECTION_STEPS):
+                frac = 1.0 - (idx / PROJECTION_STEPS)
+                target_delta = delta_groups * frac
+                target_replay = target_delta / denom_groups
+                target_energy = tl.sum(target_replay * target_replay, axis=1)
+                candidate_groups = mom_groups + target_delta
+                candidate_absmaxs = tl.maximum(
+                    tl.max(tl.abs(candidate_groups), axis=1), 1e-12
+                )
+                candidate_normalized = candidate_groups / candidate_absmaxs[:, None]
+                candidate_transformed = (
+                    2.0
+                    * candidate_normalized
+                    / (1.0 + tl.abs(candidate_normalized))
+                )
+                candidate_out = candidate_transformed * 127.0
+                candidate_i8 = tl.floor(candidate_out + 0.5).to(tl.float32)
+                candidate_unpacked = candidate_i8 / 127.0
+                candidate_recovered = candidate_unpacked / (
+                    2.0 - tl.abs(candidate_unpacked)
+                )
+                candidate_q = candidate_recovered * candidate_absmaxs[:, None]
+                stored_delta = candidate_q - mom_groups
+                stored_replay = stored_delta / denom_groups
+                gain = (
+                    tl.sum(stored_replay * target_replay, axis=1)
+                    / tl.maximum(target_energy, 1e-30)
+                )
+                scale_inflation = candidate_absmaxs / old_scales
+                ok = (
+                    (target_energy > 1e-30)
+                    & (scale_inflation <= projection_scale_budget)
+                    & (tl.abs(gain - 1.0) <= projection_gain_budget)
+                )
+                take = ok & ~found
+                chosen = tl.where(take, frac, chosen)
+                found = found | ok
+
+            delta = (delta_groups * chosen[:, None]).reshape((BLOCK_SIZE_N,))
+
+        mom_f32 = mom_f32 + delta
 
         if QUANTIZE_OPTIM_STATES:
             mom_groups = mom_f32.reshape((num_groups_per_block, GROUP_SIZE))
@@ -4322,10 +4823,11 @@ class _BucketStepScheduler:
     def _on_grad_sync_dispatched(self, bg: Any) -> None:
         """Invoked synchronously after the bucket group's RS dispatch.
 
-        Records a CUDA event right after the RS kernel was enqueued
-        (still on the dispatch stream) and instructs the optimizer
-        stream to ``wait_event`` on it before running the per-param
-        step.
+        The optimizer must not read ``param.main_grad`` until the async
+        reduce-scatter/all-reduce has actually completed.  A CUDA event
+        recorded after the host dispatch only orders against local stream
+        enqueue, not against NCCL ``Work`` completion, so prefer
+        ``Work.block_current_stream()`` when PyTorch exposes it.
 
         Skips entirely during CUDA graph capture — recording events
         and switching streams inside a captured region would either
@@ -4347,20 +4849,23 @@ class _BucketStepScheduler:
         if is_graph_capturing():
             return
 
-        # Where did the RS go? When num_distributed_optimizer_instances
-        # > 1, MCore puts it on bg.communication_stream; otherwise
-        # async_op=True keeps it on the default stream.
-        dispatch_stream = (
-            getattr(bg, "communication_stream", None)
-            or torch.cuda.current_stream()
-        )
-        rs_done = torch.cuda.Event()
-        rs_done.record(dispatch_stream)
+        handle = getattr(bg, "grad_reduce_handle", None)
 
-        # Run step + grad-zero on the optimizer stream, gated on the
-        # event so it cannot start before the RS data is visible.
+        # Run step + grad-zero on the optimizer stream, gated on the real
+        # collective completion when possible.  The fallback event is only
+        # used for synchronous/no-handle paths and preserves the old local
+        # stream ordering semantics.
         with torch.cuda.stream(self._opt_stream):
-            self._opt_stream.wait_event(rs_done)
+            if handle is not None and hasattr(handle, "block_current_stream"):
+                handle.block_current_stream()
+            else:
+                dispatch_stream = (
+                    getattr(bg, "communication_stream", None)
+                    or torch.cuda.current_stream()
+                )
+                rs_done = torch.cuda.Event()
+                rs_done.record(dispatch_stream)
+                self._opt_stream.wait_event(rs_done)
             self._step_bucket_group(bg)
 
     def _step_bucket_group(self, bg: Any) -> None:

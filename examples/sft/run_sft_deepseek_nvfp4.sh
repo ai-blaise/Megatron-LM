@@ -180,6 +180,19 @@ fi
 if [[ "$PP" -gt 1 && -n "${PIPELINE_MODEL_PARALLEL_LAYOUT:-}" ]]; then
     MODEL_PARALLEL_ARGS+=(--pipeline-model-parallel-layout "$PIPELINE_MODEL_PARALLEL_LAYOUT")
 fi
+if [[ "$PP" -gt 1 && -n "${PIPELINE_PARALLEL_SCHEDULE:-}" ]]; then
+    MODEL_PARALLEL_ARGS+=(--pipeline-parallel-schedule "$PIPELINE_PARALLEL_SCHEDULE")
+fi
+if [[ "$PP" -gt 1 && -n "${NUM_LAYERS_PER_VIRTUAL_PIPELINE_STAGE:-}" ]]; then
+    MODEL_PARALLEL_ARGS+=(
+        --num-layers-per-virtual-pipeline-stage "$NUM_LAYERS_PER_VIRTUAL_PIPELINE_STAGE"
+    )
+fi
+if [[ "$PP" -gt 1 && -n "${NUM_VIRTUAL_STAGES_PER_PIPELINE_RANK:-}" ]]; then
+    MODEL_PARALLEL_ARGS+=(
+        --num-virtual-stages-per-pipeline-rank "$NUM_VIRTUAL_STAGES_PER_PIPELINE_RANK"
+    )
+fi
 
 # ======================
 # Model args
@@ -246,8 +259,8 @@ DSA_ARGS=(
     --experimental-attention-variant dsa
     --dsa-indexer-n-heads 64
     --dsa-indexer-head-dim 128
-    --dsa-indexer-topk "${DSA_INDEXER_TOPK:-2048}"
-    --dsa-indexer-loss-coeff "${DSA_INDEXER_LOSS_COEFF:-0.0}"
+    --dsa-indexer-topk "${DSA_INDEXER_TOPK:-1024}"
+    --dsa-indexer-loss-coeff "${DSA_INDEXER_LOSS_COEFF:-0.01}"
     --dsa-chunk-size "$DSA_CHUNK_SIZE"
 )
 
@@ -259,7 +272,7 @@ MOE_ARGS=(
     --moe-layer-freq "$MOE_LAYER_FREQ"
     --moe-ffn-hidden-size 2048
     --moe-shared-expert-intermediate-size 2048
-    --moe-router-load-balancing-type seq_aux_loss
+    --moe-router-load-balancing-type "${MOE_ROUTER_LOAD_BALANCING_TYPE:-seq_aux_loss}"
     --moe-router-topk 8
     --moe-router-topk-scaling-factor 2.5
     --moe-router-num-groups 8

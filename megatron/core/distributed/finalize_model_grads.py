@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import os
 from functools import partial
 from typing import Callable, List, Optional, Union
 
@@ -36,6 +37,69 @@ def _get_main_grad_attr(param: torch.nn.Parameter):
     if hasattr(param, "main_grad"):
         return "main_grad"
     return "grad"
+
+
+def _numeric_debug_log_grads(model: List[torch.nn.Module], stage: str) -> None:
+    if os.getenv("MEGATRON_NUMERIC_DEBUG_FINALIZE_GRAD", "").lower() not in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return
+    from megatron.core import numeric_debug
+
+    if not numeric_debug.rank_allowed_for("FINALIZE_GRAD") or not numeric_debug.active_for(
+        "FINALIZE_GRAD"
+    ):
+        return
+    if not numeric_debug.event_allowed(
+        f"finalize_grad.{stage}",
+        limit=int(os.getenv("MEGATRON_NUMERIC_DEBUG_FINALIZE_GRAD_STAGE_LIMIT", "8")),
+    ):
+        return
+
+    pattern = os.getenv(
+        "MEGATRON_NUMERIC_DEBUG_FINALIZE_GRAD_REGEX",
+        r"shared_experts\.linear_fc2\.weight",
+    )
+    full_finite = os.getenv(
+        "MEGATRON_NUMERIC_DEBUG_FINALIZE_GRAD_FULL_FINITE", "1"
+    ).lower() in ("1", "true", "yes", "on")
+    abort_on_bad = os.getenv(
+        "MEGATRON_NUMERIC_DEBUG_FINALIZE_GRAD_ABORT",
+        os.getenv("MEGATRON_NUMERIC_DEBUG_ABORT_ON_NONFINITE", "1"),
+    ).lower() in ("1", "true", "yes", "on")
+
+    scanned = 0
+    bad = 0
+    for chunk_idx, model_chunk in enumerate(model):
+        for name, param in model_chunk.named_parameters():
+            qualified = f"chunk{chunk_idx}.{name}"
+            if not numeric_debug.name_matches(qualified, "FINALIZE_GRAD", pattern):
+                continue
+            grad_attr = _get_main_grad_attr(param)
+            grad = getattr(param, grad_attr, None)
+            if grad is None:
+                continue
+            scanned += 1
+            is_bad = numeric_debug.log_tensor(
+                f"finalize_grad.{stage}.{qualified}.{grad_attr}",
+                grad,
+                force=True,
+                periodic=False,
+                full_finite=full_finite,
+            )
+            bad += int(is_bad)
+            if is_bad and abort_on_bad:
+                raise RuntimeError(
+                    f"numeric debug found nonfinite grad at finalize stage {stage}: {qualified}"
+                )
+    numeric_debug.log_line(
+        "finalize_grad",
+        f"{stage} scanned={scanned} bad={bad}",
+        force=True,
+    )
 
 
 def _unshard_if_dtensor(tensor: Union[torch.Tensor, "DTensor"]) -> torch.Tensor:
@@ -323,10 +387,25 @@ def _update_router_expert_bias(model: List[torch.nn.Module], config: Transformer
 
         stacked_bias_sum = torch.stack(quantile_bias_sum_list, dim=0)
         stacked_steps = torch.stack(quantile_bias_steps_list, dim=0).unsqueeze(-1)
+        numeric_debug = None
+        if os.getenv("MEGATRON_NUMERIC_DEBUG_ROUTER", "").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
+            from megatron.core import numeric_debug as _numeric_debug
+
+            numeric_debug = _numeric_debug
+            numeric_debug.set_context(phase="router_bias_update_quantile")
+            numeric_debug.log_tensor("router_bias.quantile.bias_sum", stacked_bias_sum)
+            numeric_debug.log_tensor("router_bias.quantile.steps", stacked_steps)
         group = parallel_state.get_tensor_and_data_parallel_group(with_context_parallel=True)
         torch.distributed.all_reduce(stacked_bias_sum, group=group)
         torch.distributed.all_reduce(stacked_steps, group=group)
         updated_bias = stacked_bias_sum / stacked_steps.clamp_min(1.0)
+        if numeric_debug is not None:
+            numeric_debug.log_tensor("router_bias.quantile.updated_bias", updated_bias)
         has_updates = stacked_steps.squeeze(-1) > 0
 
         for expert_bias, next_bias, has_update in zip(
@@ -359,9 +438,24 @@ def _update_router_expert_bias(model: List[torch.nn.Module], config: Transformer
         return
     stacked_tokens_per_expert = torch.stack(tokens_per_expert_list, dim=0)
     stacked_expert_bias = torch.stack(expert_bias_list, dim=0)
+    numeric_debug = None
+    if os.getenv("MEGATRON_NUMERIC_DEBUG_ROUTER", "").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        from megatron.core import numeric_debug as _numeric_debug
+
+        numeric_debug = _numeric_debug
+        numeric_debug.set_context(phase="router_bias_update_sign")
+        numeric_debug.log_tensor("router_bias.sign.tokens_per_expert", stacked_tokens_per_expert)
+        numeric_debug.log_tensor("router_bias.sign.expert_bias.pre", stacked_expert_bias)
     stacked_updated_expert_bias = get_updated_expert_bias(
         stacked_tokens_per_expert, stacked_expert_bias, config.moe_router_bias_update_rate
     )
+    if numeric_debug is not None:
+        numeric_debug.log_tensor("router_bias.sign.expert_bias.post", stacked_updated_expert_bias)
 
     for expert_bias, updated_expert_bias in zip(expert_bias_list, stacked_updated_expert_bias):
         expert_bias.copy_(updated_expert_bias)
@@ -488,6 +582,8 @@ def finalize_model_grads(
         pos_emb_group = parallel_state.get_position_embedding_group(check_initialized=False)
         dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
 
+    _numeric_debug_log_grads(model, "before_grad_sync")
+
     # All-reduce / reduce-scatter across DP replicas.
     if config.timers is not None:
         config.timers('all-grads-sync', log_level=1).start(barrier=config.barrier_with_L1_time)
@@ -495,6 +591,7 @@ def finalize_model_grads(
         model_chunk.finish_grad_sync(force_all_reduce=force_all_reduce)
     if config.timers is not None:
         config.timers('all-grads-sync').stop()
+    _numeric_debug_log_grads(model, "after_grad_sync")
 
     # All-reduce t_embedder grads (for pp & vpp of DiT).
     if config.timers is not None:
@@ -513,6 +610,7 @@ def finalize_model_grads(
     _allreduce_non_tensor_model_parallel_grads(model, config, tp_group)
     if config.timers is not None:
         config.timers('non-tensor-parallel-grads-all-reduce').stop()
+    _numeric_debug_log_grads(model, "after_non_tp_allreduce")
 
     # All-reduce embedding grads (for pipeline parallelism).
     if config.timers is not None:
@@ -546,7 +644,9 @@ def finalize_model_grads(
 
         # all-reduce across DP ranks.
         torch.distributed.all_reduce(num_tokens, group=dp_cp_group)
+        _numeric_debug_log_grads(model, "before_token_scale")
         for model_chunk in model:
             if num_tokens > 0:
                 scaling = 1.0 / num_tokens
                 model_chunk.scale_gradients(scaling)
+        _numeric_debug_log_grads(model, "after_token_scale")

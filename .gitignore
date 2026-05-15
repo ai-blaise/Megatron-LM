@@ -28,3 +28,5 @@ docs/apidocs
 .codex
 snapshots/*
 megatron/core/datasets/helpers_cpp
+artifacts/
+

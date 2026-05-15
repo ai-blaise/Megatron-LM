@@ -5,6 +5,7 @@
 import gc
 import itertools
 import logging
+import os
 from collections import ChainMap
 from dataclasses import replace
 from logging import getLogger
@@ -2831,6 +2832,73 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         if self.ddp_config.use_megatron_fsdp:
             return
 
+        copy_debug = os.getenv("MEGATRON_NUMERIC_DEBUG_OPTIMIZER_GRAD", "").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        numeric_debug = None
+        if copy_debug:
+            try:
+                from megatron.core import numeric_debug as _numeric_debug
+
+                if _numeric_debug.rank_allowed_for("OPTIMIZER_GRAD") and _numeric_debug.active_for(
+                    "OPTIMIZER_GRAD"
+                ):
+                    numeric_debug = _numeric_debug
+            except Exception:
+                numeric_debug = None
+
+        def _debug_copy(model_param, model_grad, shard_model_grad, param_range, stage: str):
+            if numeric_debug is None:
+                return
+            name = getattr(model_param, "_numeric_debug_name", "<unnamed>")
+            if not numeric_debug.name_matches(
+                name, "OPTIMIZER_GRAD", r"shared_experts\.linear_fc2\.weight"
+            ):
+                return
+            limit = int(os.getenv("MEGATRON_NUMERIC_DEBUG_OPTIMIZER_GRAD_COPY_LIMIT", "8"))
+            if not numeric_debug.event_allowed(f"optimizer_grad.copy.{stage}", limit=limit):
+                return
+
+            def _ptr(tensor):
+                if tensor is None:
+                    return "none"
+                try:
+                    local = tensor.to_local() if hasattr(tensor, "to_local") else tensor
+                    return (
+                        f"shape={tuple(local.shape)} dtype={local.dtype} "
+                        f"stride={tuple(local.stride())} "
+                        f"storage_offset={local.storage_offset()} "
+                        f"data_ptr={local.data_ptr()} "
+                        f"contiguous={local.is_contiguous()}"
+                    )
+                except Exception as exc:
+                    return f"meta_error={exc}"
+
+            numeric_debug.log_line(
+                "optimizer_grad.copy",
+                f"{stage} name={name} range=({param_range.start},{param_range.end}) "
+                f"main_grad={_ptr(model_grad)} shard={_ptr(shard_model_grad)} "
+                f"old_decoupled={_ptr(getattr(model_param, 'decoupled_grad', None))}",
+                force=True,
+            )
+            numeric_debug.log_tensor(
+                f"optimizer_grad.copy.{stage}.{name}.main_grad",
+                model_grad,
+                force=True,
+                periodic=False,
+                full_finite=True,
+            )
+            numeric_debug.log_tensor(
+                f"optimizer_grad.copy.{stage}.{name}.shard_model_grad",
+                shard_model_grad,
+                force=True,
+                periodic=False,
+                full_finite=True,
+            )
+
         # Utility method for copying group grads.
         def copy_group_grads(model_groups, shard_main_groups):
             for model_group, shard_main_group in zip(model_groups, shard_main_groups):
@@ -2845,7 +2913,21 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         shard_model_grad = model_grad.view(-1)[
                             param_range.start : param_range.end
                         ]
+                        _debug_copy(
+                            model_param,
+                            model_grad,
+                            shard_model_grad,
+                            param_range,
+                            "before_assign_nvfp4",
+                        )
                         model_param.decoupled_grad = shard_model_grad
+                        _debug_copy(
+                            model_param,
+                            model_grad,
+                            model_param.decoupled_grad,
+                            param_range,
+                            "after_assign_nvfp4",
+                        )
                         continue
 
                     param_range_map = self._get_model_param_range_map(model_param)
@@ -2863,9 +2945,37 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         # Use decoupled_grad when param dtype != FP32 (e.g. BF16
                         # master shards for FlashAdamW) to avoid PyTorch's
                         # param/grad dtype matching requirement.
+                        _debug_copy(
+                            model_param,
+                            model_grad,
+                            shard_model_grad,
+                            param_range,
+                            "before_assign_decoupled",
+                        )
                         shard_main_param.decoupled_grad = shard_model_grad
+                        _debug_copy(
+                            model_param,
+                            model_grad,
+                            shard_main_param.decoupled_grad,
+                            param_range,
+                            "after_assign_decoupled",
+                        )
                     else:
+                        _debug_copy(
+                            model_param,
+                            model_grad,
+                            shard_model_grad,
+                            param_range,
+                            "before_assign_grad",
+                        )
                         shard_main_param.grad = shard_model_grad.float()
+                        _debug_copy(
+                            model_param,
+                            model_grad,
+                            shard_main_param.grad,
+                            param_range,
+                            "after_assign_grad",
+                        )
 
         # Copy model groups to shard groups.
         if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:

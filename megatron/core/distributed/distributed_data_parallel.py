@@ -1,6 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import logging
+import os
 from contextlib import contextmanager
 from typing import Optional
 
@@ -128,6 +129,7 @@ class DistributedDataParallel(_BaseDataParallel):
                 dense_params.append(param)
             else:
                 expert_parallel_params.append(param)
+        self.param_to_name = param_to_name
 
         def _allocate_buffers_for_parameters(
             input_params, data_parallel_group, gradient_scaling_factor
@@ -438,7 +440,59 @@ class DistributedDataParallel(_BaseDataParallel):
                 if param.grad is not None and (
                     not param.grad_added_to_main_grad or getattr(param, 'zero_out_wgrad', False)
                 ):
+                    numeric_debug = None
+                    debug_this_grad = False
+                    if os.getenv("MEGATRON_NUMERIC_DEBUG_DDP_GRAD", "").lower() in (
+                        "1",
+                        "true",
+                        "yes",
+                        "on",
+                    ):
+                        from megatron.core import numeric_debug as _numeric_debug
+
+                        param_name = getattr(self, "param_to_name", {}).get(param, "<unnamed>")
+                        if (
+                            _numeric_debug.rank_allowed_for("DDP_GRAD")
+                            and _numeric_debug.active_for("DDP_GRAD")
+                            and _numeric_debug.name_matches(
+                                param_name,
+                                "DDP_GRAD",
+                                r"shared_experts\.linear_fc2\.weight",
+                            )
+                        ):
+                            numeric_debug = _numeric_debug
+                            debug_this_grad = True
+                            numeric_debug.log_tensor(
+                                f"ddp_grad.{param_name}.param_grad.before_add",
+                                param.grad,
+                                force=True,
+                                periodic=False,
+                                full_finite=True,
+                            )
+                            numeric_debug.log_tensor(
+                                f"ddp_grad.{param_name}.main_grad.before_add",
+                                param.main_grad,
+                                force=True,
+                                periodic=False,
+                                full_finite=True,
+                            )
                     param.main_grad.add_(param.grad.data)
+                    if debug_this_grad:
+                        bad = numeric_debug.log_tensor(
+                            f"ddp_grad.{param_name}.main_grad.after_add",
+                            param.main_grad,
+                            force=True,
+                            periodic=False,
+                            full_finite=True,
+                        )
+                        if bad and os.getenv(
+                            "MEGATRON_NUMERIC_DEBUG_DDP_GRAD_ABORT",
+                            os.getenv("MEGATRON_NUMERIC_DEBUG_ABORT_ON_NONFINITE", "1"),
+                        ).lower() in ("1", "true", "yes", "on"):
+                            raise RuntimeError(
+                                "numeric debug found nonfinite DDP accumulated grad "
+                                f"for {param_name}"
+                            )
                 param.grad = None
 
                 if self.ddp_config.overlap_grad_reduce and should_streambp_register_grad_ready(param):

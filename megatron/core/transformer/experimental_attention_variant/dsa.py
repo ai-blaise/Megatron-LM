@@ -1903,6 +1903,40 @@ class DSAttention(MegatronModule):
             )
 
         q, k, weights = self.indexer.forward_before_topk(x, qr, packed_seq_params)
+        numeric_debug = None
+        log_dsa_debug = False
+        force_debug = False
+        if os.getenv("MEGATRON_NUMERIC_DEBUG_DSA", "").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
+            from megatron.core import numeric_debug as _numeric_debug
+
+            numeric_debug = _numeric_debug
+            log_dsa_debug = numeric_debug.rank_allowed_for("DSA") and numeric_debug.event_allowed(
+                f"dsa.layer{self.layer_number}",
+                limit=int(os.getenv("MEGATRON_NUMERIC_DEBUG_DSA_LIMIT", "64")),
+            )
+            force_debug = os.getenv("MEGATRON_NUMERIC_DEBUG_DSA_FORCE", "").lower() in (
+                "1",
+                "true",
+                "yes",
+            )
+            if log_dsa_debug:
+                numeric_debug.log_tensor(
+                    f"dsa.layer{self.layer_number}.query", query, force=force_debug
+                )
+                numeric_debug.log_tensor(f"dsa.layer{self.layer_number}.key", key, force=force_debug)
+                numeric_debug.log_tensor(
+                    f"dsa.layer{self.layer_number}.value", value, force=force_debug
+                )
+                numeric_debug.log_tensor(f"dsa.layer{self.layer_number}.q_index", q, force=force_debug)
+                numeric_debug.log_tensor(f"dsa.layer{self.layer_number}.k_index", k, force=force_debug)
+                numeric_debug.log_tensor(
+                    f"dsa.layer{self.layer_number}.weights", weights, force=force_debug
+                )
         streambp_query_positions = None
         streambp_key_positions = None
         if streambp_positions is not None:
@@ -1962,5 +1996,15 @@ class DSAttention(MegatronModule):
                 loss=indexer_loss, layer_number=self.layer_number, num_layers=self.config.num_layers
             )
             DSAIndexerAuxLossState.add(indexer_loss)
+        if numeric_debug is not None and log_dsa_debug:
+            numeric_debug.log_tensor(
+                f"dsa.layer{self.layer_number}.output", output, force=force_debug
+            )
+            if indexer_loss is not None:
+                numeric_debug.log_tensor(
+                    f"dsa.layer{self.layer_number}.indexer_loss",
+                    indexer_loss,
+                    force=force_debug,
+                )
 
         return output

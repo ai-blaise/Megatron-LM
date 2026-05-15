@@ -1876,6 +1876,32 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             seqlen_sum_this_global_batch = args.seq_length * args.global_batch_size
             seqlen_squared_sum_this_global_batch = args.seq_length ** 2 * args.global_batch_size
 
+        numeric_debug = None
+        numeric_debug_enabled = os.getenv("MEGATRON_NUMERIC_DEBUG", "").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        grad_ownership_enabled = os.getenv("MEGATRON_GRAD_OWNERSHIP", "").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        if numeric_debug_enabled or grad_ownership_enabled:
+            from megatron.core import numeric_debug as _numeric_debug
+
+            numeric_debug = _numeric_debug
+            numeric_debug.set_context(
+                iteration=(iteration + 1) if iteration is not None else 0,
+                phase="forward_backward",
+            )
+            numeric_debug.attach_param_names(model)
+            if numeric_debug_enabled:
+                numeric_debug.register_forward_hooks(model)
+                numeric_debug.register_grad_hooks(model)
+
         # Forward pass.
         if save_dgrads_in_this_iteration:
             enable_dgrad_logging(model, args.save)
@@ -1928,6 +1954,29 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         unwrapped_model.cancel_gradients_last_layer(args.curr_iteration)
 
     # Update parameters.
+    numeric_debug_enabled = os.getenv("MEGATRON_NUMERIC_DEBUG", "").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    grad_ownership_enabled = os.getenv("MEGATRON_GRAD_OWNERSHIP", "").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    if numeric_debug_enabled or grad_ownership_enabled:
+        from megatron.core import numeric_debug as _numeric_debug
+
+        numeric_debug = _numeric_debug
+        numeric_debug.set_context(
+            iteration=(iteration + 1) if iteration is not None else 0,
+            phase="pre_optimizer",
+        )
+        numeric_debug.attach_param_names(model)
+        if numeric_debug_enabled:
+            numeric_debug.log_param_stats(model, phase="pre_optimizer")
 
     optimizer_probe = os.getenv("MEGATRON_OPTIMIZER_STEP_PROBE", "").lower() in (
         "1",
@@ -1950,6 +1999,30 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+
+    if os.getenv("MEGATRON_NUMERIC_DEBUG", "").lower() in ("1", "true", "yes", "on"):
+        from megatron.core import numeric_debug as _numeric_debug
+
+        numeric_debug = _numeric_debug
+        numeric_debug.set_context(
+            iteration=(iteration + 1) if iteration is not None else 0,
+            phase="post_optimizer",
+        )
+        if grad_norm is not None:
+            numeric_debug.log_tensor(
+                "optimizer.grad_norm",
+                grad_norm if torch.is_tensor(grad_norm) else torch.tensor(grad_norm),
+                force=True,
+            )
+        if num_zeros_in_grad is not None:
+            numeric_debug.log_tensor(
+                "optimizer.num_zeros_in_grad",
+                num_zeros_in_grad
+                if torch.is_tensor(num_zeros_in_grad)
+                else torch.tensor(num_zeros_in_grad),
+                force=True,
+            )
+        numeric_debug.log_param_stats(model, phase="post_optimizer")
 
     if optimizer_probe:
         torch.cuda.synchronize()

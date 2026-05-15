@@ -5,6 +5,7 @@
 import copy
 import logging
 import math
+import os
 import warnings
 from abc import ABC, abstractmethod
 from itertools import chain
@@ -208,9 +209,11 @@ class MegatronOptimizer(ABC):
             grads_for_norm = self.get_main_grads_for_grad_norm()
         else:
             grads_for_norm = []
+        self._numeric_debug_log_optimizer_grads("before_grad_norm")
         grad_norm = get_grad_norm_fp32(
             grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
         )
+        self._numeric_debug_log_optimizer_grads("after_grad_norm")
 
         if params:
             clip_grad_by_total_norm_fp32(
@@ -218,12 +221,93 @@ class MegatronOptimizer(ABC):
                 clip_grad,
                 grad_norm,
                 self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8,
+                grad_stats_parallel_group=self.get_grad_stats_parallel_group(),
+            )
+            self._numeric_debug_log_optimizer_grads(
+                f"after_clip_grad_norm_{float(grad_norm):.6e}"
             )
         return grad_norm
+
+    def _numeric_debug_log_optimizer_grads(self, stage: str) -> None:
+        if os.getenv("MEGATRON_NUMERIC_DEBUG_OPTIMIZER_GRAD", "").lower() not in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
+            return
+        try:
+            from megatron.core import numeric_debug
+        except Exception:
+            return
+        if not numeric_debug.rank_allowed_for("OPTIMIZER_GRAD") or not numeric_debug.active_for(
+            "OPTIMIZER_GRAD"
+        ):
+            return
+
+        default_pattern = r"shared_experts\.linear_fc2\.weight"
+        limit = int(os.getenv("MEGATRON_NUMERIC_DEBUG_OPTIMIZER_GRAD_STAGE_LIMIT", "4"))
+        seen = 0
+        for param in self.get_parameters():
+            name = getattr(param, "_numeric_debug_name", "<unnamed>")
+            if not numeric_debug.name_matches(name, "OPTIMIZER_GRAD", default_pattern):
+                continue
+            if seen >= limit:
+                break
+            seen += 1
+
+            def _tensor_meta(tensor):
+                if tensor is None:
+                    return "none"
+                try:
+                    local = tensor.to_local() if hasattr(tensor, "to_local") else tensor
+                    return (
+                        f"shape={tuple(local.shape)} dtype={local.dtype} "
+                        f"stride={tuple(local.stride())} "
+                        f"storage_offset={local.storage_offset()} "
+                        f"data_ptr={local.data_ptr()} "
+                        f"contiguous={local.is_contiguous()}"
+                    )
+                except Exception as exc:
+                    return f"meta_error={exc}"
+
+            main_grad = getattr(param, "main_grad", None)
+            decoupled_grad = getattr(param, "decoupled_grad", None)
+            grad = getattr(param, "grad", None)
+            numeric_debug.log_line(
+                "optimizer_grad",
+                f"{stage} name={name} "
+                f"main_grad={_tensor_meta(main_grad)} "
+                f"decoupled_grad={_tensor_meta(decoupled_grad)} "
+                f"grad={_tensor_meta(grad)}",
+                force=True,
+            )
+            numeric_debug.log_tensor(
+                f"optimizer_grad.{stage}.{name}.main_grad",
+                main_grad,
+                force=True,
+                periodic=False,
+                full_finite=True,
+            )
+            numeric_debug.log_tensor(
+                f"optimizer_grad.{stage}.{name}.decoupled_grad",
+                decoupled_grad,
+                force=True,
+                periodic=False,
+                full_finite=True,
+            )
+            numeric_debug.log_tensor(
+                f"optimizer_grad.{stage}.{name}.grad",
+                grad,
+                force=True,
+                periodic=False,
+                full_finite=True,
+            )
 
     def count_zeros(self) -> float:
         """Count number of zeros in model's gradients."""
         params = self.get_parameters()
+        self._numeric_debug_log_optimizer_grads("before_count_zeros")
         return count_zeros_fp32(
             params,
             grad_stats_parallel_group=self.get_grad_stats_parallel_group(),
@@ -597,6 +681,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         found_inf_flag = self.prepare_grads()
         if found_inf_flag:
             return False, None, None
+        self._numeric_debug_log_optimizer_grads("after_prepare_grads")
 
         # Clip the main gradients.
         if timers is not None:
@@ -617,7 +702,9 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         num_zeros_in_grad = self.count_zeros() if self.config.log_num_zeros_in_grad else 0
         if timers is not None:
             timers('optimizer-count-zeros').stop()
+        self._numeric_debug_log_optimizer_grads("after_count_zeros")
 
+        self._numeric_debug_log_optimizer_grads("before_inner_step")
         success = self.step_with_ready_grads()
 
         # Successful update.
@@ -1248,8 +1335,12 @@ class ChainedOptimizer(MegatronOptimizer):
     def prepare_grads(self) -> bool:
         """Pre-processing gradients before the optimizer step, returns whether inf/nan is found."""
         found_inf_flag = False
-        for optimizer in self.chained_optimizers:
+        for optimizer_idx, optimizer in enumerate(self.chained_optimizers):
             found_inf_flag |= optimizer.prepare_grads()
+            if hasattr(optimizer, '_numeric_debug_log_optimizer_grads'):
+                optimizer._numeric_debug_log_optimizer_grads(
+                    f"chained_after_prepare_grads_{optimizer_idx}"
+                )
 
         return found_inf_flag
 
@@ -1283,8 +1374,17 @@ class ChainedOptimizer(MegatronOptimizer):
 
     @torch.no_grad()
     def get_grad_norm(self):
+        for optimizer_idx, optimizer in enumerate(self.chained_optimizers):
+            if hasattr(optimizer, '_numeric_debug_log_optimizer_grads'):
+                optimizer._numeric_debug_log_optimizer_grads(
+                    f"chained_before_grad_norm_{optimizer_idx}"
+                )
         if len(self.chained_optimizers) == 1:
-            return self.chained_optimizers[0].get_grad_norm()
+            grad_norm = self.chained_optimizers[0].get_grad_norm()
+            self.chained_optimizers[0]._numeric_debug_log_optimizer_grads(
+                f"chained_after_grad_norm_{float(grad_norm):.6e}"
+            )
+            return grad_norm
         if self.grads_states_parallel_group_is_shared():
             grads_for_norm = []
             for optimizer in self.chained_optimizers:
@@ -1298,6 +1398,11 @@ class ChainedOptimizer(MegatronOptimizer):
                 _grad_norm = optimizer.get_grad_norm()
                 grad_norms += [_grad_norm if _grad_norm else 0.0]
             grad_norm = math.sqrt(sum([x**2 for x in grad_norms]))
+        for optimizer_idx, optimizer in enumerate(self.chained_optimizers):
+            if hasattr(optimizer, '_numeric_debug_log_optimizer_grads'):
+                optimizer._numeric_debug_log_optimizer_grads(
+                    f"chained_after_grad_norm_{optimizer_idx}_{float(grad_norm):.6e}"
+                )
         return grad_norm
 
     @torch.no_grad()
@@ -1336,6 +1441,10 @@ class ChainedOptimizer(MegatronOptimizer):
             if len(parameters) == 0:
                 continue
             if optimizer.config.clip_grad > 0.0:
+                if hasattr(optimizer, '_numeric_debug_log_optimizer_grads'):
+                    optimizer._numeric_debug_log_optimizer_grads(
+                        f"chained_before_clip_grad_norm_{float(grad_norm):.6e}"
+                    )
                 clip_grad_by_total_norm_fp32(
                     parameters,
                     max_norm=optimizer.config.clip_grad,
@@ -1343,11 +1452,31 @@ class ChainedOptimizer(MegatronOptimizer):
                     use_decoupled_grad=(
                         optimizer.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
                     ),
+                    grad_stats_parallel_group=optimizer.get_grad_stats_parallel_group(),
                 )
+                if hasattr(optimizer, '_numeric_debug_log_optimizer_grads'):
+                    optimizer._numeric_debug_log_optimizer_grads(
+                        f"chained_after_clip_grad_norm_{float(grad_norm):.6e}"
+                    )
 
         # Count the zeros in the grads.
+        for optimizer_idx, optimizer in enumerate(self.chained_optimizers):
+            if hasattr(optimizer, '_numeric_debug_log_optimizer_grads'):
+                optimizer._numeric_debug_log_optimizer_grads(
+                    f"chained_before_count_zeros_{optimizer_idx}"
+                )
         num_zeros_in_grad = self.count_zeros() if self.config.log_num_zeros_in_grad else None
+        for optimizer_idx, optimizer in enumerate(self.chained_optimizers):
+            if hasattr(optimizer, '_numeric_debug_log_optimizer_grads'):
+                optimizer._numeric_debug_log_optimizer_grads(
+                    f"chained_after_count_zeros_{optimizer_idx}"
+                )
 
+        for optimizer_idx, optimizer in enumerate(self.chained_optimizers):
+            if hasattr(optimizer, '_numeric_debug_log_optimizer_grads'):
+                optimizer._numeric_debug_log_optimizer_grads(
+                    f"chained_before_inner_step_{optimizer_idx}"
+                )
         update_successful = self.step_with_ready_grads()
 
         return update_successful, grad_norm, num_zeros_in_grad
