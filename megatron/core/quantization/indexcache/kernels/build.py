@@ -16,10 +16,43 @@ import torch
 
 _THIS_DIR = Path(__file__).resolve().parent
 _CSRC = _THIS_DIR / "csrc"
+_REPO_ROOT = _THIS_DIR.parents[4]
+
+
+def _ensure_launcher_cuda_build_env() -> None:
+    """Mirror the CUDA/toolchain env exported by the SFT launcher."""
+
+    launcher_cuda = _REPO_ROOT / ".venv" / "lib" / "python3.12" / "site-packages" / "nvidia" / "cu13"
+    if not os.environ.get("CUDA_HOME") and (launcher_cuda / "bin" / "nvcc").exists():
+        os.environ["CUDA_HOME"] = str(launcher_cuda)
+    if os.environ.get("CUDA_HOME"):
+        cuda_home = Path(os.environ["CUDA_HOME"])
+        os.environ.setdefault("CUDA_PATH", str(cuda_home))
+        path_parts = os.environ.get("PATH", "").split(os.pathsep)
+        cuda_bin = str(cuda_home / "bin")
+        if cuda_bin not in path_parts:
+            os.environ["PATH"] = cuda_bin + os.pathsep + os.environ.get("PATH", "")
+        ld_parts = os.environ.get("LD_LIBRARY_PATH", "").split(os.pathsep)
+        for lib_dir in (cuda_home / "lib", cuda_home / "lib64"):
+            lib_str = str(lib_dir)
+            if lib_dir.exists() and lib_str not in ld_parts:
+                os.environ["LD_LIBRARY_PATH"] = lib_str + os.pathsep + os.environ.get(
+                    "LD_LIBRARY_PATH", ""
+                )
+    if not os.environ.get("CC") and Path("/usr/bin/gcc").exists():
+        os.environ["CC"] = "/usr/bin/gcc"
+    if not os.environ.get("CXX") and Path("/usr/bin/g++").exists():
+        os.environ["CXX"] = "/usr/bin/g++"
 
 
 def _build_ext():
-    from torch.utils.cpp_extension import load
+    _ensure_launcher_cuda_build_env()
+
+    import torch.utils.cpp_extension as cpp_extension
+
+    if os.environ.get("CUDA_HOME") and cpp_extension.CUDA_HOME is None:
+        cpp_extension.CUDA_HOME = os.environ["CUDA_HOME"]
+    load = cpp_extension.load
 
     extra_cuda_cflags = ["-O3", "--use_fast_math", "-std=c++17"]
     extra_cflags = ["-O3", "-std=c++17"]

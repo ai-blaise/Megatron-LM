@@ -34,8 +34,10 @@ from megatron.core.quantization.indexcache import (  # noqa: E402
     IndexCacheHISAConfig,
     apply_indexcache_kv,
     build_indexcache_config,
+    get_indexcache_nvfp4_packed_tensors,
     hisa_block_topk_counts,
     indexcache_hisa_cuda_select_with_scores,
+    indexcache_hisa_select_with_scores,
     indexcache_hisa_topk,
     indexcache_hisa_topk_with_scores,
     resolve_indexcache_quantization,
@@ -517,6 +519,7 @@ def test_hisa_optimized_with_scores_matches_reference_selection(monkeypatch):
     assert fast is not None
     fast_indices, fast_scores = fast
     assert fast_scores is not None
+    assert fast_indices.dtype == torch.int32
 
     q_flat = q.transpose(0, 1).reshape(bsz * sq, heads, HEAD_DIM).detach()
     w_flat = weights.transpose(0, 1).reshape(bsz * sq, heads).detach()
@@ -540,7 +543,7 @@ def test_hisa_optimized_with_scores_matches_reference_selection(monkeypatch):
     for row in range(bsz * sq):
         torch.testing.assert_close(
             fast_flat[row].sort().values.cpu(),
-            ref_indices[row].long().sort().values.cpu(),
+            ref_indices[row].to(torch.int32).sort().values.cpu(),
         )
         batch_idx = row // sq
         q_row = q_flat[row]
@@ -669,7 +672,7 @@ def test_hisa_candidate_slot_grouping_is_exact_for_causal_prefix(monkeypatch):
     for row in range(sq):
         torch.testing.assert_close(
             fast_flat[row].sort().values.cpu(),
-            ref_indices[row].long().sort().values.cpu(),
+            ref_indices[row].to(torch.int32).sort().values.cpu(),
         )
         assert int(fast_flat[row].max().item()) < q_start + row + 1
 
@@ -726,6 +729,7 @@ def test_hisa_cuda_selector_matches_reference_selection(monkeypatch):
     )
     assert got is not None
     got_indices, got_scores = got
+    assert got_indices.dtype == torch.int32
 
     ref_indices, _ = hisa_forward_reference(
         q.detach(),
@@ -743,7 +747,7 @@ def test_hisa_cuda_selector_matches_reference_selection(monkeypatch):
     for row in range(sq):
         torch.testing.assert_close(
             got_indices[row].sort().values.cpu(),
-            ref_indices[row].long().sort().values.cpu(),
+            ref_indices[row].to(torch.int32).sort().values.cpu(),
         )
 
     selected_k = k.index_select(0, got_indices.clamp_min(0).reshape(-1)).view(
@@ -754,6 +758,375 @@ def test_hisa_cuda_selector_matches_reference_selection(monkeypatch):
         * weights.unsqueeze(1)
     ).sum(-1)
     torch.testing.assert_close(got_scores, expected_scores, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_hisa_bmm_selector_backend_matches_cuda_sets(monkeypatch):
+    if torch.cuda.get_device_capability() < (10, 0):
+        pytest.skip("HISA selector backend comparison is intended for Blackwell+.")
+
+    import megatron.core.quantization.indexcache.hisa as hisa_module
+
+    ext = hisa_module._try_load_hisa_cuda_ext()
+    if ext is None or not hasattr(ext, "hisa_selector_fwd"):
+        pytest.skip("HISA CUDA selector extension unavailable.")
+
+    config = IndexCacheHISAConfig(
+        enabled=True,
+        block_size=4,
+        compression_ratio=2.0,
+        forced_boundary_blocks=("first", "last"),
+    )
+    torch.manual_seed(20260520)
+    sq, heads, context_len, topk = 8, 4, 32, 4
+    q = torch.randn(sq, heads, HEAD_DIM, device="cuda")
+    k = torch.randn(context_len, HEAD_DIM, device="cuda")
+    weights = torch.rand(sq, heads, device="cuda") + 0.1
+    q_start = 20
+    prefix_lens = torch.arange(q_start + 1, q_start + sq + 1, device="cuda").clamp(
+        0, context_len
+    )
+
+    monkeypatch.setenv("MEGATRON_HISA_SELECTOR_CUDA", "1")
+    monkeypatch.setenv("MEGATRON_HISA_SELECTOR_BACKEND", "cuda")
+    cuda_indices, cuda_scores = indexcache_hisa_cuda_select_with_scores(
+        q,
+        weights,
+        k,
+        topk,
+        config=config,
+        prefix_lens=prefix_lens,
+    )
+    monkeypatch.setenv("MEGATRON_HISA_SELECTOR_BACKEND", "bmm")
+    bmm_indices, bmm_scores = indexcache_hisa_select_with_scores(
+        q,
+        weights,
+        k,
+        topk,
+        config=config,
+        prefix_lens=prefix_lens,
+    )
+
+    for row in range(sq):
+        torch.testing.assert_close(
+            cuda_indices[row].long().sort().values.cpu(),
+            bmm_indices[row].long().sort().values.cpu(),
+            rtol=0,
+            atol=0,
+        )
+        cuda_lookup = {
+            int(tok.item()): pos for pos, tok in enumerate(cuda_indices[row]) if tok.item() >= 0
+        }
+        bmm_lookup = {
+            int(tok.item()): pos for pos, tok in enumerate(bmm_indices[row]) if tok.item() >= 0
+        }
+        for tok, cuda_pos in cuda_lookup.items():
+            torch.testing.assert_close(
+                cuda_scores[row, cuda_pos],
+                bmm_scores[row, bmm_lookup[tok]],
+                rtol=1e-5,
+                atol=2e-5,
+            )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_nvfp4_indexcache_sidecar_survives_batch_view():
+    if torch.cuda.get_device_capability() < (10, 0):
+        pytest.skip("NVFP4 packed CUDA sidecar requires Blackwell.")
+
+    torch.manual_seed(20260521)
+    x = torch.randn(9, 2, HEAD_DIM, device="cuda", dtype=torch.float32)
+    y = apply_indexcache_kv(x, _make_nvfp4_cfg())
+    packed = get_indexcache_nvfp4_packed_tensors(y[:, 1])
+
+    assert packed is not None
+    packed_values, packed_scales, row_offset, row_stride = packed
+    assert packed_values.shape == (18, 64)
+    assert packed_scales.shape == (18,)
+    assert row_offset == 1
+    assert row_stride == 2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_hisa_packed_nvfp4_selector_backend_matches_bmm(monkeypatch):
+    if torch.cuda.get_device_capability() < (10, 0):
+        pytest.skip("Packed NVFP4 HISA selector requires Blackwell.")
+
+    import megatron.core.quantization.indexcache.hisa as hisa_module
+
+    ext = hisa_module._try_load_hisa_cuda_ext()
+    if ext is None or not hasattr(ext, "hisa_selector_nvfp4_fwd"):
+        pytest.skip("Packed NVFP4 HISA selector extension unavailable.")
+
+    config = IndexCacheHISAConfig(
+        enabled=True,
+        block_size=4,
+        compression_ratio=2.0,
+        forced_boundary_blocks=("first", "last"),
+    )
+    torch.manual_seed(20260522)
+    sq, heads, context_len, topk = 8, 4, 32, 4
+    q = torch.randn(sq, heads, HEAD_DIM, device="cuda", dtype=torch.float32)
+    raw_k = torch.randn(context_len, 2, HEAD_DIM, device="cuda", dtype=torch.float32)
+    quant_k = apply_indexcache_kv(raw_k, _make_nvfp4_cfg())[:, 1]
+    weights = torch.rand(sq, heads, device="cuda", dtype=torch.float32) + 0.1
+    q_start = 20
+    prefix_lens = torch.arange(q_start + 1, q_start + sq + 1, device="cuda").clamp(
+        0, context_len
+    )
+
+    monkeypatch.setenv("MEGATRON_HISA_SELECTOR_BACKEND", "bmm")
+    bmm_indices, bmm_scores = indexcache_hisa_select_with_scores(
+        q,
+        weights,
+        quant_k,
+        topk,
+        config=config,
+        prefix_lens=prefix_lens,
+    )
+    monkeypatch.setenv("MEGATRON_HISA_SELECTOR_BACKEND", "packed_cuda")
+    packed_indices, packed_scores = indexcache_hisa_select_with_scores(
+        q,
+        weights,
+        quant_k,
+        topk,
+        config=config,
+        prefix_lens=prefix_lens,
+    )
+
+    assert packed_indices is not None and packed_scores is not None
+    for row in range(sq):
+        torch.testing.assert_close(
+            packed_indices[row].long().sort().values.cpu(),
+            bmm_indices[row].long().sort().values.cpu(),
+            rtol=0,
+            atol=0,
+        )
+        packed_lookup = {
+            int(tok.item()): pos for pos, tok in enumerate(packed_indices[row]) if tok.item() >= 0
+        }
+        bmm_lookup = {
+            int(tok.item()): pos for pos, tok in enumerate(bmm_indices[row]) if tok.item() >= 0
+        }
+        for tok, packed_pos in packed_lookup.items():
+            torch.testing.assert_close(
+                packed_scores[row, packed_pos],
+                bmm_scores[row, bmm_lookup[tok]],
+                rtol=1e-5,
+                atol=2e-5,
+            )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_hisa_packed_cublasdx_selector_backend_matches_bmm(monkeypatch):
+    if torch.cuda.get_device_capability() < (10, 0):
+        pytest.skip("cuBLASDx packed NVFP4 HISA selector requires Blackwell.")
+
+    import megatron.core.quantization.indexcache.hisa as hisa_module
+
+    ext = hisa_module._try_load_hisa_cuda_ext()
+    if ext is None or not hasattr(ext, "hisa_selector_nvfp4_cublasdx_fwd"):
+        pytest.skip("cuBLASDx packed NVFP4 HISA selector extension unavailable.")
+
+    config = IndexCacheHISAConfig(
+        enabled=True,
+        block_size=4,
+        compression_ratio=2.0,
+        forced_boundary_blocks=("first", "last"),
+    )
+    torch.manual_seed(20260523)
+    sq, heads, context_len, topk = 8, 64, 32, 4
+    q = torch.randn(sq, heads, HEAD_DIM, device="cuda", dtype=torch.float32) * 0.03
+    raw_k = torch.randn(context_len, 2, HEAD_DIM, device="cuda", dtype=torch.float32) * 0.03
+    quant_k = apply_indexcache_kv(raw_k, _make_nvfp4_cfg())[:, 1]
+    weights = torch.rand(sq, heads, device="cuda", dtype=torch.float32) + 0.1
+    q_start = 20
+    prefix_lens = torch.arange(q_start + 1, q_start + sq + 1, device="cuda").clamp(
+        0, context_len
+    )
+
+    monkeypatch.setenv("MEGATRON_HISA_SELECTOR_BACKEND", "bmm")
+    bmm_indices, bmm_scores = indexcache_hisa_select_with_scores(
+        q,
+        weights,
+        quant_k,
+        topk,
+        config=config,
+        prefix_lens=prefix_lens,
+    )
+    monkeypatch.setenv("MEGATRON_HISA_SELECTOR_BACKEND", "packed_cublasdx")
+    cublasdx_indices, cublasdx_scores = indexcache_hisa_select_with_scores(
+        q,
+        weights,
+        quant_k,
+        topk,
+        config=config,
+        prefix_lens=prefix_lens,
+    )
+
+    assert cublasdx_indices is not None and cublasdx_scores is not None
+    for row in range(sq):
+        torch.testing.assert_close(
+            cublasdx_indices[row].long().sort().values.cpu(),
+            bmm_indices[row].long().sort().values.cpu(),
+            rtol=0,
+            atol=0,
+        )
+        cublasdx_lookup = {
+            int(tok.item()): pos
+            for pos, tok in enumerate(cublasdx_indices[row])
+            if tok.item() >= 0
+        }
+        bmm_lookup = {
+            int(tok.item()): pos for pos, tok in enumerate(bmm_indices[row]) if tok.item() >= 0
+        }
+        for tok, cublasdx_pos in cublasdx_lookup.items():
+            torch.testing.assert_close(
+                cublasdx_scores[row, cublasdx_pos],
+                bmm_scores[row, bmm_lookup[tok]],
+                rtol=5e-4,
+                atol=5e-4,
+            )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_hisa_packed_cublasdx_tiled_selector_backend_matches_bmm(monkeypatch):
+    if torch.cuda.get_device_capability() < (10, 0):
+        pytest.skip("tiled cuBLASDx packed NVFP4 HISA selector requires Blackwell.")
+
+    import megatron.core.quantization.indexcache.hisa as hisa_module
+
+    ext = hisa_module._try_load_hisa_cuda_ext()
+    if ext is None or not hasattr(ext, "hisa_selector_nvfp4_cublasdx_tiled_fwd"):
+        pytest.skip("tiled cuBLASDx packed NVFP4 HISA selector extension unavailable.")
+
+    config = IndexCacheHISAConfig(
+        enabled=True,
+        block_size=4,
+        compression_ratio=2.0,
+        forced_boundary_blocks=("first", "last"),
+    )
+    torch.manual_seed(20260526)
+    sq, heads, context_len, topk = 8, 64, 32, 4
+    q = torch.randn(sq, heads, HEAD_DIM, device="cuda", dtype=torch.float32) * 0.03
+    raw_k = torch.randn(context_len, 2, HEAD_DIM, device="cuda", dtype=torch.float32) * 0.03
+    quant_k = apply_indexcache_kv(raw_k, _make_nvfp4_cfg())[:, 1]
+    weights = torch.rand(sq, heads, device="cuda", dtype=torch.float32) + 0.1
+    q_start = 20
+    prefix_lens = torch.arange(q_start + 1, q_start + sq + 1, device="cuda").clamp(
+        0, context_len
+    )
+
+    monkeypatch.setenv("MEGATRON_HISA_SELECTOR_BACKEND", "bmm")
+    bmm_indices, bmm_scores = indexcache_hisa_select_with_scores(
+        q,
+        weights,
+        quant_k,
+        topk,
+        config=config,
+        prefix_lens=prefix_lens,
+    )
+    monkeypatch.setenv("MEGATRON_HISA_SELECTOR_BACKEND", "packed_cublasdx_tiled")
+    tiled_indices, tiled_scores = indexcache_hisa_select_with_scores(
+        q,
+        weights,
+        quant_k,
+        topk,
+        config=config,
+        prefix_lens=prefix_lens,
+    )
+
+    assert tiled_indices is not None and tiled_scores is not None
+    for row in range(sq):
+        torch.testing.assert_close(
+            tiled_indices[row].long().sort().values.cpu(),
+            bmm_indices[row].long().sort().values.cpu(),
+            rtol=0,
+            atol=0,
+        )
+        tiled_lookup = {
+            int(tok.item()): pos for pos, tok in enumerate(tiled_indices[row]) if tok.item() >= 0
+        }
+        bmm_lookup = {
+            int(tok.item()): pos for pos, tok in enumerate(bmm_indices[row]) if tok.item() >= 0
+        }
+        for tok, tiled_pos in tiled_lookup.items():
+            torch.testing.assert_close(
+                tiled_scores[row, tiled_pos],
+                bmm_scores[row, bmm_lookup[tok]],
+                rtol=5e-4,
+                atol=5e-4,
+            )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_hisa_packed_cublasdx_fp8_selector_backend_matches_fp8_oracle(monkeypatch):
+    if torch.cuda.get_device_capability() < (10, 0):
+        pytest.skip("FP8 cuBLASDx packed NVFP4 HISA selector requires Blackwell.")
+
+    import megatron.core.quantization.indexcache.hisa as hisa_module
+
+    ext = hisa_module._try_load_hisa_cuda_ext()
+    if ext is None or not hasattr(ext, "hisa_selector_nvfp4_cublasdx_fp8_fwd"):
+        pytest.skip("FP8 cuBLASDx packed NVFP4 HISA selector extension unavailable.")
+
+    config = IndexCacheHISAConfig(
+        enabled=True,
+        block_size=4,
+        compression_ratio=1.0,
+        forced_boundary_blocks=(),
+    )
+    torch.manual_seed(20260524)
+    sq, heads, context_len, topk = 8, 64, 32, 4
+    q = torch.randn(sq, heads, HEAD_DIM, device="cuda", dtype=torch.float32) * 0.25
+    raw_k = torch.randn(context_len, 2, HEAD_DIM, device="cuda", dtype=torch.float32) * 0.25
+    quant_k = apply_indexcache_kv(raw_k, _make_nvfp4_cfg())[:, 1]
+    weights = torch.rand(sq, heads, device="cuda", dtype=torch.float32) + 0.1
+    prefix_lens = torch.full((sq,), context_len, device="cuda", dtype=torch.long)
+
+    monkeypatch.setenv("MEGATRON_HISA_SELECTOR_BACKEND", "packed_cublasdx_fp8")
+    fp8_indices, fp8_scores = indexcache_hisa_select_with_scores(
+        q,
+        weights,
+        quant_k,
+        topk,
+        config=config,
+        prefix_lens=prefix_lens,
+    )
+
+    # This backend intentionally validates against the FP8 MMA payload, not the
+    # FP32 BMM selector: Q and dequantized NVFP4 K are rounded to FP8 before
+    # tensor-core accumulation.
+    q8 = q.to(torch.float8_e4m3fn).to(torch.float32)
+    k8 = quant_k.to(torch.float8_e4m3fn).to(torch.float32)
+    oracle_scores = (
+        torch.relu(torch.einsum("qhd,kd->qkh", q8, k8)) * weights.unsqueeze(1)
+    ).sum(dim=-1)
+    oracle_top_scores, oracle_indices = torch.topk(
+        oracle_scores, k=topk, dim=-1, sorted=False
+    )
+
+    assert fp8_indices is not None and fp8_scores is not None
+    for row in range(sq):
+        torch.testing.assert_close(
+            fp8_indices[row].long().sort().values.cpu(),
+            oracle_indices[row].long().sort().values.cpu(),
+            rtol=0,
+            atol=0,
+        )
+        fp8_lookup = {
+            int(tok.item()): pos for pos, tok in enumerate(fp8_indices[row]) if tok.item() >= 0
+        }
+        oracle_lookup = {
+            int(tok.item()): pos for pos, tok in enumerate(oracle_indices[row]) if tok.item() >= 0
+        }
+        for tok, fp8_pos in fp8_lookup.items():
+            torch.testing.assert_close(
+                fp8_scores[row, fp8_pos],
+                oracle_top_scores[row, oracle_lookup[tok]],
+                rtol=3e-2,
+                atol=5e-3,
+            )
 
 
 def test_chunked_dsa_forward_masks_padded_hisa_candidates(monkeypatch):
@@ -1085,13 +1458,16 @@ def test_chunked_dsa_hisa_with_indexer_loss_backpropagates_indexer_grads(monkeyp
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_hisa_selected_score_bwd_cuda_matches_autograd(monkeypatch):
+@pytest.mark.parametrize("head_group", [None, 2, 4, 8])
+def test_hisa_selected_score_bwd_cuda_matches_autograd(monkeypatch, head_group):
     if torch.cuda.get_device_capability() < (10, 0):
         pytest.skip("HISA CUDA selector is intended for Blackwell+.")
 
     import megatron.core.transformer.experimental_attention_variant.dsa as dsa_module
 
     monkeypatch.setenv("MEGATRON_HISA_SELECTOR_CUDA", "1")
+    if head_group is not None:
+        monkeypatch.setenv("MEGATRON_HISA_SELECTED_SCORE_BWD_HEAD_GROUP", str(head_group))
     torch.manual_seed(20260517)
     q_len, num_heads, head_dim, seq_len, topk = 5, 3, HEAD_DIM, 19, 6
     q = torch.randn(q_len, num_heads, head_dim, device="cuda", dtype=torch.float32, requires_grad=True)
@@ -1141,6 +1517,186 @@ def test_hisa_selected_score_bwd_cuda_matches_autograd(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("tile_n", [32, 64, 128])
+def test_hisa_selected_score_bwd_cublasdx_matches_autograd(monkeypatch, tile_n):
+    if torch.cuda.get_device_capability() < (10, 0):
+        pytest.skip("cuBLASDx HISA backward is intended for Blackwell+.")
+
+    import megatron.core.transformer.experimental_attention_variant.dsa as dsa_module
+
+    monkeypatch.setenv("MEGATRON_HISA_SELECTOR_CUDA", "1")
+    monkeypatch.setenv("MEGATRON_HISA_SELECTED_SCORE_BWD_CUBLASDX", "1")
+    monkeypatch.setenv("MEGATRON_HISA_SELECTED_SCORE_BWD_CUBLASDX_TILE_N", str(tile_n))
+    torch.manual_seed(20260518 + tile_n)
+    q_len, num_heads, head_dim, seq_len, topk = 4, 64, HEAD_DIM, 257, 65
+    q = torch.randn(
+        q_len, num_heads, head_dim, device="cuda", dtype=torch.float32, requires_grad=True
+    )
+    weights = (
+        torch.rand(q_len, num_heads, device="cuda", dtype=torch.float32) + 0.1
+    ).requires_grad_()
+    k = torch.randn(seq_len, head_dim, device="cuda", dtype=torch.float32, requires_grad=True)
+    topk_i32 = torch.randint(0, seq_len, (q_len, topk), device="cuda", dtype=torch.int32)
+
+    selected_k = k.index_select(0, topk_i32.reshape(-1).long()).view(q_len, topk, head_dim)
+    ref_scores = (
+        torch.relu(torch.einsum("qhd,qkd->qkh", q, selected_k)) * weights.unsqueeze(1)
+    ).sum(dim=-1)
+    grad_seed = torch.randn_like(ref_scores)
+    (ref_scores * grad_seed).sum().backward()
+
+    grad_q, grad_w, grad_k = dsa_module._hisa_selected_score_backward_cuda(
+        grad_seed,
+        q.detach(),
+        weights.detach(),
+        k.detach(),
+        topk_i32,
+    )
+    torch.testing.assert_close(grad_q, q.grad, rtol=3e-4, atol=5e-4)
+    torch.testing.assert_close(grad_w, weights.grad, rtol=3e-4, atol=5e-4)
+    torch.testing.assert_close(grad_k, k.grad, rtol=3e-4, atol=5e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("head_group", [2, 4, 8])
+def test_hisa_selected_score_bwd_warp_grouped_matches_autograd(monkeypatch, head_group):
+    if torch.cuda.get_device_capability() < (10, 0):
+        pytest.skip("warp-grouped HISA backward is intended for Blackwell+.")
+
+    import megatron.core.transformer.experimental_attention_variant.dsa as dsa_module
+
+    monkeypatch.setenv("MEGATRON_HISA_SELECTOR_CUDA", "1")
+    monkeypatch.setenv("MEGATRON_HISA_SELECTED_SCORE_BWD_HEAD_GROUP", str(head_group))
+    monkeypatch.setenv("MEGATRON_HISA_SELECTED_SCORE_BWD_WARP_GROUPED", "1")
+    torch.manual_seed(20260519 + head_group)
+    q_len, num_heads, head_dim, seq_len, topk = 4, 64, HEAD_DIM, 257, 65
+    q = torch.randn(
+        q_len, num_heads, head_dim, device="cuda", dtype=torch.float32, requires_grad=True
+    )
+    weights = (
+        torch.rand(q_len, num_heads, device="cuda", dtype=torch.float32) + 0.1
+    ).requires_grad_()
+    k = torch.randn(seq_len, head_dim, device="cuda", dtype=torch.float32, requires_grad=True)
+    topk_i32 = torch.randint(0, seq_len, (q_len, topk), device="cuda", dtype=torch.int32)
+
+    selected_k = k.index_select(0, topk_i32.reshape(-1).long()).view(q_len, topk, head_dim)
+    ref_scores = (
+        torch.relu(torch.einsum("qhd,qkd->qkh", q, selected_k)) * weights.unsqueeze(1)
+    ).sum(dim=-1)
+    grad_seed = torch.randn_like(ref_scores)
+    (ref_scores * grad_seed).sum().backward()
+
+    grad_q, grad_w, grad_k = dsa_module._hisa_selected_score_backward_cuda(
+        grad_seed,
+        q.detach(),
+        weights.detach(),
+        k.detach(),
+        topk_i32,
+    )
+    torch.testing.assert_close(grad_q, q.grad, rtol=2e-5, atol=7e-5)
+    torch.testing.assert_close(grad_w, weights.grad, rtol=2e-5, atol=7e-5)
+    torch.testing.assert_close(grad_k, k.grad, rtol=2e-5, atol=7e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_hisa_cuda_selector_teacher_matches_split_oracle(monkeypatch):
+    if torch.cuda.get_device_capability() < (10, 0):
+        pytest.skip("HISA CUDA selector is intended for Blackwell+.")
+
+    from megatron.core.quantization.indexcache.hisa import (
+        indexcache_hisa_cuda_select_scores_teacher,
+    )
+    import megatron.core.transformer.experimental_attention_variant.dsa as dsa_module
+
+    monkeypatch.setenv("MEGATRON_HISA_SELECTOR_CUDA", "1")
+    monkeypatch.setenv("MEGATRON_HISA_TARGET_TRITON", "1")
+    torch.manual_seed(20260519)
+    q_len, idx_heads, idx_dim, attn_heads, attn_dim, seq_len, topk = (
+        7,
+        3,
+        HEAD_DIM,
+        4,
+        16,
+        31,
+        8,
+    )
+    q = torch.randn(q_len, idx_heads, idx_dim, device="cuda", dtype=torch.float32)
+    index_k = torch.randn(seq_len, idx_dim, device="cuda", dtype=torch.float32)
+    weights = torch.rand(q_len, idx_heads, device="cuda", dtype=torch.float32) + 0.1
+    query = torch.randn(q_len, attn_heads, attn_dim, device="cuda", dtype=torch.float32)
+    key = torch.randn(seq_len, attn_heads, attn_dim, device="cuda", dtype=torch.float32)
+    prefix_lens = torch.tensor([3, 5, 9, 13, 17, 23, 31], device="cuda", dtype=torch.long)
+    config = IndexCacheHISAConfig(
+        enabled=True,
+        block_size=4,
+        compression_ratio=2.0,
+        topk_tokens=topk,
+        fallback_to_dense_if_short=False,
+        forced_boundary_blocks=("first", "last"),
+    )
+
+    fused = indexcache_hisa_cuda_select_scores_teacher(
+        q,
+        weights,
+        index_k,
+        query,
+        key,
+        topk,
+        config=config,
+        prefix_lens=prefix_lens,
+        softmax_scale=0.25,
+    )
+    split = indexcache_hisa_cuda_select_with_scores(
+        q,
+        weights,
+        index_k,
+        topk,
+        config=config,
+        prefix_lens=prefix_lens,
+    )
+    assert fused is not None and split is not None
+    fused_indices, fused_scores, fused_teacher = fused
+    split_indices, split_scores = split
+    split_teacher = dsa_module._hisa_attention_target_probs(
+        query[:, None],
+        key[:, None],
+        split_indices[None].long(),
+        softmax_scale=0.25,
+        tp_group=None,
+    )
+    fused_teacher = fused_teacher / fused_teacher.sum(dim=-1, keepdim=True).clamp_min(1e-20)
+
+    for row in range(q_len):
+        fused_valid = fused_indices[row] >= 0
+        split_valid = split_indices[row] >= 0
+        fused_order = fused_indices[row, fused_valid].sort().values
+        split_order = split_indices[row, split_valid].sort().values
+        torch.testing.assert_close(fused_order, split_order, rtol=0, atol=0)
+
+        fused_lookup = {
+            int(tok.item()): pos for pos, tok in enumerate(fused_indices[row]) if tok.item() >= 0
+        }
+        split_lookup = {
+            int(tok.item()): pos for pos, tok in enumerate(split_indices[row]) if tok.item() >= 0
+        }
+        for tok in fused_lookup:
+            f_pos = fused_lookup[tok]
+            s_pos = split_lookup[tok]
+            torch.testing.assert_close(
+                fused_scores[row, f_pos],
+                split_scores[row, s_pos],
+                rtol=1e-5,
+                atol=2e-5,
+            )
+            torch.testing.assert_close(
+                fused_teacher[row, f_pos],
+                split_teacher[row, s_pos],
+                rtol=5e-4,
+                atol=5e-4,
+            )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_chunked_dsa_hisa_fused_indexer_loss_matches_existing_path(monkeypatch):
     if torch.cuda.get_device_capability() < (10, 0):
         pytest.skip("HISA CUDA selector is intended for Blackwell+.")
@@ -1155,6 +1711,7 @@ def test_chunked_dsa_hisa_fused_indexer_loss_matches_existing_path(monkeypatch):
         tp = _ProcessGroup()
 
     original_sparse_attention = dsa_module.sparse_dsa_attention_triton
+    original_sparse_attention_with_teacher = dsa_module.sparse_dsa_attention_with_teacher_triton
 
     def run_case(fused: bool):
         monkeypatch.setenv("MEGATRON_HISA_SELECTOR_CUDA", "1")
@@ -1184,7 +1741,20 @@ def test_chunked_dsa_hisa_fused_indexer_loss_matches_existing_path(monkeypatch):
             topk_seen.append(topk_arg.detach().clone())
             return original_sparse_attention(query_arg, key_arg, value_arg, topk_arg, *args, **kwargs)
 
+        def capture_sparse_attention_with_teacher(
+            query_arg, key_arg, value_arg, topk_arg, *args, **kwargs
+        ):
+            topk_seen.append(topk_arg.detach().clone())
+            return original_sparse_attention_with_teacher(
+                query_arg, key_arg, value_arg, topk_arg, *args, **kwargs
+            )
+
         monkeypatch.setattr(dsa_module, "sparse_dsa_attention_triton", capture_sparse_attention)
+        monkeypatch.setattr(
+            dsa_module,
+            "sparse_dsa_attention_with_teacher_triton",
+            capture_sparse_attention_with_teacher,
+        )
         output, indexer_loss = dsa_module.chunked_dsa_forward(
             q,
             index_k,
@@ -1222,7 +1792,7 @@ def test_chunked_dsa_hisa_fused_indexer_loss_matches_existing_path(monkeypatch):
 
     ref = run_case(False)
     fused = run_case(True)
-    torch.testing.assert_close(fused[5], ref[5], rtol=0, atol=0)
+    torch.testing.assert_close(fused[5].sort(dim=-1).values, ref[5].sort(dim=-1).values, rtol=0, atol=0)
     torch.testing.assert_close(fused[0], ref[0], rtol=8e-4, atol=8e-4)
     torch.testing.assert_close(fused[1], ref[1], rtol=2e-3, atol=2e-3)
     for got, expected in zip(fused[2:5], ref[2:5]):

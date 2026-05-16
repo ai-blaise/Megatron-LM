@@ -20,6 +20,8 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAttentionSubmodules,
     FusedDSAIndexerLoss,
     _compute_index_scores,
+    _hisa_selected_score_backward_cuda,
+    _hisa_selected_score_backward_cuda_batched,
     _sparse_dsa_attention_chunk,
     _streaming_qk_topk,
     chunked_dsa_forward,
@@ -31,6 +33,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa_triton import 
     dsa_indexer_scores_triton,
     is_dsa_indexer_scores_triton_supported,
     is_sparse_dsa_triton_supported,
+    sparse_dsa_attention_with_teacher_triton,
     sparse_dsa_attention_triton,
 )
 from megatron.core.transformer.transformer_config import MLATransformerConfig
@@ -607,6 +610,186 @@ class TestSparseDSATritonAttention:
         assert torch.allclose(value_fused.grad, reference_grads[2], atol=8e-2, rtol=8e-2)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_triton_path_emits_teacher_probs_from_selected_attention(self, monkeypatch):
+        import megatron.core.transformer.experimental_attention_variant.dsa as dsa_module
+
+        torch.manual_seed(20260520)
+        seqlen = 33
+        q_len = 9
+        num_heads = 3
+        qk_head_dim = 64
+        value_head_dim = 64
+        topk = 11
+        softmax_scale = qk_head_dim**-0.5
+
+        query = torch.randn(
+            q_len,
+            1,
+            num_heads,
+            qk_head_dim,
+            device="cuda",
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        key = torch.randn(
+            seqlen,
+            1,
+            num_heads,
+            qk_head_dim,
+            device="cuda",
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        value = torch.randn(
+            seqlen,
+            1,
+            num_heads,
+            value_head_dim,
+            device="cuda",
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        index_scores = torch.randn(1, q_len, seqlen, device="cuda", dtype=torch.float32)
+        causal_mask = torch.triu(
+            torch.ones(q_len, seqlen, device="cuda", dtype=torch.bool), diagonal=1
+        )
+        index_scores = index_scores.masked_fill(causal_mask.unsqueeze(0), float("-inf"))
+        topk_indices = index_scores.topk(topk, dim=-1, sorted=False).indices.sort(dim=-1).values
+        query_positions = torch.arange(q_len, device="cuda").view(1, q_len, 1)
+        topk_indices = topk_indices.masked_fill(topk_indices > query_positions, -1)
+
+        monkeypatch.setenv("MEGATRON_DSA_TRITON", "1")
+        monkeypatch.setenv("MEGATRON_DSA_TEACHER_FROM_LSE", "0")
+        monkeypatch.setenv("MEGATRON_DSA_TEACHER_SCORE_SCRATCH", "0")
+        fused, teacher = sparse_dsa_attention_with_teacher_triton(
+            query,
+            key,
+            value,
+            topk_indices,
+            softmax_scale,
+        )
+        monkeypatch.setenv("MEGATRON_DSA_TEACHER_SCORE_SCRATCH", "1")
+        fused_scratch, teacher_scratch = sparse_dsa_attention_with_teacher_triton(
+            query,
+            key,
+            value,
+            topk_indices,
+            softmax_scale,
+        )
+        monkeypatch.setenv("MEGATRON_DSA_TEACHER_SCORE_SCRATCH", "0")
+        monkeypatch.setenv("MEGATRON_DSA_TEACHER_FROM_LSE", "1")
+        fused_lse, teacher_lse = sparse_dsa_attention_with_teacher_triton(
+            query,
+            key,
+            value,
+            topk_indices,
+            softmax_scale,
+        )
+        reference = sparse_dsa_attention_triton(query, key, value, topk_indices, softmax_scale)
+        teacher_ref = dsa_module._hisa_attention_target_probs(
+            query.detach(),
+            key.detach(),
+            topk_indices,
+            softmax_scale,
+            tp_group=None,
+        )
+
+        teacher = teacher / teacher.sum(dim=-1, keepdim=True).clamp_min(1e-20)
+        teacher_scratch = teacher_scratch / teacher_scratch.sum(dim=-1, keepdim=True).clamp_min(
+            1e-20
+        )
+        teacher_lse = teacher_lse / teacher_lse.sum(dim=-1, keepdim=True).clamp_min(1e-20)
+        assert teacher.requires_grad is False
+        assert teacher_scratch.requires_grad is False
+        assert teacher_lse.requires_grad is False
+        torch.testing.assert_close(fused, reference, rtol=0, atol=0)
+        torch.testing.assert_close(fused_scratch, reference, rtol=0, atol=0)
+        torch.testing.assert_close(fused_lse, reference, rtol=0, atol=0)
+        # These two teacher paths use the same selected logits and LSE values,
+        # but reduce/normalize fp32 terms in a different order. Keep this
+        # tolerance at fp32 roundoff scale so the test still catches semantic
+        # drift.
+        # The scratch path reuses stored fp32 selected logits instead of
+        # recomputing QK, so it can differ from the recompute path at fp32
+        # roundoff scale after per-head atomic accumulation.
+        torch.testing.assert_close(teacher_scratch, teacher, rtol=1e-6, atol=2e-7)
+        torch.testing.assert_close(teacher_lse, teacher, rtol=1e-6, atol=2e-7)
+        torch.testing.assert_close(teacher, teacher_ref, rtol=5e-3, atol=5e-3)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_teacher_score_scratch_backward_matches_recompute(self, monkeypatch):
+        torch.manual_seed(20260521)
+        seqlen = 32
+        q_len = 16
+        num_heads = 2
+        qk_head_dim = 128
+        value_head_dim = 128
+        topk = 12
+        softmax_scale = qk_head_dim**-0.5
+
+        query = torch.randn(
+            q_len,
+            1,
+            num_heads,
+            qk_head_dim,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        key = torch.randn(
+            seqlen,
+            1,
+            num_heads,
+            qk_head_dim,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        value = torch.randn(
+            seqlen,
+            1,
+            num_heads,
+            value_head_dim,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        index_scores = torch.randn(1, q_len, seqlen, device="cuda", dtype=torch.float32)
+        causal_mask = torch.triu(
+            torch.ones(q_len, seqlen, device="cuda", dtype=torch.bool), diagonal=1
+        )
+        topk_indices = index_scores.masked_fill(causal_mask.unsqueeze(0), float("-inf")).topk(
+            topk, dim=-1, sorted=False
+        ).indices
+        grad_output = torch.randn(
+            q_len, 1, num_heads * value_head_dim, device="cuda", dtype=torch.bfloat16
+        )
+
+        def run(use_score_scratch: bool):
+            q = query.detach().clone().requires_grad_(True)
+            k = key.detach().clone().requires_grad_(True)
+            v = value.detach().clone().requires_grad_(True)
+            monkeypatch.setenv("MEGATRON_DSA_TRITON", "1")
+            monkeypatch.setenv("MEGATRON_DSA_TEACHER_FROM_LSE", "0")
+            monkeypatch.setenv(
+                "MEGATRON_DSA_TEACHER_SCORE_SCRATCH", "1" if use_score_scratch else "0"
+            )
+            monkeypatch.setenv("MEGATRON_DSA_TRITON_BWD_SCORE_SCRATCH", "1")
+            out, teacher = sparse_dsa_attention_with_teacher_triton(
+                q,
+                k,
+                v,
+                topk_indices,
+                softmax_scale,
+            )
+            (out * grad_output).sum().backward()
+            return out.detach(), teacher.detach(), q.grad.detach(), k.grad.detach(), v.grad.detach()
+
+        ref = run(False)
+        got = run(True)
+        torch.testing.assert_close(got[0], ref[0], rtol=0, atol=0)
+        torch.testing.assert_close(got[1], ref[1], rtol=1e-6, atol=2e-7)
+        for actual_grad, expected_grad in zip(got[2:], ref[2:]):
+            torch.testing.assert_close(actual_grad, expected_grad, rtol=8e-2, atol=8e-2)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_triton_path_accepts_compact_topk_indices(self, monkeypatch):
         torch.manual_seed(24601)
         seqlen = 32
@@ -650,7 +833,7 @@ class TestSparseDSATritonAttention:
         )
         index_scores = index_scores.masked_fill(causal_mask.unsqueeze(0), float("-inf"))
         topk_indices = index_scores.topk(topk, dim=-1, sorted=False).indices
-        compact_topk_indices = topk_indices.sort(dim=-1).values.to(torch.int16)
+        compact_topk_indices = topk_indices.to(torch.int16)
         grad_output = torch.randn(
             q_len, 1, num_heads * value_head_dim, device="cuda", dtype=torch.bfloat16
         )
@@ -698,6 +881,73 @@ class TestSparseDSATritonAttention:
         assert torch.allclose(query_fused.grad, reference_grads[0], atol=8e-2, rtol=8e-2)
         assert torch.allclose(key_fused.grad, reference_grads[1], atol=8e-2, rtol=8e-2)
         assert torch.allclose(value_fused.grad, reference_grads[2], atol=8e-2, rtol=8e-2)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_triton_path_narrows_long_topk_before_saving(self, monkeypatch):
+        torch.manual_seed(20260516)
+        seqlen = 32
+        q_len = 8
+        num_heads = 2
+        qk_head_dim = 64
+        value_head_dim = 64
+        topk = 8
+        softmax_scale = qk_head_dim**-0.5
+
+        query = torch.randn(
+            q_len,
+            1,
+            num_heads,
+            qk_head_dim,
+            device="cuda",
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        key = torch.randn(
+            seqlen,
+            1,
+            num_heads,
+            qk_head_dim,
+            device="cuda",
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        value = torch.randn(
+            seqlen,
+            1,
+            num_heads,
+            value_head_dim,
+            device="cuda",
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        topk_indices = torch.randint(
+            0, seqlen, (1, q_len, topk), device="cuda", dtype=torch.long
+        )
+        grad_output = torch.randn(
+            q_len, 1, num_heads * value_head_dim, device="cuda", dtype=torch.bfloat16
+        )
+        saved_topk_dtypes = []
+
+        def pack_hook(tensor):
+            if tensor.shape == topk_indices.shape:
+                saved_topk_dtypes.append(tensor.dtype)
+            return tensor
+
+        monkeypatch.setenv("MEGATRON_DSA_TRITON", "1")
+        with torch.autograd.graph.saved_tensors_hooks(pack_hook, lambda tensor: tensor):
+            fused = sparse_dsa_attention_triton(
+                query,
+                key,
+                value,
+                topk_indices,
+                softmax_scale,
+            )
+            (fused * grad_output).sum().backward()
+
+        assert topk_indices.dtype == torch.long
+        assert saved_topk_dtypes
+        assert torch.long not in saved_topk_dtypes
+        assert set(saved_topk_dtypes) == {torch.int32}
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_triton_path_masks_padded_topk_indices(self, monkeypatch):
@@ -920,6 +1170,182 @@ class TestSparseDSATritonAttention:
             assert tensor.grad.float().abs().sum().item() > 0
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_hisa_deferred_teacher_path_supports_microbatch_greater_than_one(
+        self, monkeypatch
+    ):
+        import megatron.core.transformer.experimental_attention_variant.dsa as dsa_module
+
+        class _ProcessGroup:
+            def size(self):
+                return 1
+
+        class _ProcessGroups:
+            tp = _ProcessGroup()
+
+        class _FailFusedIndexerLoss:
+            @staticmethod
+            def apply(*_args, **_kwargs):
+                raise AssertionError("MBS>1 HISA must defer teacher loss to fused DSA attention")
+
+        torch.manual_seed(20260526)
+        seqlen = 96
+        q_len = 8
+        batch = 3
+        index_heads = 4
+        index_dim = 128
+        num_heads = 2
+        qk_head_dim = 64
+        value_head_dim = 64
+        topk = 48
+        softmax_scale = qk_head_dim**-0.5
+        hisa_config = IndexCacheHISAConfig(
+            enabled=True,
+            block_size=16,
+            compression_ratio=4.0,
+            fallback_to_dense_if_short=False,
+        )
+
+        q = torch.randn(
+            q_len,
+            batch,
+            index_heads,
+            index_dim,
+            device="cuda",
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        index_k = torch.randn(
+            seqlen,
+            batch,
+            index_dim,
+            device="cuda",
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        weights = (
+            torch.rand(q_len, batch, index_heads, device="cuda", dtype=torch.bfloat16) + 0.1
+        ).requires_grad_()
+        query = torch.randn(
+            q_len,
+            batch,
+            num_heads,
+            qk_head_dim,
+            device="cuda",
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        key = torch.randn(
+            seqlen,
+            batch,
+            num_heads,
+            qk_head_dim,
+            device="cuda",
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        value = torch.randn(
+            seqlen,
+            batch,
+            num_heads,
+            value_head_dim,
+            device="cuda",
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+
+        def fail_fallback(*_args, **_kwargs):
+            raise AssertionError("MBS>1 HISA DSA must use fused Triton selected attention")
+
+        def fail_dense_indexer(*_args, **_kwargs):
+            raise AssertionError("MBS>1 HISA indexer training must not use dense KL")
+
+        monkeypatch.setattr(dsa_module, "_sparse_dsa_attention_chunk", fail_fallback)
+        monkeypatch.setattr(dsa_module, "_compute_index_scores", fail_dense_indexer)
+        monkeypatch.setattr(dsa_module, "_HISAFusedIndexerLoss", _FailFusedIndexerLoss)
+        monkeypatch.setenv("MEGATRON_DSA_TRITON", "1")
+
+        output, indexer_loss = dsa_module.chunked_dsa_forward(
+            q,
+            index_k,
+            weights,
+            query,
+            key,
+            value,
+            softmax_scale=softmax_scale,
+            topk=topk,
+            mask=None,
+            is_causal=True,
+            loss_coeff=0.1,
+            sparse_loss=True,
+            pg_collection=_ProcessGroups(),
+            chunk_size=q_len,
+            indexcache_hisa_config=hisa_config,
+        )
+        assert indexer_loss is not None
+        assert torch.isfinite(output.float()).all().item()
+        (output.float().square().mean() + indexer_loss).backward()
+        for tensor in (q, index_k, weights, query, key, value):
+            assert tensor.grad is not None
+            assert torch.isfinite(tensor.grad.float()).all().item()
+            assert tensor.grad.float().abs().sum().item() > 0
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_hisa_selected_score_batched_backward_matches_per_batch(self, monkeypatch):
+        if torch.cuda.get_device_capability()[0] < 10:
+            pytest.skip("HISA selected-score CUDA extension is exercised on Blackwell.")
+
+        torch.manual_seed(20260527)
+        q_len = 7
+        batch = 3
+        heads = 4
+        head_dim = 128
+        seqlen = 64
+        topk = 13
+
+        q = torch.randn(q_len, batch, heads, head_dim, device="cuda", dtype=torch.float32)
+        weights = torch.randn(q_len, batch, heads, device="cuda", dtype=torch.float32)
+        k = torch.randn(seqlen, batch, head_dim, device="cuda", dtype=torch.float32)
+        topk_i32 = torch.randint(0, seqlen, (batch, q_len, topk), device="cuda", dtype=torch.int32)
+        topk_i32[1, 2, 3] = -1
+        grad_scores = torch.randn(batch * q_len, topk, device="cuda", dtype=torch.float32)
+        grad_scores[1 * q_len + 2, 3] = 0.0
+
+        monkeypatch.setenv("MEGATRON_HISA_SELECTED_SCORE_BWD_HEAD_GROUP", "2")
+        monkeypatch.setenv("MEGATRON_HISA_SELECTED_SCORE_BWD_WARP_GROUPED", "1")
+
+        grad_q_batches = []
+        grad_w_batches = []
+        grad_k_batches = []
+        for batch_idx in range(batch):
+            start = batch_idx * q_len
+            stop = start + q_len
+            grad_q_b, grad_w_b, grad_k_b = _hisa_selected_score_backward_cuda(
+                grad_scores[start:stop],
+                q[:, batch_idx],
+                weights[:, batch_idx],
+                k[:, batch_idx],
+                topk_i32[batch_idx],
+            )
+            grad_q_batches.append(grad_q_b)
+            grad_w_batches.append(grad_w_b)
+            grad_k_batches.append(grad_k_b)
+        expected_q = torch.stack(grad_q_batches, dim=1)
+        expected_w = torch.stack(grad_w_batches, dim=1)
+        expected_k = torch.stack(grad_k_batches, dim=1)
+
+        got_q, got_w, got_k = _hisa_selected_score_backward_cuda_batched(
+            grad_scores,
+            q,
+            weights,
+            k,
+            topk_i32,
+        )
+
+        torch.testing.assert_close(got_q, expected_q, rtol=0, atol=0)
+        torch.testing.assert_close(got_w, expected_w, rtol=0, atol=0)
+        torch.testing.assert_close(got_k, expected_k, rtol=1e-6, atol=1e-6)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_hisa_indexer_loss_supports_streambp_positions(self, monkeypatch):
         import megatron.core.transformer.experimental_attention_variant.dsa as dsa_module
 
@@ -1087,6 +1513,810 @@ class TestSparseDSATritonAttention:
         assert torch.allclose(query_fused.grad, reference_grads[0], atol=atol, rtol=rtol)
         assert torch.allclose(key_fused.grad, reference_grads[1], atol=atol, rtol=rtol)
         assert torch.allclose(value_fused.grad, reference_grads[2], atol=atol, rtol=rtol)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_forward_backward_supports_microbatch_greater_than_one(self):
+        torch.manual_seed(20260520)
+        seqlen = 24
+        batch = 3
+        num_heads = 2
+        qk_head_dim = 192
+        value_head_dim = 128
+        topk = 12
+        softmax_scale = qk_head_dim**-0.5
+
+        query = torch.randn(
+            seqlen,
+            batch,
+            num_heads,
+            qk_head_dim,
+            device="cuda",
+            dtype=torch.float32,
+            requires_grad=True,
+        )
+        key = torch.randn(
+            seqlen,
+            batch,
+            num_heads,
+            qk_head_dim,
+            device="cuda",
+            dtype=torch.float32,
+            requires_grad=True,
+        )
+        value = torch.randn(
+            seqlen,
+            batch,
+            num_heads,
+            value_head_dim,
+            device="cuda",
+            dtype=torch.float32,
+            requires_grad=True,
+        )
+        index_scores = torch.randn(batch, seqlen, seqlen, device="cuda", dtype=torch.float32)
+        causal_mask = torch.triu(
+            torch.ones(seqlen, seqlen, device="cuda", dtype=torch.bool), diagonal=1
+        )
+        topk_indices = (
+            index_scores.masked_fill(causal_mask.unsqueeze(0), float("-inf"))
+            .topk(topk, dim=-1)
+            .indices
+        )
+        grad_output = torch.randn(
+            seqlen,
+            batch,
+            num_heads * value_head_dim,
+            device="cuda",
+            dtype=torch.float32,
+        )
+
+        reference = _sparse_dsa_attention_chunk(
+            query, key, value, topk_indices, softmax_scale, mask=None, q_start=0, is_causal=True
+        )
+        (reference * grad_output).sum().backward()
+        reference_grads = (
+            query.grad.detach().clone(),
+            key.grad.detach().clone(),
+            value.grad.detach().clone(),
+        )
+
+        query_fused = query.detach().clone().requires_grad_(True)
+        key_fused = key.detach().clone().requires_grad_(True)
+        value_fused = value.detach().clone().requires_grad_(True)
+
+        assert is_sparse_dsa_triton_supported(
+            query_fused, key_fused, value_fused, topk_indices, mask=None, is_causal=True
+        )
+        fused = sparse_dsa_attention_triton(
+            query_fused, key_fused, value_fused, topk_indices, softmax_scale
+        )
+        (fused * grad_output).sum().backward()
+
+        torch.testing.assert_close(fused, reference, rtol=2e-4, atol=2e-4)
+        torch.testing.assert_close(query_fused.grad, reference_grads[0], rtol=2e-4, atol=2e-4)
+        torch.testing.assert_close(key_fused.grad, reference_grads[1], rtol=2e-4, atol=2e-4)
+        torch.testing.assert_close(value_fused.grad, reference_grads[2], rtol=2e-4, atol=2e-4)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_key_block_kv_backward_matches_torch_sparse_reference(self, monkeypatch):
+        torch.manual_seed(4321)
+        seqlen = 32
+        num_heads = 2
+        qk_head_dim = 192
+        value_head_dim = 128
+        topk = 16
+        softmax_scale = qk_head_dim**-0.5
+
+        query = torch.randn(
+            seqlen,
+            1,
+            num_heads,
+            qk_head_dim,
+            device="cuda",
+            dtype=torch.float32,
+            requires_grad=True,
+        )
+        key = torch.randn(
+            seqlen,
+            1,
+            num_heads,
+            qk_head_dim,
+            device="cuda",
+            dtype=torch.float32,
+            requires_grad=True,
+        )
+        value = torch.randn(
+            seqlen,
+            1,
+            num_heads,
+            value_head_dim,
+            device="cuda",
+            dtype=torch.float32,
+            requires_grad=True,
+        )
+        index_scores = torch.randn(1, seqlen, seqlen, device="cuda", dtype=torch.float32)
+        causal_mask = torch.triu(
+            torch.ones(seqlen, seqlen, device="cuda", dtype=torch.bool), diagonal=1
+        )
+        topk_indices = (
+            index_scores.masked_fill(causal_mask.unsqueeze(0), float("-inf"))
+            .topk(topk, dim=-1)
+            .indices.sort(dim=-1)
+            .values
+        )
+        grad_output = torch.randn(
+            seqlen, 1, num_heads * value_head_dim, device="cuda", dtype=torch.float32
+        )
+
+        reference = _sparse_dsa_attention_chunk(
+            query, key, value, topk_indices, softmax_scale, mask=None, q_start=0, is_causal=True
+        )
+        (reference * grad_output).sum().backward()
+        reference_grads = (
+            query.grad.detach().clone(),
+            key.grad.detach().clone(),
+            value.grad.detach().clone(),
+        )
+
+        query_fused = query.detach().clone().requires_grad_(True)
+        key_fused = key.detach().clone().requires_grad_(True)
+        value_fused = value.detach().clone().requires_grad_(True)
+
+        monkeypatch.setenv("MEGATRON_DSA_TRITON_KEY_BLOCK_KV_BWD", "1")
+        fused = sparse_dsa_attention_triton(
+            query_fused, key_fused, value_fused, topk_indices, softmax_scale
+        )
+        (fused * grad_output).sum().backward()
+
+        torch.testing.assert_close(fused, reference, rtol=2e-4, atol=2e-4)
+        torch.testing.assert_close(query_fused.grad, reference_grads[0], rtol=2e-4, atol=2e-4)
+        torch.testing.assert_close(key_fused.grad, reference_grads[1], rtol=2e-4, atol=2e-4)
+        torch.testing.assert_close(value_fused.grad, reference_grads[2], rtol=2e-4, atol=2e-4)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_key_block_kv_backward_falls_back_for_unsorted_topk(self, monkeypatch):
+        torch.manual_seed(4322)
+        seqlen = 32
+        num_heads = 2
+        qk_head_dim = 192
+        value_head_dim = 128
+        topk = 16
+        softmax_scale = qk_head_dim**-0.5
+
+        query = torch.randn(
+            seqlen,
+            1,
+            num_heads,
+            qk_head_dim,
+            device="cuda",
+            dtype=torch.float32,
+            requires_grad=True,
+        )
+        key = torch.randn(
+            seqlen,
+            1,
+            num_heads,
+            qk_head_dim,
+            device="cuda",
+            dtype=torch.float32,
+            requires_grad=True,
+        )
+        value = torch.randn(
+            seqlen,
+            1,
+            num_heads,
+            value_head_dim,
+            device="cuda",
+            dtype=torch.float32,
+            requires_grad=True,
+        )
+        index_scores = torch.randn(1, seqlen, seqlen, device="cuda", dtype=torch.float32)
+        causal_mask = torch.triu(
+            torch.ones(seqlen, seqlen, device="cuda", dtype=torch.bool), diagonal=1
+        )
+        topk_indices = (
+            index_scores.masked_fill(causal_mask.unsqueeze(0), float("-inf"))
+            .topk(topk, dim=-1)
+            .indices
+        )
+        assert not bool((topk_indices[..., 1:] >= topk_indices[..., :-1]).all().item())
+        grad_output = torch.randn(
+            seqlen, 1, num_heads * value_head_dim, device="cuda", dtype=torch.float32
+        )
+
+        reference = _sparse_dsa_attention_chunk(
+            query, key, value, topk_indices, softmax_scale, mask=None, q_start=0, is_causal=True
+        )
+        (reference * grad_output).sum().backward()
+        reference_grads = (
+            query.grad.detach().clone(),
+            key.grad.detach().clone(),
+            value.grad.detach().clone(),
+        )
+
+        query_fused = query.detach().clone().requires_grad_(True)
+        key_fused = key.detach().clone().requires_grad_(True)
+        value_fused = value.detach().clone().requires_grad_(True)
+
+        monkeypatch.setenv("MEGATRON_DSA_TRITON_KEY_BLOCK_KV_BWD", "1")
+        fused = sparse_dsa_attention_triton(
+            query_fused, key_fused, value_fused, topk_indices, softmax_scale
+        )
+        (fused * grad_output).sum().backward()
+
+        torch.testing.assert_close(fused, reference, rtol=2e-4, atol=2e-4)
+        torch.testing.assert_close(query_fused.grad, reference_grads[0], rtol=2e-4, atol=2e-4)
+        torch.testing.assert_close(key_fused.grad, reference_grads[1], rtol=2e-4, atol=2e-4)
+        torch.testing.assert_close(value_fused.grad, reference_grads[2], rtol=2e-4, atol=2e-4)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_qtile_unique_kv_backward_matches_torch_sparse_reference(self, monkeypatch):
+        torch.manual_seed(8765)
+        seqlen = 32
+        num_heads = 2
+        qk_head_dim = 192
+        value_head_dim = 128
+        topk = 16
+        softmax_scale = qk_head_dim**-0.5
+
+        query = torch.randn(
+            seqlen,
+            1,
+            num_heads,
+            qk_head_dim,
+            device="cuda",
+            dtype=torch.float32,
+            requires_grad=True,
+        )
+        key = torch.randn(
+            seqlen,
+            1,
+            num_heads,
+            qk_head_dim,
+            device="cuda",
+            dtype=torch.float32,
+            requires_grad=True,
+        )
+        value = torch.randn(
+            seqlen,
+            1,
+            num_heads,
+            value_head_dim,
+            device="cuda",
+            dtype=torch.float32,
+            requires_grad=True,
+        )
+        index_scores = torch.randn(1, seqlen, seqlen, device="cuda", dtype=torch.float32)
+        causal_mask = torch.triu(
+            torch.ones(seqlen, seqlen, device="cuda", dtype=torch.bool), diagonal=1
+        )
+        topk_indices = (
+            index_scores.masked_fill(causal_mask.unsqueeze(0), float("-inf"))
+            .topk(topk, dim=-1)
+            .indices.sort(dim=-1)
+            .values
+        )
+        grad_output = torch.randn(
+            seqlen, 1, num_heads * value_head_dim, device="cuda", dtype=torch.float32
+        )
+
+        reference = _sparse_dsa_attention_chunk(
+            query, key, value, topk_indices, softmax_scale, mask=None, q_start=0, is_causal=True
+        )
+        (reference * grad_output).sum().backward()
+        reference_grads = (
+            query.grad.detach().clone(),
+            key.grad.detach().clone(),
+            value.grad.detach().clone(),
+        )
+
+        query_fused = query.detach().clone().requires_grad_(True)
+        key_fused = key.detach().clone().requires_grad_(True)
+        value_fused = value.detach().clone().requires_grad_(True)
+
+        monkeypatch.setenv("MEGATRON_DSA_TRITON_QTILE_UNIQUE_KV_BWD", "1")
+        fused = sparse_dsa_attention_triton(
+            query_fused, key_fused, value_fused, topk_indices, softmax_scale
+        )
+        (fused * grad_output).sum().backward()
+
+        torch.testing.assert_close(fused, reference, rtol=2e-4, atol=2e-4)
+        torch.testing.assert_close(query_fused.grad, reference_grads[0], rtol=2e-4, atol=2e-4)
+        torch.testing.assert_close(key_fused.grad, reference_grads[1], rtol=4e-4, atol=4e-4)
+        torch.testing.assert_close(value_fused.grad, reference_grads[2], rtol=4e-4, atol=4e-4)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_grouped_kv_backward_matches_torch_sparse_reference(self, monkeypatch):
+        torch.manual_seed(2468)
+        seqlen = 32
+        num_heads = 2
+        qk_head_dim = 192
+        value_head_dim = 128
+        topk = 16
+        softmax_scale = qk_head_dim**-0.5
+
+        query = torch.randn(
+            seqlen,
+            1,
+            num_heads,
+            qk_head_dim,
+            device="cuda",
+            dtype=torch.float32,
+            requires_grad=True,
+        )
+        key = torch.randn(
+            seqlen,
+            1,
+            num_heads,
+            qk_head_dim,
+            device="cuda",
+            dtype=torch.float32,
+            requires_grad=True,
+        )
+        value = torch.randn(
+            seqlen,
+            1,
+            num_heads,
+            value_head_dim,
+            device="cuda",
+            dtype=torch.float32,
+            requires_grad=True,
+        )
+        index_scores = torch.randn(1, seqlen, seqlen, device="cuda", dtype=torch.float32)
+        causal_mask = torch.triu(
+            torch.ones(seqlen, seqlen, device="cuda", dtype=torch.bool), diagonal=1
+        )
+        topk_indices = (
+            index_scores.masked_fill(causal_mask.unsqueeze(0), float("-inf"))
+            .topk(topk, dim=-1)
+            .indices.sort(dim=-1)
+            .values
+        )
+        grad_output = torch.randn(
+            seqlen, 1, num_heads * value_head_dim, device="cuda", dtype=torch.float32
+        )
+
+        reference = _sparse_dsa_attention_chunk(
+            query, key, value, topk_indices, softmax_scale, mask=None, q_start=0, is_causal=True
+        )
+        (reference * grad_output).sum().backward()
+        reference_grads = (
+            query.grad.detach().clone(),
+            key.grad.detach().clone(),
+            value.grad.detach().clone(),
+        )
+
+        query_fused = query.detach().clone().requires_grad_(True)
+        key_fused = key.detach().clone().requires_grad_(True)
+        value_fused = value.detach().clone().requires_grad_(True)
+
+        monkeypatch.setenv("MEGATRON_DSA_TRITON_GROUPED_KV_BWD", "1")
+        monkeypatch.setenv("MEGATRON_DSA_TRITON_BLOCK_Q_BWD", "4")
+        monkeypatch.setenv("MEGATRON_DSA_TRITON_BLOCK_K_BWD", "8")
+        fused = sparse_dsa_attention_triton(
+            query_fused, key_fused, value_fused, topk_indices, softmax_scale
+        )
+        (fused * grad_output).sum().backward()
+
+        torch.testing.assert_close(fused, reference, rtol=2e-4, atol=2e-4)
+        torch.testing.assert_close(query_fused.grad, reference_grads[0], rtol=2e-4, atol=2e-4)
+        torch.testing.assert_close(key_fused.grad, reference_grads[1], rtol=4e-4, atol=4e-4)
+        torch.testing.assert_close(value_fused.grad, reference_grads[2], rtol=4e-4, atol=4e-4)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_cuda_kv_backward_matches_torch_sparse_reference_int16_topk(self, monkeypatch):
+        import megatron.core.transformer.experimental_attention_variant.dsa_triton as dsa_triton_mod
+
+        torch.manual_seed(97531)
+        seqlen = 32
+        bsz = 2
+        num_heads = 2
+        qk_head_dim = 128
+        value_head_dim = 64
+        topk = 16
+        softmax_scale = qk_head_dim**-0.5
+
+        query = torch.randn(
+            seqlen,
+            bsz,
+            num_heads,
+            qk_head_dim,
+            device="cuda",
+            dtype=torch.float32,
+            requires_grad=True,
+        )
+        key = torch.randn(
+            seqlen,
+            bsz,
+            num_heads,
+            qk_head_dim,
+            device="cuda",
+            dtype=torch.float32,
+            requires_grad=True,
+        )
+        value = torch.randn(
+            seqlen,
+            bsz,
+            num_heads,
+            value_head_dim,
+            device="cuda",
+            dtype=torch.float32,
+            requires_grad=True,
+        )
+        index_scores = torch.randn(bsz, seqlen, seqlen, device="cuda", dtype=torch.float32)
+        causal_mask = torch.triu(
+            torch.ones(seqlen, seqlen, device="cuda", dtype=torch.bool), diagonal=1
+        )
+        topk_indices = (
+            index_scores.masked_fill(causal_mask.unsqueeze(0), float("-inf"))
+            .topk(topk, dim=-1)
+            .indices.to(torch.int16)
+            .contiguous()
+        )
+        reference_topk_indices = topk_indices.to(torch.long)
+        grad_output = torch.randn(
+            seqlen, bsz, num_heads * value_head_dim, device="cuda", dtype=torch.float32
+        )
+
+        reference = _sparse_dsa_attention_chunk(
+            query,
+            key,
+            value,
+            reference_topk_indices,
+            softmax_scale,
+            mask=None,
+            q_start=0,
+            is_causal=True,
+        )
+        (reference * grad_output).sum().backward()
+        reference_grads = (
+            query.grad.detach().clone(),
+            key.grad.detach().clone(),
+            value.grad.detach().clone(),
+        )
+
+        query_fused = query.detach().clone().requires_grad_(True)
+        key_fused = key.detach().clone().requires_grad_(True)
+        value_fused = value.detach().clone().requires_grad_(True)
+
+        called = False
+        original = dsa_triton_mod._dsa_sparse_kv_backward_cuda
+
+        def wrapped_cuda_kv_backward(*args, **kwargs):
+            nonlocal called
+            called = True
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(
+            dsa_triton_mod, "_dsa_sparse_kv_backward_cuda", wrapped_cuda_kv_backward
+        )
+        monkeypatch.setenv("MEGATRON_DSA_CUDA_KV_BWD", "1")
+        monkeypatch.setenv("MEGATRON_DSA_CUDA_KV_BWD_TILE_Q", "2")
+        monkeypatch.setenv("MEGATRON_DSA_CUDA_KV_BWD_TILE_K", "4")
+
+        fused = sparse_dsa_attention_triton(
+            query_fused, key_fused, value_fused, topk_indices, softmax_scale
+        )
+        (fused * grad_output).sum().backward()
+
+        assert called, "CUDA DSA K/V backward path was not exercised"
+        torch.testing.assert_close(fused, reference, rtol=2e-4, atol=2e-4)
+        torch.testing.assert_close(query_fused.grad, reference_grads[0], rtol=2e-4, atol=2e-4)
+        torch.testing.assert_close(key_fused.grad, reference_grads[1], rtol=4e-4, atol=4e-4)
+        torch.testing.assert_close(value_fused.grad, reference_grads[2], rtol=4e-4, atol=4e-4)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_cuda_backward_from_scores_matches_torch_sparse_reference(self, monkeypatch):
+        import megatron.core.transformer.experimental_attention_variant.dsa_triton as dsa_triton_mod
+
+        torch.manual_seed(86420)
+        seqlen = 32
+        bsz = 2
+        num_heads = 2
+        qk_head_dim = 128
+        value_head_dim = 64
+        topk = 16
+        softmax_scale = qk_head_dim**-0.5
+
+        query = torch.randn(
+            seqlen,
+            bsz,
+            num_heads,
+            qk_head_dim,
+            device="cuda",
+            dtype=torch.float32,
+            requires_grad=True,
+        )
+        key = torch.randn(
+            seqlen,
+            bsz,
+            num_heads,
+            qk_head_dim,
+            device="cuda",
+            dtype=torch.float32,
+            requires_grad=True,
+        )
+        value = torch.randn(
+            seqlen,
+            bsz,
+            num_heads,
+            value_head_dim,
+            device="cuda",
+            dtype=torch.float32,
+            requires_grad=True,
+        )
+        index_scores = torch.randn(bsz, seqlen, seqlen, device="cuda", dtype=torch.float32)
+        causal_mask = torch.triu(
+            torch.ones(seqlen, seqlen, device="cuda", dtype=torch.bool), diagonal=1
+        )
+        topk_indices = (
+            index_scores.masked_fill(causal_mask.unsqueeze(0), float("-inf"))
+            .topk(topk, dim=-1)
+            .indices.to(torch.int16)
+            .contiguous()
+        )
+        reference_topk_indices = topk_indices.to(torch.long)
+        grad_output = torch.randn(
+            seqlen, bsz, num_heads * value_head_dim, device="cuda", dtype=torch.float32
+        )
+
+        reference = _sparse_dsa_attention_chunk(
+            query,
+            key,
+            value,
+            reference_topk_indices,
+            softmax_scale,
+            mask=None,
+            q_start=0,
+            is_causal=True,
+        )
+        (reference * grad_output).sum().backward()
+        reference_grads = (
+            query.grad.detach().clone(),
+            key.grad.detach().clone(),
+            value.grad.detach().clone(),
+        )
+
+        query_fused = query.detach().clone().requires_grad_(True)
+        key_fused = key.detach().clone().requires_grad_(True)
+        value_fused = value.detach().clone().requires_grad_(True)
+
+        called = False
+        original = dsa_triton_mod._dsa_sparse_backward_from_scores_cuda
+
+        def wrapped_cuda_backward_from_scores(*args, **kwargs):
+            nonlocal called
+            called = True
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(
+            dsa_triton_mod,
+            "_dsa_sparse_backward_from_scores_cuda",
+            wrapped_cuda_backward_from_scores,
+        )
+        monkeypatch.setenv("MEGATRON_DSA_TEACHER_SCORE_SCRATCH", "1")
+        monkeypatch.setenv("MEGATRON_DSA_CUDA_BWD_FROM_SCORES", "1")
+        monkeypatch.setenv("MEGATRON_DSA_CUDA_KV_BWD_TILE_Q", "2")
+        monkeypatch.setenv("MEGATRON_DSA_CUDA_KV_BWD_TILE_K", "4")
+
+        fused, teacher = sparse_dsa_attention_with_teacher_triton(
+            query_fused, key_fused, value_fused, topk_indices, softmax_scale
+        )
+        (fused * grad_output).sum().backward()
+
+        assert called, "CUDA DSA backward-from-scores path was not exercised"
+        assert teacher.shape == (bsz * seqlen, topk)
+        torch.testing.assert_close(fused, reference, rtol=2e-4, atol=2e-4)
+        torch.testing.assert_close(query_fused.grad, reference_grads[0], rtol=4e-4, atol=4e-4)
+        torch.testing.assert_close(key_fused.grad, reference_grads[1], rtol=4e-4, atol=4e-4)
+        torch.testing.assert_close(value_fused.grad, reference_grads[2], rtol=4e-4, atol=4e-4)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_cuda_row_backward_from_scores_matches_torch_sparse_reference(self, monkeypatch):
+        import megatron.core.transformer.experimental_attention_variant.dsa_triton as dsa_triton_mod
+
+        torch.manual_seed(97531)
+        seqlen = 32
+        bsz = 2
+        num_heads = 2
+        qk_head_dim = 128
+        value_head_dim = 64
+        topk = 16
+        softmax_scale = qk_head_dim**-0.5
+
+        query = torch.randn(
+            seqlen,
+            bsz,
+            num_heads,
+            qk_head_dim,
+            device="cuda",
+            dtype=torch.float32,
+            requires_grad=True,
+        )
+        key = torch.randn(
+            seqlen,
+            bsz,
+            num_heads,
+            qk_head_dim,
+            device="cuda",
+            dtype=torch.float32,
+            requires_grad=True,
+        )
+        value = torch.randn(
+            seqlen,
+            bsz,
+            num_heads,
+            value_head_dim,
+            device="cuda",
+            dtype=torch.float32,
+            requires_grad=True,
+        )
+        index_scores = torch.randn(bsz, seqlen, seqlen, device="cuda", dtype=torch.float32)
+        causal_mask = torch.triu(
+            torch.ones(seqlen, seqlen, device="cuda", dtype=torch.bool), diagonal=1
+        )
+        topk_indices = (
+            index_scores.masked_fill(causal_mask.unsqueeze(0), float("-inf"))
+            .topk(topk, dim=-1)
+            .indices.to(torch.int16)
+            .contiguous()
+        )
+        reference_topk_indices = topk_indices.to(torch.long)
+        grad_output = torch.randn(
+            seqlen, bsz, num_heads * value_head_dim, device="cuda", dtype=torch.float32
+        )
+
+        reference = _sparse_dsa_attention_chunk(
+            query,
+            key,
+            value,
+            reference_topk_indices,
+            softmax_scale,
+            mask=None,
+            q_start=0,
+            is_causal=True,
+        )
+        (reference * grad_output).sum().backward()
+        reference_grads = (
+            query.grad.detach().clone(),
+            key.grad.detach().clone(),
+            value.grad.detach().clone(),
+        )
+
+        query_fused = query.detach().clone().requires_grad_(True)
+        key_fused = key.detach().clone().requires_grad_(True)
+        value_fused = value.detach().clone().requires_grad_(True)
+
+        called = False
+        original = dsa_triton_mod._dsa_sparse_backward_from_scores_row_cuda
+
+        def wrapped_cuda_row_backward_from_scores(*args, **kwargs):
+            nonlocal called
+            called = True
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(
+            dsa_triton_mod,
+            "_dsa_sparse_backward_from_scores_row_cuda",
+            wrapped_cuda_row_backward_from_scores,
+        )
+        monkeypatch.setenv("MEGATRON_DSA_TEACHER_SCORE_SCRATCH", "1")
+        monkeypatch.setenv("MEGATRON_DSA_CUDA_ROW_BWD_FROM_SCORES", "1")
+
+        fused, teacher = sparse_dsa_attention_with_teacher_triton(
+            query_fused, key_fused, value_fused, topk_indices, softmax_scale
+        )
+        (fused * grad_output).sum().backward()
+
+        assert called, "CUDA row-owned DSA backward-from-scores path was not exercised"
+        assert teacher.shape == (bsz * seqlen, topk)
+        torch.testing.assert_close(fused, reference, rtol=2e-4, atol=2e-4)
+        torch.testing.assert_close(query_fused.grad, reference_grads[0], rtol=4e-4, atol=4e-4)
+        torch.testing.assert_close(key_fused.grad, reference_grads[1], rtol=4e-4, atol=4e-4)
+        torch.testing.assert_close(value_fused.grad, reference_grads[2], rtol=4e-4, atol=4e-4)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_cuda_sorted_kv_backward_matches_torch_sparse_reference(self, monkeypatch):
+        import megatron.core.transformer.experimental_attention_variant.dsa_triton as dsa_triton_mod
+
+        torch.manual_seed(24680)
+        seqlen = 32
+        bsz = 2
+        num_heads = 2
+        qk_head_dim = 128
+        value_head_dim = 64
+        topk = 16
+        softmax_scale = qk_head_dim**-0.5
+
+        query = torch.randn(
+            seqlen,
+            bsz,
+            num_heads,
+            qk_head_dim,
+            device="cuda",
+            dtype=torch.float32,
+            requires_grad=True,
+        )
+        key = torch.randn(
+            seqlen,
+            bsz,
+            num_heads,
+            qk_head_dim,
+            device="cuda",
+            dtype=torch.float32,
+            requires_grad=True,
+        )
+        value = torch.randn(
+            seqlen,
+            bsz,
+            num_heads,
+            value_head_dim,
+            device="cuda",
+            dtype=torch.float32,
+            requires_grad=True,
+        )
+        index_scores = torch.randn(bsz, seqlen, seqlen, device="cuda", dtype=torch.float32)
+        causal_mask = torch.triu(
+            torch.ones(seqlen, seqlen, device="cuda", dtype=torch.bool), diagonal=1
+        )
+        topk_indices = (
+            index_scores.masked_fill(causal_mask.unsqueeze(0), float("-inf"))
+            .topk(topk, dim=-1)
+            .indices.to(torch.int16)
+            .contiguous()
+        )
+        reference_topk_indices = topk_indices.to(torch.long)
+        grad_output = torch.randn(
+            seqlen, bsz, num_heads * value_head_dim, device="cuda", dtype=torch.float32
+        )
+
+        reference = _sparse_dsa_attention_chunk(
+            query,
+            key,
+            value,
+            reference_topk_indices,
+            softmax_scale,
+            mask=None,
+            q_start=0,
+            is_causal=True,
+        )
+        (reference * grad_output).sum().backward()
+        reference_grads = (
+            query.grad.detach().clone(),
+            key.grad.detach().clone(),
+            value.grad.detach().clone(),
+        )
+
+        query_fused = query.detach().clone().requires_grad_(True)
+        key_fused = key.detach().clone().requires_grad_(True)
+        value_fused = value.detach().clone().requires_grad_(True)
+
+        called = False
+        original = dsa_triton_mod._dsa_sparse_kv_backward_sorted_from_scores_cuda
+
+        def wrapped_cuda_sorted_kv_backward(*args, **kwargs):
+            nonlocal called
+            called = True
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(
+            dsa_triton_mod,
+            "_dsa_sparse_kv_backward_sorted_from_scores_cuda",
+            wrapped_cuda_sorted_kv_backward,
+        )
+        monkeypatch.setenv("MEGATRON_DSA_TEACHER_SCORE_SCRATCH", "1")
+        monkeypatch.setenv("MEGATRON_DSA_CUDA_SORTED_KV_BWD", "1")
+
+        fused, teacher = sparse_dsa_attention_with_teacher_triton(
+            query_fused, key_fused, value_fused, topk_indices, softmax_scale
+        )
+        (fused * grad_output).sum().backward()
+
+        assert called, "CUDA sorted-segment DSA K/V backward path was not exercised"
+        assert teacher.shape == (bsz * seqlen, topk)
+        torch.testing.assert_close(fused, reference, rtol=2e-4, atol=2e-4)
+        torch.testing.assert_close(query_fused.grad, reference_grads[0], rtol=4e-4, atol=4e-4)
+        torch.testing.assert_close(key_fused.grad, reference_grads[1], rtol=4e-4, atol=4e-4)
+        torch.testing.assert_close(value_fused.grad, reference_grads[2], rtol=4e-4, atol=4e-4)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_chunked_forward_triton_path_matches_fallback(self, monkeypatch):

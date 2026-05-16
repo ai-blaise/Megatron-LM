@@ -24,6 +24,53 @@ from megatron.core.quantization.indexcache.reference import (
 )
 
 
+_NVFP4_PACKED_VALUES_ATTR = "_indexcache_nvfp4_packed_values"
+_NVFP4_PACKED_SCALES_ATTR = "_indexcache_nvfp4_packed_scales"
+
+
+def _set_nvfp4_packed_sidecar(
+    tensor: torch.Tensor,
+    packed_values: torch.Tensor,
+    packed_scales: torch.Tensor,
+) -> torch.Tensor:
+    tensor.__dict__[_NVFP4_PACKED_VALUES_ATTR] = packed_values
+    tensor.__dict__[_NVFP4_PACKED_SCALES_ATTR] = packed_scales
+    return tensor
+
+
+def get_indexcache_nvfp4_packed_tensors(
+    tensor: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, int, int] | None:
+    """Return packed NVFP4 sidecar tensors attached by ``apply_indexcache_kv``.
+
+    PyTorch view ops do not preserve Python attributes on the view object, so
+    this helper also walks ``_base`` links. It intentionally returns ``None``
+    when the sidecar is unavailable or the view cannot be mapped back to packed
+    rows without changing ordinary IndexCache tensor semantics.
+    """
+
+    if tensor.dim() < 2 or tensor.size(-1) <= 0 or tensor.stride(-1) != 1:
+        return None
+    head_dim = int(tensor.size(-1))
+    if tensor.storage_offset() % head_dim != 0 or tensor.stride(0) % head_dim != 0:
+        return None
+    row_offset = int(tensor.storage_offset() // head_dim)
+    row_stride = int(tensor.stride(0) // head_dim)
+    if row_stride <= 0:
+        return None
+
+    current = tensor
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        values = getattr(current, _NVFP4_PACKED_VALUES_ATTR, None)
+        scales = getattr(current, _NVFP4_PACKED_SCALES_ATTR, None)
+        if values is not None and scales is not None:
+            return values, scales, row_offset, row_stride
+        current = getattr(current, "_base", None)
+    return None
+
+
 def _try_load_cuda_ext():
     try:
         from megatron.core.quantization.indexcache.kernels.build import get_ext
@@ -129,7 +176,14 @@ class IndexCacheKVFn(torch.autograd.Function):
 
         ctx.config = config
         ctx.original_shape = original_shape
-        return out.reshape(original_shape)
+        result = out.reshape(original_shape)
+        if (
+            getattr(ctx, "cuda_path", False)
+            and getattr(ctx, "cuda_quantization", None) == INDEXCACHE_QUANT_NVFP4
+        ):
+            _set_nvfp4_packed_sidecar(result, packed_values, packed_scales)
+            _set_nvfp4_packed_sidecar(out, packed_values, packed_scales)
+        return result
 
     @staticmethod
     def backward(ctx, grad_y: torch.Tensor):

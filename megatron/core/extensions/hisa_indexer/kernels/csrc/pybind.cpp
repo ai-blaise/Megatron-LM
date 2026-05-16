@@ -30,6 +30,48 @@ void launch_hisa_selector_fwd(
     int force_first, int force_last, int force_last_minus_one,
     cudaStream_t stream);
 
+void launch_hisa_selector_nvfp4_fwd(
+    const float* q, const uint8_t* packed_values,
+    const int32_t* packed_scales, const float* block_reps,
+    const float* weights, const int32_t* prefix_lens,
+    const int32_t* block_topk_counts, int32_t* topk_indices,
+    float* selected_scores, int Q, int H, int D, int L, int packed_row_offset,
+    int packed_row_stride, int MB, int block_size, int effective_block_topk,
+    int topk_tokens, int force_first, int force_last,
+    int force_last_minus_one, cudaStream_t stream);
+
+void launch_hisa_selector_nvfp4_cublasdx_fwd(
+    const float* q, const uint8_t* packed_values,
+    const int32_t* packed_scales, const float* block_reps,
+    const float* weights, const int32_t* prefix_lens,
+    const int32_t* block_topk_counts, int32_t* topk_indices,
+    float* selected_scores, int Q, int H, int D, int L, int packed_row_offset,
+    int packed_row_stride, int MB, int block_size, int effective_block_topk,
+    int topk_tokens, int force_first, int force_last,
+    int force_last_minus_one, cudaStream_t stream);
+
+void launch_hisa_selector_nvfp4_cublasdx_tiled_fwd(
+    const float* q, const uint8_t* packed_values,
+    const int32_t* packed_scales, const float* block_reps,
+    const float* weights, const int32_t* prefix_lens,
+    const int32_t* block_topk_counts, int32_t* selected_blocks,
+    float* candidate_scores, int32_t* candidate_indices,
+    int32_t* topk_indices, float* selected_scores,
+    int Q, int H, int D, int L, int packed_row_offset,
+    int packed_row_stride, int MB, int block_size, int effective_block_topk,
+    int topk_tokens, int candidate_capacity, int force_first, int force_last,
+    int force_last_minus_one, cudaStream_t stream);
+
+void launch_hisa_selector_nvfp4_cublasdx_fp8_fwd(
+    const float* q, const uint8_t* packed_values,
+    const int32_t* packed_scales, const float* block_reps,
+    const float* weights, const int32_t* prefix_lens,
+    const int32_t* block_topk_counts, int32_t* topk_indices,
+    float* selected_scores, int Q, int H, int D, int L, int packed_row_offset,
+    int packed_row_stride, int MB, int block_size, int effective_block_topk,
+    int topk_tokens, int force_first, int force_last,
+    int force_last_minus_one, cudaStream_t stream);
+
 void launch_hisa_selected_score_bwd(
     const float* grad_selected_scores, const float* q, const float* k,
     const float* weights, const int32_t* topk_indices, float* grad_q,
@@ -45,6 +87,42 @@ void launch_hisa_selector_teacher_fwd(
     int effective_block_topk, int topk_tokens, float softmax_scale,
     int force_first, int force_last, int force_last_minus_one,
     cudaStream_t stream);
+
+void launch_dsa_sparse_kv_bwd(
+    const void* query, const void* key, const void* value,
+    const void* topk_indices, const void* output, const float* lse,
+    const void* grad_output, void* grad_key, void* grad_value,
+    float softmax_scale, int q_len, int bsz, int sk, int num_heads,
+    int head_dim, int value_dim, int topk_count, int q_start,
+    int scalar_dtype, int topk_dtype, int grad_dtype, int tile_q,
+    int tile_k, cudaStream_t stream);
+
+void launch_dsa_sparse_bwd_from_scores(
+    const void* query, const void* key, const void* value,
+    const void* topk_indices, const float* selected_scores, const void* output,
+    const float* lse, const void* grad_output, float* grad_query,
+    void* grad_key, void* grad_value, int q_len, int bsz, int sk,
+    int num_heads, int head_dim, int value_dim, int topk_count,
+    float softmax_scale, int scalar_dtype, int topk_dtype, int grad_dtype,
+    int tile_q, int tile_k, cudaStream_t stream);
+
+void launch_dsa_sparse_bwd_from_scores_row(
+    const void* query, const void* key, const void* value,
+    const void* topk_indices, const float* selected_scores, const void* output,
+    const float* lse, const void* grad_output, float* grad_query,
+    void* grad_key, void* grad_value, int q_len, int bsz, int sk,
+    int num_heads, int head_dim, int value_dim, int topk_count,
+    float softmax_scale, int scalar_dtype, int topk_dtype, int grad_dtype,
+    cudaStream_t stream);
+
+void launch_dsa_sparse_kv_bwd_sorted_from_scores(
+    const void* query, const void* value, const void* topk_indices,
+    const float* selected_scores, const void* output, const float* lse,
+    const void* grad_output, uint64_t* edge_keys, int64_t* edge_ids,
+    float* edge_prob, float* edge_ds, float* delta, void* grad_key,
+    void* grad_value, int q_len, int bsz, int sk, int num_heads,
+    int head_dim, int value_dim, int topk_count, float softmax_scale,
+    int scalar_dtype, int topk_dtype, int grad_dtype, cudaStream_t stream);
 
 }  // namespace hisa_indexer
 }  // namespace megatron
@@ -212,6 +290,468 @@ void hisa_selector_fwd(
       topk_indices.data_ptr<int32_t>(),
       selected_scores.data_ptr<float>(),
       Q, H, D, L, MB, static_cast<int>(block_size),
+      static_cast<int>(effective_block_topk), static_cast<int>(topk_tokens),
+      force_first ? 1 : 0, force_last ? 1 : 0,
+      force_last_minus_one ? 1 : 0, stream);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void hisa_selector_nvfp4_fwd(
+    torch::Tensor q,
+    torch::Tensor packed_values,
+    torch::Tensor packed_scales,
+    torch::Tensor block_reps,
+    torch::Tensor weights,
+    torch::Tensor prefix_lens,
+    torch::Tensor block_topk_counts,
+    torch::Tensor topk_indices,
+    torch::Tensor selected_scores,
+    int64_t key_length,
+    int64_t packed_row_offset,
+    int64_t packed_row_stride,
+    int64_t block_size,
+    int64_t effective_block_topk,
+    int64_t topk_tokens,
+    bool force_first,
+    bool force_last,
+    bool force_last_minus_one) {
+  HISA_CHECK_CUDA(q);
+  HISA_CHECK_CUDA(packed_values);
+  HISA_CHECK_CUDA(packed_scales);
+  HISA_CHECK_CUDA(block_reps);
+  HISA_CHECK_CUDA(weights);
+  HISA_CHECK_CUDA(prefix_lens);
+  HISA_CHECK_CUDA(block_topk_counts);
+  HISA_CHECK_CUDA(topk_indices);
+  HISA_CHECK_CUDA(selected_scores);
+
+  HISA_CHECK_CONTIG(q);
+  HISA_CHECK_CONTIG(packed_values);
+  HISA_CHECK_CONTIG(packed_scales);
+  HISA_CHECK_CONTIG(block_reps);
+  HISA_CHECK_CONTIG(weights);
+  HISA_CHECK_CONTIG(prefix_lens);
+  HISA_CHECK_CONTIG(block_topk_counts);
+  HISA_CHECK_CONTIG(topk_indices);
+  HISA_CHECK_CONTIG(selected_scores);
+
+  HISA_CHECK_DTYPE(q, torch::kFloat32);
+  HISA_CHECK_DTYPE(packed_values, torch::kUInt8);
+  HISA_CHECK_DTYPE(packed_scales, torch::kInt32);
+  HISA_CHECK_DTYPE(block_reps, torch::kFloat32);
+  HISA_CHECK_DTYPE(weights, torch::kFloat32);
+  HISA_CHECK_DTYPE(prefix_lens, torch::kInt32);
+  HISA_CHECK_DTYPE(block_topk_counts, torch::kInt32);
+  HISA_CHECK_DTYPE(topk_indices, torch::kInt32);
+  HISA_CHECK_DTYPE(selected_scores, torch::kFloat32);
+
+  TORCH_CHECK(q.dim() == 3, "q must be [Q, H, D]");
+  TORCH_CHECK(packed_values.dim() == 2, "packed_values must be [N, 64]");
+  TORCH_CHECK(packed_scales.dim() == 1, "packed_scales must be [N]");
+  TORCH_CHECK(block_reps.dim() == 2, "block_reps must be [MB, D]");
+  TORCH_CHECK(weights.dim() == 2, "weights must be [Q, H]");
+  TORCH_CHECK(prefix_lens.dim() == 1, "prefix_lens must be [Q]");
+  TORCH_CHECK(block_topk_counts.dim() == 1, "block_topk_counts must be [Q]");
+  TORCH_CHECK(topk_indices.dim() == 2, "topk_indices must be [Q, K]");
+  TORCH_CHECK(selected_scores.dim() == 2, "selected_scores must be [Q, K]");
+
+  const int Q = q.size(0);
+  const int H = q.size(1);
+  const int D = q.size(2);
+  const int L = static_cast<int>(key_length);
+  const int MB = block_reps.size(0);
+  const int K = topk_indices.size(1);
+
+  TORCH_CHECK(D == 128, "HISA selector requires head_dim=128 (got ", D, ")");
+  TORCH_CHECK(packed_values.size(1) == 64, "NVFP4 packed values must have 64 bytes per row");
+  TORCH_CHECK(packed_scales.size(0) == packed_values.size(0),
+              "packed scale/value row count mismatch");
+  TORCH_CHECK(block_reps.size(1) == D, "block_reps dim must match q head dim");
+  TORCH_CHECK(weights.size(0) == Q && weights.size(1) == H, "weights must be [Q, H]");
+  TORCH_CHECK(prefix_lens.size(0) == Q, "prefix_lens must be [Q]");
+  TORCH_CHECK(block_topk_counts.size(0) == Q, "block_topk_counts must be [Q]");
+  TORCH_CHECK(selected_scores.size(0) == Q && selected_scores.size(1) == K,
+              "selected_scores must match topk_indices shape");
+  TORCH_CHECK(topk_tokens == K, "topk_tokens must equal topk_indices.size(1)");
+  TORCH_CHECK(L >= 0, "key_length must be non-negative");
+  TORCH_CHECK(block_size > 0, "block_size must be positive");
+  TORCH_CHECK(effective_block_topk > 0, "effective_block_topk must be positive");
+  TORCH_CHECK(packed_row_stride > 0, "packed_row_stride must be positive");
+  TORCH_CHECK(packed_row_offset >= 0, "packed_row_offset must be non-negative");
+  if (L > 0) {
+    TORCH_CHECK(
+        packed_row_offset + (static_cast<int64_t>(L) - 1) * packed_row_stride <
+            packed_values.size(0),
+        "packed row mapping exceeds packed_values rows");
+  }
+
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  megatron::hisa_indexer::launch_hisa_selector_nvfp4_fwd(
+      q.data_ptr<float>(),
+      packed_values.data_ptr<uint8_t>(),
+      packed_scales.data_ptr<int32_t>(),
+      block_reps.data_ptr<float>(),
+      weights.data_ptr<float>(),
+      prefix_lens.data_ptr<int32_t>(),
+      block_topk_counts.data_ptr<int32_t>(),
+      topk_indices.data_ptr<int32_t>(),
+      selected_scores.data_ptr<float>(),
+      Q, H, D, L, static_cast<int>(packed_row_offset),
+      static_cast<int>(packed_row_stride), MB, static_cast<int>(block_size),
+      static_cast<int>(effective_block_topk), static_cast<int>(topk_tokens),
+      force_first ? 1 : 0, force_last ? 1 : 0,
+      force_last_minus_one ? 1 : 0, stream);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void hisa_selector_nvfp4_cublasdx_fwd(
+    torch::Tensor q,
+    torch::Tensor packed_values,
+    torch::Tensor packed_scales,
+    torch::Tensor block_reps,
+    torch::Tensor weights,
+    torch::Tensor prefix_lens,
+    torch::Tensor block_topk_counts,
+    torch::Tensor topk_indices,
+    torch::Tensor selected_scores,
+    int64_t key_length,
+    int64_t packed_row_offset,
+    int64_t packed_row_stride,
+    int64_t block_size,
+    int64_t effective_block_topk,
+    int64_t topk_tokens,
+    bool force_first,
+    bool force_last,
+    bool force_last_minus_one) {
+  HISA_CHECK_CUDA(q);
+  HISA_CHECK_CUDA(packed_values);
+  HISA_CHECK_CUDA(packed_scales);
+  HISA_CHECK_CUDA(block_reps);
+  HISA_CHECK_CUDA(weights);
+  HISA_CHECK_CUDA(prefix_lens);
+  HISA_CHECK_CUDA(block_topk_counts);
+  HISA_CHECK_CUDA(topk_indices);
+  HISA_CHECK_CUDA(selected_scores);
+
+  HISA_CHECK_CONTIG(q);
+  HISA_CHECK_CONTIG(packed_values);
+  HISA_CHECK_CONTIG(packed_scales);
+  HISA_CHECK_CONTIG(block_reps);
+  HISA_CHECK_CONTIG(weights);
+  HISA_CHECK_CONTIG(prefix_lens);
+  HISA_CHECK_CONTIG(block_topk_counts);
+  HISA_CHECK_CONTIG(topk_indices);
+  HISA_CHECK_CONTIG(selected_scores);
+
+  HISA_CHECK_DTYPE(q, torch::kFloat32);
+  HISA_CHECK_DTYPE(packed_values, torch::kUInt8);
+  HISA_CHECK_DTYPE(packed_scales, torch::kInt32);
+  HISA_CHECK_DTYPE(block_reps, torch::kFloat32);
+  HISA_CHECK_DTYPE(weights, torch::kFloat32);
+  HISA_CHECK_DTYPE(prefix_lens, torch::kInt32);
+  HISA_CHECK_DTYPE(block_topk_counts, torch::kInt32);
+  HISA_CHECK_DTYPE(topk_indices, torch::kInt32);
+  HISA_CHECK_DTYPE(selected_scores, torch::kFloat32);
+
+  TORCH_CHECK(q.dim() == 3, "q must be [Q, H, D]");
+  TORCH_CHECK(packed_values.dim() == 2, "packed_values must be [N, 64]");
+  TORCH_CHECK(packed_scales.dim() == 1, "packed_scales must be [N]");
+  TORCH_CHECK(block_reps.dim() == 2, "block_reps must be [MB, D]");
+  TORCH_CHECK(weights.dim() == 2, "weights must be [Q, H]");
+  TORCH_CHECK(prefix_lens.dim() == 1, "prefix_lens must be [Q]");
+  TORCH_CHECK(block_topk_counts.dim() == 1, "block_topk_counts must be [Q]");
+  TORCH_CHECK(topk_indices.dim() == 2, "topk_indices must be [Q, K]");
+  TORCH_CHECK(selected_scores.dim() == 2, "selected_scores must be [Q, K]");
+
+  const int Q = q.size(0);
+  const int H = q.size(1);
+  const int D = q.size(2);
+  const int L = static_cast<int>(key_length);
+  const int MB = block_reps.size(0);
+  const int K = topk_indices.size(1);
+
+  TORCH_CHECK(H == 64, "cuBLASDx NVFP4 HISA selector requires 64 indexer heads");
+  TORCH_CHECK(D == 128, "cuBLASDx NVFP4 HISA selector requires head_dim=128");
+  TORCH_CHECK(packed_values.size(1) == 64, "NVFP4 packed values must have 64 bytes per row");
+  TORCH_CHECK(packed_scales.size(0) == packed_values.size(0),
+              "packed scale/value row count mismatch");
+  TORCH_CHECK(block_reps.size(1) == D, "block_reps dim must match q head dim");
+  TORCH_CHECK(weights.size(0) == Q && weights.size(1) == H, "weights must be [Q, H]");
+  TORCH_CHECK(prefix_lens.size(0) == Q, "prefix_lens must be [Q]");
+  TORCH_CHECK(block_topk_counts.size(0) == Q, "block_topk_counts must be [Q]");
+  TORCH_CHECK(selected_scores.size(0) == Q && selected_scores.size(1) == K,
+              "selected_scores must match topk_indices shape");
+  TORCH_CHECK(topk_tokens == K, "topk_tokens must equal topk_indices.size(1)");
+  TORCH_CHECK(L >= 0, "key_length must be non-negative");
+  TORCH_CHECK(block_size > 0, "block_size must be positive");
+  TORCH_CHECK(effective_block_topk > 0, "effective_block_topk must be positive");
+  TORCH_CHECK(packed_row_stride > 0, "packed_row_stride must be positive");
+  TORCH_CHECK(packed_row_offset >= 0, "packed_row_offset must be non-negative");
+  if (L > 0) {
+    TORCH_CHECK(
+        packed_row_offset + (static_cast<int64_t>(L) - 1) * packed_row_stride <
+            packed_values.size(0),
+        "packed row mapping exceeds packed_values rows");
+  }
+
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  megatron::hisa_indexer::launch_hisa_selector_nvfp4_cublasdx_fwd(
+      q.data_ptr<float>(),
+      packed_values.data_ptr<uint8_t>(),
+      packed_scales.data_ptr<int32_t>(),
+      block_reps.data_ptr<float>(),
+      weights.data_ptr<float>(),
+      prefix_lens.data_ptr<int32_t>(),
+      block_topk_counts.data_ptr<int32_t>(),
+      topk_indices.data_ptr<int32_t>(),
+      selected_scores.data_ptr<float>(),
+      Q, H, D, L, static_cast<int>(packed_row_offset),
+      static_cast<int>(packed_row_stride), MB, static_cast<int>(block_size),
+      static_cast<int>(effective_block_topk), static_cast<int>(topk_tokens),
+      force_first ? 1 : 0, force_last ? 1 : 0,
+      force_last_minus_one ? 1 : 0, stream);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void hisa_selector_nvfp4_cublasdx_tiled_fwd(
+    torch::Tensor q,
+    torch::Tensor packed_values,
+    torch::Tensor packed_scales,
+    torch::Tensor block_reps,
+    torch::Tensor weights,
+    torch::Tensor prefix_lens,
+    torch::Tensor block_topk_counts,
+    torch::Tensor selected_blocks,
+    torch::Tensor candidate_scores,
+    torch::Tensor candidate_indices,
+    torch::Tensor topk_indices,
+    torch::Tensor selected_scores,
+    int64_t key_length,
+    int64_t packed_row_offset,
+    int64_t packed_row_stride,
+    int64_t block_size,
+    int64_t effective_block_topk,
+    int64_t topk_tokens,
+    bool force_first,
+    bool force_last,
+    bool force_last_minus_one) {
+  HISA_CHECK_CUDA(q);
+  HISA_CHECK_CUDA(packed_values);
+  HISA_CHECK_CUDA(packed_scales);
+  HISA_CHECK_CUDA(block_reps);
+  HISA_CHECK_CUDA(weights);
+  HISA_CHECK_CUDA(prefix_lens);
+  HISA_CHECK_CUDA(block_topk_counts);
+  HISA_CHECK_CUDA(selected_blocks);
+  HISA_CHECK_CUDA(candidate_scores);
+  HISA_CHECK_CUDA(candidate_indices);
+  HISA_CHECK_CUDA(topk_indices);
+  HISA_CHECK_CUDA(selected_scores);
+
+  HISA_CHECK_CONTIG(q);
+  HISA_CHECK_CONTIG(packed_values);
+  HISA_CHECK_CONTIG(packed_scales);
+  HISA_CHECK_CONTIG(block_reps);
+  HISA_CHECK_CONTIG(weights);
+  HISA_CHECK_CONTIG(prefix_lens);
+  HISA_CHECK_CONTIG(block_topk_counts);
+  HISA_CHECK_CONTIG(selected_blocks);
+  HISA_CHECK_CONTIG(candidate_scores);
+  HISA_CHECK_CONTIG(candidate_indices);
+  HISA_CHECK_CONTIG(topk_indices);
+  HISA_CHECK_CONTIG(selected_scores);
+
+  HISA_CHECK_DTYPE(q, torch::kFloat32);
+  HISA_CHECK_DTYPE(packed_values, torch::kUInt8);
+  HISA_CHECK_DTYPE(packed_scales, torch::kInt32);
+  HISA_CHECK_DTYPE(block_reps, torch::kFloat32);
+  HISA_CHECK_DTYPE(weights, torch::kFloat32);
+  HISA_CHECK_DTYPE(prefix_lens, torch::kInt32);
+  HISA_CHECK_DTYPE(block_topk_counts, torch::kInt32);
+  HISA_CHECK_DTYPE(selected_blocks, torch::kInt32);
+  HISA_CHECK_DTYPE(candidate_scores, torch::kFloat32);
+  HISA_CHECK_DTYPE(candidate_indices, torch::kInt32);
+  HISA_CHECK_DTYPE(topk_indices, torch::kInt32);
+  HISA_CHECK_DTYPE(selected_scores, torch::kFloat32);
+
+  TORCH_CHECK(q.dim() == 3, "q must be [Q, H, D]");
+  TORCH_CHECK(packed_values.dim() == 2, "packed_values must be [N, 64]");
+  TORCH_CHECK(packed_scales.dim() == 1, "packed_scales must be [N]");
+  TORCH_CHECK(block_reps.dim() == 2, "block_reps must be [MB, D]");
+  TORCH_CHECK(weights.dim() == 2, "weights must be [Q, H]");
+  TORCH_CHECK(prefix_lens.dim() == 1, "prefix_lens must be [Q]");
+  TORCH_CHECK(block_topk_counts.dim() == 1, "block_topk_counts must be [Q]");
+  TORCH_CHECK(selected_blocks.dim() == 2, "selected_blocks must be [Q, TB]");
+  TORCH_CHECK(candidate_scores.dim() == 2, "candidate_scores must be [Q, C]");
+  TORCH_CHECK(candidate_indices.dim() == 2, "candidate_indices must be [Q, C]");
+  TORCH_CHECK(topk_indices.dim() == 2, "topk_indices must be [Q, K]");
+  TORCH_CHECK(selected_scores.dim() == 2, "selected_scores must be [Q, K]");
+
+  const int Q = q.size(0);
+  const int H = q.size(1);
+  const int D = q.size(2);
+  const int L = static_cast<int>(key_length);
+  const int MB = block_reps.size(0);
+  const int K = topk_indices.size(1);
+  const int candidate_capacity = candidate_scores.size(1);
+
+  TORCH_CHECK(H == 64, "tiled cuBLASDx NVFP4 HISA selector requires 64 indexer heads");
+  TORCH_CHECK(D == 128, "tiled cuBLASDx NVFP4 HISA selector requires head_dim=128");
+  TORCH_CHECK(packed_values.size(1) == 64, "NVFP4 packed values must have 64 bytes per row");
+  TORCH_CHECK(packed_scales.size(0) == packed_values.size(0),
+              "packed scale/value row count mismatch");
+  TORCH_CHECK(block_reps.size(1) == D, "block_reps dim must match q head dim");
+  TORCH_CHECK(weights.size(0) == Q && weights.size(1) == H, "weights must be [Q, H]");
+  TORCH_CHECK(prefix_lens.size(0) == Q, "prefix_lens must be [Q]");
+  TORCH_CHECK(block_topk_counts.size(0) == Q, "block_topk_counts must be [Q]");
+  TORCH_CHECK(selected_blocks.size(0) == Q, "selected_blocks row count mismatch");
+  TORCH_CHECK(selected_blocks.size(1) == effective_block_topk,
+              "selected_blocks must be [Q, effective_block_topk]");
+  TORCH_CHECK(candidate_indices.size(0) == Q && candidate_indices.size(1) == candidate_capacity,
+              "candidate_indices must match candidate_scores shape");
+  TORCH_CHECK(selected_scores.size(0) == Q && selected_scores.size(1) == K,
+              "selected_scores must match topk_indices shape");
+  TORCH_CHECK(topk_tokens == K, "topk_tokens must equal topk_indices.size(1)");
+  TORCH_CHECK(candidate_capacity >= K, "candidate scratch must be at least topk_tokens");
+  TORCH_CHECK((candidate_capacity & (candidate_capacity - 1)) == 0,
+              "candidate scratch width must be a power of two");
+  TORCH_CHECK(L >= 0, "key_length must be non-negative");
+  TORCH_CHECK(block_size > 0, "block_size must be positive");
+  TORCH_CHECK(effective_block_topk > 0, "effective_block_topk must be positive");
+  TORCH_CHECK(packed_row_stride > 0, "packed_row_stride must be positive");
+  TORCH_CHECK(packed_row_offset >= 0, "packed_row_offset must be non-negative");
+  if (L > 0) {
+    TORCH_CHECK(
+        packed_row_offset + (static_cast<int64_t>(L) - 1) * packed_row_stride <
+            packed_values.size(0),
+        "packed row mapping exceeds packed_values rows");
+  }
+
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  megatron::hisa_indexer::launch_hisa_selector_nvfp4_cublasdx_tiled_fwd(
+      q.data_ptr<float>(),
+      packed_values.data_ptr<uint8_t>(),
+      packed_scales.data_ptr<int32_t>(),
+      block_reps.data_ptr<float>(),
+      weights.data_ptr<float>(),
+      prefix_lens.data_ptr<int32_t>(),
+      block_topk_counts.data_ptr<int32_t>(),
+      selected_blocks.data_ptr<int32_t>(),
+      candidate_scores.data_ptr<float>(),
+      candidate_indices.data_ptr<int32_t>(),
+      topk_indices.data_ptr<int32_t>(),
+      selected_scores.data_ptr<float>(),
+      Q, H, D, L, static_cast<int>(packed_row_offset),
+      static_cast<int>(packed_row_stride), MB, static_cast<int>(block_size),
+      static_cast<int>(effective_block_topk), static_cast<int>(topk_tokens),
+      candidate_capacity, force_first ? 1 : 0, force_last ? 1 : 0,
+      force_last_minus_one ? 1 : 0, stream);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void hisa_selector_nvfp4_cublasdx_fp8_fwd(
+    torch::Tensor q,
+    torch::Tensor packed_values,
+    torch::Tensor packed_scales,
+    torch::Tensor block_reps,
+    torch::Tensor weights,
+    torch::Tensor prefix_lens,
+    torch::Tensor block_topk_counts,
+    torch::Tensor topk_indices,
+    torch::Tensor selected_scores,
+    int64_t key_length,
+    int64_t packed_row_offset,
+    int64_t packed_row_stride,
+    int64_t block_size,
+    int64_t effective_block_topk,
+    int64_t topk_tokens,
+    bool force_first,
+    bool force_last,
+    bool force_last_minus_one) {
+  HISA_CHECK_CUDA(q);
+  HISA_CHECK_CUDA(packed_values);
+  HISA_CHECK_CUDA(packed_scales);
+  HISA_CHECK_CUDA(block_reps);
+  HISA_CHECK_CUDA(weights);
+  HISA_CHECK_CUDA(prefix_lens);
+  HISA_CHECK_CUDA(block_topk_counts);
+  HISA_CHECK_CUDA(topk_indices);
+  HISA_CHECK_CUDA(selected_scores);
+
+  HISA_CHECK_CONTIG(q);
+  HISA_CHECK_CONTIG(packed_values);
+  HISA_CHECK_CONTIG(packed_scales);
+  HISA_CHECK_CONTIG(block_reps);
+  HISA_CHECK_CONTIG(weights);
+  HISA_CHECK_CONTIG(prefix_lens);
+  HISA_CHECK_CONTIG(block_topk_counts);
+  HISA_CHECK_CONTIG(topk_indices);
+  HISA_CHECK_CONTIG(selected_scores);
+
+  HISA_CHECK_DTYPE(q, torch::kFloat32);
+  HISA_CHECK_DTYPE(packed_values, torch::kUInt8);
+  HISA_CHECK_DTYPE(packed_scales, torch::kInt32);
+  HISA_CHECK_DTYPE(block_reps, torch::kFloat32);
+  HISA_CHECK_DTYPE(weights, torch::kFloat32);
+  HISA_CHECK_DTYPE(prefix_lens, torch::kInt32);
+  HISA_CHECK_DTYPE(block_topk_counts, torch::kInt32);
+  HISA_CHECK_DTYPE(topk_indices, torch::kInt32);
+  HISA_CHECK_DTYPE(selected_scores, torch::kFloat32);
+
+  TORCH_CHECK(q.dim() == 3, "q must be [Q, H, D]");
+  TORCH_CHECK(packed_values.dim() == 2, "packed_values must be [N, 64]");
+  TORCH_CHECK(packed_scales.dim() == 1, "packed_scales must be [N]");
+  TORCH_CHECK(block_reps.dim() == 2, "block_reps must be [MB, D]");
+  TORCH_CHECK(weights.dim() == 2, "weights must be [Q, H]");
+  TORCH_CHECK(prefix_lens.dim() == 1, "prefix_lens must be [Q]");
+  TORCH_CHECK(block_topk_counts.dim() == 1, "block_topk_counts must be [Q]");
+  TORCH_CHECK(topk_indices.dim() == 2, "topk_indices must be [Q, K]");
+  TORCH_CHECK(selected_scores.dim() == 2, "selected_scores must be [Q, K]");
+
+  const int Q = q.size(0);
+  const int H = q.size(1);
+  const int D = q.size(2);
+  const int L = static_cast<int>(key_length);
+  const int MB = block_reps.size(0);
+  const int K = topk_indices.size(1);
+
+  TORCH_CHECK(H == 64, "FP8 cuBLASDx NVFP4 HISA selector requires 64 indexer heads");
+  TORCH_CHECK(D == 128, "FP8 cuBLASDx NVFP4 HISA selector requires head_dim=128");
+  TORCH_CHECK(packed_values.size(1) == 64, "NVFP4 packed values must have 64 bytes per row");
+  TORCH_CHECK(packed_scales.size(0) == packed_values.size(0),
+              "packed scale/value row count mismatch");
+  TORCH_CHECK(block_reps.size(1) == D, "block_reps dim must match q head dim");
+  TORCH_CHECK(weights.size(0) == Q && weights.size(1) == H, "weights must be [Q, H]");
+  TORCH_CHECK(prefix_lens.size(0) == Q, "prefix_lens must be [Q]");
+  TORCH_CHECK(block_topk_counts.size(0) == Q, "block_topk_counts must be [Q]");
+  TORCH_CHECK(selected_scores.size(0) == Q && selected_scores.size(1) == K,
+              "selected_scores must match topk_indices shape");
+  TORCH_CHECK(topk_tokens == K, "topk_tokens must equal topk_indices.size(1)");
+  TORCH_CHECK(L >= 0, "key_length must be non-negative");
+  TORCH_CHECK(block_size > 0, "block_size must be positive");
+  TORCH_CHECK(effective_block_topk > 0, "effective_block_topk must be positive");
+  TORCH_CHECK(packed_row_stride > 0, "packed_row_stride must be positive");
+  TORCH_CHECK(packed_row_offset >= 0, "packed_row_offset must be non-negative");
+  if (L > 0) {
+    TORCH_CHECK(
+        packed_row_offset + (static_cast<int64_t>(L) - 1) * packed_row_stride <
+            packed_values.size(0),
+        "packed row mapping exceeds packed_values rows");
+  }
+
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  megatron::hisa_indexer::launch_hisa_selector_nvfp4_cublasdx_fp8_fwd(
+      q.data_ptr<float>(),
+      packed_values.data_ptr<uint8_t>(),
+      packed_scales.data_ptr<int32_t>(),
+      block_reps.data_ptr<float>(),
+      weights.data_ptr<float>(),
+      prefix_lens.data_ptr<int32_t>(),
+      block_topk_counts.data_ptr<int32_t>(),
+      topk_indices.data_ptr<int32_t>(),
+      selected_scores.data_ptr<float>(),
+      Q, H, D, L, static_cast<int>(packed_row_offset),
+      static_cast<int>(packed_row_stride), MB, static_cast<int>(block_size),
       static_cast<int>(effective_block_topk), static_cast<int>(topk_tokens),
       force_first ? 1 : 0, force_last ? 1 : 0,
       force_last_minus_one ? 1 : 0, stream);
@@ -403,11 +943,525 @@ void hisa_selector_teacher_fwd(
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+int dtype_code(torch::ScalarType dtype) {
+  if (dtype == torch::kFloat32) {
+    return 0;
+  }
+  if (dtype == torch::kBFloat16) {
+    return 1;
+  }
+  if (dtype == torch::kFloat16) {
+    return 2;
+  }
+  TORCH_CHECK(false, "unsupported dtype for DSA sparse K/V backward: ", dtype);
+}
+
+int topk_dtype_code(torch::ScalarType dtype) {
+  if (dtype == torch::kInt16) {
+    return 0;
+  }
+  if (dtype == torch::kInt32) {
+    return 1;
+  }
+  if (dtype == torch::kInt64) {
+    return 2;
+  }
+  TORCH_CHECK(false, "unsupported topk dtype for DSA sparse K/V backward: ", dtype);
+}
+
+void dsa_sparse_kv_bwd(
+    torch::Tensor query,
+    torch::Tensor key,
+    torch::Tensor value,
+    torch::Tensor topk_indices,
+    torch::Tensor output,
+    torch::Tensor lse,
+    torch::Tensor grad_output,
+    torch::Tensor grad_key,
+    torch::Tensor grad_value,
+    double softmax_scale,
+    int64_t q_start,
+    int64_t tile_q,
+    int64_t tile_k) {
+  HISA_CHECK_CUDA(query);
+  HISA_CHECK_CUDA(key);
+  HISA_CHECK_CUDA(value);
+  HISA_CHECK_CUDA(topk_indices);
+  HISA_CHECK_CUDA(output);
+  HISA_CHECK_CUDA(lse);
+  HISA_CHECK_CUDA(grad_output);
+  HISA_CHECK_CUDA(grad_key);
+  HISA_CHECK_CUDA(grad_value);
+
+  HISA_CHECK_CONTIG(query);
+  HISA_CHECK_CONTIG(key);
+  HISA_CHECK_CONTIG(value);
+  HISA_CHECK_CONTIG(topk_indices);
+  HISA_CHECK_CONTIG(output);
+  HISA_CHECK_CONTIG(lse);
+  HISA_CHECK_CONTIG(grad_output);
+  HISA_CHECK_CONTIG(grad_key);
+  HISA_CHECK_CONTIG(grad_value);
+
+  TORCH_CHECK(query.dim() == 4, "query must be [Q, B, H, D]");
+  TORCH_CHECK(key.dim() == 4, "key must be [S, B, H, D]");
+  TORCH_CHECK(value.dim() == 4, "value must be [S, B, H, V]");
+  TORCH_CHECK(topk_indices.dim() == 3, "topk_indices must be [B, Q, K]");
+  TORCH_CHECK(output.dim() == 4, "output must be [Q, B, H, V]");
+  TORCH_CHECK(grad_output.dim() == 4, "grad_output must be [Q, B, H, V]");
+  TORCH_CHECK(lse.dim() == 2, "lse must be [B * Q, H]");
+
+  const int Q = query.size(0);
+  const int B = query.size(1);
+  const int H = query.size(2);
+  const int D = query.size(3);
+  const int S = key.size(0);
+  const int V = value.size(3);
+  const int K = topk_indices.size(2);
+
+  TORCH_CHECK(key.size(1) == B && key.size(2) == H && key.size(3) == D,
+              "key shape must match query batch/head/head_dim");
+  TORCH_CHECK(value.size(0) == S && value.size(1) == B && value.size(2) == H,
+              "value shape must match key sequence/batch/head");
+  TORCH_CHECK(topk_indices.size(0) == B && topk_indices.size(1) == Q,
+              "topk_indices must be [B, Q, K]");
+  TORCH_CHECK(output.size(0) == Q && output.size(1) == B && output.size(2) == H &&
+                  output.size(3) == V,
+              "output shape must be [Q, B, H, V]");
+  TORCH_CHECK(grad_output.size(0) == Q && grad_output.size(1) == B &&
+                  grad_output.size(2) == H && grad_output.size(3) == V,
+              "grad_output shape must match output");
+  TORCH_CHECK(lse.size(0) == B * Q && lse.size(1) == H,
+              "lse must be [B * Q, H]");
+  TORCH_CHECK(grad_key.sizes() == key.sizes(), "grad_key shape must match key");
+  TORCH_CHECK(grad_value.sizes() == value.sizes(), "grad_value shape must match value");
+  TORCH_CHECK(query.scalar_type() == key.scalar_type() &&
+                  query.scalar_type() == value.scalar_type() &&
+                  query.scalar_type() == output.scalar_type() &&
+                  query.scalar_type() == grad_output.scalar_type(),
+              "query/key/value/output/grad_output must share dtype");
+  TORCH_CHECK(grad_key.scalar_type() == grad_value.scalar_type(),
+              "grad_key and grad_value must share dtype");
+  HISA_CHECK_DTYPE(lse, torch::kFloat32);
+  TORCH_CHECK(D > 0 && D <= 256, "DSA sparse K/V backward supports head_dim in (0, 256]");
+  TORCH_CHECK(V > 0 && V <= 256, "DSA sparse K/V backward supports value_dim in (0, 256]");
+  TORCH_CHECK(K > 0, "topk count must be positive");
+  TORCH_CHECK(tile_q > 0 && tile_k > 0, "tile_q and tile_k must be positive");
+  TORCH_CHECK(tile_q * tile_k <= 8,
+              "DSA sparse K/V backward currently supports at most 8 edge-warps per CTA");
+
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  megatron::hisa_indexer::launch_dsa_sparse_kv_bwd(
+      query.data_ptr(),
+      key.data_ptr(),
+      value.data_ptr(),
+      topk_indices.data_ptr(),
+      output.data_ptr(),
+      lse.data_ptr<float>(),
+      grad_output.data_ptr(),
+      grad_key.data_ptr(),
+      grad_value.data_ptr(),
+      static_cast<float>(softmax_scale),
+      Q,
+      B,
+      S,
+      H,
+      D,
+      V,
+      K,
+      static_cast<int>(q_start),
+      dtype_code(query.scalar_type()),
+      topk_dtype_code(topk_indices.scalar_type()),
+      dtype_code(grad_key.scalar_type()),
+      static_cast<int>(tile_q),
+      static_cast<int>(tile_k),
+      stream);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void dsa_sparse_bwd_from_scores(
+    torch::Tensor query,
+    torch::Tensor key,
+    torch::Tensor value,
+    torch::Tensor topk_indices,
+    torch::Tensor selected_scores,
+    torch::Tensor output,
+    torch::Tensor lse,
+    torch::Tensor grad_output,
+    torch::Tensor grad_query,
+    torch::Tensor grad_key,
+    torch::Tensor grad_value,
+    double softmax_scale,
+    int64_t tile_q,
+    int64_t tile_k) {
+  HISA_CHECK_CUDA(query);
+  HISA_CHECK_CUDA(key);
+  HISA_CHECK_CUDA(value);
+  HISA_CHECK_CUDA(topk_indices);
+  HISA_CHECK_CUDA(selected_scores);
+  HISA_CHECK_CUDA(output);
+  HISA_CHECK_CUDA(lse);
+  HISA_CHECK_CUDA(grad_output);
+  HISA_CHECK_CUDA(grad_query);
+  HISA_CHECK_CUDA(grad_key);
+  HISA_CHECK_CUDA(grad_value);
+
+  HISA_CHECK_CONTIG(query);
+  HISA_CHECK_CONTIG(key);
+  HISA_CHECK_CONTIG(value);
+  HISA_CHECK_CONTIG(topk_indices);
+  HISA_CHECK_CONTIG(selected_scores);
+  HISA_CHECK_CONTIG(output);
+  HISA_CHECK_CONTIG(lse);
+  HISA_CHECK_CONTIG(grad_output);
+  HISA_CHECK_CONTIG(grad_query);
+  HISA_CHECK_CONTIG(grad_key);
+  HISA_CHECK_CONTIG(grad_value);
+
+  TORCH_CHECK(query.dim() == 4, "query must be [Q, B, H, D]");
+  TORCH_CHECK(key.dim() == 4, "key must be [S, B, H, D]");
+  TORCH_CHECK(value.dim() == 4, "value must be [S, B, H, V]");
+  TORCH_CHECK(topk_indices.dim() == 3, "topk_indices must be [B, Q, K]");
+  TORCH_CHECK(selected_scores.dim() == 3, "selected_scores must be [B * Q, H, K]");
+  TORCH_CHECK(output.dim() == 4, "output must be [Q, B, H, V]");
+  TORCH_CHECK(grad_output.dim() == 4, "grad_output must be [Q, B, H, V]");
+  TORCH_CHECK(grad_query.dim() == 4, "grad_query must be [Q, B, H, D]");
+  TORCH_CHECK(lse.dim() == 2, "lse must be [B * Q, H]");
+
+  const int Q = query.size(0);
+  const int B = query.size(1);
+  const int H = query.size(2);
+  const int D = query.size(3);
+  const int S = key.size(0);
+  const int V = value.size(3);
+  const int K = topk_indices.size(2);
+
+  TORCH_CHECK(key.size(1) == B && key.size(2) == H && key.size(3) == D,
+              "key shape must match query batch/head/head_dim");
+  TORCH_CHECK(value.size(0) == S && value.size(1) == B && value.size(2) == H,
+              "value shape must match key sequence/batch/head");
+  TORCH_CHECK(topk_indices.size(0) == B && topk_indices.size(1) == Q,
+              "topk_indices must be [B, Q, K]");
+  TORCH_CHECK(selected_scores.size(0) == B * Q && selected_scores.size(1) == H &&
+                  selected_scores.size(2) == K,
+              "selected_scores must be [B * Q, H, K]");
+  TORCH_CHECK(output.size(0) == Q && output.size(1) == B && output.size(2) == H &&
+                  output.size(3) == V,
+              "output shape must be [Q, B, H, V]");
+  TORCH_CHECK(grad_output.size(0) == Q && grad_output.size(1) == B &&
+                  grad_output.size(2) == H && grad_output.size(3) == V,
+              "grad_output shape must match output");
+  TORCH_CHECK(grad_query.sizes() == query.sizes(), "grad_query shape must match query");
+  TORCH_CHECK(lse.size(0) == B * Q && lse.size(1) == H,
+              "lse must be [B * Q, H]");
+  TORCH_CHECK(grad_key.sizes() == key.sizes(), "grad_key shape must match key");
+  TORCH_CHECK(grad_value.sizes() == value.sizes(), "grad_value shape must match value");
+  TORCH_CHECK(query.scalar_type() == key.scalar_type() &&
+                  query.scalar_type() == value.scalar_type() &&
+                  query.scalar_type() == output.scalar_type() &&
+                  query.scalar_type() == grad_output.scalar_type(),
+              "query/key/value/output/grad_output must share dtype");
+  HISA_CHECK_DTYPE(selected_scores, torch::kFloat32);
+  HISA_CHECK_DTYPE(lse, torch::kFloat32);
+  HISA_CHECK_DTYPE(grad_query, torch::kFloat32);
+  TORCH_CHECK(grad_key.scalar_type() == grad_value.scalar_type(),
+              "grad_key and grad_value must share dtype");
+  TORCH_CHECK(D > 0 && D <= 256, "DSA sparse backward supports head_dim in (0, 256]");
+  TORCH_CHECK(V > 0 && V <= 256, "DSA sparse backward supports value_dim in (0, 256]");
+  TORCH_CHECK(K > 0, "topk count must be positive");
+  TORCH_CHECK(tile_q > 0 && tile_k > 0, "tile_q and tile_k must be positive");
+  TORCH_CHECK(tile_q * tile_k <= 8,
+              "DSA sparse backward currently supports at most 8 edge-warps per CTA");
+
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  megatron::hisa_indexer::launch_dsa_sparse_bwd_from_scores(
+      query.data_ptr(),
+      key.data_ptr(),
+      value.data_ptr(),
+      topk_indices.data_ptr(),
+      selected_scores.data_ptr<float>(),
+      output.data_ptr(),
+      lse.data_ptr<float>(),
+      grad_output.data_ptr(),
+      grad_query.data_ptr<float>(),
+      grad_key.data_ptr(),
+      grad_value.data_ptr(),
+      Q,
+      B,
+      S,
+      H,
+      D,
+      V,
+      K,
+      static_cast<float>(softmax_scale),
+      dtype_code(query.scalar_type()),
+      topk_dtype_code(topk_indices.scalar_type()),
+      dtype_code(grad_key.scalar_type()),
+      static_cast<int>(tile_q),
+      static_cast<int>(tile_k),
+      stream);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void dsa_sparse_bwd_from_scores_row(
+    torch::Tensor query,
+    torch::Tensor key,
+    torch::Tensor value,
+    torch::Tensor topk_indices,
+    torch::Tensor selected_scores,
+    torch::Tensor output,
+    torch::Tensor lse,
+    torch::Tensor grad_output,
+    torch::Tensor grad_query,
+    torch::Tensor grad_key,
+    torch::Tensor grad_value,
+    double softmax_scale) {
+  HISA_CHECK_CUDA(query);
+  HISA_CHECK_CUDA(key);
+  HISA_CHECK_CUDA(value);
+  HISA_CHECK_CUDA(topk_indices);
+  HISA_CHECK_CUDA(selected_scores);
+  HISA_CHECK_CUDA(output);
+  HISA_CHECK_CUDA(lse);
+  HISA_CHECK_CUDA(grad_output);
+  HISA_CHECK_CUDA(grad_query);
+  HISA_CHECK_CUDA(grad_key);
+  HISA_CHECK_CUDA(grad_value);
+
+  HISA_CHECK_CONTIG(query);
+  HISA_CHECK_CONTIG(key);
+  HISA_CHECK_CONTIG(value);
+  HISA_CHECK_CONTIG(topk_indices);
+  HISA_CHECK_CONTIG(selected_scores);
+  HISA_CHECK_CONTIG(output);
+  HISA_CHECK_CONTIG(lse);
+  HISA_CHECK_CONTIG(grad_output);
+  HISA_CHECK_CONTIG(grad_query);
+  HISA_CHECK_CONTIG(grad_key);
+  HISA_CHECK_CONTIG(grad_value);
+
+  TORCH_CHECK(query.dim() == 4, "query must be [Q, B, H, D]");
+  TORCH_CHECK(key.dim() == 4, "key must be [S, B, H, D]");
+  TORCH_CHECK(value.dim() == 4, "value must be [S, B, H, V]");
+  TORCH_CHECK(topk_indices.dim() == 3, "topk_indices must be [B, Q, K]");
+  TORCH_CHECK(selected_scores.dim() == 3, "selected_scores must be [B * Q, H, K]");
+  TORCH_CHECK(output.dim() == 4, "output must be [Q, B, H, V]");
+  TORCH_CHECK(grad_output.dim() == 4, "grad_output must be [Q, B, H, V]");
+  TORCH_CHECK(grad_query.dim() == 4, "grad_query must be [Q, B, H, D]");
+  TORCH_CHECK(lse.dim() == 2, "lse must be [B * Q, H]");
+
+  const int Q = query.size(0);
+  const int B = query.size(1);
+  const int H = query.size(2);
+  const int D = query.size(3);
+  const int S = key.size(0);
+  const int V = value.size(3);
+  const int K = topk_indices.size(2);
+
+  TORCH_CHECK(key.size(1) == B && key.size(2) == H && key.size(3) == D,
+              "key shape must match query batch/head/head_dim");
+  TORCH_CHECK(value.size(0) == S && value.size(1) == B && value.size(2) == H,
+              "value shape must match key sequence/batch/head");
+  TORCH_CHECK(topk_indices.size(0) == B && topk_indices.size(1) == Q,
+              "topk_indices must be [B, Q, K]");
+  TORCH_CHECK(selected_scores.size(0) == B * Q && selected_scores.size(1) == H &&
+                  selected_scores.size(2) == K,
+              "selected_scores must be [B * Q, H, K]");
+  TORCH_CHECK(output.size(0) == Q && output.size(1) == B && output.size(2) == H &&
+                  output.size(3) == V,
+              "output shape must be [Q, B, H, V]");
+  TORCH_CHECK(grad_output.size(0) == Q && grad_output.size(1) == B &&
+                  grad_output.size(2) == H && grad_output.size(3) == V,
+              "grad_output shape must match output");
+  TORCH_CHECK(grad_query.sizes() == query.sizes(), "grad_query shape must match query");
+  TORCH_CHECK(lse.size(0) == B * Q && lse.size(1) == H,
+              "lse must be [B * Q, H]");
+  TORCH_CHECK(grad_key.sizes() == key.sizes(), "grad_key shape must match key");
+  TORCH_CHECK(grad_value.sizes() == value.sizes(), "grad_value shape must match value");
+  TORCH_CHECK(query.scalar_type() == key.scalar_type() &&
+                  query.scalar_type() == value.scalar_type() &&
+                  query.scalar_type() == output.scalar_type() &&
+                  query.scalar_type() == grad_output.scalar_type(),
+              "query/key/value/output/grad_output must share dtype");
+  HISA_CHECK_DTYPE(selected_scores, torch::kFloat32);
+  HISA_CHECK_DTYPE(lse, torch::kFloat32);
+  HISA_CHECK_DTYPE(grad_query, torch::kFloat32);
+  TORCH_CHECK(grad_key.scalar_type() == grad_value.scalar_type(),
+              "grad_key and grad_value must share dtype");
+  TORCH_CHECK(D > 0 && D <= 256, "DSA row backward supports head_dim in (0, 256]");
+  TORCH_CHECK(V > 0 && V <= 256, "DSA row backward supports value_dim in (0, 256]");
+  TORCH_CHECK(K > 0, "topk count must be positive");
+
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  megatron::hisa_indexer::launch_dsa_sparse_bwd_from_scores_row(
+      query.data_ptr(),
+      key.data_ptr(),
+      value.data_ptr(),
+      topk_indices.data_ptr(),
+      selected_scores.data_ptr<float>(),
+      output.data_ptr(),
+      lse.data_ptr<float>(),
+      grad_output.data_ptr(),
+      grad_query.data_ptr<float>(),
+      grad_key.data_ptr(),
+      grad_value.data_ptr(),
+      Q,
+      B,
+      S,
+      H,
+      D,
+      V,
+      K,
+      static_cast<float>(softmax_scale),
+      dtype_code(query.scalar_type()),
+      topk_dtype_code(topk_indices.scalar_type()),
+      dtype_code(grad_key.scalar_type()),
+      stream);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void dsa_sparse_kv_bwd_sorted_from_scores(
+    torch::Tensor query,
+    torch::Tensor key,
+    torch::Tensor value,
+    torch::Tensor topk_indices,
+    torch::Tensor selected_scores,
+    torch::Tensor output,
+    torch::Tensor lse,
+    torch::Tensor grad_output,
+    torch::Tensor grad_key,
+    torch::Tensor grad_value,
+    double softmax_scale) {
+  HISA_CHECK_CUDA(query);
+  HISA_CHECK_CUDA(key);
+  HISA_CHECK_CUDA(value);
+  HISA_CHECK_CUDA(topk_indices);
+  HISA_CHECK_CUDA(selected_scores);
+  HISA_CHECK_CUDA(output);
+  HISA_CHECK_CUDA(lse);
+  HISA_CHECK_CUDA(grad_output);
+  HISA_CHECK_CUDA(grad_key);
+  HISA_CHECK_CUDA(grad_value);
+
+  HISA_CHECK_CONTIG(query);
+  HISA_CHECK_CONTIG(key);
+  HISA_CHECK_CONTIG(value);
+  HISA_CHECK_CONTIG(topk_indices);
+  HISA_CHECK_CONTIG(selected_scores);
+  HISA_CHECK_CONTIG(output);
+  HISA_CHECK_CONTIG(lse);
+  HISA_CHECK_CONTIG(grad_output);
+  HISA_CHECK_CONTIG(grad_key);
+  HISA_CHECK_CONTIG(grad_value);
+
+  TORCH_CHECK(query.dim() == 4, "query must be [Q, B, H, D]");
+  TORCH_CHECK(key.dim() == 4, "key must be [S, B, H, D]");
+  TORCH_CHECK(value.dim() == 4, "value must be [S, B, H, V]");
+  TORCH_CHECK(topk_indices.dim() == 3, "topk_indices must be [B, Q, K]");
+  TORCH_CHECK(selected_scores.dim() == 3, "selected_scores must be [B * Q, H, K]");
+  TORCH_CHECK(output.dim() == 4, "output must be [Q, B, H, V]");
+  TORCH_CHECK(grad_output.dim() == 4, "grad_output must be [Q, B, H, V]");
+  TORCH_CHECK(lse.dim() == 2, "lse must be [B * Q, H]");
+
+  const int Q = query.size(0);
+  const int B = query.size(1);
+  const int H = query.size(2);
+  const int D = query.size(3);
+  const int S = key.size(0);
+  const int V = value.size(3);
+  const int K = topk_indices.size(2);
+
+  TORCH_CHECK(key.size(1) == B && key.size(2) == H && key.size(3) == D,
+              "key shape must match query batch/head/head_dim");
+  TORCH_CHECK(value.size(0) == S && value.size(1) == B && value.size(2) == H,
+              "value shape must match key sequence/batch/head");
+  TORCH_CHECK(topk_indices.size(0) == B && topk_indices.size(1) == Q,
+              "topk_indices must be [B, Q, K]");
+  TORCH_CHECK(selected_scores.size(0) == B * Q && selected_scores.size(1) == H &&
+                  selected_scores.size(2) == K,
+              "selected_scores must be [B * Q, H, K]");
+  TORCH_CHECK(output.size(0) == Q && output.size(1) == B && output.size(2) == H &&
+                  output.size(3) == V,
+              "output shape must be [Q, B, H, V]");
+  TORCH_CHECK(grad_output.size(0) == Q && grad_output.size(1) == B &&
+                  grad_output.size(2) == H && grad_output.size(3) == V,
+              "grad_output shape must match output");
+  TORCH_CHECK(lse.size(0) == B * Q && lse.size(1) == H,
+              "lse must be [B * Q, H]");
+  TORCH_CHECK(grad_key.sizes() == key.sizes(), "grad_key shape must match key");
+  TORCH_CHECK(grad_value.sizes() == value.sizes(), "grad_value shape must match value");
+  TORCH_CHECK(query.scalar_type() == key.scalar_type() &&
+                  query.scalar_type() == value.scalar_type() &&
+                  query.scalar_type() == output.scalar_type() &&
+                  query.scalar_type() == grad_output.scalar_type(),
+              "query/key/value/output/grad_output must share dtype");
+  HISA_CHECK_DTYPE(selected_scores, torch::kFloat32);
+  HISA_CHECK_DTYPE(lse, torch::kFloat32);
+  TORCH_CHECK(grad_key.scalar_type() == grad_value.scalar_type(),
+              "grad_key and grad_value must share dtype");
+  TORCH_CHECK(D > 0 && D <= 256, "DSA sorted K/V backward supports head_dim in (0, 256]");
+  TORCH_CHECK(V > 0 && V <= 256, "DSA sorted K/V backward supports value_dim in (0, 256]");
+  TORCH_CHECK(K > 0, "topk count must be positive");
+
+  const int64_t total_edges = static_cast<int64_t>(Q) * B * H * K;
+  auto edge_keys = torch::empty({total_edges}, topk_indices.options().dtype(torch::kInt64));
+  auto edge_ids = torch::empty({total_edges}, topk_indices.options().dtype(torch::kInt64));
+  auto edge_prob = torch::empty({total_edges}, selected_scores.options().dtype(torch::kFloat32));
+  auto edge_ds = torch::empty({total_edges}, selected_scores.options().dtype(torch::kFloat32));
+  auto delta = torch::empty({B * Q, H}, selected_scores.options().dtype(torch::kFloat32));
+
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  megatron::hisa_indexer::launch_dsa_sparse_kv_bwd_sorted_from_scores(
+      query.data_ptr(),
+      value.data_ptr(),
+      topk_indices.data_ptr(),
+      selected_scores.data_ptr<float>(),
+      output.data_ptr(),
+      lse.data_ptr<float>(),
+      grad_output.data_ptr(),
+      reinterpret_cast<uint64_t*>(edge_keys.data_ptr<int64_t>()),
+      edge_ids.data_ptr<int64_t>(),
+      edge_prob.data_ptr<float>(),
+      edge_ds.data_ptr<float>(),
+      delta.data_ptr<float>(),
+      grad_key.data_ptr(),
+      grad_value.data_ptr(),
+      Q,
+      B,
+      S,
+      H,
+      D,
+      V,
+      K,
+      static_cast<float>(softmax_scale),
+      dtype_code(query.scalar_type()),
+      topk_dtype_code(topk_indices.scalar_type()),
+      dtype_code(grad_key.scalar_type()),
+      stream);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("hisa_score_bwd", &hisa_score_bwd, "HISA score backward (CUDA)");
   m.def("hisa_selector_fwd", &hisa_selector_fwd, "HISA selector forward (CUDA)");
+  m.def(
+      "hisa_selector_nvfp4_fwd",
+      &hisa_selector_nvfp4_fwd,
+      "HISA selector forward from packed NVFP4 IndexCache rows (CUDA)");
+  m.def(
+      "hisa_selector_nvfp4_cublasdx_fwd",
+      &hisa_selector_nvfp4_cublasdx_fwd,
+      "HISA selector forward from packed NVFP4 IndexCache rows (cuBLASDx/CuTe)");
+  m.def(
+      "hisa_selector_nvfp4_cublasdx_tiled_fwd",
+      &hisa_selector_nvfp4_cublasdx_tiled_fwd,
+      "Tiled HISA selector forward from packed NVFP4 IndexCache rows (cuBLASDx/CuTe)");
+  m.def(
+      "hisa_selector_nvfp4_cublasdx_fp8_fwd",
+      &hisa_selector_nvfp4_cublasdx_fp8_fwd,
+      "HISA selector forward from packed NVFP4 rows with FP8 cuBLASDx MMA (CUDA)");
   m.def(
       "hisa_selected_score_bwd",
       &hisa_selected_score_bwd,
@@ -416,4 +1470,20 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "hisa_selector_teacher_fwd",
       &hisa_selector_teacher_fwd,
       "HISA selector + local teacher forward (CUDA)");
+  m.def(
+      "dsa_sparse_kv_bwd",
+      &dsa_sparse_kv_bwd,
+      "Sparse DSA selected K/V backward edge-tile reducer (CUDA)");
+  m.def(
+      "dsa_sparse_bwd_from_scores",
+      &dsa_sparse_bwd_from_scores,
+      "Sparse DSA selected backward from forward-saved scores (CUDA)");
+  m.def(
+      "dsa_sparse_bwd_from_scores_row",
+      &dsa_sparse_bwd_from_scores_row,
+      "Sparse DSA row-owned backward from forward-saved scores (CUDA)");
+  m.def(
+      "dsa_sparse_kv_bwd_sorted_from_scores",
+      &dsa_sparse_kv_bwd_sorted_from_scores,
+      "Sparse DSA sorted-segment K/V backward from forward-saved scores (CUDA)");
 }
