@@ -35,6 +35,7 @@ _DSA_TRITON_BF16_GRAD_ATOMICS_ENV = "MEGATRON_DSA_TRITON_BF16_GRAD_ATOMICS"
 _DSA_TRITON_BWD_NUM_WARPS_ENV = "MEGATRON_DSA_TRITON_BWD_NUM_WARPS"
 _HISA_TARGET_TRITON_ENV = "MEGATRON_HISA_TARGET_TRITON"
 _HISA_TARGET_BLOCK_K_ENV = "MEGATRON_HISA_TARGET_BLOCK_K"
+_HISA_KL_GRAD_TRITON_ENV = "MEGATRON_HISA_KL_GRAD_TRITON"
 
 
 def _env_enabled() -> bool:
@@ -49,6 +50,11 @@ def _indexer_env_enabled() -> bool:
 
 def _hisa_target_env_enabled() -> bool:
     raw = os.getenv(_HISA_TARGET_TRITON_ENV, "1").strip().lower()
+    return raw not in {"0", "false", "off", "no"}
+
+
+def _hisa_kl_grad_env_enabled() -> bool:
+    raw = os.getenv(_HISA_KL_GRAD_TRITON_ENV, "1").strip().lower()
     return raw not in {"0", "false", "off", "no"}
 
 
@@ -81,6 +87,10 @@ def _backward_block_k(topk: int) -> int:
 
 def _hisa_target_block_k(topk: int) -> int:
     return _block_k_from_env(_HISA_TARGET_BLOCK_K_ENV, topk, large_topk_default=64)
+
+
+def _hisa_kl_block_k(topk: int) -> int:
+    return min(triton.next_power_of_2(topk), 2048)
 
 
 def _sparse_block_q() -> int:
@@ -577,6 +587,100 @@ def hisa_attention_target_probs_triton(
         num_warps=4,
     )
     return out
+
+
+def is_hisa_kl_grad_triton_supported(
+    selected_scores: torch.Tensor,
+    teacher_probs: torch.Tensor,
+) -> bool:
+    if not (_env_enabled() and _hisa_kl_grad_env_enabled()) or not HAVE_TRITON:
+        return False
+    if not (selected_scores.is_cuda and teacher_probs.is_cuda):
+        return False
+    if selected_scores.dtype != torch.float32 or teacher_probs.dtype != torch.float32:
+        return False
+    if selected_scores.dim() != 2 or teacher_probs.dim() != 2:
+        return False
+    if selected_scores.shape != teacher_probs.shape:
+        return False
+    if selected_scores.size(1) <= 0 or selected_scores.size(1) > 2048:
+        return False
+    return True
+
+
+@triton.jit
+def _hisa_kl_grad_kernel(
+    selected_scores_ptr,
+    teacher_probs_ptr,
+    grad_scores_ptr,
+    loss_ptr,
+    num_rows: tl.constexpr,
+    topk_count: tl.constexpr,
+    stride_s_row: tl.constexpr,
+    stride_t_row: tl.constexpr,
+    stride_g_row: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK_K)
+    valid_k = offsets < topk_count
+
+    scores = tl.load(
+        selected_scores_ptr + row * stride_s_row + offsets,
+        mask=valid_k,
+        other=-float("inf"),
+    ).to(tl.float32)
+    teacher = tl.load(
+        teacher_probs_ptr + row * stride_t_row + offsets,
+        mask=valid_k,
+        other=0.0,
+    ).to(tl.float32)
+    valid = valid_k & (scores > -3.0e38)
+    scores = tl.where(valid, scores, -float("inf"))
+
+    row_max = tl.max(scores, axis=0)
+    exp_scores = tl.exp(scores - row_max)
+    exp_scores = tl.where(valid, exp_scores, 0.0)
+    denom = tl.sum(exp_scores, axis=0)
+    index_probs = exp_scores / denom
+    index_probs = tl.where(valid, index_probs, 0.0)
+    teacher = tl.where(valid, teacher, 0.0)
+
+    grad = index_probs - teacher
+    tl.store(grad_scores_ptr + row * stride_g_row + offsets, grad, mask=valid_k)
+
+    kl = teacher * (tl.log(teacher + 1.0e-10) - tl.log(index_probs + 1.0e-10))
+    kl = tl.where(valid, kl, 0.0)
+    loss = tl.sum(kl, axis=0)
+    tl.atomic_add(loss_ptr, loss, sem="relaxed")
+
+
+def hisa_kl_loss_and_grad_triton(
+    selected_scores: torch.Tensor,
+    teacher_probs: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute HISA indexer KL loss and dL/d(selected_scores) in one Triton launch."""
+
+    if not is_hisa_kl_grad_triton_supported(selected_scores, teacher_probs):
+        raise RuntimeError("hisa_kl_loss_and_grad_triton called for unsupported tensors")
+    num_rows, topk_count = selected_scores.shape
+    grad_scores = torch.empty_like(selected_scores)
+    loss = torch.zeros((), device=selected_scores.device, dtype=torch.float32)
+    block_k = _hisa_kl_block_k(topk_count)
+    _hisa_kl_grad_kernel[(num_rows,)](
+        selected_scores,
+        teacher_probs,
+        grad_scores,
+        loss,
+        num_rows,
+        topk_count,
+        selected_scores.stride(0),
+        teacher_probs.stride(0),
+        grad_scores.stride(0),
+        BLOCK_K=block_k,
+        num_warps=8,
+    )
+    return loss, grad_scores
 
 
 def is_sparse_dsa_triton_supported(

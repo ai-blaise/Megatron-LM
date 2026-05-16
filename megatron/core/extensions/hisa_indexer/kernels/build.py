@@ -31,6 +31,7 @@ def _build_ext():
         str(_CSRC / "pybind.cpp"),
         str(_CSRC / "hisa_selector_fwd.cu"),
         str(_CSRC / "hisa_score_bwd.cu"),
+        str(_CSRC / "hisa_selected_score_bwd.cu"),
     ]
     fused_path = _CSRC / "hisa_score_bwd_fused.cu"
     if fused_path.exists():

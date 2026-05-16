@@ -21,6 +21,7 @@ import torch
 
 _HISA_SELECTOR_CUDA_ENV = "MEGATRON_HISA_SELECTOR_CUDA"
 _HISA_CANDIDATE_SLOT_GROUP_ENV = "MEGATRON_HISA_CANDIDATE_SLOT_GROUP"
+_HISA_SELECTOR_ROW_CHUNK_ENV = "MEGATRON_HISA_SELECTOR_ROW_CHUNK"
 
 
 @dataclass(frozen=True)
@@ -259,6 +260,14 @@ def _hisa_candidate_slot_group() -> int:
     return value
 
 
+def _hisa_selector_row_chunk(num_rows: int) -> int:
+    raw = os.getenv(_HISA_SELECTOR_ROW_CHUNK_ENV, "256")
+    value = int(raw)
+    if value <= 0:
+        return max(1, num_rows)
+    return min(max(1, value), max(1, num_rows))
+
+
 def _try_load_hisa_cuda_ext():
     try:
         from megatron.core.extensions.hisa_indexer.kernels.build import get_ext
@@ -286,12 +295,20 @@ def _selected_hisa_scores(
 ) -> torch.Tensor:
     sq, _, head_dim = q_rows.shape
     topk_k = topk_indices.shape[-1]
-    valid = topk_indices >= 0
-    safe_idx = topk_indices.clamp_min(0).reshape(-1)
-    selected_k = k_rows.index_select(0, safe_idx).view(sq, topk_k, head_dim)
-    dot = torch.einsum("qhd,qkd->qkh", q_rows, selected_k)
-    scores = (torch.relu(dot) * weights_rows.unsqueeze(1)).sum(dim=-1)
-    return scores.masked_fill(~valid, float("-inf"))
+    row_chunk = _hisa_selector_row_chunk(sq)
+    score_chunks = []
+    for row_start in range(0, sq, row_chunk):
+        row_end = min(row_start + row_chunk, sq)
+        q_chunk = q_rows[row_start:row_end]
+        weights_chunk = weights_rows[row_start:row_end]
+        indices_chunk = topk_indices[row_start:row_end]
+        valid = indices_chunk >= 0
+        safe_idx = indices_chunk.clamp_min(0).reshape(-1)
+        selected_k = k_rows.index_select(0, safe_idx).view(row_end - row_start, topk_k, head_dim)
+        dot = torch.einsum("qhd,qkd->qkh", q_chunk, selected_k)
+        scores = (torch.relu(dot) * weights_chunk.unsqueeze(1)).sum(dim=-1)
+        score_chunks.append(scores.masked_fill(~valid, float("-inf")))
+    return torch.cat(score_chunks, dim=0)
 
 
 def _hisa_grouped_candidate_topk(
@@ -306,6 +323,25 @@ def _hisa_grouped_candidate_topk(
     """Score HISA candidate blocks in tensor-core-friendly block-slot groups."""
 
     sq, _, head_dim = q_rows.shape
+    row_chunk = _hisa_selector_row_chunk(sq)
+    if row_chunk < sq:
+        index_chunks = []
+        score_chunks = []
+        for row_start in range(0, sq, row_chunk):
+            row_end = min(row_start + row_chunk, sq)
+            indices, scores = _hisa_grouped_candidate_topk(
+                q_rows[row_start:row_end],
+                weights_rows[row_start:row_end],
+                k_rows,
+                top_blocks[row_start:row_end],
+                prefix_lens[row_start:row_end],
+                topk_k,
+                block_size,
+            )
+            index_chunks.append(indices)
+            score_chunks.append(scores)
+        return torch.cat(index_chunks, dim=0), torch.cat(score_chunks, dim=0)
+
     sk = k_rows.shape[0]
     offsets = torch.arange(block_size, device=q_rows.device, dtype=torch.long)
     running_scores = q_rows.new_full((sq, topk_k), float("-inf"))
@@ -421,6 +457,196 @@ def _indexcache_hisa_topk_cuda_for_batch(
     else:
         scores = None
     return topk_indices, scores
+
+
+def indexcache_hisa_cuda_select_with_scores(
+    q_rows: torch.Tensor,
+    weights_rows: torch.Tensor,
+    k_rows: torch.Tensor,
+    topk: int,
+    *,
+    config: IndexCacheHISAConfig,
+    prefix_lens: torch.Tensor,
+) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+    """CUDA HISA selector returning compact selected logits for custom autograd.
+
+    This helper intentionally returns the selector kernel's ``selected_scores``
+    directly instead of rebuilding them with PyTorch tensor ops. The selector
+    itself remains non-differentiable; callers that train through the selected
+    logits should pair this with the fused selected-score backward kernel.
+    """
+
+    if (
+        not _hisa_selector_cuda_enabled()
+        or not q_rows.is_cuda
+        or not config.is_optimized
+        or not _is_blackwell_or_newer(q_rows.device)
+    ):
+        return None
+    ext = _try_load_hisa_cuda_ext()
+    if ext is None or not hasattr(ext, "hisa_selector_fwd"):
+        return None
+
+    sq, _, head_dim = q_rows.shape
+    sk = k_rows.shape[0]
+    topk_k = min(int(topk), sk)
+    if topk_k <= 0:
+        return None
+    prefix_lens = prefix_lens.to(device=q_rows.device, dtype=torch.long).clamp(0, sk)
+    if config.fallback_to_dense_if_short and int(prefix_lens.max().item()) <= topk_k:
+        return None
+    block_size = int(config.block_size)
+    block_count = int(math.ceil(sk / block_size))
+    if block_count <= 0:
+        return None
+
+    row_block_counts = torch.div(
+        prefix_lens + block_size - 1, block_size, rounding_mode="floor"
+    ).to(torch.int32)
+    if config.compression_ratio > 0:
+        block_topk_counts, effective_block_topk = hisa_block_topk_counts(
+            row_block_counts,
+            block_size=block_size,
+            topk_tokens=topk_k,
+            compression_ratio=config.compression_ratio,
+        )
+    else:
+        block_topk_counts = torch.full(
+            (sq,),
+            min(int(config.block_topk), block_count),
+            device=q_rows.device,
+            dtype=torch.int32,
+        )
+        effective_block_topk = min(int(config.block_topk), block_count)
+
+    q_f = q_rows.contiguous().float()
+    w_f = weights_rows.contiguous().float()
+    k_f = k_rows.contiguous().float()
+    reps = _mean_pool_all_blocks(k_f, block_size).contiguous()
+    prefix_i32 = prefix_lens.to(dtype=torch.int32).contiguous()
+    indices_i32 = torch.empty((sq, topk_k), device=q_rows.device, dtype=torch.int32)
+    selected_scores = torch.empty((sq, topk_k), device=q_rows.device, dtype=torch.float32)
+    forced = tuple(config.forced_boundary_blocks or ())
+
+    ext.hisa_selector_fwd(
+        q_f,
+        k_f,
+        reps,
+        w_f,
+        prefix_i32,
+        block_topk_counts.contiguous(),
+        indices_i32,
+        selected_scores,
+        block_size,
+        int(effective_block_topk),
+        int(topk_k),
+        "first" in forced,
+        "last" in forced,
+        "last_minus_one" in forced,
+    )
+    return indices_i32, selected_scores
+
+
+def indexcache_hisa_cuda_select_scores_teacher(
+    q_rows: torch.Tensor,
+    weights_rows: torch.Tensor,
+    k_rows: torch.Tensor,
+    attn_query_rows: torch.Tensor,
+    attn_key_rows: torch.Tensor,
+    topk: int,
+    *,
+    config: IndexCacheHISAConfig,
+    prefix_lens: torch.Tensor,
+    softmax_scale: float,
+) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """CUDA HISA selector fused with local teacher probability construction."""
+
+    if (
+        not _hisa_selector_cuda_enabled()
+        or not q_rows.is_cuda
+        or not attn_query_rows.is_cuda
+        or not config.is_optimized
+        or not _is_blackwell_or_newer(q_rows.device)
+    ):
+        return None
+    ext = _try_load_hisa_cuda_ext()
+    if ext is None or not hasattr(ext, "hisa_selector_teacher_fwd"):
+        return None
+
+    sq, _, head_dim = q_rows.shape
+    sk = k_rows.shape[0]
+    topk_k = min(int(topk), sk)
+    if topk_k <= 0:
+        return None
+    if attn_query_rows.dim() != 3 or attn_key_rows.dim() != 3:
+        return None
+    if attn_query_rows.shape[0] != sq or attn_key_rows.shape[0] != sk:
+        return None
+    if attn_query_rows.shape[1:] != attn_key_rows.shape[1:]:
+        return None
+    if attn_query_rows.shape[-1] <= 0 or attn_query_rows.shape[-1] > 256:
+        return None
+    prefix_lens = prefix_lens.to(device=q_rows.device, dtype=torch.long).clamp(0, sk)
+    if config.fallback_to_dense_if_short and int(prefix_lens.max().item()) <= topk_k:
+        return None
+
+    block_size = int(config.block_size)
+    block_count = int(math.ceil(sk / block_size))
+    if block_count <= 0:
+        return None
+
+    row_block_counts = torch.div(
+        prefix_lens + block_size - 1, block_size, rounding_mode="floor"
+    ).to(torch.int32)
+    if config.compression_ratio > 0:
+        block_topk_counts, effective_block_topk = hisa_block_topk_counts(
+            row_block_counts,
+            block_size=block_size,
+            topk_tokens=topk_k,
+            compression_ratio=config.compression_ratio,
+        )
+    else:
+        block_topk_counts = torch.full(
+            (sq,),
+            min(int(config.block_topk), block_count),
+            device=q_rows.device,
+            dtype=torch.int32,
+        )
+        effective_block_topk = min(int(config.block_topk), block_count)
+
+    q_f = q_rows.contiguous().float()
+    w_f = weights_rows.contiguous().float()
+    k_f = k_rows.contiguous().float()
+    aq_f = attn_query_rows.contiguous().float()
+    ak_f = attn_key_rows.contiguous().float()
+    reps = _mean_pool_all_blocks(k_f, block_size).contiguous()
+    prefix_i32 = prefix_lens.to(dtype=torch.int32).contiguous()
+    indices_i32 = torch.empty((sq, topk_k), device=q_rows.device, dtype=torch.int32)
+    selected_scores = torch.empty((sq, topk_k), device=q_rows.device, dtype=torch.float32)
+    teacher_probs = torch.empty((sq, topk_k), device=q_rows.device, dtype=torch.float32)
+    forced = tuple(config.forced_boundary_blocks or ())
+
+    ext.hisa_selector_teacher_fwd(
+        q_f,
+        k_f,
+        reps,
+        w_f,
+        aq_f,
+        ak_f,
+        prefix_i32,
+        block_topk_counts.contiguous(),
+        indices_i32,
+        selected_scores,
+        teacher_probs,
+        block_size,
+        int(effective_block_topk),
+        int(topk_k),
+        float(softmax_scale),
+        "first" in forced,
+        "last" in forced,
+        "last_minus_one" in forced,
+    )
+    return indices_i32, selected_scores, teacher_probs
 
 
 def indexcache_hisa_topk_with_scores(

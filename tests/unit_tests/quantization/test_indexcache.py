@@ -35,6 +35,7 @@ from megatron.core.quantization.indexcache import (  # noqa: E402
     apply_indexcache_kv,
     build_indexcache_config,
     hisa_block_topk_counts,
+    indexcache_hisa_cuda_select_with_scores,
     indexcache_hisa_topk,
     indexcache_hisa_topk_with_scores,
     resolve_indexcache_quantization,
@@ -1081,6 +1082,151 @@ def test_chunked_dsa_hisa_with_indexer_loss_backpropagates_indexer_grads(monkeyp
         assert tensor.grad is not None
         assert torch.isfinite(tensor.grad.float()).all().item()
         assert tensor.grad.float().abs().sum().item() > 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_hisa_selected_score_bwd_cuda_matches_autograd(monkeypatch):
+    if torch.cuda.get_device_capability() < (10, 0):
+        pytest.skip("HISA CUDA selector is intended for Blackwell+.")
+
+    import megatron.core.transformer.experimental_attention_variant.dsa as dsa_module
+
+    monkeypatch.setenv("MEGATRON_HISA_SELECTOR_CUDA", "1")
+    torch.manual_seed(20260517)
+    q_len, num_heads, head_dim, seq_len, topk = 5, 3, HEAD_DIM, 19, 6
+    q = torch.randn(q_len, num_heads, head_dim, device="cuda", dtype=torch.float32, requires_grad=True)
+    weights = (torch.rand(q_len, num_heads, device="cuda", dtype=torch.float32) + 0.1).requires_grad_()
+    k = torch.randn(seq_len, head_dim, device="cuda", dtype=torch.float32, requires_grad=True)
+    prefix_lens = torch.tensor([7, 9, 13, 17, 19], device="cuda", dtype=torch.long)
+    config = IndexCacheHISAConfig(
+        enabled=True,
+        block_size=4,
+        compression_ratio=2.0,
+        topk_tokens=topk,
+        fallback_to_dense_if_short=False,
+    )
+
+    result = indexcache_hisa_cuda_select_with_scores(
+        q,
+        weights,
+        k,
+        topk,
+        config=config,
+        prefix_lens=prefix_lens,
+    )
+    assert result is not None
+    topk_i32, selected_scores = result
+    valid = topk_i32 >= 0
+    selected_k = k.index_select(0, topk_i32.clamp_min(0).reshape(-1)).view(
+        q_len, topk, head_dim
+    )
+    ref_scores = (
+        torch.relu(torch.einsum("qhd,qkd->qkh", q, selected_k)) * weights.unsqueeze(1)
+    ).sum(dim=-1)
+    ref_scores = ref_scores.masked_fill(~valid, float("-inf"))
+    torch.testing.assert_close(selected_scores, ref_scores.detach(), rtol=1e-5, atol=2e-5)
+
+    grad_seed = torch.randn_like(ref_scores).masked_fill(~valid, 0)
+    (ref_scores.masked_fill(~valid, 0) * grad_seed).sum().backward()
+    grad_q, grad_w, grad_k = dsa_module._hisa_selected_score_backward_cuda(
+        grad_seed,
+        q.detach(),
+        weights.detach(),
+        k.detach(),
+        topk_i32,
+    )
+    torch.testing.assert_close(grad_q, q.grad, rtol=5e-5, atol=1e-4)
+    torch.testing.assert_close(grad_w, weights.grad, rtol=5e-5, atol=1e-4)
+    torch.testing.assert_close(grad_k, k.grad, rtol=5e-5, atol=1e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_chunked_dsa_hisa_fused_indexer_loss_matches_existing_path(monkeypatch):
+    if torch.cuda.get_device_capability() < (10, 0):
+        pytest.skip("HISA CUDA selector is intended for Blackwell+.")
+
+    import megatron.core.transformer.experimental_attention_variant.dsa as dsa_module
+
+    class _ProcessGroup:
+        def size(self):
+            return 1
+
+    class _ProcessGroups:
+        tp = _ProcessGroup()
+
+    original_sparse_attention = dsa_module.sparse_dsa_attention_triton
+
+    def run_case(fused: bool):
+        monkeypatch.setenv("MEGATRON_HISA_SELECTOR_CUDA", "1")
+        monkeypatch.setenv("MEGATRON_HISA_FUSED_INDEXER_LOSS", "1" if fused else "0")
+        monkeypatch.setenv("MEGATRON_HISA_KL_GRAD_TRITON", "1")
+        torch.manual_seed(20260518)
+        q_len, bsz, idx_heads, idx_dim, attn_heads, attn_dim, seq_len, topk = (
+            8,
+            1,
+            2,
+            HEAD_DIM,
+            2,
+            16,
+            23,
+            6,
+        )
+        q = torch.randn(q_len, bsz, idx_heads, idx_dim, device="cuda", requires_grad=True)
+        index_k = torch.randn(seq_len, bsz, idx_dim, device="cuda", requires_grad=True)
+        weights = (torch.rand(q_len, bsz, idx_heads, device="cuda") + 0.1).requires_grad_()
+        query = torch.randn(q_len, bsz, attn_heads, attn_dim, device="cuda", requires_grad=True)
+        key = torch.randn(seq_len, bsz, attn_heads, attn_dim, device="cuda", requires_grad=True)
+        value = torch.randn(seq_len, bsz, attn_heads, attn_dim, device="cuda", requires_grad=True)
+
+        topk_seen = []
+
+        def capture_sparse_attention(query_arg, key_arg, value_arg, topk_arg, *args, **kwargs):
+            topk_seen.append(topk_arg.detach().clone())
+            return original_sparse_attention(query_arg, key_arg, value_arg, topk_arg, *args, **kwargs)
+
+        monkeypatch.setattr(dsa_module, "sparse_dsa_attention_triton", capture_sparse_attention)
+        output, indexer_loss = dsa_module.chunked_dsa_forward(
+            q,
+            index_k,
+            weights,
+            query,
+            key,
+            value,
+            softmax_scale=0.25,
+            topk=topk,
+            mask=None,
+            is_causal=True,
+            loss_coeff=0.1,
+            sparse_loss=False,
+            pg_collection=_ProcessGroups(),
+            chunk_size=4,
+            indexcache_hisa_config=IndexCacheHISAConfig(
+                enabled=True,
+                block_size=4,
+                compression_ratio=2.0,
+                topk_tokens=topk,
+                fallback_to_dense_if_short=False,
+            ),
+        )
+        assert indexer_loss is not None
+        (output.float().sum() + indexer_loss).backward()
+        assert topk_seen
+        return (
+            output.detach(),
+            indexer_loss.detach(),
+            q.grad,
+            index_k.grad,
+            weights.grad,
+            torch.cat([x.reshape(-1, x.size(-1)) for x in topk_seen], dim=0),
+        )
+
+    ref = run_case(False)
+    fused = run_case(True)
+    torch.testing.assert_close(fused[5], ref[5], rtol=0, atol=0)
+    torch.testing.assert_close(fused[0], ref[0], rtol=8e-4, atol=8e-4)
+    torch.testing.assert_close(fused[1], ref[1], rtol=2e-3, atol=2e-3)
+    for got, expected in zip(fused[2:5], ref[2:5]):
+        torch.testing.assert_close(got, expected, rtol=2e-3, atol=2e-3)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
