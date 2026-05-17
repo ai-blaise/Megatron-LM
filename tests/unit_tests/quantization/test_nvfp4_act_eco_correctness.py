@@ -28,6 +28,7 @@ from megatron.core.quantization.nvfp4_act_eco import (  # noqa: E402
     build_nvfp4_act_eco_config,
 )
 from megatron.core.quantization.nvfp4_act_eco.reference import (  # noqa: E402
+    _round_to_nvfp4_grid,
     activation_eco_bias_correction,
     nvfp4_act_quant_forward,
 )
@@ -39,6 +40,62 @@ OUT = 32
 
 def _cfg():
     return build_nvfp4_act_eco_config()
+
+
+def _old_grid_round(x, *, fp4_max):
+    grid = torch.tensor(
+        [
+            -fp4_max,
+            -4.0,
+            -3.0,
+            -2.0,
+            -1.5,
+            -1.0,
+            -0.5,
+            0.0,
+            0.0,
+            0.5,
+            1.0,
+            1.5,
+            2.0,
+            3.0,
+            4.0,
+            fp4_max,
+        ],
+        dtype=x.dtype,
+        device=x.device,
+    )
+    return grid[(x.unsqueeze(-1) - grid).abs().argmin(dim=-1)]
+
+
+def test_threshold_rounder_matches_previous_grid_rounder():
+    cfg = _cfg()
+    values = torch.cat(
+        [
+            torch.linspace(-8.0, 8.0, 4097),
+            torch.tensor(
+                [
+                    -5.0,
+                    -3.5,
+                    -2.5,
+                    -1.75,
+                    -1.25,
+                    -0.75,
+                    -0.25,
+                    0.25,
+                    0.75,
+                    1.25,
+                    1.75,
+                    2.5,
+                    3.5,
+                    5.0,
+                ]
+            ),
+        ]
+    )
+    expected = _old_grid_round(values.clamp(-cfg.fp4_max, cfg.fp4_max), fp4_max=cfg.fp4_max)
+    got = _round_to_nvfp4_grid(values, fp4_max=cfg.fp4_max)
+    torch.testing.assert_close(got, expected, atol=0, rtol=0)
 
 
 def test_forward_shape_and_finite():

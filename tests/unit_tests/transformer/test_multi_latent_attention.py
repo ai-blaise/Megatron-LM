@@ -189,6 +189,65 @@ class TestParallelMLAAttention:
             assert output.shape[2] == config.hidden_size
             assert bias.shape[0] == config.hidden_size
 
+    def test_get_qkv_streambp_query_indices_match_full_prefix(self):
+        if is_te_min_version("1.10.0"):
+            config = self.parallel_attention.config
+            config.attention_output_gate = True
+            sequence_length = 24
+            micro_batch_size = 1
+            start, end = 7, 15
+            query_indices = torch.arange(start, end, device="cuda", dtype=torch.long)
+
+            streambp_attention = (
+                MLASelfAttention(
+                    config,
+                    get_mla_self_attn_submodules(),
+                    layer_number=1,
+                    attn_mask_type=AttnMaskType.causal,
+                )
+                .cuda()
+                .bfloat16()
+                .train()
+            )
+
+            hidden_states = torch.randn(
+                sequence_length,
+                micro_batch_size,
+                config.hidden_size,
+                device="cuda",
+                dtype=torch.bfloat16,
+            )
+
+            q_up_input_lengths = []
+            q_down_input_lengths = []
+            q_down_hook = streambp_attention.linear_q_down_proj.register_forward_pre_hook(
+                lambda _module, args: q_down_input_lengths.append(args[0].size(0))
+            )
+            q_up_hook = streambp_attention.linear_q_up_proj.register_forward_pre_hook(
+                lambda _module, args: q_up_input_lengths.append(args[0].size(0))
+            )
+            full_q, full_k, full_v, full_qr, full_kvr, full_gate = (
+                streambp_attention.get_query_key_value_tensors(hidden_states)
+            )
+            chunk_q, chunk_k, chunk_v, chunk_qr, chunk_kvr, chunk_gate = (
+                streambp_attention.get_query_key_value_tensors(
+                    hidden_states,
+                    chunk_range=(start, end),
+                    streambp_query_indices=query_indices,
+                )
+            )
+            q_down_hook.remove()
+            q_up_hook.remove()
+
+            torch.testing.assert_close(chunk_q, full_q[start:end], rtol=2e-3, atol=2e-3)
+            torch.testing.assert_close(chunk_k, full_k, rtol=2e-3, atol=2e-3)
+            torch.testing.assert_close(chunk_v, full_v, rtol=2e-3, atol=2e-3)
+            torch.testing.assert_close(chunk_qr, full_qr[start:end], rtol=2e-3, atol=2e-3)
+            torch.testing.assert_close(chunk_kvr, full_kvr, rtol=2e-3, atol=2e-3)
+            torch.testing.assert_close(chunk_gate, full_gate[start:end], rtol=2e-3, atol=2e-3)
+            assert q_down_input_lengths == [sequence_length, end - start]
+            assert q_up_input_lengths == [sequence_length, end - start]
+
     @pytest.mark.experimental
     def test_gpu_forward_with_yarn_rope_fusion(self):
         if self.transformer_config.rope_type == "rope":
@@ -298,7 +357,7 @@ class TestParallelMLAAttention:
             assert bias.shape[0] == config.hidden_size
 
             # Test that the get_query_key_value_tensors function properly handles padded cu_seqlens
-            query, key, value, q_compressed, kv_compressed = (
+            query, key, value, q_compressed, kv_compressed, gate = (
                 self.parallel_attention.get_query_key_value_tensors(
                     hidden_states, None, None, packed_seq_params, None
                 )
@@ -309,6 +368,8 @@ class TestParallelMLAAttention:
             assert value is not None
             assert q_compressed is not None
             assert kv_compressed is not None
+            if self.parallel_attention.config.attention_output_gate:
+                assert gate is not None
             assert query.is_contiguous()
             assert key.is_contiguous()
             assert value.is_contiguous()
@@ -379,7 +440,7 @@ class TestParallelMLAAttention:
             )
             hidden_states = hidden_states.cuda()
 
-            q, k, v, q_compressed, kv_compressed = (
+            q, k, v, q_compressed, kv_compressed, _gate = (
                 checkpointed_parallel_attention.get_query_key_value_tensors(hidden_states)
             )
             assert q.is_contiguous()
@@ -686,12 +747,26 @@ class TestParallelMLAAttentionPrecision:
             packed_seq_params = make_test_packed_seq_params(cu_seqlens=cu_seqlens)
 
             # fine-grained check
-            query_sbhd, key_sbhd, value_sbhd, q_compressed_sbhd, kv_compressed_sbhd = (
+            (
+                query_sbhd,
+                key_sbhd,
+                value_sbhd,
+                q_compressed_sbhd,
+                kv_compressed_sbhd,
+                gate_sbhd,
+            ) = (
                 self.parallel_attention.get_query_key_value_tensors(
                     hidden_states_sbhd, None, None, None, None
                 )
             )
-            query_thd, key_thd, value_thd, q_compressed_thd, kv_compressed_thd = (
+            (
+                query_thd,
+                key_thd,
+                value_thd,
+                q_compressed_thd,
+                kv_compressed_thd,
+                gate_thd,
+            ) = (
                 self.parallel_attention.get_query_key_value_tensors(
                     hidden_states_thd, None, None, packed_seq_params, None
                 )
@@ -705,11 +780,18 @@ class TestParallelMLAAttentionPrecision:
             _kv_compressed_sbhd = (
                 kv_compressed_sbhd.transpose(0, 1).contiguous().view(*kv_compressed_thd.shape)
             )
+            _gate_sbhd = (
+                None
+                if gate_sbhd is None
+                else gate_sbhd.transpose(0, 1).contiguous().view(*gate_thd.shape)
+            )
             assert torch.equal(_query_sbhd, query_thd)
             assert torch.equal(_key_sbhd, key_thd)
             assert torch.equal(_value_sbhd, value_thd)
             assert torch.equal(_q_compressed_sbhd, q_compressed_thd)
             assert torch.equal(_kv_compressed_sbhd, kv_compressed_thd)
+            if gate_thd is not None:
+                assert torch.equal(_gate_sbhd, gate_thd)
 
             core_attn_out_sbhd = self.parallel_attention.core_attention(
                 query_sbhd,
@@ -851,12 +933,26 @@ class TestContextParallelMLAAttentionPrecision:
             packed_seq_params = make_test_packed_seq_params(cu_seqlens=cu_seqlens)
 
             # fine-grained check
-            query_sbhd, key_sbhd, value_sbhd, q_compressed_sbhd, kv_compressed_sbhd = (
+            (
+                query_sbhd,
+                key_sbhd,
+                value_sbhd,
+                q_compressed_sbhd,
+                kv_compressed_sbhd,
+                gate_sbhd,
+            ) = (
                 self.parallel_attention.get_query_key_value_tensors(
                     hidden_states_sbhd, None, None, None, None
                 )
             )
-            query_thd, key_thd, value_thd, q_compressed_thd, kv_compressed_thd = (
+            (
+                query_thd,
+                key_thd,
+                value_thd,
+                q_compressed_thd,
+                kv_compressed_thd,
+                gate_thd,
+            ) = (
                 self.parallel_attention.get_query_key_value_tensors(
                     hidden_states_thd, None, None, packed_seq_params, None
                 )
@@ -870,11 +966,18 @@ class TestContextParallelMLAAttentionPrecision:
             _kv_compressed_sbhd = (
                 kv_compressed_sbhd.transpose(0, 1).contiguous().view(*kv_compressed_thd.shape)
             )
+            _gate_sbhd = (
+                None
+                if gate_sbhd is None
+                else gate_sbhd.transpose(0, 1).contiguous().view(*gate_thd.shape)
+            )
             torch.testing.assert_close(_query_sbhd, query_thd, atol=1e-6, rtol=1e-6)
             torch.testing.assert_close(_key_sbhd, key_thd, atol=1e-6, rtol=1e-6)
             torch.testing.assert_close(_value_sbhd, value_thd, atol=1e-6, rtol=1e-6)
             torch.testing.assert_close(_q_compressed_sbhd, q_compressed_thd, atol=1e-6, rtol=1e-6)
             torch.testing.assert_close(_kv_compressed_sbhd, kv_compressed_thd, atol=1e-6, rtol=1e-6)
+            if gate_thd is not None:
+                torch.testing.assert_close(_gate_sbhd, gate_thd, atol=1e-6, rtol=1e-6)
 
             core_attn_out_sbhd = self.parallel_attention.core_attention(
                 query_sbhd,
@@ -1002,12 +1105,26 @@ class TestParallelMLAAttentionPrecisionWithRopeFusion:
             packed_seq_params = make_test_packed_seq_params(cu_seqlens=cu_seqlens)
 
             # fine-grained check
-            query_sbhd, key_sbhd, value_sbhd, q_compressed_sbhd, kv_compressed_sbhd = (
+            (
+                query_sbhd,
+                key_sbhd,
+                value_sbhd,
+                q_compressed_sbhd,
+                kv_compressed_sbhd,
+                gate_sbhd,
+            ) = (
                 self.parallel_attention.get_query_key_value_tensors(
                     hidden_states_sbhd, None, None, None, None
                 )
             )
-            query_thd, key_thd, value_thd, q_compressed_thd, kv_compressed_thd = (
+            (
+                query_thd,
+                key_thd,
+                value_thd,
+                q_compressed_thd,
+                kv_compressed_thd,
+                gate_thd,
+            ) = (
                 self.parallel_attention.get_query_key_value_tensors(
                     hidden_states_thd, None, None, packed_seq_params, None
                 )
@@ -1021,11 +1138,18 @@ class TestParallelMLAAttentionPrecisionWithRopeFusion:
             _kv_compressed_sbhd = (
                 kv_compressed_sbhd.transpose(0, 1).contiguous().view(*kv_compressed_thd.shape)
             )
+            _gate_sbhd = (
+                None
+                if gate_sbhd is None
+                else gate_sbhd.transpose(0, 1).contiguous().view(*gate_thd.shape)
+            )
             assert torch.equal(_query_sbhd, query_thd)
             assert torch.equal(_key_sbhd, key_thd)
             assert torch.equal(_value_sbhd, value_thd)
             assert torch.equal(_q_compressed_sbhd, q_compressed_thd)
             assert torch.equal(_kv_compressed_sbhd, kv_compressed_thd)
+            if gate_thd is not None:
+                assert torch.equal(_gate_sbhd, gate_thd)
 
             core_attn_out_sbhd = self.parallel_attention.core_attention(
                 query_sbhd,

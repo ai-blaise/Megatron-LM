@@ -224,6 +224,9 @@ def _test_fused_apply_mla_rope_for_kv(input_format):
         v_dim,
         cu_seqlens_kv=cu_seqlens,
     )
+    assert fused_v_output.untyped_storage().data_ptr() == fused_fwd_kv_input.untyped_storage().data_ptr()
+    assert fused_v_output.stride(-1) == 1
+    assert not fused_v_output.is_contiguous()
     torch.autograd.backward(
         (fused_k_output, fused_v_output), (fused_bwd_k_input, fused_bwd_v_input)
     )

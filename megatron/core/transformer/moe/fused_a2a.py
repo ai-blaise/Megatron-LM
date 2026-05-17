@@ -3,6 +3,8 @@
 # Copyright (c) 2025 DeepSeek
 # Licensed under the MIT License - https://github.com/deepseek-ai/DeepEP/blob/main/LICENSE
 
+from typing import Optional
+
 from megatron.core.utils import internal_api
 
 try:
@@ -283,6 +285,7 @@ def init_hybrid_ep_buffer(
     num_sms_dispatch_api: int,
     num_sms_combine_api: int,
     fp8_dispatch: bool,
+    num_sms_preprocessing_api: Optional[int] = None,
 ) -> None:
     '''
     Initialize the HybridEP buffer, including buffer allocation and metadata
@@ -307,8 +310,13 @@ def init_hybrid_ep_buffer(
             Number of SMs used by the combine API.
         fp8_dispatch (bool):
             Whether to use FP8 communication during the dispatch phase.
+        num_sms_preprocessing_api (Optional[int]):
+            Number of SMs used by the preprocessing metadata scan kernel.
     '''
     assert not fp8_dispatch, "HybridEP dispatcher does not support fp8 dispatch now"
+    kwargs = {}
+    if num_sms_preprocessing_api is not None:
+        kwargs["num_sms_preprocessing_api"] = num_sms_preprocessing_api
     global _hybrid_ep_buffer
     _hybrid_ep_buffer = HybridEPBuffer(
         group=group,
@@ -318,6 +326,7 @@ def init_hybrid_ep_buffer(
         use_fp8=fp8_dispatch,
         num_sms_dispatch_api=num_sms_dispatch_api,
         num_sms_combine_api=num_sms_combine_api,
+        **kwargs,
     )
 
 
@@ -346,6 +355,7 @@ class HybridEPDispatch(torch.autograd.Function):
         num_sms_combine_api=24,
         num_permuted_tokens=None,
         pad_multiple=None,
+        num_sms_preprocessing_api=108,
     ):
         '''
         Forward pass of fused dispatch of the HybridEP backend
@@ -361,6 +371,7 @@ class HybridEPDispatch(torch.autograd.Function):
                 num_sms_dispatch_api,
                 num_sms_combine_api,
                 fp8_dispatch,
+                num_sms_preprocessing_api,
             )
         # If we provide the num_permuted_tokens, we do not need to use sync to
         # wait for the data in pinned memory ready
@@ -402,7 +413,7 @@ class HybridEPDispatch(torch.autograd.Function):
         combined_hidden, combined_probs = _hybrid_ep_buffer.combine_with_unpermute(
             hidden=grad_x, probs=grad_probs, handle=handle, pad_multiple=ctx.pad_multiple
         )
-        return combined_hidden, None, combined_probs, None, None, None, None, None, None, None
+        return combined_hidden, None, combined_probs, None, None, None, None, None, None, None, None
 
 
 @internal_api
@@ -453,6 +464,7 @@ if HAVE_HYBRIDEP:
         num_sms_combine_api=24,
         num_permuted_tokens=None,
         pad_multiple=None,
+        num_sms_preprocessing_api=108,
     ):
         '''
         Perform fused dispatch for "permute + dispatch a2a + permute" using the
@@ -480,6 +492,8 @@ if HAVE_HYBRIDEP:
             pad_multiple (int):
                 Alignment multiple required for FP8 GEMM. If not provided, no padding
                 is performed.
+            num_sms_preprocessing_api (int):
+                Number of SMs used by the preprocessing metadata scan kernel.
         '''
         return HybridEPDispatch.apply(
             x,
@@ -491,6 +505,7 @@ if HAVE_HYBRIDEP:
             num_sms_combine_api,
             num_permuted_tokens,
             pad_multiple,
+            num_sms_preprocessing_api,
         )
 
     @internal_api

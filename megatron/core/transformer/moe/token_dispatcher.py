@@ -1051,6 +1051,7 @@ class _HybridEPManager(_DispatchManager):
                 num_sms_combine_api=self.config.moe_hybridep_num_sms,
                 num_permuted_tokens=self.num_permuted_tokens,
                 pad_multiple=self.pad_multiple,
+                num_sms_preprocessing_api=self.config.moe_hybridep_num_sms_preprocessing,
             )
         )
 

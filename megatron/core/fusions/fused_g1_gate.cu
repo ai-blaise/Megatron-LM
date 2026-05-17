@@ -105,6 +105,20 @@ void compute_bwd(__nv_bfloat162 d_o, __nv_bfloat162 o_u, __nv_bfloat162 g,
                                   fd.y * fo.y * fg.y * (1.f - fg.y)});
 }
 
+__device__ __forceinline__
+void compute_bwd_from_output(__nv_bfloat162 d_o, __nv_bfloat162 o_g, __nv_bfloat162 g,
+                             __nv_bfloat162& d_o_u, __nv_bfloat162& d_g_l) {
+  float2 fd = __bfloat1622float2(d_o);
+  float2 fo = __bfloat1622float2(o_g);
+  float2 fg = __bfloat1622float2(g);
+  d_o_u = __float22bfloat162_rn({fd.x * fg.x, fd.y * fg.y});
+  // output = ungated * gate, so
+  // d_linear = grad * ungated * gate * (1 - gate)
+  //          = grad * output * (1 - gate).
+  d_g_l = __float22bfloat162_rn({fd.x * fo.x * (1.f - fg.x),
+                                  fd.y * fo.y * (1.f - fg.y)});
+}
+
 template <int BLOCK>
 __global__ void __launch_bounds__(BLOCK)
 g1_gate_bwd_kernel(
@@ -139,6 +153,43 @@ g1_gate_bwd_kernel(
     float fg = __bfloat162float(gate[i]);
     d_out_ungated[i] = __float2bfloat16(fd * fg);
     d_gate_linear[i] = __float2bfloat16(fd * fo * fg * (1.f - fg));
+  }
+}
+
+template <int BLOCK>
+__global__ void __launch_bounds__(BLOCK)
+g1_gate_bwd_from_output_kernel(
+    const __nv_bfloat16* __restrict__ d_out,
+    const __nv_bfloat16* __restrict__ out_gated,
+    const __nv_bfloat16* __restrict__ gate,
+    __nv_bfloat16* __restrict__ d_out_ungated,
+    __nv_bfloat16* __restrict__ d_gate_linear,
+    int64_t n_total
+) {
+  const int64_t tid = int64_t(blockIdx.x) * BLOCK + threadIdx.x;
+  const int64_t stride = int64_t(gridDim.x) * BLOCK;
+  const int64_t n_vec8 = n_total / 8;
+  const int64_t rem_start = n_vec8 * 8;
+
+  for (int64_t i = tid; i < n_vec8; i += stride) {
+    const int64_t off = i * 8;
+    bf16x8 d_o = load_bf16x8(d_out + off);
+    bf16x8 o_g = load_bf16x8(out_gated + off);
+    bf16x8 g = load_bf16x8(gate + off);
+    bf16x8 d_o_u, d_g_l;
+    #pragma unroll
+    for (int j = 0; j < 4; j++)
+      compute_bwd_from_output(d_o.v[j], o_g.v[j], g.v[j], d_o_u.v[j], d_g_l.v[j]);
+    store_bf16x8(d_out_ungated + off, d_o_u);
+    store_bf16x8(d_gate_linear + off, d_g_l);
+  }
+
+  for (int64_t i = rem_start + tid; i < n_total; i += stride) {
+    float fd = __bfloat162float(d_out[i]);
+    float fo = __bfloat162float(out_gated[i]);
+    float fg = __bfloat162float(gate[i]);
+    d_out_ungated[i] = __float2bfloat16(fd * fg);
+    d_gate_linear[i] = __float2bfloat16(fd * fo * (1.f - fg));
   }
 }
 
@@ -207,6 +258,35 @@ extern "C" void g1_gate_bwd(
   g1_gate_bwd_kernel<BLOCK><<<blocks, BLOCK, 0, stream>>>(
       (const __nv_bfloat16*)d_out,
       (const __nv_bfloat16*)out_ungated,
+      (const __nv_bfloat16*)gate,
+      (__nv_bfloat16*)d_out_ungated,
+      (__nv_bfloat16*)d_gate_linear,
+      n);
+}
+
+extern "C" void g1_gate_bwd_from_output(
+    const void* d_out,
+    const void* out_gated,
+    const void* gate,
+    void* d_out_ungated,
+    void* d_gate_linear,
+    int64_t n,
+    cudaStream_t stream
+) {
+  if (n <= 0) return;
+
+  constexpr int BLOCK = 256;
+
+  int dev, sm;
+  cudaGetDevice(&dev);
+  cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, dev);
+  const int64_t total_threads = (n + 7) / 8 * 8;
+  int blocks = std::min(sm * 4, int((total_threads + BLOCK - 1) / BLOCK));
+  if (blocks < 1) blocks = 1;
+
+  g1_gate_bwd_from_output_kernel<BLOCK><<<blocks, BLOCK, 0, stream>>>(
+      (const __nv_bfloat16*)d_out,
+      (const __nv_bfloat16*)out_gated,
       (const __nv_bfloat16*)gate,
       (__nv_bfloat16*)d_out_ungated,
       (__nv_bfloat16*)d_gate_linear,

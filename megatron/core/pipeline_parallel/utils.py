@@ -327,7 +327,7 @@ _COMP_STREAM = None
 _COMM_STREAM = None
 
 
-def set_streams(comp_stream=None, comm_stream=None):
+def set_streams(comp_stream=None, comm_stream=None, high_priority=False):
     """Set the streams for communication and computation"""
     global _COMP_STREAM
     global _COMM_STREAM
@@ -337,7 +337,11 @@ def set_streams(comp_stream=None, comm_stream=None):
     if comp_stream is None:
         comp_stream = torch.cuda.current_stream()
     if comm_stream is None:
-        comm_stream = torch.cuda.Stream(device="cuda")
+        if high_priority:
+            _, high = torch.cuda.Stream.priority_range()
+            comm_stream = torch.cuda.Stream(device="cuda", priority=high)
+        else:
+            comm_stream = torch.cuda.Stream(device="cuda")
 
     assert _COMP_STREAM is None
     assert _COMM_STREAM is None

@@ -619,6 +619,10 @@ class TransformerConfig(ModelParallelConfig):
     """Python import path to a callable quantizer factory, e.g., package.module.quantizer_factory.
     Required when fp4_recipe is custom."""
 
+    high_priority_a2a_comm_stream: bool = False
+    """If True, the communication stream created by set_streams for combined 1F1B
+    A2A overlap is created with CUDA high priority."""
+
     ####################
     # SpinQuant related
     ####################
@@ -971,6 +975,9 @@ class TransformerConfig(ModelParallelConfig):
     """Number of SMs to use for HybridEP. In pure NVL scenarios,
     16 SMs can generally achieve good bandwidth."""
 
+    moe_hybridep_num_sms_preprocessing: int = 108
+    """Number of SMs to use for HybridEP preprocessing metadata scan kernels."""
+
     ##################
     # Context Parallel
     ##################
@@ -1163,6 +1170,36 @@ class TransformerConfig(ModelParallelConfig):
     fallback_to_eager_attn: bool = False
     """Whether to fallback to eager attention in TE implementation.
     Suggested for when desired features are not available in TE implementation."""
+
+    nvfp4_activation_eco: bool = False
+    """If True, apply NVFP4 activation-ECO correction on Transformer Engine linear layers.
+
+    This adds the activation quantization residual contribution back into the weight gradient:
+    ``dW += dY.T @ (X - q_nvfp4(X))``. It is intended for the FP4/NVFP4 training path where
+    the GEMM consumes quantized activations.
+    """
+
+    nvfp4_activation_eco_modules: Optional[list[str]] = field(default_factory=lambda: ["all"])
+    """Transformer Engine linear groups to apply activation-ECO to.
+
+    Allowed values: "all", "qkv", "proj", "fc1", "fc2", "expert", "nonexpert",
+    "duplicated", "other". "other" covers TELinear instances without a standard
+    qkv/proj/fc1/fc2 communication-buffer name.
+    """
+
+    nvfp4_activation_eco_recompute_only: bool = True
+    """If True, only capture activations when autograd is enabled.
+
+    With StreamBP this means the no-grad forward pass does not retain BF16 activations; only
+    the backward replay chunks capture the short-lived tensors needed for the correction.
+    """
+
+    nvfp4_activation_eco_quantizer_backend: Literal["te", "reference"] = "te"
+    """Quantizer backend for activation-ECO correction: TE NVFP4 when possible, or reference."""
+
+    nvfp4_activation_eco_correction_dtype: Literal["fp32", "bf16", "fp16"] = "fp32"
+    """Accumulator dtype for the activation-ECO correction matmul."""
+
     #####################################
     # Fine-grained Activation Offloading
     #####################################
@@ -1285,7 +1322,10 @@ class TransformerConfig(ModelParallelConfig):
                     f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=})."
                 )
         elif self.experimental_attention_variant == "dsa":
-            assert not self.apply_rope_fusion, "RoPE fusion is not supported for DSAttention"
+            assert not self.apply_rope_fusion or self.multi_latent_attention, (
+                "RoPE fusion is only supported for DSA when DSA is hosted behind "
+                "MultiLatentAttention, where MLA owns the fused Q/KV RoPE path."
+            )
 
         if self.fp8:
             # cannot support first last layer bf16 with delayed scaling
@@ -1497,6 +1537,37 @@ class TransformerConfig(ModelParallelConfig):
             if self.dsa_indexcache_hisa_compression_ratio < 0:
                 raise ValueError(
                     "dsa_indexcache_hisa_compression_ratio must be non-negative"
+                )
+
+        if self.nvfp4_activation_eco:
+            if self.transformer_impl != "transformer_engine":
+                raise ValueError("nvfp4_activation_eco requires transformer_impl='transformer_engine'")
+            if self.nvfp4_activation_eco_modules is None:
+                self.nvfp4_activation_eco_modules = ["all"]
+            allowed_act_eco_modules = {
+                "all",
+                "qkv",
+                "proj",
+                "fc1",
+                "fc2",
+                "expert",
+                "nonexpert",
+                "duplicated",
+                "other",
+            }
+            invalid_modules = set(self.nvfp4_activation_eco_modules) - allowed_act_eco_modules
+            if invalid_modules:
+                raise ValueError(
+                    f"Invalid nvfp4_activation_eco_modules: {invalid_modules}. "
+                    f"Allowed modules are: {allowed_act_eco_modules}"
+                )
+            if self.nvfp4_activation_eco_quantizer_backend not in {"te", "reference"}:
+                raise ValueError(
+                    "nvfp4_activation_eco_quantizer_backend must be 'te' or 'reference'"
+                )
+            if self.nvfp4_activation_eco_correction_dtype not in {"fp32", "bf16", "fp16"}:
+                raise ValueError(
+                    "nvfp4_activation_eco_correction_dtype must be one of fp32, bf16, fp16"
                 )
 
         if self.cpu_offloading and self.recompute_granularity is not None:
@@ -2354,6 +2425,19 @@ class TransformerConfig(ModelParallelConfig):
                     'TE version >= 2.10.0 is required for delay_wgrad_compute with '
                     'partial cuda graph'
                 )
+
+        if self.overlap_dispatch_backward_with_experts_wgrad:
+            assert not self.overlap_moe_expert_parallel_comm, (
+                'overlap_moe_expert_parallel_comm must be disabled when enabling '
+                'overlap_dispatch_backward_with_experts_wgrad.'
+            )
+            assert is_te_min_version(
+                "2.3.0"
+            ), 'TE version >= 2.3.0 is required for overlap_dispatch_backward_with_experts_wgrad'
+            assert not self.delay_wgrad_compute, (
+                'delay_wgrad_compute and overlap_dispatch_backward_with_experts_wgrad '
+                'are mutually exclusive; use only one'
+            )
 
         if self.ep_overlap_early_attn_memory_release:
             assert self.overlap_moe_expert_parallel_comm, (

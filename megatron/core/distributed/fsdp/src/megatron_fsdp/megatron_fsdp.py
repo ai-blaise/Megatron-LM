@@ -72,6 +72,18 @@ class TrainingState(Enum):
     IDLE = auto()
 
 
+def setup_delayed_wgrad_acc_hook(module, grad_acc_func):
+    """Configure delayed-wgrad gradient processing for MoE expert parameters."""
+
+    need_backward_dw = getattr(module, "need_backward_dw", lambda: False)
+    if not need_backward_dw():
+        return
+
+    for param in module.parameters():
+        if getattr(param, "skip_backward_post_hook", False):
+            param.post_wgrad_grad_acc_hook = functools.partial(grad_acc_func, [param])
+
+
 class MegatronFSDP(torch.nn.Module):
     """Fully Sharded Data Parallel training.
 
@@ -671,6 +683,17 @@ class MegatronFSDP(torch.nn.Module):
             """
             # Filter out shared parameters whose gradients are handled by the root hook.
             param_list = [p for p in param_list if not getattr(p, "_is_shared", False)]
+            param_list = [
+                p
+                for p in param_list
+                if not (
+                    getattr(p, "skip_backward_post_hook", False)
+                    and hasattr(p, "post_wgrad_grad_acc_hook")
+                )
+            ]
+            if not param_list:
+                return
+
             for param in param_list:
                 _grad_acc(param)
 
@@ -977,6 +1000,7 @@ class MegatronFSDP(torch.nn.Module):
 
         fsdp_modules = []
         for name, module in root_module.named_modules():
+            setup_delayed_wgrad_acc_hook(module, _process_post_backward_gradients)
             if self.enable_fine_grained_param_gather_hook:
                 _register_pre_forward_param_unshard_hook(module)
                 _register_pre_backward_param_unshard_hook(module)

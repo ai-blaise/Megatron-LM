@@ -2,6 +2,7 @@
 
 import logging
 import os
+import re
 from contextlib import contextmanager
 from typing import Optional
 
@@ -23,6 +24,70 @@ from .param_and_grad_buffer import (
 )
 
 logger = logging.getLogger(__name__)
+
+_ACT_ECO_PENDING_GRAD_CORRECTION_ATTR = "_nvfp4_act_eco_pending_grad_correction"
+
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).lower() in ("1", "true", "yes", "on")
+
+
+def _rank_selected(spec: str, rank: int) -> bool:
+    spec = spec.strip()
+    if not spec or spec == "all":
+        return True
+    return rank in {int(item) for item in spec.split(",") if item.strip()}
+
+
+def _debug_tensor_meta(tensor: Optional[torch.Tensor]) -> str:
+    if tensor is None:
+        return "None"
+    try:
+        ptr = tensor.data_ptr()
+    except Exception:
+        ptr = "<no_ptr>"
+    return (
+        f"shape={tuple(tensor.shape)} dtype={tensor.dtype} device={tensor.device} "
+        f"contig={tensor.is_contiguous()} ptr={ptr}"
+    )
+
+
+def _ddp_grad_debug_sync(
+    label: str,
+    *,
+    param_name: str,
+    param_grad: Optional[torch.Tensor],
+    main_grad: Optional[torch.Tensor],
+) -> None:
+    """Fence the DDP grad handoff path for CUDA illegal-address localization."""
+
+    if not _env_flag("MEGATRON_DDP_GRAD_DEBUG_SYNC"):
+        return
+    if not torch.cuda.is_available():
+        return
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else int(
+        os.getenv("RANK", "0")
+    )
+    if not _rank_selected(os.getenv("MEGATRON_DDP_GRAD_DEBUG_RANKS", "all"), rank):
+        return
+    pattern = os.getenv("MEGATRON_DDP_GRAD_DEBUG_PARAM_REGEX", "")
+    if pattern and re.search(pattern, param_name) is None:
+        return
+    if _env_flag("MEGATRON_DDP_GRAD_DEBUG_VERBOSE"):
+        print(
+            f"[rank{rank}] ddp-grad sync: {label} name={param_name} "
+            f"param_grad=({_debug_tensor_meta(param_grad)}) "
+            f"main_grad=({_debug_tensor_meta(main_grad)})",
+            flush=True,
+        )
+    torch.cuda.synchronize()
+
+
+def _pop_act_eco_grad_correction(param: torch.nn.Parameter) -> Optional[torch.Tensor]:
+    correction = getattr(param, _ACT_ECO_PENDING_GRAD_CORRECTION_ATTR, None)
+    if correction is not None:
+        delattr(param, _ACT_ECO_PENDING_GRAD_CORRECTION_ATTR)
+    return correction
 
 
 class DistributedDataParallel(_BaseDataParallel):
@@ -476,7 +541,35 @@ class DistributedDataParallel(_BaseDataParallel):
                                 periodic=False,
                                 full_finite=True,
                             )
+                    param_name = getattr(self, "param_to_name", {}).get(param, "<unnamed>")
+                    _ddp_grad_debug_sync(
+                        "before_main_grad_add",
+                        param_name=param_name,
+                        param_grad=param.grad,
+                        main_grad=param.main_grad,
+                    )
                     param.main_grad.add_(param.grad.data)
+                    act_eco_correction = _pop_act_eco_grad_correction(param)
+                    if act_eco_correction is not None:
+                        _ddp_grad_debug_sync(
+                            "before_act_eco_correction_add",
+                            param_name=param_name,
+                            param_grad=act_eco_correction,
+                            main_grad=param.main_grad,
+                        )
+                        param.main_grad.add_(act_eco_correction)
+                        _ddp_grad_debug_sync(
+                            "after_act_eco_correction_add",
+                            param_name=param_name,
+                            param_grad=act_eco_correction,
+                            main_grad=param.main_grad,
+                        )
+                    _ddp_grad_debug_sync(
+                        "after_main_grad_add",
+                        param_name=param_name,
+                        param_grad=param.grad,
+                        main_grad=param.main_grad,
+                    )
                     if debug_this_grad:
                         bad = numeric_debug.log_tensor(
                             f"ddp_grad.{param_name}.main_grad.after_add",
@@ -493,7 +586,27 @@ class DistributedDataParallel(_BaseDataParallel):
                                 "numeric debug found nonfinite DDP accumulated grad "
                                 f"for {param_name}"
                             )
+                if getattr(param, _ACT_ECO_PENDING_GRAD_CORRECTION_ATTR, None) is not None:
+                    param_name = getattr(self, "param_to_name", {}).get(param, "<unnamed>")
+                    raise RuntimeError(
+                        "Activation-ECO correction was stashed but not consumed by DDP for "
+                        f"{param_name}; param.grad_added_to_main_grad="
+                        f"{getattr(param, 'grad_added_to_main_grad', None)}"
+                    )
+                param_name = getattr(self, "param_to_name", {}).get(param, "<unnamed>")
+                _ddp_grad_debug_sync(
+                    "before_param_grad_clear",
+                    param_name=param_name,
+                    param_grad=param.grad,
+                    main_grad=getattr(param, "main_grad", None),
+                )
                 param.grad = None
+                _ddp_grad_debug_sync(
+                    "after_param_grad_clear",
+                    param_name=param_name,
+                    param_grad=param.grad,
+                    main_grad=getattr(param, "main_grad", None),
+                )
 
                 if self.ddp_config.overlap_grad_reduce and should_streambp_register_grad_ready(param):
                     self.param_to_bucket_group[param].register_grad_ready(

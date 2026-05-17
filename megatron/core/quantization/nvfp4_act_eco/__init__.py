@@ -26,6 +26,7 @@ from megatron.core.quantization.nvfp4_act_eco.codec import (
     build_nvfp4_act_eco_config,
 )
 from megatron.core.quantization.nvfp4_act_eco.te_hook import (
+    install_act_eco_on_te_grouped_linear,
     install_act_eco_on_te_linear,
     is_te_available,
 )
@@ -38,6 +39,7 @@ __all__ = [
     "Nvfp4ActEcoLinearFn",
     "apply_nvfp4_act_eco_linear",
     "build_nvfp4_act_eco_config",
+    "install_act_eco_on_te_grouped_linear",
     "install_act_eco_on_te_linear",
     "is_te_available",
 ]

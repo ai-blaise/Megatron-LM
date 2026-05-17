@@ -4,7 +4,7 @@ import copy
 import math
 import os
 from dataclasses import dataclass, replace
-from typing import Optional, Tuple, Union
+from typing import Callable, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -60,11 +60,14 @@ _DSA_STREAMING_INDEXER_TOPK_ENV = "MEGATRON_DSA_STREAMING_INDEXER_TOPK"
 _DSA_INDEXER_KEY_BLOCK_SIZE_ENV = "MEGATRON_DSA_INDEXER_KEY_BLOCK_SIZE"
 _DSA_SORT_TOPK_INDICES_ENV = "MEGATRON_DSA_SORT_TOPK_INDICES"
 _DSA_COMPACT_TOPK_INDICES_ENV = "MEGATRON_DSA_COMPACT_TOPK_INDICES"
+_DSA_STREAM_TRITON_ATTENTION_CHUNKS_ENV = "MEGATRON_DSA_STREAM_TRITON_ATTENTION_CHUNKS"
 _DSA_VALIDATE_TOPK_INDICES_ENV = "MEGATRON_DSA_VALIDATE_TOPK_INDICES"
 _HISA_TARGET_ROW_CHUNK_ENV = "MEGATRON_HISA_TARGET_ROW_CHUNK"
 _HISA_FUSED_INDEXER_LOSS_ENV = "MEGATRON_HISA_FUSED_INDEXER_LOSS"
 _HISA_ASSUME_SORTED_POSITIONS_ENV = "MEGATRON_HISA_ASSUME_SORTED_POSITIONS"
 _HISA_FALLBACK_DENSE_IF_SHORT_ENV = "MEGATRON_HISA_FALLBACK_DENSE_IF_SHORT"
+_DSA_CHUNK_INDEXER_PROJ_ENV = "MEGATRON_DSA_CHUNK_INDEXER_PROJ"
+_DSA_SP_PROJECT_BEFORE_GATHER_ENV = "MEGATRON_DSA_SP_PROJECT_BEFORE_GATHER"
 
 
 def _env_flag_enabled(name: str, default: str = "1") -> bool:
@@ -151,12 +154,38 @@ def _in_te_no_grad_activation_recompute_forward() -> bool:
         )
     except (ImportError, ModuleNotFoundError):
         return False
-
     return (
         is_fp8_activation_recompute_enabled()
         and not in_fp8_activation_recompute_phase()
         and not torch.is_grad_enabled()
     )
+
+
+class _BroadcastFromTensorParallelOwner(torch.autograd.Function):
+    """Broadcast a compact sequence-parallel chunk and reduce its gradient to the owner."""
+
+    @staticmethod
+    def forward(ctx, input_: torch.Tensor, owner_global_rank: int, group):
+        ctx.owner_global_rank = int(owner_global_rank)
+        ctx.group = group
+        output = torch.empty_like(input_)
+        if torch.distributed.get_rank() == ctx.owner_global_rank:
+            output.copy_(input_)
+        torch.distributed.broadcast(output, src=ctx.owner_global_rank, group=group)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        grad_input = grad_output.contiguous()
+        torch.distributed.reduce(
+            grad_input,
+            dst=ctx.owner_global_rank,
+            op=torch.distributed.ReduceOp.SUM,
+            group=ctx.group,
+        )
+        if torch.distributed.get_rank() != ctx.owner_global_rank:
+            grad_input.zero_()
+        return grad_input, None, None
 
 
 def _torch_layer_norm_like_te(layer_norm: torch.nn.Module, x: torch.Tensor, eps: float) -> torch.Tensor:
@@ -278,7 +307,10 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
         Rotated tensor.
     """
     if hasattr(x, "dequantize"):
-        x = x.dequantize()
+        try:
+            x = x.dequantize(dtype=torch.bfloat16)
+        except TypeError:
+            x = x.dequantize()
     if x.dtype != torch.bfloat16:
         x = x.to(dtype=torch.bfloat16)
     assert hadamard_transform is not None, "fast_hadamard_transform is not installed."
@@ -579,7 +611,10 @@ def fused_qk_topk_naive(
     # =========================================
     topk_k = min(index_topk, seqlen)
     # [batch, seqlen, index_topk]
-    topk_indices = index_scores.topk(topk_k, dim=-1, sorted=False)[1]
+    # Keep this legacy fused-loss helper deterministic and aligned with the
+    # autograd reference tests. The production chunked/HISA path keeps its own
+    # sorted=False top-k where order is not part of the sparse attention semantics.
+    topk_indices = index_scores.topk(topk_k, dim=-1, sorted=True)[1]
 
     return index_scores, topk_indices
 
@@ -948,6 +983,8 @@ class DSAIndexer(MegatronModule):
             pg_collection (ProcessGroupCollection, optional): Process groups for the indexer.
         """
         super().__init__(config=config)
+        self._indexer_rope_config = copy.copy(self.config)
+        self._indexer_rope_config.apply_rope_fusion = False
         self.hidden_size = self.config.hidden_size
         self.qk_pos_emb_head_dim = self.config.qk_pos_emb_head_dim
         self.q_lora_rank = (
@@ -1091,7 +1128,7 @@ class DSAIndexer(MegatronModule):
         x_pe = apply_rotary_pos_emb(
             x_pe,
             rotary_pos_emb,
-            config=self.config,
+            config=self._indexer_rope_config,
             cu_seqlens=None,
             mscale=mscale,
             cp_group=self.pg_collection.cp,
@@ -1103,10 +1140,29 @@ class DSAIndexer(MegatronModule):
         x = torch.cat([x_pe, x_nope], dim=-1)
         return x
 
-    def forward_before_topk(
-        self, x: torch.Tensor, qr: torch.Tensor, packed_seq_params: Optional[PackedSeqParams] = None
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """All computations before topk."""
+    @staticmethod
+    def _slice_rotary_pos_emb(rotary_pos_emb, start: int, end: int):
+        if isinstance(rotary_pos_emb, tuple):
+            return tuple(None if item is None else item[start:end] for item in rotary_pos_emb)
+        return rotary_pos_emb[start:end]
+
+    @staticmethod
+    def _index_rotary_pos_emb(rotary_pos_emb, indices: torch.Tensor):
+        if isinstance(rotary_pos_emb, tuple):
+            return tuple(
+                None if item is None else item.index_select(0, indices.to(item.device))
+                for item in rotary_pos_emb
+            )
+        return rotary_pos_emb.index_select(0, indices.to(rotary_pos_emb.device))
+
+    def _prepare_inputs_before_topk(
+        self,
+        x: torch.Tensor,
+        qr: torch.Tensor,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        gather_sequence_parallel: bool = True,
+    ):
+        """Prepare shared DSA indexer inputs before per-query projection/top-k work."""
         orig_seqlen = x.size(0)
         pad_len = 0
         if self.config.fp4 and packed_seq_params is None:
@@ -1126,9 +1182,6 @@ class DSAIndexer(MegatronModule):
                     dim=0,
                 )
 
-        # =========================================
-        # Prepare RoPE params
-        # =========================================
         rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
             None, None, x, self.config, packed_seq_params
         )
@@ -1138,32 +1191,61 @@ class DSAIndexer(MegatronModule):
         else:
             rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq=False)
 
-        # =========================================
-        # Gather inputs if sp is enabled
-        # =========================================
-        if self.config.sequence_parallel and self.pg_collection.tp.size() > 1:
+        if (
+            gather_sequence_parallel
+            and self.config.sequence_parallel
+            and self.pg_collection.tp.size() > 1
+        ):
             x = gather_from_sequence_parallel_region(x, group=self.pg_collection.tp)
             qr = gather_from_sequence_parallel_region(qr, group=self.pg_collection.tp)
 
-        # =========================================
-        # Get sequence length and batch size
-        # =========================================
+        return x, qr, rotary_pos_emb, mscale, orig_seqlen, pad_len
+
+    def _project_query_before_topk(
+        self,
+        query_x: torch.Tensor,
+        query_qr: torch.Tensor,
+        query_rotary_pos_emb,
+        mscale: float,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Project one query span into DSA indexer q and score weights."""
+        query_seqlen, bsz, _ = query_qr.size()
+        q, _ = self.linear_wq_b(query_qr)
+        q = q.reshape(query_seqlen, bsz, self.index_n_heads, self.index_head_dim)
+        q = self._apply_rope(q, query_rotary_pos_emb, mscale)
+        q = rotate_activation(q)
+
+        weights, _ = self.linear_weights_proj(query_x)
+        weights = weights * (self.index_n_heads**-0.5) * self.softmax_scale
+        return q, weights
+
+    def _project_query_chunk_before_topk(
+        self,
+        x: torch.Tensor,
+        qr: torch.Tensor,
+        rotary_pos_emb,
+        mscale: float,
+        q_start: int,
+        q_end: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self._project_query_before_topk(
+            x[q_start:q_end],
+            qr[q_start:q_end],
+            self._slice_rotary_pos_emb(rotary_pos_emb, q_start, q_end),
+            mscale,
+        )
+
+    def _project_key_before_topk(
+        self,
+        x: torch.Tensor,
+        rotary_pos_emb,
+        mscale: float,
+        orig_seqlen: int,
+        pad_len: int,
+        apply_indexcache: bool = True,
+    ) -> torch.Tensor:
+        """Project the full DSA indexer key prefix once."""
         seqlen, bsz, _ = x.size()
-
-        # =========================================
-        # q linear and apply rope to q
-        # =========================================
-        # [seqlen, batch, q_lora_rank] -> [seqlen, batch, index_n_heads * index_head_dim]
-        q, _ = self.linear_wq_b(qr)
-        # [seqlen, batch, index_n_heads * index_head_dim]
-        #   -> [seqlen, batch, index_n_heads, index_head_dim]
-        q = q.reshape(seqlen, bsz, self.index_n_heads, self.index_head_dim)
-        q = self._apply_rope(q, rotary_pos_emb, mscale)
-
-        # =========================================
-        # k linear and apply rope to k
-        # =========================================
-        # [seqlen, batch, hidden_size] -> [seqlen, batch, index_head_dim]
         k, _ = self.linear_wk(x)
         if self.config.fp4 and _in_te_no_grad_activation_recompute_forward():
             # The StreamBP reference-style checkpoint forward runs under TE's
@@ -1174,36 +1256,162 @@ class DSAIndexer(MegatronModule):
             k = _torch_layer_norm_like_te(self.k_norm, k, self.config.layernorm_epsilon)
         else:
             k = self.k_norm(k)
-        # [seqlen, batch, index_head_dim] -> [seqlen, batch, 1, index_head_dim]
         k = k.reshape(seqlen, bsz, 1, self.index_head_dim)
         k = self._apply_rope(k, rotary_pos_emb, mscale)
-        # [seqlen, batch, 1, index_head_dim] -> [seqlen, batch, index_head_dim]
         k = k.reshape(seqlen, bsz, self.index_head_dim)
-
-        # =========================================
-        # Rotate activation
-        # =========================================
-        q = rotate_activation(q)
         k = rotate_activation(k)
         if pad_len:
-            q = q[:orig_seqlen]
             k = k[:orig_seqlen]
 
-        # IndexCache fake-quant on the post-rotation indexer K. K only —
-        # SGLang's reference quantizes the indexer key cache, not the query.
-        if self.indexcache_config is not None:
+        if apply_indexcache and self.indexcache_config is not None:
             from megatron.core.quantization.indexcache import apply_indexcache_kv
 
             k = apply_indexcache_kv(k, self.indexcache_config)
+        return k
 
-        # =========================================
-        # Prepare weights for index scores
-        # =========================================
-        # [seqlen, batch, hidden_size] -> [seqlen, batch, index_n_heads]
-        weights, _ = self.linear_weights_proj(x)
-        if pad_len:
+    def _apply_indexcache_to_key(self, k: torch.Tensor) -> torch.Tensor:
+        if self.indexcache_config is None:
+            return k
+        from megatron.core.quantization.indexcache import apply_indexcache_kv
+
+        return apply_indexcache_kv(k, self.indexcache_config)
+
+    def _project_local_key_then_gather_before_topk(
+        self,
+        x: torch.Tensor,
+        rotary_pos_emb,
+        mscale: float,
+        orig_seqlen: int,
+        pad_len: int,
+    ) -> torch.Tensor:
+        """Project the local SP hidden shard before gathering compact DSA index keys."""
+        local_rank = self.pg_collection.tp.rank()
+        local_start = local_rank * orig_seqlen
+        local_rotary_pos_emb = self._slice_rotary_pos_emb(
+            rotary_pos_emb, local_start, local_start + x.size(0)
+        )
+        k_local = self._project_key_before_topk(
+            x,
+            local_rotary_pos_emb,
+            mscale,
+            orig_seqlen,
+            pad_len,
+            apply_indexcache=False,
+        )
+        k = gather_from_sequence_parallel_region(k_local, group=self.pg_collection.tp)
+        return self._apply_indexcache_to_key(k)
+
+    def _project_query_chunk_sp_owner_broadcast_before_topk(
+        self,
+        x: torch.Tensor,
+        qr: torch.Tensor,
+        rotary_pos_emb,
+        mscale: float,
+        q_start: int,
+        q_end: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Project one global query chunk from its SP owner, then broadcast compact tensors.
+
+        The current training shape uses DSA chunks that divide the TP-local sequence
+        shard. That lets us avoid gathering the full hidden state while preserving
+        exact per-token projections and autograd via reduce-to-owner backward.
+        """
+        tp_group = self.pg_collection.tp
+        tp_size = tp_group.size()
+        local_seq_len = x.size(0)
+        q_len = q_end - q_start
+        if tp_size <= 1:
+            return self._project_query_chunk_before_topk(
+                x, qr, rotary_pos_emb, mscale, q_start, q_end
+            )
+        if local_seq_len <= 0:
+            raise ValueError("DSA sequence-parallel query projection received empty local shard")
+
+        owner_rank = q_start // local_seq_len
+        if owner_rank >= tp_size or q_end > (owner_rank + 1) * local_seq_len:
+            raise RuntimeError(
+                "MEGATRON_DSA_SP_PROJECT_BEFORE_GATHER requires DSA chunks to stay within "
+                f"one TP sequence shard; got q_start={q_start}, q_end={q_end}, "
+                f"local_seq_len={local_seq_len}, tp_size={tp_size}"
+            )
+
+        local_offset = q_start - owner_rank * local_seq_len
+        if tp_group.rank() == owner_rank:
+            q, weights = self._project_query_before_topk(
+                x[local_offset : local_offset + q_len],
+                qr[local_offset : local_offset + q_len],
+                self._slice_rotary_pos_emb(rotary_pos_emb, q_start, q_end),
+                mscale,
+            )
+        else:
+            q = torch.empty(
+                q_len,
+                x.size(1),
+                self.index_n_heads,
+                self.index_head_dim,
+                device=x.device,
+                dtype=x.dtype,
+                requires_grad=True,
+            )
+            weights = torch.empty(
+                q_len,
+                x.size(1),
+                self.index_n_heads,
+                device=x.device,
+                dtype=x.dtype,
+                requires_grad=True,
+            )
+
+        owner_global_rank = torch.distributed.get_global_rank(tp_group, int(owner_rank))
+        q = _BroadcastFromTensorParallelOwner.apply(q, owner_global_rank, tp_group)
+        weights = _BroadcastFromTensorParallelOwner.apply(weights, owner_global_rank, tp_group)
+        return q, weights
+
+    def forward_before_topk(
+        self,
+        x: torch.Tensor,
+        qr: torch.Tensor,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        query_indices: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """All computations before topk."""
+        x, qr, rotary_pos_emb, mscale, orig_seqlen, pad_len = self._prepare_inputs_before_topk(
+            x, qr, packed_seq_params
+        )
+        query_x = x
+        query_qr = qr
+        query_rotary_pos_emb = rotary_pos_emb
+        if query_indices is not None:
+            if packed_seq_params is not None:
+                raise ValueError("DSA query_indices are only supported for unpacked StreamBP chunks")
+            query_indices = query_indices.to(device=x.device, dtype=torch.long)
+            if query_indices.dim() != 1:
+                raise ValueError(
+                    f"DSA query_indices must be 1D, got shape {tuple(query_indices.shape)}"
+                )
+            if query_indices.numel() == 0:
+                raise ValueError("DSA query_indices must not be empty")
+            if bool((query_indices < 0).any().item()) or bool(
+                (query_indices >= x.size(0)).any().item()
+            ):
+                raise ValueError(
+                    f"DSA query_indices out of range for sequence length {x.size(0)}"
+                )
+            query_x = x.index_select(0, query_indices)
+            if qr.size(0) == query_indices.numel():
+                query_qr = qr
+            else:
+                query_qr = qr.index_select(0, query_indices)
+            query_rotary_pos_emb = self._index_rotary_pos_emb(rotary_pos_emb, query_indices)
+
+        q, weights = self._project_query_before_topk(
+            query_x, query_qr, query_rotary_pos_emb, mscale
+        )
+        k = self._project_key_before_topk(x, rotary_pos_emb, mscale, orig_seqlen, pad_len)
+        if pad_len and query_indices is None:
+            q = q[:orig_seqlen]
+        if pad_len and query_indices is None:
             weights = weights[:orig_seqlen]
-        weights = weights * (self.index_n_heads**-0.5) * self.softmax_scale
 
         return q, k, weights
 
@@ -2225,9 +2433,9 @@ class _HISAFusedIndexerLoss(torch.autograd.Function):
 
 
 def chunked_dsa_forward(
-    q: torch.Tensor,
+    q: Union[torch.Tensor, Callable[[int, int], Tuple[torch.Tensor, torch.Tensor]]],
     k: torch.Tensor,
-    weights: torch.Tensor,
+    weights: Optional[torch.Tensor],
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -2245,6 +2453,8 @@ def chunked_dsa_forward(
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     sq, bsz, num_heads, head_dim = query.size()
     sk = key.size(0)
+    q_weights_provider = q if callable(q) else None
+    work_device = query.device
     outputs = []
     topk_buffer = None
     use_triton_attention = None
@@ -2259,11 +2469,15 @@ def chunked_dsa_forward(
     loss_count = 0
     attention_teacher_score_chunks = []
     attention_teacher_row_indices = []
+    stream_triton_attention_chunks = _env_flag_enabled(_DSA_STREAM_TRITON_ATTENTION_CHUNKS_ENV, "0")
 
     for q_start in range(0, sq, chunk_size):
         q_end = min(q_start + chunk_size, sq)
-        q_chunk = q[q_start:q_end]
-        weights_chunk = weights[q_start:q_end]
+        if q_weights_provider is not None:
+            q_chunk, weights_chunk = q_weights_provider(q_start, q_end)
+        else:
+            q_chunk = q[q_start:q_end]
+            weights_chunk = weights[q_start:q_end]
         query_chunk = query[q_start:q_end]
         query_positions_chunk = (
             None if query_positions is None else query_positions[q_start:q_end]
@@ -2296,7 +2510,7 @@ def chunked_dsa_forward(
                         mask=mask,
                         query_positions=query_positions_chunk,
                         key_positions=key_positions,
-                        device=q.device,
+                        device=work_device,
                     )
                 if (
                     prefix_lens is not None
@@ -2311,7 +2525,7 @@ def chunked_dsa_forward(
                         value,
                         torch.empty(
                             (bsz, q_end - q_start, topk_k),
-                            device=q.device,
+                            device=work_device,
                             dtype=torch.int32,
                         ),
                         mask,
@@ -2415,7 +2629,7 @@ def chunked_dsa_forward(
                 score_shape = (bsz, q_end - q_start, sk)
                 if index_scores_buffer is None or tuple(index_scores_buffer.shape) != score_shape:
                     index_scores_buffer = torch.empty(
-                        score_shape, device=q.device, dtype=torch.float32
+                        score_shape, device=work_device, dtype=torch.float32
                     )
                 index_scores = dsa_indexer_scores_triton(
                     q_chunk,
@@ -2572,6 +2786,49 @@ def chunked_dsa_forward(
             topk_indices, hisa_selected_scores = _maybe_sort_dsa_topk_indices_and_scores(
                 topk_indices, hisa_selected_scores
             )
+            if stream_triton_attention_chunks:
+                if hisa_loss_deferred_to_attention:
+                    chunk_output, attention_teacher_probs = sparse_dsa_attention_with_teacher_triton(
+                        query_chunk,
+                        key,
+                        value,
+                        topk_indices,
+                        softmax_scale,
+                        q_start,
+                        query_positions=query_positions_chunk,
+                        key_positions=key_positions,
+                    )
+                    if pg_collection is not None and _dsa_process_group_size(pg_collection.tp) > 1:
+                        torch.distributed.all_reduce(
+                            attention_teacher_probs.contiguous(), group=pg_collection.tp
+                        )
+                    attention_teacher_probs = attention_teacher_probs / attention_teacher_probs.sum(
+                        dim=-1, keepdim=True
+                    ).clamp_min(1e-20)
+                    flat_topk = topk_indices.reshape(bsz * (q_end - q_start), -1)
+                    valid = flat_topk >= 0
+                    chunk_loss_sum = _SelectedScoresKLLoss.apply(
+                        hisa_selected_scores,
+                        attention_teacher_probs.reshape_as(hisa_selected_scores),
+                        valid,
+                    )
+                    loss_sum = chunk_loss_sum if loss_sum is None else loss_sum + chunk_loss_sum
+                    loss_count += hisa_selected_scores.size(0)
+                    outputs.append(chunk_output)
+                else:
+                    outputs.append(
+                        sparse_dsa_attention_triton(
+                            query_chunk,
+                            key,
+                            value,
+                            topk_indices,
+                            softmax_scale,
+                            q_start,
+                            query_positions=query_positions_chunk,
+                            key_positions=key_positions,
+                        )
+                    )
+                continue
             if topk_buffer is None:
                 topk_buffer = torch.empty(
                     (bsz, sq, topk_indices.size(-1)),
@@ -2610,7 +2867,9 @@ def chunked_dsa_forward(
                 )
             )
 
-    if use_triton_attention:
+    if use_triton_attention and stream_triton_attention_chunks:
+        output = torch.cat(outputs, dim=0)
+    elif use_triton_attention:
         # Keep top-k generation chunked to bound the indexer score tensor, then run
         # the selected-token attention as one autograd op so K/V gradients are
         # accumulated once per layer instead of once per query chunk.
@@ -2882,6 +3141,25 @@ class DSAttention(MegatronModule):
         x = x.detach()
         qr = qr.detach()
 
+        streambp_query_positions = None
+        streambp_key_positions = None
+        streambp_query_indices = None
+        if streambp_positions is not None:
+            streambp_query_positions, streambp_key_positions = streambp_positions
+            if streambp_query_positions is None or streambp_key_positions is None:
+                raise ValueError("StreamBP DSA requires both query and key positions")
+            streambp_query_indices = streambp_query_positions.to(device=x.device, dtype=torch.long)
+            if streambp_query_indices.numel() != sq:
+                raise ValueError(
+                    f"StreamBP DSA query position length {streambp_query_indices.numel()} "
+                    f"does not match query length {sq}"
+                )
+            if streambp_key_positions.numel() != skv:
+                raise ValueError(
+                    f"StreamBP DSA key position length {streambp_key_positions.numel()} "
+                    f"does not match key length {skv}"
+                )
+
         is_causal = False
         # Get a FP32 mask with -inf for masked positions.
         if attn_mask_type is not None:
@@ -2897,7 +3175,86 @@ class DSAttention(MegatronModule):
                 mask, float('-inf')
             )
 
-        q, k, weights = self.indexer.forward_before_topk(x, qr, packed_seq_params)
+        indexer_loss_coeff = getattr(self.config, 'dsa_indexer_loss_coeff', 0.0)
+        chunk_size = int(self.config.dsa_chunk_size)
+        chunk_indexer_q = (
+            streambp_positions is None
+            and packed_seq_params is None
+            and chunk_size > 0
+            and sq > chunk_size
+            and _env_flag_enabled(_DSA_CHUNK_INDEXER_PROJ_ENV, "1")
+        )
+        if chunk_indexer_q:
+            sp_project_before_gather = (
+                _env_flag_enabled(_DSA_SP_PROJECT_BEFORE_GATHER_ENV, "1")
+                and self.config.sequence_parallel
+                and self.indexer.pg_collection.tp.size() > 1
+                and x.size(0) * self.indexer.pg_collection.tp.size() == sq
+                and chunk_size > 0
+                and x.size(0) % chunk_size == 0
+            )
+            if sp_project_before_gather:
+                (
+                    indexer_x,
+                    indexer_qr,
+                    indexer_rotary_pos_emb,
+                    indexer_mscale,
+                    indexer_orig_seqlen,
+                    indexer_pad_len,
+                ) = self.indexer._prepare_inputs_before_topk(
+                    x, qr, packed_seq_params, gather_sequence_parallel=False
+                )
+                k = self.indexer._project_local_key_then_gather_before_topk(
+                    indexer_x,
+                    indexer_rotary_pos_emb,
+                    indexer_mscale,
+                    indexer_orig_seqlen,
+                    indexer_pad_len,
+                )
+
+                def q_weights_provider(q_start: int, q_end: int):
+                    return self.indexer._project_query_chunk_sp_owner_broadcast_before_topk(
+                        indexer_x,
+                        indexer_qr,
+                        indexer_rotary_pos_emb,
+                        indexer_mscale,
+                        q_start,
+                        q_end,
+                    )
+
+            else:
+                (
+                    indexer_x,
+                    indexer_qr,
+                    indexer_rotary_pos_emb,
+                    indexer_mscale,
+                    indexer_orig_seqlen,
+                    indexer_pad_len,
+                ) = self.indexer._prepare_inputs_before_topk(x, qr, packed_seq_params)
+                k = self.indexer._project_key_before_topk(
+                    indexer_x,
+                    indexer_rotary_pos_emb,
+                    indexer_mscale,
+                    indexer_orig_seqlen,
+                    indexer_pad_len,
+                )
+
+                def q_weights_provider(q_start: int, q_end: int):
+                    return self.indexer._project_query_chunk_before_topk(
+                        indexer_x,
+                        indexer_qr,
+                        indexer_rotary_pos_emb,
+                        indexer_mscale,
+                        q_start,
+                        q_end,
+                    )
+
+            q = q_weights_provider
+            weights = None
+        else:
+            q, k, weights = self.indexer.forward_before_topk(
+                x, qr, packed_seq_params, query_indices=streambp_query_indices
+            )
         numeric_debug = None
         log_dsa_debug = False
         force_debug = False
@@ -2927,32 +3284,15 @@ class DSAttention(MegatronModule):
                 numeric_debug.log_tensor(
                     f"dsa.layer{self.layer_number}.value", value, force=force_debug
                 )
-                numeric_debug.log_tensor(f"dsa.layer{self.layer_number}.q_index", q, force=force_debug)
+                if not callable(q):
+                    numeric_debug.log_tensor(
+                        f"dsa.layer{self.layer_number}.q_index", q, force=force_debug
+                    )
                 numeric_debug.log_tensor(f"dsa.layer{self.layer_number}.k_index", k, force=force_debug)
-                numeric_debug.log_tensor(
-                    f"dsa.layer{self.layer_number}.weights", weights, force=force_debug
-                )
-        streambp_query_positions = None
-        streambp_key_positions = None
-        if streambp_positions is not None:
-            streambp_query_positions, streambp_key_positions = streambp_positions
-            if streambp_query_positions is None or streambp_key_positions is None:
-                raise ValueError("StreamBP DSA requires both query and key positions")
-            q_indices = streambp_query_positions.to(device=q.device, dtype=torch.long)
-            if q_indices.numel() != sq:
-                raise ValueError(
-                    f"StreamBP DSA query position length {q_indices.numel()} does not match "
-                    f"query length {sq}"
-                )
-            if streambp_key_positions.numel() != skv:
-                raise ValueError(
-                    f"StreamBP DSA key position length {streambp_key_positions.numel()} "
-                    f"does not match key length {skv}"
-                )
-            q = q.index_select(0, q_indices)
-            weights = weights.index_select(0, q_indices)
-        indexer_loss_coeff = getattr(self.config, 'dsa_indexer_loss_coeff', 0.0)
-        chunk_size = int(self.config.dsa_chunk_size)
+                if weights is not None:
+                    numeric_debug.log_tensor(
+                        f"dsa.layer{self.layer_number}.weights", weights, force=force_debug
+                    )
         query_positions = streambp_query_positions
         key_positions = streambp_key_positions
         cp_group = self.indexer.pg_collection.cp

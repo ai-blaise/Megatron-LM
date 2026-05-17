@@ -620,6 +620,60 @@ def test_hisa_candidate_slot_grouping_is_exact(monkeypatch):
             torch.testing.assert_close(scores[row], expected, rtol=1e-5, atol=1e-5)
 
 
+def test_hisa_selector_row_chunking_is_exact(monkeypatch):
+    config = IndexCacheHISAConfig(
+        enabled=True,
+        block_size=8,
+        compression_ratio=2.0,
+        forced_boundary_blocks=("first", "last"),
+    )
+    torch.manual_seed(20260528)
+    sq, bsz, heads, context_len, topk = 7, 1, 3, 112, 12
+    q = torch.randn(sq, bsz, heads, HEAD_DIM)
+    k = torch.randn(context_len, bsz, HEAD_DIM)
+    weights = torch.rand(sq, bsz, heads) + 0.1
+
+    results = {}
+    for row_chunk in (0, 1, 2, 4):
+        monkeypatch.setenv("MEGATRON_HISA_SELECTOR_ROW_CHUNK", str(row_chunk))
+        result = indexcache_hisa_topk_with_scores(
+            q,
+            weights,
+            k,
+            topk,
+            config=config,
+            q_start=0,
+            is_causal=False,
+            mask=None,
+            query_positions=None,
+            key_positions=None,
+            return_scores=True,
+        )
+        assert result is not None
+        results[row_chunk] = result
+
+    base_indices, base_scores = results[0]
+    for row_chunk in (1, 2, 4):
+        indices, scores = results[row_chunk]
+        torch.testing.assert_close(
+            indices.reshape(-1, topk).sort(dim=-1).values,
+            base_indices.reshape(-1, topk).sort(dim=-1).values,
+        )
+        for row in range(sq * bsz):
+            base_order = base_indices.reshape(-1, topk)[row]
+            row_indices = indices.reshape(-1, topk)[row]
+            base_lookup = {
+                int(idx.item()): base_scores[row, pos].item()
+                for pos, idx in enumerate(base_order)
+            }
+            expected = torch.tensor(
+                [base_lookup[int(idx.item())] for idx in row_indices],
+                dtype=scores.dtype,
+                device=scores.device,
+            )
+            torch.testing.assert_close(scores[row], expected, rtol=1e-5, atol=1e-5)
+
+
 def test_hisa_candidate_slot_grouping_is_exact_for_causal_prefix(monkeypatch):
     config = IndexCacheHISAConfig(
         enabled=True,

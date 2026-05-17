@@ -1906,6 +1906,8 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                 numeric_debug.register_grad_hooks(model)
 
         # Forward pass.
+        if args.empty_unused_memory_level >= 1:
+            torch.cuda.empty_cache()
         if save_dgrads_in_this_iteration:
             enable_dgrad_logging(model, args.save)
         schedule_seq_length = args.seq_length

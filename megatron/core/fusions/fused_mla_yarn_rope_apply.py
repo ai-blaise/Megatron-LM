@@ -399,6 +399,7 @@ def rotary_fwd_kv_kernel(
     stride_v_nheads,
     cp_rank,
     cp_size,
+    EMIT_VALUE: tl.constexpr,
     BLOCK_H: tl.constexpr,
 ):
     """
@@ -438,17 +439,20 @@ def rotary_fwd_kv_kernel(
     kv_off = tl.arange(0, BLOCK_H)[:, None] * stride_kv_nheads
     mask = kv_off < head_num * stride_kv_nheads
     k_in_off = kv_off + tl.arange(0, k_dim)[None, :]
-    v_in_off = kv_off + k_dim + tl.arange(0, v_dim)[None, :]
     k = tl.load(KV_ptr + k_in_off, mask=mask)
-    v = tl.load(KV_ptr + v_in_off, mask=mask)
 
     K_ptr = O_KEY + pid_m * stride_k_seq + pid_head * BLOCK_H * stride_k_nheads
-    V_ptr = O_VALUE + pid_m * stride_v_seq + pid_head * BLOCK_H * stride_v_nheads
 
     k_out_off = tl.arange(0, BLOCK_H)[:, None] * stride_k_nheads + tl.arange(0, k_dim)[None, :]
-    v_out_off = tl.arange(0, BLOCK_H)[:, None] * stride_v_nheads + tl.arange(0, v_dim)[None, :]
     tl.store(K_ptr + k_out_off, k, mask=mask)
-    tl.store(V_ptr + v_out_off, v, mask=mask)
+    if EMIT_VALUE:
+        v_in_off = kv_off + k_dim + tl.arange(0, v_dim)[None, :]
+        v = tl.load(KV_ptr + v_in_off, mask=mask)
+        V_ptr = O_VALUE + pid_m * stride_v_seq + pid_head * BLOCK_H * stride_v_nheads
+        v_out_off = (
+            tl.arange(0, BLOCK_H)[:, None] * stride_v_nheads + tl.arange(0, v_dim)[None, :]
+        )
+        tl.store(V_ptr + v_out_off, v, mask=mask)
 
     EMB = K_POS_EMB + pid_m * stride_emb_seq
     # x1 = t[..., 0::2], x2 = t[..., 1::2]
@@ -613,6 +617,7 @@ class ApplyMLARotaryEmbKV(torch.autograd.Function):
         max_seqlen = None
         batch_size = None
         seq_num = None
+        kv_base = kv
         if cu_seqlens_kv is None:
             # sbhd
             max_seqlen, batch_size, nheads, headdim = kv.shape
@@ -631,7 +636,7 @@ class ApplyMLARotaryEmbKV(torch.autograd.Function):
         assert emb_dim % 4 == 0
 
         o_key = kv.new_empty(total_seqlen, nheads, emb_dim + k_dim)
-        o_value = kv.new_empty(total_seqlen, nheads, v_dim)
+        o_value = kv_base[..., k_dim : k_dim + v_dim]
 
         grid = lambda META: (total_seqlen, triton.cdiv(nheads, META["BLOCK_H"]))
         rotary_fwd_kv_kernel[grid](
@@ -657,6 +662,7 @@ class ApplyMLARotaryEmbKV(torch.autograd.Function):
             o_value.stride(1),
             cp_rank,
             cp_size,
+            EMIT_VALUE=False,
         )
         ctx.save_for_backward(cos, sin)
         ctx.rotary_interleaved = rotary_interleaved

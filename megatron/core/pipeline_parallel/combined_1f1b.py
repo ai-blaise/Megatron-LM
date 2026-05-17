@@ -47,7 +47,7 @@ def combined_1f1b_schedule_for_no_pipelining(
     Phases 4: 4th microbatch backward
     """
 
-    set_streams()
+    set_streams(high_priority=config.high_priority_a2a_comm_stream)
     # The forward step for the first microbatch is executed alone, no a2a overlapping
     output_tensor, num_tokens, _ = combined_forward_backward_step(
         forward_step_func,
@@ -173,7 +173,7 @@ def combined_1f1b_schedule_for_interleaved_pipelining(
                 # backward_step_helper_postprocess()
     """
 
-    set_streams()
+    set_streams(high_priority=config.high_priority_a2a_comm_stream)
     # forward prepare
     f_model_chunk_id = None
     f_microbatch_id = None
@@ -226,10 +226,10 @@ def combined_1f1b_schedule_for_interleaved_pipelining(
     if f_model_chunk_id is not None:
         forward_step_helper_postprocess(f_model_chunk_id, output_tensor, num_tokens)
     # backward post process
-    if b_model_chunk_id:
+    if b_model_chunk_id is not None:
         # The same as the backward_step_helper
         backward_step_helper_postprocess(b_virtual_microbatch_id)
-        if input_tensor is not None:
+        if b_input_tensor is not None:
             assert input_tensor_grad is not None
     return output_tensor, input_tensor_grad
 

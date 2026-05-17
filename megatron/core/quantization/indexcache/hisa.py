@@ -457,7 +457,10 @@ def _hisa_grouped_candidate_topk(
         # exact FP32 selector semantics; the opt-in tensor-core mode keeps
         # BF16/FP16 inputs and requests FP32 output accumulation from cuBLAS.
         cand_dot = _hisa_bmm_fp32_accum(q_rows, candidate_k.transpose(1, 2))
-        cand_scores = (torch.relu(cand_dot) * weights_rows.unsqueeze(-1)).sum(dim=1)
+        # Same memory discipline as the block selector: avoid materializing the
+        # [rows, heads, candidates] broadcast product before reducing heads.
+        cand_dot.relu_()
+        cand_scores = torch.bmm(weights_rows.unsqueeze(1), cand_dot).squeeze(1)
         cand_scores = cand_scores.masked_fill(~valid.reshape(sq, -1), float("-inf"))
 
         merged_scores = torch.cat((running_scores, cand_scores), dim=-1)
@@ -490,6 +493,32 @@ def _indexcache_hisa_topk_bmm_for_batch(
     Blackwell than scalar per-token CUDA loops while preserving the selected set.
     """
 
+    sq_total = q_rows.shape[0]
+    row_chunk = _hisa_selector_row_chunk(sq_total)
+    if sq_total > row_chunk:
+        index_chunks = []
+        score_chunks = []
+        for row_start in range(0, sq_total, row_chunk):
+            row_end = min(row_start + row_chunk, sq_total)
+            block_counts_chunk = (
+                block_topk_counts[row_start:row_end]
+                if block_topk_counts is not None
+                else None
+            )
+            indices, scores = _indexcache_hisa_topk_bmm_for_batch(
+                q_rows[row_start:row_end],
+                weights_rows[row_start:row_end],
+                k_rows,
+                topk_k,
+                config=config,
+                prefix_lens=prefix_lens[row_start:row_end],
+                block_topk_counts=block_counts_chunk,
+                effective_block_topk=effective_block_topk,
+            )
+            index_chunks.append(indices)
+            score_chunks.append(scores)
+        return torch.cat(index_chunks, dim=0), torch.cat(score_chunks, dim=0)
+
     use_tc_inputs = (
         _hisa_bmm_fp32_accum_tensorcores_enabled()
         and q_rows.is_cuda
@@ -517,7 +546,12 @@ def _indexcache_hisa_topk_bmm_for_batch(
             q_b.reshape(1, sq * q_b.shape[1], head_dim),
             reps.t().unsqueeze(0),
         ).reshape(sq, q_b.shape[1], block_count)
-        block_scores = (torch.relu(block_dot).transpose(1, 2) * w_b.unsqueeze(1)).sum(dim=-1)
+        # Keep the block selector workspace flat. The previous transpose +
+        # broadcast multiply materialized [rows, blocks, heads], which is a
+        # large temporary at 32k context. ReLU is selector-local/no-grad, and
+        # the batched 1xH @ HxB reduction writes only [rows, blocks].
+        block_dot.relu_()
+        block_scores = torch.bmm(w_b.unsqueeze(1), block_dot).squeeze(1)
         block_scores = block_scores.masked_fill(
             arange_blocks.view(1, -1) >= row_block_counts.view(-1, 1),
             float("-inf"),

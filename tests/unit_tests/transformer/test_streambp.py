@@ -13,7 +13,16 @@ from megatron.core.extensions.transformer_engine import TELinear, TENorm
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.nvfp4_act_eco.codec import Nvfp4ActEcoConfig
-from megatron.core.quantization.nvfp4_act_eco.te_hook import install_act_eco_on_te_linear
+import megatron.core.quantization.nvfp4_act_eco.te_hook as act_eco_te_hook
+from megatron.core.quantization.nvfp4_act_eco.te_hook import (
+    install_act_eco_on_te_grouped_linear,
+    install_act_eco_on_te_linear,
+    pop_act_eco_grad_correction,
+)
+from megatron.core.quantization.nvfp4_act_eco.reference import (
+    activation_eco_bias_correction,
+    nvfp4_act_quant_forward,
+)
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
     get_gpt_layer_local_spec,
@@ -115,8 +124,10 @@ class ToyMoeAttentionSplitLayer(torch.nn.Module):
         )
         self.no_grad_attention_chunks = []
         self.no_grad_mlp_shapes = []
+        self.no_grad_events = []
         self.grad_attention_chunks = []
         self.grad_mlp_shapes = []
+        self.grad_events = []
 
     def _forward_attention(self, hidden_states, chunk_range=None, context=None, **_kwargs):
         assert context is None
@@ -126,8 +137,10 @@ class ToyMoeAttentionSplitLayer(torch.nn.Module):
             start, end = chunk_range
             if not torch.is_grad_enabled():
                 self.no_grad_attention_chunks.append((start, end))
+                self.no_grad_events.append(("attention", start, end))
             else:
                 self.grad_attention_chunks.append((start, end))
+                self.grad_events.append(("attention", start, end))
             chunk = hidden_states[start:end]
         return chunk * self.weight, None
 
@@ -135,8 +148,10 @@ class ToyMoeAttentionSplitLayer(torch.nn.Module):
         del inference_context, padding_mask
         if not torch.is_grad_enabled():
             self.no_grad_mlp_shapes.append(tuple(hidden_states.shape))
+            self.no_grad_events.append(("mlp", hidden_states.size(0)))
         else:
             self.grad_mlp_shapes.append(tuple(hidden_states.shape))
+            self.grad_events.append(("mlp", hidden_states.size(0)))
         return hidden_states + 1.0
 
     def forward(self, hidden_states, context=None, chunk_range=None, **kwargs):
@@ -435,15 +450,44 @@ def test_streambp_moe_hybrid_can_split_mlp_replay_into_large_chunks():
         )
 
         grad_output = torch.randn_like(output)
-        assert layer.no_grad_attention_chunks == [(0, 4), (4, 8), (8, 10)]
+        assert layer.no_grad_attention_chunks == [(0, 4), (4, 5), (5, 8), (8, 10)]
         assert layer.no_grad_mlp_shapes == [(5, 2, 3), (5, 2, 3)]
+        assert layer.no_grad_events == [
+            ("attention", 0, 4),
+            ("attention", 4, 5),
+            ("mlp", 5),
+            ("attention", 5, 8),
+            ("attention", 8, 10),
+            ("mlp", 5),
+        ]
         assert torch.allclose(output, full_output)
         full_output.backward(grad_output)
         output.backward(grad_output)
 
-    assert layer.grad_attention_chunks == [(0, 4), (4, 8), (8, 10)]
+    assert layer.grad_attention_chunks == [(0, 4), (4, 5), (5, 8), (8, 10)]
     assert layer.grad_mlp_shapes == [(5, 2, 3), (5, 2, 3)]
-    assert recompute_phases == [False, False, False, False, False, True, True, True, True, True]
+    assert layer.grad_events == [
+        ("attention", 0, 4),
+        ("attention", 4, 5),
+        ("mlp", 5),
+        ("attention", 5, 8),
+        ("attention", 8, 10),
+        ("mlp", 5),
+    ]
+    assert recompute_phases == [
+        False,
+        False,
+        False,
+        False,
+        False,
+        False,
+        True,
+        True,
+        True,
+        True,
+        True,
+        True,
+    ]
     assert torch.allclose(hidden_states.grad, full_hidden_states.grad)
     assert torch.allclose(layer.weight.grad, full_layer.weight.grad)
 
@@ -1067,12 +1111,259 @@ def test_streambp_config_rejects_inexact_dropout():
 
 def test_act_eco_te_hook_queues_multiple_pending_forwards():
     torch.manual_seed(9012)
+    cfg = Nvfp4ActEcoConfig(block_size=16)
     linear = torch.nn.Linear(16, 4, bias=False)
-    install_act_eco_on_te_linear(linear, Nvfp4ActEcoConfig(block_size=16))
+    install_act_eco_on_te_linear(linear, cfg, quantizer_backend="reference")
 
     x0 = torch.randn(2, 16, requires_grad=True)
     x1 = torch.randn(2, 16, requires_grad=True)
-    loss = linear(x0).sum() + linear(x1).sum()
+    loss = 2.0 * linear(x0).sum() + 3.0 * linear(x1).sum()
     loss.backward()
 
+    dy0 = torch.full((2, 4), 2.0)
+    dy1 = torch.full((2, 4), 3.0)
+    q0 = nvfp4_act_quant_forward(x0.detach(), cfg)
+    q1 = nvfp4_act_quant_forward(x1.detach(), cfg)
+    expected = (
+        dy0.T @ x0.detach()
+        + dy1.T @ x1.detach()
+        + activation_eco_bias_correction(dy0, x0.detach(), q0)
+        + activation_eco_bias_correction(dy1, x1.detach(), q1)
+    )
+    torch.testing.assert_close(linear.weight.grad, expected, rtol=1e-6, atol=1e-6)
+
+
+def test_act_eco_te_hook_stashes_correction_for_ddp_main_grad():
+    torch.manual_seed(9020)
+    cfg = Nvfp4ActEcoConfig(block_size=16)
+    linear = torch.nn.Linear(16, 4, bias=False)
+    linear.weight.main_grad = torch.zeros_like(linear.weight)
+    install_act_eco_on_te_linear(linear, cfg, quantizer_backend="reference")
+
+    x0 = torch.randn(2, 16, requires_grad=True)
+    x1 = torch.randn(2, 16, requires_grad=True)
+    loss = 2.0 * linear(x0).sum() + 3.0 * linear(x1).sum()
+    loss.backward()
+
+    dy0 = torch.full((2, 4), 2.0)
+    dy1 = torch.full((2, 4), 3.0)
+    q0 = nvfp4_act_quant_forward(x0.detach(), cfg)
+    q1 = nvfp4_act_quant_forward(x1.detach(), cfg)
+    base_grad = dy0.T @ x0.detach() + dy1.T @ x1.detach()
+    correction = activation_eco_bias_correction(dy0, x0.detach(), q0)
+    correction = correction + activation_eco_bias_correction(dy1, x1.detach(), q1)
+
+    torch.testing.assert_close(linear.weight.grad, base_grad, rtol=1e-6, atol=1e-6)
+    pending = pop_act_eco_grad_correction(linear.weight)
+    assert pending is not None
+    torch.testing.assert_close(pending, correction, rtol=1e-6, atol=1e-6)
+
+    linear.weight.main_grad.add_(linear.weight.grad)
+    linear.weight.main_grad.add_(pending.to(linear.weight.main_grad.dtype))
+    torch.testing.assert_close(
+        linear.weight.main_grad,
+        base_grad + correction,
+        rtol=1e-6,
+        atol=1e-6,
+    )
+
+
+def test_act_eco_te_hook_handles_tuple_outputs_and_skips_no_grad_capture():
+    class TupleLinear(torch.nn.Linear):
+        def forward(self, x):
+            return super().forward(x), None
+
+    torch.manual_seed(9013)
+    linear = TupleLinear(16, 4, bias=False)
+    install_act_eco_on_te_linear(
+        linear,
+        Nvfp4ActEcoConfig(block_size=16),
+        capture_recompute_only=True,
+        quantizer_backend="reference",
+    )
+
+    with torch.no_grad():
+        out, bias = linear(torch.randn(2, 16))
+    assert bias is None
+    assert out.shape == (2, 4)
+
+    x = torch.randn(2, 16, requires_grad=True)
+    out, bias = linear(x)
+    assert bias is None
+    out.sum().backward()
+
     assert linear.weight.grad is not None
+    assert x.grad is not None
+
+
+def test_act_eco_te_hook_survives_released_input_storage_when_cloning():
+    class CloneInputLinear(torch.nn.Linear):
+        def forward(self, x):
+            return super().forward(x.clone()), None
+
+    torch.manual_seed(9015)
+    linear = CloneInputLinear(16, 4, bias=False)
+    install_act_eco_on_te_linear(
+        linear,
+        Nvfp4ActEcoConfig(block_size=16),
+        clone_captured_input=True,
+        quantizer_backend="reference",
+    )
+
+    x = torch.randn(2, 16, requires_grad=True)
+    out, _ = linear(x)
+    x.untyped_storage().resize_(0)
+    out.sum().backward()
+
+    assert linear.weight.grad is not None
+
+
+def test_act_eco_te_hook_slices_gathered_sequence_parallel_activation(monkeypatch):
+    class SequenceParallelLinear(torch.nn.Linear):
+        def forward(self, x):
+            local = x[2:4]
+            return super().forward(local), None
+
+    torch.manual_seed(9017)
+    cfg = Nvfp4ActEcoConfig(block_size=16)
+    linear = SequenceParallelLinear(16, 4, bias=False)
+    install_act_eco_on_te_linear(linear, cfg, quantizer_backend="reference")
+    monkeypatch.setattr(act_eco_te_hook, "_tensor_model_parallel_rank_size", lambda: (1, 4))
+
+    x = torch.randn(8, 16, requires_grad=True)
+    out, _ = linear(x)
+    out.sum().backward()
+
+    x_local = x.detach()[2:4]
+    dy = torch.ones(2, 4)
+    q_local = nvfp4_act_quant_forward(x_local, cfg)
+    expected = dy.T @ x_local + activation_eco_bias_correction(dy, x_local, q_local)
+    torch.testing.assert_close(linear.weight.grad, expected, rtol=1e-6, atol=1e-6)
+
+
+def test_act_eco_row_alignment_slices_gathered_sequence_parallel_grad(monkeypatch):
+    monkeypatch.setattr(act_eco_te_hook, "_tensor_model_parallel_rank_size", lambda: (2, 4))
+
+    x = torch.randn(2, 16)
+    dy = torch.randn(8, 4)
+    aligned_x, aligned_dy = act_eco_te_hook._align_activation_and_grad_rows(
+        x,
+        dy,
+        module_name="ToyColumnParallelLinear",
+    )
+
+    assert aligned_x is x
+    torch.testing.assert_close(aligned_dy, dy[4:6])
+
+
+def test_act_eco_grouped_hook_applies_per_expert_correction():
+    class ToyGroupedLinear(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight0 = torch.nn.Parameter(torch.randn(4, 16))
+            self.weight1 = torch.nn.Parameter(torch.randn(4, 16))
+
+        def forward(self, x, m_splits):
+            chunks = torch.split(x, m_splits)
+            out0 = chunks[0] @ self.weight0.T
+            out1 = chunks[1] @ self.weight1.T
+            return torch.cat([out0, out1], dim=0), None
+
+    torch.manual_seed(9014)
+    grouped = ToyGroupedLinear()
+    install_act_eco_on_te_grouped_linear(
+        grouped,
+        Nvfp4ActEcoConfig(block_size=16),
+        num_gemms=2,
+        quantizer_backend="reference",
+    )
+
+    x = torch.randn(6, 16, requires_grad=True)
+    y, bias = grouped(x, [2, 4])
+    assert bias is None
+    y.sum().backward()
+
+    assert grouped.weight0.grad is not None
+    assert grouped.weight1.grad is not None
+    assert grouped.weight0.grad.shape == grouped.weight0.shape
+    assert grouped.weight1.grad.shape == grouped.weight1.shape
+
+
+def test_act_eco_grouped_hook_stashes_correction_for_ddp_main_grad():
+    class ToyGroupedLinear(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight0 = torch.nn.Parameter(torch.randn(4, 16))
+            self.weight1 = torch.nn.Parameter(torch.randn(4, 16))
+
+        def forward(self, x, m_splits):
+            chunks = torch.split(x, m_splits)
+            out0 = chunks[0] @ self.weight0.T
+            out1 = chunks[1] @ self.weight1.T
+            return torch.cat([out0, out1], dim=0), None
+
+    torch.manual_seed(9021)
+    cfg = Nvfp4ActEcoConfig(block_size=16)
+    grouped = ToyGroupedLinear()
+    grouped.weight0.main_grad = torch.zeros_like(grouped.weight0)
+    grouped.weight1.main_grad = torch.zeros_like(grouped.weight1)
+    install_act_eco_on_te_grouped_linear(
+        grouped,
+        cfg,
+        num_gemms=2,
+        quantizer_backend="reference",
+    )
+
+    x = torch.randn(6, 16, requires_grad=True)
+    y, _ = grouped(x, [2, 4])
+    y.sum().backward()
+
+    x0, x1 = torch.split(x.detach(), [2, 4])
+    dy0 = torch.ones(2, 4)
+    dy1 = torch.ones(4, 4)
+    base0 = dy0.T @ x0
+    base1 = dy1.T @ x1
+    corr0 = activation_eco_bias_correction(dy0, x0, nvfp4_act_quant_forward(x0, cfg))
+    corr1 = activation_eco_bias_correction(dy1, x1, nvfp4_act_quant_forward(x1, cfg))
+
+    torch.testing.assert_close(grouped.weight0.grad, base0, rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(grouped.weight1.grad, base1, rtol=1e-6, atol=1e-6)
+    pending0 = pop_act_eco_grad_correction(grouped.weight0)
+    pending1 = pop_act_eco_grad_correction(grouped.weight1)
+    assert pending0 is not None
+    assert pending1 is not None
+    torch.testing.assert_close(pending0, corr0, rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(pending1, corr1, rtol=1e-6, atol=1e-6)
+
+
+def test_act_eco_grouped_hook_survives_released_input_storage_when_cloning():
+    class CloneInputGroupedLinear(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight0 = torch.nn.Parameter(torch.randn(4, 16))
+            self.weight1 = torch.nn.Parameter(torch.randn(4, 16))
+
+        def forward(self, x, m_splits):
+            x = x.clone()
+            chunks = torch.split(x, m_splits)
+            out0 = chunks[0] @ self.weight0.T
+            out1 = chunks[1] @ self.weight1.T
+            return torch.cat([out0, out1], dim=0), None
+
+    torch.manual_seed(9016)
+    grouped = CloneInputGroupedLinear()
+    install_act_eco_on_te_grouped_linear(
+        grouped,
+        Nvfp4ActEcoConfig(block_size=16),
+        num_gemms=2,
+        clone_captured_input=True,
+        quantizer_backend="reference",
+    )
+
+    x = torch.randn(6, 16, requires_grad=True)
+    y, _ = grouped(x, [2, 4])
+    x.untyped_storage().resize_(0)
+    y.sum().backward()
+
+    assert grouped.weight0.grad is not None
+    assert grouped.weight1.grad is not None

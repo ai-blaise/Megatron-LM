@@ -35,10 +35,60 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return value.lower() in ("1", "true", "yes", "on")
 
 
+def _maybe_trim_cuda_cache_before_moe_replay() -> None:
+    """Release cached allocator blocks when StreamBP MoE replay is near OOM."""
+    if not torch.cuda.is_available():
+        return
+    if not _env_flag("MEGATRON_STREAMBP_MOE_REPLAY_TRIM_CACHE", default=True):
+        return
+
+    free_bytes, _ = torch.cuda.mem_get_info()
+    allocated = torch.cuda.memory_allocated()
+    reserved = torch.cuda.memory_reserved()
+    cached = max(0, reserved - allocated)
+
+    mib = 1024 * 1024
+    free_threshold_mb = int(os.getenv("MEGATRON_STREAMBP_MOE_REPLAY_TRIM_FREE_MB", "2048"))
+    cached_threshold_mb = int(os.getenv("MEGATRON_STREAMBP_MOE_REPLAY_TRIM_CACHED_MB", "512"))
+    if free_bytes < free_threshold_mb * mib and cached > cached_threshold_mb * mib:
+        torch.cuda.empty_cache()
+
+
 def _distributed_rank() -> int:
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         return torch.distributed.get_rank()
     return int(os.getenv("RANK", "0"))
+
+
+def _rank_selected(spec: str, rank: int) -> bool:
+    spec = spec.strip()
+    if not spec or spec == "all":
+        return True
+    return rank in {int(item) for item in spec.split(",") if item.strip()}
+
+
+def _debug_sync(label: str) -> None:
+    """Opt-in CUDA sync fence for locating asynchronous StreamBP failures."""
+    if os.getenv("MEGATRON_STREAMBP_DEBUG_SYNC", "0").lower() not in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return
+    if not torch.cuda.is_available():
+        return
+    rank = _distributed_rank()
+    if not _rank_selected(os.getenv("MEGATRON_STREAMBP_DEBUG_RANKS", "all"), rank):
+        return
+    if os.getenv("MEGATRON_STREAMBP_DEBUG_VERBOSE", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        print(f"[rank{rank}] streambp sync: {label}", flush=True)
+    torch.cuda.synchronize()
 
 
 class _StreamBPChunkProfiler:
@@ -302,6 +352,36 @@ def _slice_padding_mask_for_sequence_chunk(
     if padding_mask.dim() >= 2 and padding_mask.size(1) == seq_len:
         return padding_mask[:, start:end]
     return padding_mask
+
+
+def _intersect_streambp_chunk_ranges(
+    chunks: Sequence[ChunkRange], start: int, end: int
+) -> list[ChunkRange]:
+    """Return chunk intersections covering ``[start, end)`` without gaps."""
+    if not (0 <= start < end):
+        raise ValueError(f"Invalid StreamBP chunk intersection range [{start}, {end})")
+
+    intersections: list[ChunkRange] = []
+    for chunk_start, chunk_end in chunks:
+        sub_start = max(start, chunk_start)
+        sub_end = min(end, chunk_end)
+        if sub_start < sub_end:
+            intersections.append((sub_start, sub_end))
+
+    cursor = start
+    for sub_start, sub_end in intersections:
+        if sub_start != cursor:
+            raise ValueError(
+                f"StreamBP chunks do not cover range [{start}, {end}); "
+                f"missing [{cursor}, {sub_start})"
+            )
+        cursor = sub_end
+    if cursor != end:
+        raise ValueError(
+            f"StreamBP chunks do not cover range [{start}, {end}); "
+            f"missing [{cursor}, {end})"
+        )
+    return intersections
 
 
 def _concat_streambp_chunk_outputs(outputs: list[Any]) -> Any:
@@ -841,36 +921,34 @@ def _moe_chunk_attention_full_mlp_no_grad_forward(
     # strips them before entering the attention/MLP internals.
     call_kwargs.pop("dynamic_inference_decode_only", None)
     call_kwargs.pop("mhc_recompute_manager", None)
-    attention_outputs = []
     with _maybe_context(context_factory):
-        for chunk_index, chunk_range in enumerate(chunks):
-            with _profile_streambp_chunk(
-                f"streambp/no_grad_forward_moe_attention_chunk/{chunk_index}"
-            ):
-                # Backward replay still recomputes this MoE layer once per chunk.
-                # TE's FP8 activation-recompute context keeps one bookkeeping entry
-                # per replayed forward, so seed that stack even though this hybrid
-                # no-grad path only chunks attention and runs the MoE MLP once.
-                with _te_activation_recompute_context(recompute_phase=False):
-                    attention_output, context = layer._forward_attention(
-                        hidden_states=hidden_states,
-                        chunk_range=chunk_range,
-                        **call_kwargs,
-                    )
-                if context is not None:
-                    raise ValueError(
-                        "StreamBP currently supports decoder-only MoE layers with context=None"
-                    )
-                attention_outputs.append(attention_output)
-
-        post_attention = torch.cat(attention_outputs, dim=0)
-        # The full MLP input is now contiguous in post_attention. Drop the
-        # per-chunk tensor references before TE FP8 unpadding allocates its
-        # temporary full-token buffer.
-        attention_outputs.clear()
-        del attention_outputs, attention_output
         if moe_mlp_chunks == 1:
+            attention_outputs = []
+            for chunk_index, chunk_range in enumerate(chunks):
+                with _profile_streambp_chunk(
+                    f"streambp/no_grad_forward_moe_attention_chunk/{chunk_index}"
+                ):
+                    # Backward replay still recomputes this MoE layer once per chunk.
+                    # TE's FP8 activation-recompute context keeps one bookkeeping entry
+                    # per replayed forward, so seed that stack even though this hybrid
+                    # no-grad path only chunks attention and runs the MoE MLP once.
+                    with _te_activation_recompute_context(recompute_phase=False):
+                        attention_output, context = layer._forward_attention(
+                            hidden_states=hidden_states,
+                            chunk_range=chunk_range,
+                            **call_kwargs,
+                        )
+                    if context is not None:
+                        raise ValueError(
+                            "StreamBP currently supports decoder-only MoE layers with context=None"
+                        )
+                    attention_outputs.append(attention_output)
+
+            post_attention = torch.cat(attention_outputs, dim=0)
+            attention_outputs.clear()
+            del attention_outputs, attention_output
             with _profile_streambp_chunk("streambp/no_grad_forward_moe_mlp_full"):
+                _maybe_trim_cuda_cache_before_moe_replay()
                 with _te_activation_recompute_context(recompute_phase=False):
                     return layer._forward_mlp(
                         post_attention,
@@ -878,25 +956,59 @@ def _moe_chunk_attention_full_mlp_no_grad_forward(
                         padding_mask=call_kwargs.get("padding_mask", None),
                     )
 
-        seq_len = post_attention.size(0)
+        seq_len = hidden_states.size(0)
+        chunk_size = chunks[0][1] - chunks[0][0] if chunks else seq_len
         padding_mask = call_kwargs.get("padding_mask", None)
         mlp_outputs = []
-        for chunk_index, (start, end) in enumerate(
+        for mlp_chunk_index, (mlp_start, mlp_end) in enumerate(
             iter_streambp_num_chunks(seq_len, moe_mlp_chunks)
         ):
-            with _profile_streambp_chunk(
-                f"streambp/no_grad_forward_moe_mlp_chunk/{chunk_index}"
+            attention_outputs = []
+            for attention_start, attention_end in _intersect_streambp_chunk_ranges(
+                chunks, mlp_start, mlp_end
             ):
+                attention_chunk_index = attention_start // chunk_size
+                with _profile_streambp_chunk(
+                    "streambp/no_grad_forward_moe_attention_chunk/"
+                    f"{attention_chunk_index}"
+                ):
+                    with _te_activation_recompute_context(recompute_phase=False):
+                        attention_output, context = layer._forward_attention(
+                            hidden_states=hidden_states,
+                            chunk_range=(attention_start, attention_end),
+                            **call_kwargs,
+                        )
+                    if context is not None:
+                        raise ValueError(
+                            "StreamBP currently supports decoder-only MoE layers with context=None"
+                        )
+                    attention_outputs.append(attention_output)
+            if len(attention_outputs) == 1:
+                post_attention = attention_outputs[0]
+            else:
+                post_attention = torch.cat(attention_outputs, dim=0)
+            attention_outputs.clear()
+            del attention_outputs, attention_output
+            if post_attention.size(0) != mlp_end - mlp_start:
+                raise RuntimeError(
+                    "StreamBP MoE no-grad forward produced attention chunk length "
+                    f"{post_attention.size(0)} for MLP range [{mlp_start}, {mlp_end})"
+                )
+            with _profile_streambp_chunk(
+                f"streambp/no_grad_forward_moe_mlp_chunk/{mlp_chunk_index}"
+            ):
+                _maybe_trim_cuda_cache_before_moe_replay()
                 with _te_activation_recompute_context(recompute_phase=False):
                     mlp_outputs.append(
                         layer._forward_mlp(
-                            post_attention[start:end],
+                            post_attention,
                             call_kwargs.get("inference_context", None),
                             padding_mask=_slice_padding_mask_for_sequence_chunk(
-                                padding_mask, start, end, seq_len
+                                padding_mask, mlp_start, mlp_end, seq_len
                             ),
                         )
                     )
+            del post_attention
         return _concat_streambp_chunk_outputs(mlp_outputs)
 
 
@@ -911,81 +1023,147 @@ def _moe_chunk_attention_full_mlp_backward(
     moe_mlp_chunks: int,
     moe_aux_stats: Optional[StreamBPMoeAuxState],
 ) -> None:
-    """Replay MoE backward with chunked attention and one full MoE MLP graph."""
+    """Replay MoE backward while keeping only one MLP chunk's attention graphs live."""
     call_kwargs = dict(kwargs)
     # These are whole-layer wrapper hints. The regular TransformerLayer.forward
     # strips them before entering the attention/MLP internals.
     call_kwargs.pop("dynamic_inference_decode_only", None)
     call_kwargs.pop("mhc_recompute_manager", None)
 
-    attention_outputs = []
-    chunk_size = chunks[0][1] - chunks[0][0] if chunks else hidden_states.size(0)
+    seq_len = hidden_states.size(0)
+    chunk_size = chunks[0][1] - chunks[0][0] if chunks else seq_len
+    layer_number = getattr(layer, "layer_number", "?")
 
     with _maybe_context(context_factory):
-        for chunk_range in chunks:
-            start, _ = chunk_range
-            chunk_index = start // chunk_size
-            with _profile_streambp_chunk(
-                f"streambp/backward_replay_moe_attention_chunk/{chunk_index}"
-            ):
-                with _te_activation_recompute_context(recompute_phase=True):
-                    attention_output, context = layer._forward_attention(
-                        hidden_states=hidden_states,
-                        chunk_range=chunk_range,
-                        **call_kwargs,
-                    )
-                if context is not None:
-                    raise ValueError(
-                        "StreamBP currently supports decoder-only MoE layers with context=None"
-                    )
-                attention_outputs.append(attention_output)
-
-        post_attention = torch.cat(attention_outputs, dim=0)
-        # Cat backward only needs split metadata and graph edges; the chunk
-        # output storages themselves can be released before the full MoE MLP
-        # replay reaches TE FP8 unpadding.
-        attention_outputs.clear()
-        del attention_outputs, attention_output
         if moe_mlp_chunks == 1:
+            attention_outputs = []
+            for chunk_range in chunks:
+                start, _ = chunk_range
+                chunk_index = start // chunk_size
+                with _profile_streambp_chunk(
+                    f"streambp/backward_replay_moe_attention_chunk/{chunk_index}"
+                ):
+                    with _te_activation_recompute_context(recompute_phase=True):
+                        _debug_sync(
+                            f"layer{layer_number}:bwd_moe_attention_chunk{chunk_index}:before"
+                        )
+                        attention_output, context = layer._forward_attention(
+                            hidden_states=hidden_states,
+                            chunk_range=chunk_range,
+                            **call_kwargs,
+                        )
+                        _debug_sync(
+                            f"layer{layer_number}:bwd_moe_attention_chunk{chunk_index}:after"
+                        )
+                    if context is not None:
+                        raise ValueError(
+                            "StreamBP currently supports decoder-only MoE layers with context=None"
+                        )
+                    attention_outputs.append(attention_output)
+            post_attention = torch.cat(attention_outputs, dim=0)
+            attention_outputs.clear()
+            del attention_outputs, attention_output
             with _profile_streambp_chunk("streambp/backward_replay_moe_mlp_full"):
+                _maybe_trim_cuda_cache_before_moe_replay()
                 with (
                     replay_streambp_moe_aux_stats(moe_aux_stats),
                     _te_activation_recompute_context(recompute_phase=True),
                 ):
+                    _debug_sync(f"layer{layer_number}:bwd_moe_mlp_full:before")
                     output = layer._forward_mlp(
                         post_attention,
                         call_kwargs.get("inference_context", None),
                         padding_mask=call_kwargs.get("padding_mask", None),
                     )
+                    _debug_sync(f"layer{layer_number}:bwd_moe_mlp_full:after")
+            _debug_sync(f"layer{layer_number}:bwd_moe_full_autograd:before")
+            torch.autograd.backward(output, grad_output)
+            _debug_sync(f"layer{layer_number}:bwd_moe_full_autograd:after")
         else:
-            seq_len = post_attention.size(0)
             padding_mask = call_kwargs.get("padding_mask", None)
-            mlp_outputs = []
-            for chunk_index, (start, end) in enumerate(
+            for mlp_chunk_index, (mlp_start, mlp_end) in enumerate(
                 iter_streambp_num_chunks(seq_len, moe_mlp_chunks)
             ):
-                with _profile_streambp_chunk(
-                    f"streambp/backward_replay_moe_mlp_chunk/{chunk_index}"
+                attention_outputs = []
+                for attention_start, attention_end in _intersect_streambp_chunk_ranges(
+                    chunks, mlp_start, mlp_end
                 ):
+                    attention_chunk_index = attention_start // chunk_size
+                    with _profile_streambp_chunk(
+                        "streambp/backward_replay_moe_attention_chunk/"
+                        f"{attention_chunk_index}"
+                    ):
+                        with _te_activation_recompute_context(recompute_phase=True):
+                            _debug_sync(
+                                f"layer{layer_number}:bwd_moe_mlp_chunk{mlp_chunk_index}:"
+                                f"attention_chunk{attention_chunk_index}:before"
+                            )
+                            attention_output, context = layer._forward_attention(
+                                hidden_states=hidden_states,
+                                chunk_range=(attention_start, attention_end),
+                                **call_kwargs,
+                            )
+                            _debug_sync(
+                                f"layer{layer_number}:bwd_moe_mlp_chunk{mlp_chunk_index}:"
+                                f"attention_chunk{attention_chunk_index}:after"
+                            )
+                        if context is not None:
+                            raise ValueError(
+                                "StreamBP currently supports decoder-only MoE layers "
+                                "with context=None"
+                            )
+                        attention_outputs.append(attention_output)
+                if len(attention_outputs) == 1:
+                    post_attention = attention_outputs[0]
+                else:
+                    post_attention = torch.cat(attention_outputs, dim=0)
+                attention_outputs.clear()
+                del attention_outputs, attention_output
+                if post_attention.size(0) != mlp_end - mlp_start:
+                    raise RuntimeError(
+                        "StreamBP MoE replay produced attention chunk length "
+                        f"{post_attention.size(0)} for MLP range "
+                        f"[{mlp_start}, {mlp_end})"
+                    )
+                with _profile_streambp_chunk(
+                    f"streambp/backward_replay_moe_mlp_chunk/{mlp_chunk_index}"
+                ):
+                    _maybe_trim_cuda_cache_before_moe_replay()
                     with (
                         replay_streambp_moe_aux_stats(
                             moe_aux_stats,
-                            chunk_index=chunk_index,
+                            chunk_index=mlp_chunk_index,
                         ),
                         _te_activation_recompute_context(recompute_phase=True),
                     ):
-                        mlp_outputs.append(
-                            layer._forward_mlp(
-                                post_attention[start:end],
-                                call_kwargs.get("inference_context", None),
-                                padding_mask=_slice_padding_mask_for_sequence_chunk(
-                                    padding_mask, start, end, seq_len
-                                ),
-                            )
+                        _debug_sync(
+                            f"layer{layer_number}:bwd_moe_mlp_chunk{mlp_chunk_index}:before"
                         )
-            output = _concat_streambp_chunk_outputs(mlp_outputs)
-
-    torch.autograd.backward(output, grad_output)
+                        chunk_output = layer._forward_mlp(
+                            post_attention,
+                            call_kwargs.get("inference_context", None),
+                            padding_mask=_slice_padding_mask_for_sequence_chunk(
+                                padding_mask, mlp_start, mlp_end, seq_len
+                            ),
+                        )
+                        _debug_sync(
+                            f"layer{layer_number}:bwd_moe_mlp_chunk{mlp_chunk_index}:after"
+                        )
+                    if not torch.is_tensor(chunk_output):
+                        raise TypeError(
+                            "StreamBP split MoE MLP replay expects TransformerLayer._forward_mlp "
+                            f"to return a Tensor, got {type(chunk_output)}"
+                        )
+                    _debug_sync(
+                        f"layer{layer_number}:bwd_moe_mlp_chunk{mlp_chunk_index}:"
+                        "autograd_before"
+                    )
+                    torch.autograd.backward(chunk_output, grad_output[mlp_start:mlp_end])
+                    _debug_sync(
+                        f"layer{layer_number}:bwd_moe_mlp_chunk{mlp_chunk_index}:"
+                        "autograd_after"
+                    )
+                    del chunk_output, post_attention
 
 
 def _full_layer_activation_checkpoint(

@@ -1515,6 +1515,94 @@ class TestSparseDSATritonAttention:
         assert torch.allclose(value_fused.grad, reference_grads[2], atol=atol, rtol=rtol)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_forward_backward_accepts_strided_value_view(self, monkeypatch):
+        torch.manual_seed(20260517)
+        monkeypatch.setenv("MEGATRON_DSA_TRITON", "1")
+        seqlen = 24
+        batch = 2
+        num_heads = 2
+        qk_head_dim = 128
+        value_head_dim = 64
+        topk = 12
+        softmax_scale = qk_head_dim**-0.5
+
+        query = torch.randn(
+            seqlen,
+            batch,
+            num_heads,
+            qk_head_dim,
+            device="cuda",
+            dtype=torch.float32,
+            requires_grad=True,
+        )
+        key = torch.randn(
+            seqlen,
+            batch,
+            num_heads,
+            qk_head_dim,
+            device="cuda",
+            dtype=torch.float32,
+            requires_grad=True,
+        )
+        value_base = torch.randn(
+            seqlen,
+            batch,
+            num_heads,
+            value_head_dim * 2,
+            device="cuda",
+            dtype=torch.float32,
+            requires_grad=True,
+        )
+        value = value_base[..., value_head_dim:]
+        assert value.stride(-1) == 1
+        assert not value.is_contiguous()
+
+        index_scores = torch.randn(batch, seqlen, seqlen, device="cuda", dtype=torch.float32)
+        causal_mask = torch.triu(
+            torch.ones(seqlen, seqlen, device="cuda", dtype=torch.bool), diagonal=1
+        )
+        topk_indices = (
+            index_scores.masked_fill(causal_mask.unsqueeze(0), float("-inf"))
+            .topk(topk, dim=-1)
+            .indices
+        )
+        grad_output = torch.randn(
+            seqlen,
+            batch,
+            num_heads * value_head_dim,
+            device="cuda",
+            dtype=torch.float32,
+        )
+
+        reference = _sparse_dsa_attention_chunk(
+            query, key, value, topk_indices, softmax_scale, mask=None, q_start=0, is_causal=True
+        )
+        (reference * grad_output).sum().backward()
+        reference_grads = (
+            query.grad.detach().clone(),
+            key.grad.detach().clone(),
+            value_base.grad.detach().clone(),
+        )
+
+        query_fused = query.detach().clone().requires_grad_(True)
+        key_fused = key.detach().clone().requires_grad_(True)
+        value_base_fused = value_base.detach().clone().requires_grad_(True)
+        value_fused = value_base_fused[..., value_head_dim:]
+
+        assert is_sparse_dsa_triton_supported(
+            query_fused, key_fused, value_fused, topk_indices, mask=None, is_causal=True
+        )
+        fused = sparse_dsa_attention_triton(
+            query_fused, key_fused, value_fused, topk_indices, softmax_scale
+        )
+        (fused * grad_output).sum().backward()
+
+        torch.testing.assert_close(fused, reference, rtol=2e-4, atol=2e-4)
+        torch.testing.assert_close(query_fused.grad, reference_grads[0], rtol=2e-4, atol=2e-4)
+        torch.testing.assert_close(key_fused.grad, reference_grads[1], rtol=2e-4, atol=2e-4)
+        torch.testing.assert_close(value_base_fused.grad, reference_grads[2], rtol=2e-4, atol=2e-4)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_forward_backward_supports_microbatch_greater_than_one(self):
         torch.manual_seed(20260520)
         seqlen = 24
@@ -2853,6 +2941,32 @@ class TestDSAIndexer:
         )
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_dsa_indexer_query_indices_match_full_prefix(self, seqlen):
+        """Query-indexed pre-topk path must match selecting from the full-prefix output."""
+        batch_size = 2
+
+        self.indexer.cuda()
+
+        x = torch.randn(seqlen, batch_size, self.config.hidden_size, dtype=torch.bfloat16).cuda()
+        qr = torch.randn(seqlen, batch_size, self.config.q_lora_rank, dtype=torch.bfloat16).cuda()
+        query_indices = torch.arange(0, seqlen, 2, device=x.device, dtype=torch.long)
+
+        q_full, k_full, weights_full = self.indexer.forward_before_topk(x, qr)
+        q_chunk, k_chunk, weights_chunk = self.indexer.forward_before_topk(
+            x, qr, query_indices=query_indices
+        )
+        q_pruned_qr, k_pruned_qr, weights_pruned_qr = self.indexer.forward_before_topk(
+            x, qr.index_select(0, query_indices), query_indices=query_indices
+        )
+
+        torch.testing.assert_close(q_chunk, q_full.index_select(0, query_indices))
+        torch.testing.assert_close(k_chunk, k_full)
+        torch.testing.assert_close(weights_chunk, weights_full.index_select(0, query_indices))
+        torch.testing.assert_close(q_pruned_qr, q_chunk)
+        torch.testing.assert_close(k_pruned_qr, k_full)
+        torch.testing.assert_close(weights_pruned_qr, weights_chunk)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_dsa_indexer_with_mask(self, seqlen):
         """Test indexer with attention mask."""
         batch_size = 2
@@ -3064,6 +3178,62 @@ class TestDSAttention:
         for name, param in self.sparse_attention.indexer.named_parameters():
             if param.requires_grad:
                 assert param.grad is not None, f"Indexer parameter {name} has no gradient"
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_dsa_chunked_indexer_projection_matches_eager(self, monkeypatch):
+        """Chunked indexer-q projection matches the eager full-projection path."""
+        monkeypatch.setenv("MEGATRON_DSA_CHUNK_INDEXER_PROJ", "1")
+        self.sparse_attention.config.dsa_chunk_size = 8
+        seq_len = 16
+        batch_size = 2
+
+        self.sparse_attention.train()
+        self.sparse_attention.cuda()
+        x = torch.randn(
+            seq_len, batch_size, self.config.hidden_size, dtype=torch.bfloat16, device="cuda"
+        )
+        qr = torch.randn(
+            seq_len, batch_size, self.config.q_lora_rank, dtype=torch.bfloat16, device="cuda"
+        )
+
+        eager_q, eager_k, eager_weights = self.sparse_attention.indexer.forward_before_topk(
+            x, qr, None
+        )
+        (
+            indexer_x,
+            indexer_qr,
+            indexer_rotary_pos_emb,
+            indexer_mscale,
+            indexer_orig_seqlen,
+            indexer_pad_len,
+        ) = self.sparse_attention.indexer._prepare_inputs_before_topk(x, qr, None)
+        lazy_k = self.sparse_attention.indexer._project_key_before_topk(
+            indexer_x,
+            indexer_rotary_pos_emb,
+            indexer_mscale,
+            indexer_orig_seqlen,
+            indexer_pad_len,
+        )
+        q_chunks = []
+        weight_chunks = []
+        for q_start in range(0, seq_len, self.sparse_attention.config.dsa_chunk_size):
+            q_end = min(q_start + self.sparse_attention.config.dsa_chunk_size, seq_len)
+            q_chunk, weights_chunk = self.sparse_attention.indexer._project_query_chunk_before_topk(
+                indexer_x,
+                indexer_qr,
+                indexer_rotary_pos_emb,
+                indexer_mscale,
+                q_start,
+                q_end,
+            )
+            q_chunks.append(q_chunk)
+            weight_chunks.append(weights_chunk)
+        lazy_q = torch.cat(q_chunks, dim=0)
+        lazy_weights = torch.cat(weight_chunks, dim=0)
+
+        torch.testing.assert_close(lazy_q, eager_q, rtol=0, atol=0)
+        torch.testing.assert_close(lazy_k, eager_k, rtol=0, atol=0)
+        torch.testing.assert_close(lazy_weights, eager_weights, rtol=0, atol=0)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_dsa_topk_selection(self):

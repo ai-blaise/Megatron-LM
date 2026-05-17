@@ -333,6 +333,28 @@ class MultiLatentAttention(Attention):
             local_positions = torch.arange(start, end, device=device, dtype=torch.long)
             return (rank_offsets[:, None] + local_positions[None, :]).reshape(-1)
 
+        streambp_query_indices = None
+        streambp_sequence_parallel_query_indices = None
+        streambp_qkv_query_indices = None
+        if chunk_range is not None:
+            assert (
+                streambp_start is not None
+                and streambp_end is not None
+                and streambp_prefix_end is not None
+            )
+            streambp_query_indices = torch.arange(
+                streambp_start, streambp_end, device=hidden_states.device, dtype=torch.long
+            )
+            if streambp_use_sequence_parallel:
+                streambp_sequence_parallel_query_indices = make_streambp_sequence_parallel_positions(
+                    streambp_start,
+                    streambp_end,
+                    streambp_prefix_end * get_pg_size(self.tp_group),
+                    get_pg_size(self.tp_group),
+                    hidden_states.device,
+                )
+            streambp_qkv_query_indices = streambp_query_indices
+
         with off_interface(self.offload_qkv_linear, hidden_states, "qkv_linear") as hidden_states:
             query, key, value, q_compressed, kv_compressed, gate = self.get_query_key_value_tensors(
                 hidden_states,
@@ -341,6 +363,7 @@ class MultiLatentAttention(Attention):
                 streambp_prefix_packed_seq_params,
                 inference_context=inference_context,
                 chunk_range=chunk_range,
+                streambp_query_indices=streambp_qkv_query_indices,
             )
             q_compressed_for_dsa = q_compressed
             hidden_states_for_dsa = hidden_states
@@ -354,22 +377,84 @@ class MultiLatentAttention(Attention):
                 )
                 if streambp_use_sequence_parallel:
                     tp_size = get_pg_size(self.tp_group)
-                    query = select_streambp_sequence_parallel_chunk(
-                        query, streambp_start, streambp_end, tp_size
-                    )
-                    if gate is not None:
-                        if gate.size(0) * tp_size == key.size(0):
-                            gate = gather_from_sequence_parallel_region(gate, group=self.tp_group)
-                        gate = select_streambp_sequence_parallel_chunk(
-                            gate, streambp_start, streambp_end, tp_size
+
+                    def select_streambp_query_tensor(tensor):
+                        sequence_parallel_positions = (
+                            streambp_sequence_parallel_query_indices.to(device=tensor.device)
+                            if streambp_sequence_parallel_query_indices is not None
+                            else None
                         )
-                    streambp_query_positions = make_streambp_sequence_parallel_positions(
-                        streambp_start,
-                        streambp_end,
-                        key.size(0),
-                        tp_size,
-                        query.device,
-                    )
+                        if tensor.size(0) == streambp_query_indices.numel():
+                            return (
+                                gather_from_sequence_parallel_region(
+                                    tensor, group=self.tp_group
+                                ),
+                                sequence_parallel_positions,
+                            )
+                        if (
+                            sequence_parallel_positions is not None
+                            and tensor.size(0) == sequence_parallel_positions.numel()
+                        ):
+                            return tensor, sequence_parallel_positions
+                        if streambp_end <= tensor.size(0):
+                            return (
+                                gather_from_sequence_parallel_region(
+                                    tensor[streambp_start:streambp_end],
+                                    group=self.tp_group,
+                                ),
+                                sequence_parallel_positions,
+                            )
+                        if tensor.size(0) % tp_size == 0 and streambp_end <= tensor.size(0) // tp_size:
+                            selected = select_streambp_sequence_parallel_chunk(
+                                tensor, streambp_start, streambp_end, tp_size
+                            )
+                            positions = make_streambp_sequence_parallel_positions(
+                                streambp_start,
+                                streambp_end,
+                                tensor.size(0),
+                                tp_size,
+                                tensor.device,
+                            )
+                            return selected, positions
+                        raise ValueError(
+                            f"Cannot select StreamBP query chunk [{streambp_start}, {streambp_end}) "
+                            f"from tensor with sequence length {tensor.size(0)}"
+                        )
+
+                    query, streambp_query_positions = select_streambp_query_tensor(query)
+
+                    if gate is not None:
+                        if gate.size(0) != query.size(0):
+                            if gate.size(0) == streambp_query_indices.numel():
+                                gate = gather_from_sequence_parallel_region(
+                                    gate, group=self.tp_group
+                                )
+                            elif streambp_end <= gate.size(0):
+                                gate = gather_from_sequence_parallel_region(
+                                    gate[streambp_start:streambp_end],
+                                    group=self.tp_group,
+                                )
+                            elif gate.size(0) * tp_size == key.size(0):
+                                gate = gather_from_sequence_parallel_region(
+                                    gate, group=self.tp_group
+                                )
+                                if gate.size(0) != query.size(0):
+                                    gate = select_streambp_sequence_parallel_chunk(
+                                        gate, streambp_start, streambp_end, tp_size
+                                    )
+                            elif (
+                                gate.size(0) % tp_size == 0
+                                and streambp_end <= gate.size(0) // tp_size
+                            ):
+                                gate = select_streambp_sequence_parallel_chunk(
+                                    gate, streambp_start, streambp_end, tp_size
+                                )
+                            else:
+                                raise ValueError(
+                                    f"Cannot align StreamBP gate chunk [{streambp_start}, "
+                                    f"{streambp_end}) from tensor with sequence length "
+                                    f"{gate.size(0)} to query length {query.size(0)}"
+                                )
                     streambp_key_positions = torch.arange(
                         key.size(0), device=key.device, dtype=torch.long
                     )
@@ -382,20 +467,17 @@ class MultiLatentAttention(Attention):
                             )
                         )
                 else:
-                    query = query[streambp_start:streambp_end]
-                    streambp_query_positions = torch.arange(
-                        streambp_start,
-                        streambp_start + query.size(0),
-                        device=query.device,
-                        dtype=torch.long,
-                    )
+                    if query.size(0) != streambp_query_indices.numel():
+                        query = query[streambp_start:streambp_end]
+                    streambp_query_positions = streambp_query_indices.to(device=query.device)
                     streambp_key_positions = torch.arange(
                         streambp_prefix_end,
                         device=query.device,
                         dtype=torch.long,
                     )
                     if gate is not None:
-                        gate = gate[streambp_start:streambp_end]
+                        if gate.size(0) != query.size(0):
+                            gate = gate[streambp_start:streambp_end]
         if self.offload_qkv_linear:
             query = off_interface.group_commit(
                 query, name="qkv_linear", forced_released_tensors=[hidden_states]
@@ -430,7 +512,8 @@ class MultiLatentAttention(Attention):
 
         # Value is none during decode for absorption
         if value is not None:
-            value = value.contiguous()
+            if self.config.experimental_attention_variant != "dsa":
+                value = value.contiguous()
 
         # ==================================
         # core attention computation
@@ -808,6 +891,7 @@ class MLASelfAttention(MultiLatentAttention):
         *,
         inference_params=None,
         chunk_range: Optional[ChunkRange] = None,
+        streambp_query_indices: Optional[torch.Tensor] = None,
     ):
         """
         Derives `query`, `key` and `value` tensors from `hidden_states`.
@@ -825,12 +909,31 @@ class MLASelfAttention(MultiLatentAttention):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
+        if streambp_query_indices is not None:
+            streambp_query_indices = streambp_query_indices.to(
+                device=hidden_states.device, dtype=torch.long
+            )
+            if streambp_query_indices.dim() != 1:
+                raise ValueError(
+                    "streambp_query_indices must be 1D, got "
+                    f"{tuple(streambp_query_indices.shape)}"
+                )
+            if bool((streambp_query_indices < 0).any().item()) or bool(
+                (streambp_query_indices >= hidden_states.size(0)).any().item()
+            ):
+                raise ValueError(
+                    f"streambp_query_indices out of range for sequence length {hidden_states.size(0)}"
+                )
+
         gate = None
         if self.config.attention_output_gate:
             #NOTE: G1 needs a query-shaped, head-specific gate for the final attention output.
             # Keep it outside MLA's Q/KV low-rank projections so the old MLA projection flow
             # remains easy to restore: remove this block and the later gate application.
-            gate, _ = self.linear_gate_proj(hidden_states)
+            gate_input = hidden_states
+            if streambp_query_indices is not None:
+                gate_input = hidden_states.index_select(0, streambp_query_indices)
+            gate, _ = self.linear_gate_proj(gate_input)
             gate = gate.view(
                 *gate.size()[:-1],
                 self.num_attention_heads_per_partition,
@@ -852,7 +955,7 @@ class MLASelfAttention(MultiLatentAttention):
         if self.config.rope_type == "rope":
             rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
         else:
-            if self.config.apply_rope_fusion:
+            if self.config.apply_rope_fusion and chunk_range is None:
                 rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
                     rotary_seq_len, dtype=hidden_states.dtype, packed_seq=packed_seq
                 )
@@ -885,7 +988,12 @@ class MLASelfAttention(MultiLatentAttention):
             #     q_compressed: [s, b, q_lora_rank / TP]
             # elif linear_q_down_proj is Linear:
             #     q_compressed: [s / TP, b, q_lora_rank]
-            q_compressed, _ = self.linear_q_down_proj(hidden_states)
+            q_down_input = hidden_states
+            if streambp_query_indices is not None:
+                q_down_input = hidden_states.index_select(
+                    0, streambp_query_indices.to(device=hidden_states.device)
+                )
+            q_compressed, _ = self.linear_q_down_proj(q_down_input)
 
             # When output is sharded (ColumnParallelLinear), two things are needed to be
             # identical to a normal Linear.
@@ -1035,17 +1143,90 @@ class MLASelfAttention(MultiLatentAttention):
             we uniformly use [num_tokens, ...] to denote [s, b, ...] or [t, ...] for two cases.
             """
             rope_mscale = mscale
+            q_streambp_indices = None
+            q_streambp_slice = None
+            q_up_input = q_compressed
+            if streambp_query_indices is not None:
+                q_indices = streambp_query_indices.to(device=q_up_input.device, dtype=torch.long)
+                if q_indices.numel() == 0:
+                    raise ValueError("streambp_query_indices must not be empty")
+                if q_up_input.size(0) == q_indices.numel():
+                    q_streambp_indices = q_indices
+                elif not bool((q_indices < 0).any().item()) and not bool(
+                    (q_indices >= q_up_input.size(0)).any().item()
+                ):
+                    q_up_input = q_up_input.index_select(0, q_indices)
+                    q_streambp_indices = q_indices
+                else:
+                    if chunk_range is None:
+                        raise ValueError("StreamBP q projection selection requires chunk_range")
+                    start, end = chunk_range
+                    if end > q_up_input.size(0):
+                        raise ValueError(
+                            f"StreamBP q slice [{start}, {end}) exceeds q length "
+                            f"{q_up_input.size(0)}"
+                        )
+                    q_up_input = q_up_input[start:end]
+                    q_streambp_slice = (start, end)
+
             if self.config.q_lora_rank is not None:
                 # q_compressed: [num_tokens, q_lora_rank]
                 # q: [num_tokens, n * (qk_head_dim + qk_pos_emb_head_dim)]
-                q, _ = self.linear_q_up_proj(q_compressed)
+                q, _ = self.linear_q_up_proj(q_up_input)
             else:
                 # q_compressed: [num_tokens, hidden_size]
                 # q: [num_tokens, n * (qk_head_dim + qk_pos_emb_head_dim)]
-                q, _ = self.linear_q_proj(q_compressed)
+                q, _ = self.linear_q_proj(q_up_input)
 
             # q: [num_tokens, n, q_head_dim]
             q = q.view(*q.size()[:-1], self.num_attention_heads_per_partition, self.q_head_dim)
+            if streambp_query_indices is not None and q.size(0) != streambp_query_indices.numel():
+                local_query_len = streambp_query_indices.numel()
+                if local_query_len == 0 or q.size(0) % local_query_len != 0:
+                    raise ValueError(
+                        f"Cannot map StreamBP q length {q.size(0)} to local query length "
+                        f"{local_query_len}"
+                    )
+                if chunk_range is None:
+                    raise ValueError("StreamBP gathered q projection requires chunk_range")
+                start, end = chunk_range
+                gathered_tp_size = q.size(0) // local_query_len
+                prefix_per_rank = hidden_states.size(0)
+                if end > prefix_per_rank:
+                    raise ValueError(
+                        f"StreamBP chunk [{start}, {end}) exceeds prefix length "
+                        f"{prefix_per_rank}"
+                    )
+                rank_offsets = (
+                    torch.arange(gathered_tp_size, device=q.device, dtype=torch.long)
+                    * prefix_per_rank
+                )
+                local_positions = torch.arange(start, end, device=q.device, dtype=torch.long)
+                q_streambp_indices = (
+                    rank_offsets[:, None] + local_positions[None, :]
+                ).reshape(-1)
+                q_streambp_slice = None
+            if (
+                streambp_query_indices is not None
+                and q_streambp_indices is None
+                and q_streambp_slice is None
+            ):
+                q_indices = streambp_query_indices.to(device=q.device, dtype=torch.long)
+                if bool((q_indices < 0).any().item()) or bool(
+                    (q_indices >= q.size(0)).any().item()
+                ):
+                    if chunk_range is None:
+                        raise ValueError("StreamBP q projection selection requires chunk_range")
+                    start, end = chunk_range
+                    if end > q.size(0):
+                        raise ValueError(
+                            f"StreamBP q slice [{start}, {end}) exceeds q length {q.size(0)}"
+                        )
+                    q = q[start:end]
+                    q_streambp_slice = (start, end)
+                else:
+                    q = q.index_select(0, q_indices)
+                    q_streambp_indices = q_indices
 
             # kv: [num_tokens, n * (qk_head_dim + v_head_dim)]
             kv, _ = self.linear_kv_up_proj(kv_compressed)
@@ -1060,8 +1241,32 @@ class MLASelfAttention(MultiLatentAttention):
             # [num_tokens, qk_pos_emb_head_dim] -> [num_tokens, 1, qk_pos_emb_head_dim]
             k_pos_emb = torch.unsqueeze(k_pos_emb, -2)
 
-            # todo add assert about fusions and caching
-            if self.config.apply_rope_fusion:
+            def slice_rotary_pos_emb(pos_emb, start, end):
+                if pos_emb is None:
+                    return None
+                if isinstance(pos_emb, tuple):
+                    return tuple(None if item is None else item[start:end] for item in pos_emb)
+                return pos_emb[start:end]
+
+            def index_rotary_pos_emb(pos_emb, indices):
+                if pos_emb is None:
+                    return None
+                if isinstance(pos_emb, tuple):
+                    return tuple(
+                        None if item is None else item.index_select(0, indices.to(item.device))
+                        for item in pos_emb
+                    )
+                return pos_emb.index_select(0, indices.to(pos_emb.device))
+
+            # The fused MLA RoPE kernels consume cached cos/sin tensors. StreamBP
+            # chunked replay intentionally uses the generic rotary embedding path
+            # so query chunks can use chunk-shaped RoPE while keys keep prefix RoPE.
+            use_mla_rope_fusion = (
+                self.config.apply_rope_fusion
+                and rotary_pos_cos is not None
+                and rotary_pos_sin is not None
+            )
+            if use_mla_rope_fusion:
                 cp_rank = self.pg_collection.cp.rank()
                 cp_size = self.pg_collection.cp.size()
                 query = fused_apply_mla_rope_for_q(
@@ -1093,16 +1298,6 @@ class MLASelfAttention(MultiLatentAttention):
                     sequence_start = inference_context.sequence_len_offset
                     sequence_end = sequence_start + q_len
                     rotary_pos_emb = rotary_pos_emb[sequence_start:sequence_end]
-                elif packed_seq_params is None or self.config.context_parallel_size == 1:
-                    # Shorten rotary_pos_emb to the sequence length when inference_params
-                    # is not provided. This makes sure we can run forward directly with
-                    # any sequence length. During training, the sequence length is always
-                    # the full rotary_pos_emb length, except for sequence packing + CP.
-                    # When sequence packing and context parallel are both enabled, the
-                    # position embedding will not split rotary_pos_emb, so it may exceed
-                    # the sequence length on this CP rank, but we need the full rotary_pos_emb
-                    # to cover the full sequence, so we do not shorten it here.
-                    rotary_pos_emb = rotary_pos_emb[0:q_len]
 
                 # q_no_pe: [num_tokens, n, qk_head_dim]
                 # q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
@@ -1167,10 +1362,35 @@ class MLASelfAttention(MultiLatentAttention):
                                     required_rotary_seq_len, packed_seq=True
                                 )
 
+                query_rotary_pos_emb = rotary_pos_emb
+                key_rotary_pos_emb = rotary_pos_emb
+                if inference_context is None and (
+                    packed_seq_params is None or self.config.context_parallel_size == 1
+                ):
+                    # StreamBP replays a query chunk against the full causal prefix. Keep
+                    # query RoPE chunk-shaped, but keep key RoPE prefix-shaped.
+                    if q_streambp_indices is not None:
+                        query_rotary_pos_emb = index_rotary_pos_emb(
+                            rotary_pos_emb, q_streambp_indices
+                        )
+                        key_rotary_pos_emb = slice_rotary_pos_emb(
+                            rotary_pos_emb, 0, k_pos_emb.size(0)
+                        )
+                    elif q_streambp_slice is not None:
+                        start, end = q_streambp_slice
+                        query_rotary_pos_emb = slice_rotary_pos_emb(rotary_pos_emb, start, end)
+                        key_rotary_pos_emb = slice_rotary_pos_emb(
+                            rotary_pos_emb, 0, k_pos_emb.size(0)
+                        )
+                    else:
+                        rotary_pos_emb = slice_rotary_pos_emb(rotary_pos_emb, 0, q_len)
+                        query_rotary_pos_emb = rotary_pos_emb
+                        key_rotary_pos_emb = rotary_pos_emb
+
                 # q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
                 q_pos_emb = apply_rotary_pos_emb(
                     q_pos_emb,
-                    rotary_pos_emb,
+                    query_rotary_pos_emb,
                     config=self.config,
                     cu_seqlens=rope_cu_seqlens_q,
                     mscale=rope_mscale,
@@ -1180,7 +1400,7 @@ class MLASelfAttention(MultiLatentAttention):
                 # k_pos_emb:[num_tokens, 1, qk_pos_emb_head_dim]
                 k_pos_emb = apply_rotary_pos_emb(
                     k_pos_emb,
-                    rotary_pos_emb,
+                    key_rotary_pos_emb,
                     config=self.config,
                     cu_seqlens=rope_cu_seqlens_kv,
                     mscale=rope_mscale,
@@ -1201,7 +1421,8 @@ class MLASelfAttention(MultiLatentAttention):
 
             query = query.contiguous()
             key = key.contiguous()
-            value = value.contiguous()
+            if self.config.experimental_attention_variant != "dsa":
+                value = value.contiguous()
 
             return query, key, value
 

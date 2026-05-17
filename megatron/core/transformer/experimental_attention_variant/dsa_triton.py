@@ -1256,6 +1256,10 @@ def _sparse_dsa_forward_kernel(
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
     value_dim: tl.constexpr,
+    v_stride_s: tl.constexpr,
+    v_stride_b: tl.constexpr,
+    v_stride_h: tl.constexpr,
+    v_stride_d: tl.constexpr,
     topk_count: tl.constexpr,
     q_start,
     BLOCK_Q: tl.constexpr,
@@ -1358,9 +1362,10 @@ def _sparse_dsa_forward_kernel(
 
         value_ptrs = (
             value_ptr
-            + ((safe_selected[:, :, None] * bsz + batch_idx) * num_heads + head_idx)
-            * value_dim
-            + vd_offsets[None, None, :]
+            + safe_selected[:, :, None] * v_stride_s
+            + batch_idx * v_stride_b
+            + head_idx * v_stride_h
+            + vd_offsets[None, None, :] * v_stride_d
         )
         value = tl.load(
             value_ptrs,
@@ -1471,6 +1476,10 @@ def _sparse_dsa_backward_kernel(
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
     value_dim: tl.constexpr,
+    v_stride_s: tl.constexpr,
+    v_stride_b: tl.constexpr,
+    v_stride_h: tl.constexpr,
+    v_stride_d: tl.constexpr,
     topk_count: tl.constexpr,
     q_start,
     BLOCK_Q: tl.constexpr,
@@ -1597,9 +1606,10 @@ def _sparse_dsa_backward_kernel(
 
         value_ptrs = (
             value_ptr
-            + ((safe_selected[:, :, None] * bsz + batch_idx) * num_heads + head_idx)
-            * value_dim
-            + vd_offsets[None, None, :]
+            + safe_selected[:, :, None] * v_stride_s
+            + batch_idx * v_stride_b
+            + head_idx * v_stride_h
+            + vd_offsets[None, None, :] * v_stride_d
         )
         value = tl.load(
             value_ptrs,
@@ -1740,6 +1750,10 @@ def _sparse_dsa_backward_key_block_kv_kernel(
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
     value_dim: tl.constexpr,
+    v_stride_s: tl.constexpr,
+    v_stride_b: tl.constexpr,
+    v_stride_h: tl.constexpr,
+    v_stride_d: tl.constexpr,
     topk_count: tl.constexpr,
     q_start,
     BLOCK_KEYS: tl.constexpr,
@@ -1839,7 +1853,11 @@ def _sparse_dsa_backward_key_block_kv_kernel(
             other=0.0,
         ).to(tl.float32)
         value_vec = tl.load(
-            value_ptr + ((selected_key * bsz + batch_idx) * num_heads + head_idx) * value_dim + vd_offsets,
+            value_ptr
+            + selected_key * v_stride_s
+            + batch_idx * v_stride_b
+            + head_idx * v_stride_h
+            + vd_offsets * v_stride_d,
             mask=key_ok & (vd_offsets < value_dim),
             other=0.0,
         ).to(tl.float32)
@@ -1901,6 +1919,10 @@ def _sparse_dsa_backward_qtile_unique_kv_kernel(
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
     value_dim: tl.constexpr,
+    v_stride_s: tl.constexpr,
+    v_stride_b: tl.constexpr,
+    v_stride_h: tl.constexpr,
+    v_stride_d: tl.constexpr,
     topk_count: tl.constexpr,
     q_start,
     BLOCK_Q: tl.constexpr,
@@ -1962,8 +1984,10 @@ def _sparse_dsa_backward_qtile_unique_kv_kernel(
     ).to(tl.float32)
     value = tl.load(
         value_ptr
-        + ((safe_selected[:, None] * bsz + batch_idx) * num_heads + head_idx) * value_dim
-        + vd_offsets[None, :],
+        + safe_selected[:, None] * v_stride_s
+        + batch_idx * v_stride_b
+        + head_idx * v_stride_h
+        + vd_offsets[None, :] * v_stride_d,
         mask=valid[:, None] & (vd_offsets[None, :] < value_dim),
         other=0.0,
     ).to(tl.float32)
@@ -2063,7 +2087,7 @@ class SparseDSAAttentionTriton(torch.autograd.Function):
 
         query_flat = query.contiguous()
         key_flat = key.contiguous()
-        value_flat = value.contiguous()
+        value_flat = value if value.stride(-1) == 1 else value.contiguous()
         topk_flat = topk_indices.contiguous()
         has_positions = query_positions is not None
         if has_positions:
@@ -2166,6 +2190,10 @@ class SparseDSAAttentionTriton(torch.autograd.Function):
             num_heads,
             head_dim,
             value_dim,
+            value_flat.stride(0),
+            value_flat.stride(1),
+            value_flat.stride(2),
+            value_flat.stride(3),
             topk_count,
             int(q_start),
             BLOCK_Q=block_q,
@@ -2349,6 +2377,10 @@ class SparseDSAAttentionTriton(torch.autograd.Function):
                 num_heads,
                 head_dim,
                 value_dim,
+                value.stride(0),
+                value.stride(1),
+                value.stride(2),
+                value.stride(3),
                 ctx.topk_count,
                 ctx.q_start,
                 BLOCK_Q=ctx.backward_block_q,
@@ -2422,6 +2454,10 @@ class SparseDSAAttentionTriton(torch.autograd.Function):
                 num_heads,
                 head_dim,
                 value_dim,
+                value.stride(0),
+                value.stride(1),
+                value.stride(2),
+                value.stride(3),
                 ctx.topk_count,
                 ctx.q_start,
                 BLOCK_KEYS=ctx.key_block_kv_backward_keys,
@@ -2456,6 +2492,10 @@ class SparseDSAAttentionTriton(torch.autograd.Function):
                 num_heads,
                 head_dim,
                 value_dim,
+                value.stride(0),
+                value.stride(1),
+                value.stride(2),
+                value.stride(3),
                 ctx.topk_count,
                 ctx.q_start,
                 BLOCK_Q=ctx.qtile_unique_kv_backward_queries,

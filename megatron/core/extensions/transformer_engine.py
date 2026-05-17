@@ -472,6 +472,63 @@ class TENorm:
         return cast(LayerNormInterface, instance)
 
 
+def _activation_eco_correction_dtype(config: ModelParallelConfig) -> torch.dtype:
+    dtype = getattr(config, "nvfp4_activation_eco_correction_dtype", "fp32")
+    if dtype == "fp32":
+        return torch.float32
+    if dtype == "bf16":
+        return torch.bfloat16
+    if dtype == "fp16":
+        return torch.float16
+    raise ValueError(f"unknown nvfp4 activation-ECO correction dtype {dtype!r}")
+
+
+def _should_install_nvfp4_activation_eco(
+    config: ModelParallelConfig,
+    *,
+    tp_comm_buffer_name: Optional[str],
+    parallel_mode: Optional[str],
+    is_expert: bool,
+) -> bool:
+    if not getattr(config, "nvfp4_activation_eco", False):
+        return False
+    modules = getattr(config, "nvfp4_activation_eco_modules", None) or ["all"]
+    module_set = set(modules)
+    if "all" in module_set:
+        return True
+    if tp_comm_buffer_name in module_set:
+        return True
+    if is_expert and "expert" in module_set:
+        return True
+    if not is_expert and "nonexpert" in module_set:
+        return True
+    if parallel_mode == "duplicated" and "duplicated" in module_set:
+        return True
+    if tp_comm_buffer_name is None and "other" in module_set:
+        return True
+    return False
+
+
+def _activation_eco_input_may_be_storage_released(
+    config: ModelParallelConfig,
+    *,
+    tp_comm_buffer_name: Optional[str],
+    is_expert: bool,
+) -> bool:
+    """Return whether fine-grained offload can free this linear's input storage."""
+
+    if not getattr(config, "fine_grained_activation_offloading", False):
+        return False
+    offload_modules = set(getattr(config, "offload_modules", None) or [])
+    if tp_comm_buffer_name == "proj" and "attn_proj" in offload_modules:
+        return True
+    if tp_comm_buffer_name == "qkv" and "qkv_linear" in offload_modules:
+        return True
+    if is_expert and tp_comm_buffer_name == "fc1" and "expert_fc1" in offload_modules:
+        return True
+    return False
+
+
 class TELinear(te.pytorch.Linear):
     """Wrapper for the Transformer-Engine's `Linear` layer.
 
@@ -659,6 +716,40 @@ class TELinear(te.pytorch.Linear):
 
         tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
         self._tp_group = tp_group
+
+        if _should_install_nvfp4_activation_eco(
+            self.config,
+            tp_comm_buffer_name=tp_comm_buffer_name,
+            parallel_mode=parallel_mode,
+            is_expert=is_expert,
+        ):
+            from megatron.core.quantization.nvfp4_act_eco.codec import (
+                build_nvfp4_act_eco_config,
+            )
+            from megatron.core.quantization.nvfp4_act_eco.te_hook import (
+                install_act_eco_on_te_linear,
+            )
+
+            install_act_eco_on_te_linear(
+                self,
+                build_nvfp4_act_eco_config(),
+                capture_recompute_only=getattr(
+                    self.config, "nvfp4_activation_eco_recompute_only", True
+                ),
+                clone_captured_input=_activation_eco_input_may_be_storage_released(
+                    self.config,
+                    tp_comm_buffer_name=tp_comm_buffer_name,
+                    is_expert=is_expert,
+                ),
+                quantizer_backend=getattr(
+                    self.config, "nvfp4_activation_eco_quantizer_backend", "te"
+                ),
+                correction_dtype=_activation_eco_correction_dtype(self.config),
+                module_label=(
+                    f"TELinear(buffer={tp_comm_buffer_name},mode={parallel_mode},"
+                    f"expert={is_expert},in={input_size},out={output_size})"
+                ),
+            )
 
     def finish_init(self, quantization_config: QuantizationConfig):
         """Post-init of quantization override"""
@@ -1512,9 +1603,14 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
 
             extra_kwargs = _get_extra_te_kwargs(config)
 
-            if self.config.delay_wgrad_compute:
+            self.delay_wgrad_compute = (
+                self.config.delay_wgrad_compute
+                or self.config.overlap_dispatch_backward_with_experts_wgrad
+            )
+
+            if self.delay_wgrad_compute:
                 if is_te_min_version("2.3.0"):
-                    extra_kwargs["delay_wgrad_compute"] = self.config.delay_wgrad_compute
+                    extra_kwargs["delay_wgrad_compute"] = True
                 else:
                     raise RuntimeError(
                         "Only TE with version >=2.3.0 supports delay_wgrad_compute now."
@@ -1568,6 +1664,42 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             self.te_quant_params: Optional[TEQuantizationParams] = None
             for param in self.parameters():
                 setattr(param, "allreduce", not (is_expert and self.expert_parallel))
+
+            if _should_install_nvfp4_activation_eco(
+                self.config,
+                tp_comm_buffer_name=tp_comm_buffer_name,
+                parallel_mode=parallel_mode,
+                is_expert=is_expert,
+            ):
+                from megatron.core.quantization.nvfp4_act_eco.codec import (
+                    build_nvfp4_act_eco_config,
+                )
+                from megatron.core.quantization.nvfp4_act_eco.te_hook import (
+                    install_act_eco_on_te_grouped_linear,
+                )
+
+                install_act_eco_on_te_grouped_linear(
+                    self,
+                    build_nvfp4_act_eco_config(),
+                    num_gemms=num_gemms,
+                    capture_recompute_only=getattr(
+                        self.config, "nvfp4_activation_eco_recompute_only", True
+                    ),
+                    clone_captured_input=_activation_eco_input_may_be_storage_released(
+                        self.config,
+                        tp_comm_buffer_name=tp_comm_buffer_name,
+                        is_expert=is_expert,
+                    ),
+                    quantizer_backend=getattr(
+                        self.config, "nvfp4_activation_eco_quantizer_backend", "te"
+                    ),
+                    correction_dtype=_activation_eco_correction_dtype(self.config),
+                    module_label=(
+                        f"TEGroupedLinear(buffer={tp_comm_buffer_name},mode={parallel_mode},"
+                        f"expert={is_expert},in={input_size},out={output_size},"
+                        f"num_gemms={num_gemms})"
+                    ),
+                )
 
             def merge_extra_states(
                 self,
@@ -1822,8 +1954,45 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             Compute weight gradients during the backward pass
             if delay_wgrad_compute is enabled.
             """
-            if self.config.delay_wgrad_compute:
+            if not self.delay_wgrad_compute:
+                return
+
+            if self.fuse_wgrad_accumulation:
                 super().backward_dw()
+                return
+
+            if not self.need_backward_dw():
+                return
+
+            # TE's default delayed GroupedLinear wgrad path assigns weight.grad
+            # on every backward_dw() call when fused grad accumulation is disabled.
+            # Accumulate explicitly so multi-microbatch training keeps the same
+            # semantics as the normal autograd path.
+            with torch.cuda.nvtx.range("_GroupedLinear_wgrad_accumulate"):
+                (_, grad_biases, _), tensor_list = self.wgrad_store.pop()
+                wgrad_list = tensor_list[2]
+                for i in range(self.num_gemms):
+                    weight = getattr(self, f"weight{i}")
+                    wgrad = wgrad_list[i].to(weight.dtype)
+                    if weight.grad is None:
+                        weight.grad = wgrad
+                    else:
+                        weight.grad.add_(wgrad)
+
+                if self.use_bias:
+                    for i in range(self.num_gemms):
+                        bias = getattr(self, f"bias{i}")
+                        bgrad = grad_biases[i].to(bias.dtype)
+                        if bias.grad is None:
+                            bias.grad = bgrad
+                        else:
+                            bias.grad.add_(bgrad)
+
+                del grad_biases
+                del wgrad_list
+                del tensor_list
+                for hook in self.wgrad_accumulation_and_reduce_hooks:
+                    hook()
 
     class TEColumnParallelGroupedLinear(TEGroupedLinear):
         """

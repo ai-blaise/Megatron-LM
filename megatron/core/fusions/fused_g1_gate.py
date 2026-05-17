@@ -69,14 +69,14 @@ def _g1_gate_fwd(linear_out: torch.Tensor, attn_out: torch.Tensor):
     return output, gate
 
 
-def _g1_gate_bwd(
-    grad_output: torch.Tensor, attn_out: torch.Tensor, gate: torch.Tensor
+def _g1_gate_bwd_from_output(
+    grad_output: torch.Tensor, gated_out: torch.Tensor, gate: torch.Tensor
 ):
     """Launch the fused G1 gate backward kernel.
 
     Args:
         grad_output: Gradient w.r.t. output (BF16).
-        attn_out:    The ungated values saved from forward (BF16).
+        gated_out:   The gated output saved from forward (BF16).
         gate:        sigmoid(linear_out) saved from forward (BF16).
 
     Returns:
@@ -84,11 +84,13 @@ def _g1_gate_bwd(
     """
     grad_output = grad_output.contiguous()
 
-    d_attn_out = torch.empty_like(attn_out)
+    d_attn_out = torch.empty_like(gated_out)
     d_linear_out = torch.empty_like(gate)
 
     ext = _load_kernel()
-    ext.g1_gate_bwd(grad_output, attn_out, gate, d_attn_out, d_linear_out, gate.numel())
+    ext.g1_gate_bwd_from_output(
+        grad_output, gated_out, gate, d_attn_out, d_linear_out, gate.numel()
+    )
     return d_attn_out, d_linear_out
 
 
@@ -103,13 +105,13 @@ class G1GateFunction(torch.autograd.Function):
         linear_out = linear_out.contiguous()
         attn_out = attn_out.contiguous()
         output, gate = _g1_gate_fwd(linear_out, attn_out)
-        ctx.save_for_backward(attn_out, gate)
+        ctx.save_for_backward(output, gate)
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
-        attn_out, gate = ctx.saved_tensors
-        d_attn_out, d_linear_out = _g1_gate_bwd(grad_output, attn_out, gate)
+        output, gate = ctx.saved_tensors
+        d_attn_out, d_linear_out = _g1_gate_bwd_from_output(grad_output, output, gate)
         return d_linear_out, d_attn_out
 
 

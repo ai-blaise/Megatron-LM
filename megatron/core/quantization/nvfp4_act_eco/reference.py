@@ -161,19 +161,71 @@ def _round_to_nvfp4_grid(x: torch.Tensor, *, fp4_max: float) -> torch.Tensor:
     """Round each coordinate to its nearest NVFP4 (E2M1) representable.
 
     NVFP4 unsigned magnitudes are {0, 0.5, 1, 1.5, 2, 3, 4, 6}; signs
-    flip the sign bit. The full grid is exactly the union of those 8
-    magnitudes negated and not-negated. ``round`` nearest with banker's
-    ties matches what flashinfer's fp4_quantize emits.
+    flip the sign bit. This uses midpoint thresholds instead of a
+    broadcasted ``[..., 16]`` distance table so production-sized
+    activation-ECO probes can use the reference backend without a 16x
+    temporary. Ties match the previous argmin-grid implementation:
+    positive ties choose the lower magnitude, negative ties choose the
+    larger magnitude because the signed grid was ordered from negative
+    to positive.
     """
 
-    grid = torch.tensor(
-        [
-            -fp4_max, -4.0, -3.0, -2.0, -1.5, -1.0, -0.5, 0.0,
-            0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, fp4_max,
-        ],
-        dtype=x.dtype,
-        device=x.device,
+    x = x.clamp(-fp4_max, fp4_max)
+    mag = x.abs()
+    zero = torch.zeros((), dtype=x.dtype, device=x.device)
+    half = torch.full((), 0.5, dtype=x.dtype, device=x.device)
+    one = torch.ones((), dtype=x.dtype, device=x.device)
+    one_half = torch.full((), 1.5, dtype=x.dtype, device=x.device)
+    two = torch.full((), 2.0, dtype=x.dtype, device=x.device)
+    three = torch.full((), 3.0, dtype=x.dtype, device=x.device)
+    four = torch.full((), 4.0, dtype=x.dtype, device=x.device)
+    six = torch.full((), fp4_max, dtype=x.dtype, device=x.device)
+
+    # Positive ties matched the previous grid-argmin by selecting the lower
+    # magnitude at each midpoint.
+    pos_mag = torch.where(
+        mag <= 0.25,
+        zero,
+        torch.where(
+            mag <= 0.75,
+            half,
+            torch.where(
+                mag <= 1.25,
+                one,
+                torch.where(
+                    mag <= 1.75,
+                    one_half,
+                    torch.where(
+                        mag <= 2.5,
+                        two,
+                        torch.where(mag <= 3.5, three, torch.where(mag <= 5.0, four, six)),
+                    ),
+                ),
+            ),
+        ),
     )
-    diffs = (x.unsqueeze(-1) - grid).abs()
-    idx = diffs.argmin(dim=-1)
-    return grid[idx]
+    # Negative ties matched the previous signed grid-argmin by selecting the
+    # larger magnitude at each midpoint.
+    neg_mag = torch.where(
+        mag < 0.25,
+        zero,
+        torch.where(
+            mag < 0.75,
+            half,
+            torch.where(
+                mag < 1.25,
+                one,
+                torch.where(
+                    mag < 1.75,
+                    one_half,
+                    torch.where(
+                        mag < 2.5,
+                        two,
+                        torch.where(mag < 3.5, three, torch.where(mag < 5.0, four, six)),
+                    ),
+                ),
+            ),
+        ),
+    )
+    rounded_mag = torch.where(x < 0, neg_mag, pos_mag)
+    return torch.where(x < 0, -rounded_mag, rounded_mag)

@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 
+import os
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -11,6 +12,11 @@ from megatron.core.utils import nvtx_decorator
 
 # Types
 Shape = Union[List[int], torch.Size]
+
+
+def _prewarm_pipeline_p2p_enabled() -> bool:
+    raw = os.getenv("MEGATRON_PREWARM_PIPELINE_P2P", "1").strip().lower()
+    return raw not in ("0", "false", "off", "no")
 
 
 def _batched_p2p_ops(
@@ -161,6 +167,36 @@ class P2PCommunicator:
             if config.virtual_pipeline_model_parallel_size is not None
             else None
         )
+        if _prewarm_pipeline_p2p_enabled():
+            self._prewarm_p2p_communicators()
+
+    def _prewarm_p2p_communicators(self) -> None:
+        """Force lazy NCCL P2P communicator creation before activation peak memory.
+
+        PyTorch/NCCL lazily creates pair communicators for unbatched isend/irecv.
+        With overlapped PP communication this can otherwise happen inside the
+        first training step, when large DSA/StreamBP activations are already live.
+        """
+
+        if self.pp_group.size() <= 1 or self.config.batch_p2p_comm or self.config.use_ring_exchange_p2p:
+            return
+        device = torch.cuda.current_device()
+        send_prev = torch.empty((1,), device=device, dtype=torch.uint8)
+        recv_prev = torch.empty((1,), device=device, dtype=torch.uint8)
+        send_next = torch.empty((1,), device=device, dtype=torch.uint8)
+        recv_next = torch.empty((1,), device=device, dtype=torch.uint8)
+        reqs = _p2p_ops(
+            tensor_send_prev=send_prev,
+            tensor_recv_prev=recv_prev,
+            tensor_send_next=send_next,
+            tensor_recv_next=recv_next,
+            group=self.pp_group,
+            prev_pipeline_rank=self.prev_rank,
+            next_pipeline_rank=self.next_rank,
+        )
+        for req in reqs.values():
+            req.wait()
+        torch.cuda.synchronize()
 
     def _communicate_shapes(self, tensor_send_next, tensor_send_prev, recv_prev, recv_next):
         """Communicate tensor shapes between stages. Used to communicate
