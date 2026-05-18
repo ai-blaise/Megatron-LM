@@ -33,6 +33,7 @@ from megatron.core.jit import jit_fuser
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
+from megatron.core.tensor_audit import tensor_audit as _tensor_audit
 from megatron.core.tensor_parallel.layers import (
     _initialize_affine_weight_cpu,
     _initialize_affine_weight_gpu,
@@ -71,6 +72,33 @@ except ImportError:
     HAVE_TE = False
 
 logger = logging.getLogger(__name__)
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.lower() in ("1", "true", "yes", "on")
+
+
+def _maybe_trim_cuda_cache_before_moe_unpadding() -> None:
+    """Release cached allocator blocks before the large TE MoE unpadding output."""
+    if not torch.cuda.is_available():
+        return
+    if not _env_flag("MEGATRON_MOE_UNPADDING_TRIM_CACHE", default=True):
+        return
+
+    free_bytes, _ = torch.cuda.mem_get_info()
+    allocated = torch.cuda.memory_allocated()
+    reserved = torch.cuda.memory_reserved()
+    cached = max(0, reserved - allocated)
+
+    mib = 1024 * 1024
+    free_threshold_mb = int(os.getenv("MEGATRON_MOE_UNPADDING_TRIM_FREE_MB", "4096"))
+    cached_threshold_mb = int(os.getenv("MEGATRON_MOE_UNPADDING_TRIM_CACHED_MB", "512"))
+    if free_bytes < free_threshold_mb * mib and cached > cached_threshold_mb * mib:
+        torch.cuda.empty_cache()
+
 
 class GroupedMLP(MegatronModule):
     """An efficient implementation of the Experts layer using GroupedGEMM.
@@ -789,6 +817,14 @@ class TEGroupedMLP(MegatronModule):
         Return:
             output (torch.Tensor): The output of the local experts.
         """
+        grad_enabled = torch.is_grad_enabled()
+        _tensor_audit(
+            "moe_expert/input",
+            hidden=permuted_local_hidden_states,
+            probs=permuted_probs,
+            tokens=tokens_per_expert,
+            num_local_experts=self.num_local_experts,
+        )
         tokens_per_expert: list[int] = tokens_per_expert.tolist()
         if self.config.fp8 or self.config.fp4:
             actual_tokens_per_expert = tokens_per_expert
@@ -797,6 +833,13 @@ class TEGroupedMLP(MegatronModule):
             )
             permuted_probs, _ = self.quantization_padding(
                 permuted_probs.unsqueeze(-1), actual_tokens_per_expert
+            )
+            _tensor_audit(
+                "moe_expert/after_quant_padding",
+                hidden=permuted_local_hidden_states,
+                probs=permuted_probs,
+                actual_tokens=actual_tokens_per_expert,
+                padded_tokens=tokens_per_expert,
             )
         else:
             permuted_probs = permuted_probs.unsqueeze(-1)
@@ -814,9 +857,21 @@ class TEGroupedMLP(MegatronModule):
         with off_interface(
             self.offload_expert_fc1, permuted_local_hidden_states, "expert_fc1"
         ) as permuted_local_hidden_states:
+            _tensor_audit(
+                "moe_expert/before_fc1",
+                hidden=permuted_local_hidden_states,
+                probs=permuted_probs,
+                tokens=tokens_per_expert,
+            )
             fc1_output, bias_parallel = apply_module(self.linear_fc1)(
                 permuted_local_hidden_states, tokens_per_expert
             )
+        _tensor_audit(
+            "moe_expert/after_fc1",
+            fc1_output=fc1_output,
+            bias=bias_parallel,
+            tokens=tokens_per_expert,
+        )
         if self.offload_expert_fc1:
             fc1_output = off_interface.group_commit(
                 fc1_output,
@@ -891,22 +946,63 @@ class TEGroupedMLP(MegatronModule):
         else:
             with off_interface(self.offload_moe_act, fc1_output, "moe_act") as fc1_output:
                 bias_act_output = bias_act_func(fc1_output, bias_parallel, permuted_probs)
+        _tensor_audit(
+            "moe_expert/after_activation",
+            fc1_output=fc1_output,
+            bias_act_output=bias_act_output,
+            probs=permuted_probs,
+        )
+
+        if not grad_enabled:
+            # StreamBP no-grad replay only needs the activated tensor for fc2.
+            # Release the much larger fc1/input intermediates before TE grouped
+            # fc2 quantizes and allocates its output.
+            del fc1_output
+            del bias_parallel
+            del permuted_local_hidden_states
+            _maybe_trim_cuda_cache_before_moe_unpadding()
 
         output, output_bias = apply_module(self.linear_fc2)(bias_act_output, tokens_per_expert)
+        _tensor_audit(
+            "moe_expert/after_fc2",
+            output=output,
+            output_bias=output_bias,
+            bias_act_output=bias_act_output,
+            tokens=tokens_per_expert,
+        )
         if self.activation_recompute:
             self.activation_checkpoint.discard_output_and_register_recompute(output)
 
         # Delay the offload of the moe act until after the linear_fc2 has been computed
         # to make sure the fc1_output is reloaded to GPU before recomputing moe_act.
-        if self.offload_moe_act:
+        if self.offload_moe_act and grad_enabled:
             output = off_interface.group_commit(
                 output, name="moe_act", forced_released_tensors=[fc1_output]
             )
         output = self._apply_bias(output, output_bias, tokens_per_expert, permuted_probs)
+        if not grad_enabled:
+            # StreamBP no-grad replay does not need these large intermediates once
+            # fc2 has produced the expert output. Free them before TE unpadding
+            # allocates its dense unpadded output.
+            del bias_act_output
+            del permuted_probs
+            output_bias = None
 
         # upad and concat the output
         if self.config.fp8 or self.config.fp4:
+            _tensor_audit(
+                "moe_expert/before_quant_unpadding",
+                output=output,
+                actual_tokens=actual_tokens_per_expert,
+                padded_tokens=tokens_per_expert,
+            )
+            _maybe_trim_cuda_cache_before_moe_unpadding()
             output = self.quantization_unpadding(output, actual_tokens_per_expert)
+            _tensor_audit(
+                "moe_expert/after_quant_unpadding",
+                output=output,
+                actual_tokens=actual_tokens_per_expert,
+            )
 
         output_bias = None
 

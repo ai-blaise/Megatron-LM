@@ -1084,8 +1084,8 @@ name = "cuda-python"
 version = "13.2.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "cuda-bindings" },
-    { name = "cuda-pathfinder" },
+    { name = "cuda-bindings", marker = "sys_platform == 'linux' or extra == 'extra-13-megatron-core-dev' or extra == 'extra-13-megatron-core-lts'" },
+    { name = "cuda-pathfinder", marker = "sys_platform == 'linux' or extra == 'extra-13-megatron-core-dev' or extra == 'extra-13-megatron-core-lts'" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/4a/da/b4dbe129f941afe1c24a09ba53521b78875626763d96414798a74763282f/cuda_python-13.2.0-py3-none-any.whl", hash = "sha256:2f092b0ec13a860115fa595411889ee939ad203450ea4f91e9461b174ea7b084", size = 8145, upload-time = "2026-03-11T13:55:19.143Z" },
@@ -2445,6 +2445,7 @@ source = { editable = "." }
 dependencies = [
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11' or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
     { name = "numpy", version = "2.4.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11' or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
+    { name = "nvidia-cutlass-dsl", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine != 'x86_64' and extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (sys_platform != 'linux' and extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
     { name = "packaging" },
     { name = "psutil" },
     { name = "torch" },
@@ -2597,6 +2598,7 @@ requires-dist = [
     { name = "numpy" },
     { name = "nv-grouped-gemm", marker = "extra == 'dev'", specifier = "~=1.1" },
     { name = "nv-grouped-gemm", marker = "extra == 'lts'", specifier = "~=1.1" },
+    { name = "nvidia-cutlass-dsl", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = "==4.4.0" },
     { name = "nvidia-modelopt", extras = ["torch"], marker = "sys_platform != 'darwin' and extra == 'dev'" },
     { name = "nvidia-resiliency-ext", marker = "extra == 'dev'" },
     { name = "nvtx", marker = "extra == 'dev'", specifier = "~=0.2" },
@@ -3525,7 +3527,7 @@ name = "nvidia-cutlass-dsl"
 version = "4.4.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "nvidia-cutlass-dsl-libs-base" },
+    { name = "nvidia-cutlass-dsl-libs-base", marker = "sys_platform == 'linux' or extra == 'extra-13-megatron-core-dev' or extra == 'extra-13-megatron-core-lts'" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/55/09/42fca58af350265131b6f8665ad5b62526c95e6692788460bd5306d3efe2/nvidia_cutlass_dsl-4.4.0-py3-none-any.whl", hash = "sha256:2d1f34333e4d774002d44b53262d71aaf738700fcf3858290629f9a7b374c61c", size = 10168, upload-time = "2026-02-14T03:38:54.267Z" },
@@ -3536,10 +3538,10 @@ name = "nvidia-cutlass-dsl-libs-base"
 version = "4.4.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "cuda-python" },
-    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version < '3.11' and extra == 'extra-13-megatron-core-dev') or (python_full_version < '3.11' and extra == 'extra-13-megatron-core-lts') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
-    { name = "numpy", version = "2.4.2", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version >= '3.11' and extra == 'extra-13-megatron-core-dev') or (python_full_version >= '3.11' and extra == 'extra-13-megatron-core-lts') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
-    { name = "typing-extensions" },
+    { name = "cuda-python", marker = "sys_platform == 'linux' or extra == 'extra-13-megatron-core-dev' or extra == 'extra-13-megatron-core-lts'" },
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version < '3.11' and sys_platform == 'linux') or (python_full_version < '3.11' and extra == 'extra-13-megatron-core-dev') or (python_full_version < '3.11' and extra == 'extra-13-megatron-core-lts') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
+    { name = "numpy", version = "2.4.2", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version >= '3.11' and sys_platform == 'linux') or (python_full_version >= '3.11' and extra == 'extra-13-megatron-core-dev') or (python_full_version >= '3.11' and extra == 'extra-13-megatron-core-lts') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
+    { name = "typing-extensions", marker = "sys_platform == 'linux' or extra == 'extra-13-megatron-core-dev' or extra == 'extra-13-megatron-core-lts'" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/ad/af/cf64251bae66077769adbcd9a2e96b86aeb3c41490c5ee0a939a1a3b511e/nvidia_cutlass_dsl_libs_base-4.4.0-cp310-cp310-manylinux_2_28_aarch64.whl", hash = "sha256:703169d0843ad7e310b397aa95128e3fa983571a9a488f826c2968f3e71df2b8", size = 75460001, upload-time = "2026-02-14T03:44:18.705Z" },

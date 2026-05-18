@@ -623,6 +623,11 @@ def get_batch_on_this_tp_rank(
 
         assert data_iterator is not None
         data = next(data_iterator)
+        if args.sft and not args.hybrid_context_parallel:
+            # Keep packed-THD metadata reshaping on CPU.  Doing this after the
+            # cuda copies puts small max/cat kernels on the critical pipeline
+            # path for every virtual-stage microbatch.
+            data = _prepare_thd_packed_batch_for_tp_broadcast(dict(data))
         batch = {
             'tokens': data["tokens"].cuda(non_blocking=True),
             'labels': data["labels"].cuda(non_blocking=True),
@@ -654,8 +659,6 @@ def get_batch_on_this_tp_rank(
                 else data["local_cp_size"].cuda(non_blocking=True)
             ),
         }
-        if args.sft and not args.hybrid_context_parallel:
-            batch = _prepare_thd_packed_batch_for_tp_broadcast(batch)
 
         def _broadcast_cu_seqlens(cu_seqlens):
             dev = torch.cuda.current_device()

@@ -21,6 +21,7 @@ from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.tensor_audit import tensor_audit
 from megatron.core.utils import deprecated, internal_api, is_te_min_version
 
 try:
@@ -802,6 +803,17 @@ def topk_routing_with_score_function(
         routing_probs = torch.zeros_like(logits).scatter(1, top_indices, probs)
         routing_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
 
+    tensor_audit(
+        "moe_router/topk",
+        logits=logits,
+        scores=scores,
+        probs=probs,
+        top_indices=top_indices,
+        routing_probs=routing_probs,
+        routing_map=routing_map,
+        num_tokens=num_tokens,
+        topk=topk,
+    )
     return routing_probs, routing_map
 
 

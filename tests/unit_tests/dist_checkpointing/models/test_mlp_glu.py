@@ -38,6 +38,33 @@ def initialize_mlp(glu=True):
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="NVFP4 split test requires CUDA")
+def test_swiglu_factory_splits_nvfp4_without_dequantizing():
+    try:
+        from transformer_engine.pytorch.tensor.nvfp4_tensor import NVFP4Quantizer
+    except (ImportError, ModuleNotFoundError, AttributeError):
+        pytest.skip("TransformerEngine NVFP4 quantizer is unavailable")
+
+    source = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16)
+    quantized = NVFP4Quantizer(rowwise=True, columnwise=True).quantize(source)
+    full_dequantized = quantized.dequantize(dtype=torch.bfloat16)
+
+    sharded_tensor = ShardedTensor.from_rank_offsets("linear_fc1.weight", quantized, (0, 0, 1))
+    factory = apply_swiglu_sharded_factory(sharded_tensor, ())
+    sharded_state_dict = factory.build()
+
+    assert len(sharded_state_dict) == 2
+    assert all(type(sh_ten.data).__name__ == "NVFP4Tensor" for sh_ten in sharded_state_dict)
+    torch.testing.assert_close(
+        sharded_state_dict[0].data.dequantize(dtype=torch.bfloat16),
+        full_dequantized[:64],
+    )
+    torch.testing.assert_close(
+        sharded_state_dict[1].data.dequantize(dtype=torch.bfloat16),
+        full_dequantized[64:],
+    )
+
+
 class TestParallelMLPWithGLU:
     def setup_method(self, method):
         pass

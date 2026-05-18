@@ -112,6 +112,29 @@ def _replace_first_tensor(output, replacement, location):
     raise AssertionError(f"unexpected output location {location!r}")
 
 
+def _forced_release_enabled_for_group(name: str | None) -> bool:
+    if name is None:
+        return True
+    try:
+        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+            fine_grained_offloading_forced_release_enabled,
+        )
+
+        return fine_grained_offloading_forced_release_enabled(name)
+    except Exception:
+        return True
+
+
+def _maybe_clone_captured_input(
+    x_pre: torch.Tensor,
+    clone_captured_input: bool,
+    forced_release_group: str | None,
+) -> torch.Tensor:
+    if clone_captured_input and _forced_release_enabled_for_group(forced_release_group):
+        return x_pre.clone()
+    return x_pre
+
+
 def _te_nvfp4_quant_dequant(x_flat: torch.Tensor, config: Nvfp4ActEcoConfig):
     """Quantize/dequantize with TE's NVFP4 tensor path when it can handle the shape.
 
@@ -253,6 +276,7 @@ def install_act_eco_on_te_linear(
     *,
     capture_recompute_only: bool = True,
     clone_captured_input: bool = False,
+    forced_release_group: str | None = None,
     quantizer_backend: str = "te",
     correction_dtype: torch.dtype = torch.float32,
     module_label: str = "te_linear",
@@ -293,9 +317,9 @@ def install_act_eco_on_te_linear(
             return None
         if not isinstance(x, torch.Tensor) or not x.requires_grad:
             return None
-        x_pre = x.detach()
-        if clone_captured_input:
-            x_pre = x_pre.clone()
+        x_pre = _maybe_clone_captured_input(
+            x.detach(), clone_captured_input, forced_release_group
+        )
         entry = {"x_pre": x_pre, "dy": None}
         cell["entries"].append(entry)
         cell["unbound"].append(entry)
@@ -373,6 +397,7 @@ def install_act_eco_on_te_grouped_linear(
     num_gemms: int,
     capture_recompute_only: bool = True,
     clone_captured_input: bool = False,
+    forced_release_group: str | None = None,
     quantizer_backend: str = "te",
     correction_dtype: torch.dtype = torch.float32,
     module_label: str = "te_grouped_linear",
@@ -402,9 +427,9 @@ def install_act_eco_on_te_grouped_linear(
             return None
         if not isinstance(x, torch.Tensor) or not x.requires_grad:
             return None
-        x_pre = x.detach()
-        if clone_captured_input:
-            x_pre = x_pre.clone()
+        x_pre = _maybe_clone_captured_input(
+            x.detach(), clone_captured_input, forced_release_group
+        )
         if isinstance(m_splits, torch.Tensor):
             m_splits = m_splits.detach().cpu().to(torch.long).tolist()
         counts = [int(v) for v in m_splits]

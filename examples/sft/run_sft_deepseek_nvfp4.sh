@@ -16,7 +16,20 @@ set -euo pipefail
 # ======================
 USE_MEGATRON_FSDP="${USE_MEGATRON_FSDP:-0}"
 USE_STREAMBP="${USE_STREAMBP:-1}"
-STREAMBP_MOE_MLP_CHUNKS="${STREAMBP_MOE_MLP_CHUNKS:-1}"
+STREAMBP_LOGITS_CHUNK_SIZE="${STREAMBP_LOGITS_CHUNK_SIZE:-8192}"
+export MEGATRON_STREAMBP_FUSED_LCE="${MEGATRON_STREAMBP_FUSED_LCE:-1}"
+export MEGATRON_STREAMBP_FUSED_LCE_SP_TILE_SIZE="${MEGATRON_STREAMBP_FUSED_LCE_SP_TILE_SIZE:-1024}"
+export MEGATRON_STREAMBP_SKIP_PP_RANKS="${MEGATRON_STREAMBP_SKIP_PP_RANKS:-3}"
+export LCE_FWD_VOCAB_SPLIT_SIZE="${LCE_FWD_VOCAB_SPLIT_SIZE:-8192}"
+export LCE_BWD_VOCAB_SPLIT_SIZE="${LCE_BWD_VOCAB_SPLIT_SIZE:-8192}"
+STREAMBP_MOE_MLP_CHUNKS="${STREAMBP_MOE_MLP_CHUNKS:-4}"
+STREAMBP_MOE_MLP_BACKWARD_CHUNKS="${STREAMBP_MOE_MLP_BACKWARD_CHUNKS:-8}"
+export MEGATRON_FINE_OFFLOAD_STREAMBP_REPLAY_KEEP_STORAGES="${MEGATRON_FINE_OFFLOAD_STREAMBP_REPLAY_KEEP_STORAGES:-core_attn attn_proj expert_fc1}"
+export MEGATRON_FINE_OFFLOAD_FORCE_RELEASE_IN_STREAMBP_REPLAY="${MEGATRON_FINE_OFFLOAD_FORCE_RELEASE_IN_STREAMBP_REPLAY:-0}"
+export MEGATRON_FINE_OFFLOAD_PIN_MEMORY="${MEGATRON_FINE_OFFLOAD_PIN_MEMORY:-auto}"
+export MEGATRON_FINE_OFFLOAD_PINNED_MAX_MB="${MEGATRON_FINE_OFFLOAD_PINNED_MAX_MB:-64}"
+export MEGATRON_FINE_OFFLOAD_STRIDED_COPY_CHUNK_MB="${MEGATRON_FINE_OFFLOAD_STRIDED_COPY_CHUNK_MB:-128}"
+export MEGATRON_FINE_OFFLOAD_STRIDED_COPY_NON_BLOCKING="${MEGATRON_FINE_OFFLOAD_STRIDED_COPY_NON_BLOCKING:-0}"
 OVERLAP_MOE_EXPERT_PARALLEL_COMM="${OVERLAP_MOE_EXPERT_PARALLEL_COMM:-0}"
 if [[ -z "${RECOMPUTE+x}" ]]; then
     if [[ "$USE_STREAMBP" == "1" ]]; then
@@ -39,6 +52,7 @@ fi
 export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-0}"
 export NCCL_TIMEOUT="${NCCL_TIMEOUT:-3600}"
 export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
+export SUPPRESS_UNBATCHED_P2P_WARN="${SUPPRESS_UNBATCHED_P2P_WARN:-1}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True,garbage_collection_threshold:0.8}"
@@ -70,11 +84,25 @@ if [[ "${ENABLE_TRAINING_DEBUG:-0}" != "1" ]]; then
     export MEGATRON_GRAD_OWNERSHIP=0
 fi
 export MEGATRON_STREAMBP_MOE_REPLAY_TRIM_CACHE="${MEGATRON_STREAMBP_MOE_REPLAY_TRIM_CACHE:-1}"
-export MEGATRON_STREAMBP_MOE_REPLAY_TRIM_FREE_MB="${MEGATRON_STREAMBP_MOE_REPLAY_TRIM_FREE_MB:-2048}"
-export MEGATRON_STREAMBP_MOE_REPLAY_TRIM_CACHED_MB="${MEGATRON_STREAMBP_MOE_REPLAY_TRIM_CACHED_MB:-512}"
+export MEGATRON_STREAMBP_MOE_REPLAY_TRIM_FREE_MB="${MEGATRON_STREAMBP_MOE_REPLAY_TRIM_FREE_MB:-65536}"
+export MEGATRON_STREAMBP_MOE_REPLAY_TRIM_CACHED_MB="${MEGATRON_STREAMBP_MOE_REPLAY_TRIM_CACHED_MB:-0}"
+export MEGATRON_MOE_UNPADDING_TRIM_CACHE="${MEGATRON_MOE_UNPADDING_TRIM_CACHE:-1}"
+export MEGATRON_MOE_UNPADDING_TRIM_FREE_MB="${MEGATRON_MOE_UNPADDING_TRIM_FREE_MB:-65536}"
+export MEGATRON_MOE_UNPADDING_TRIM_CACHED_MB="${MEGATRON_MOE_UNPADDING_TRIM_CACHED_MB:-0}"
+export MEGATRON_MLA_TRIM_CACHE_BEFORE_KEY_CAT="${MEGATRON_MLA_TRIM_CACHE_BEFORE_KEY_CAT:-1}"
+export MEGATRON_MLA_KEY_CAT_TRIM_MARGIN_MB="${MEGATRON_MLA_KEY_CAT_TRIM_MARGIN_MB:-1024}"
+export MEGATRON_MLA_KEY_CAT_TRIM_CACHED_MB="${MEGATRON_MLA_KEY_CAT_TRIM_CACHED_MB:-512}"
+export MEGATRON_TENSOR_AUDIT="${MEGATRON_TENSOR_AUDIT:-0}"
+export MEGATRON_TENSOR_AUDIT_RANKS="${MEGATRON_TENSOR_AUDIT_RANKS:-all}"
+export MEGATRON_TENSOR_AUDIT_LIMIT="${MEGATRON_TENSOR_AUDIT_LIMIT:-128}"
+export MEGATRON_TENSOR_AUDIT_FILTER="${MEGATRON_TENSOR_AUDIT_FILTER:-moe_expert}"
 export MEGATRON_DSA_TRITON="${MEGATRON_DSA_TRITON:-1}"
 export MEGATRON_DSA_TRITON_INDEXER="${MEGATRON_DSA_TRITON_INDEXER:-1}"
+export MEGATRON_DSA_SPLIT_QK="${MEGATRON_DSA_SPLIT_QK:-1}"
 export MEGATRON_DSA_STREAMING_INDEXER_TOPK="${MEGATRON_DSA_STREAMING_INDEXER_TOPK:-1}"
+export MEGATRON_DSA_INDEXER_ROPE_FUSION="${MEGATRON_DSA_INDEXER_ROPE_FUSION:-1}"
+export MEGATRON_DSA_INDEXER_ROPE_INPLACE="${MEGATRON_DSA_INDEXER_ROPE_INPLACE:-1}"
+export MEGATRON_DSA_INDEXER_TORCH_K_NORM="${MEGATRON_DSA_INDEXER_TORCH_K_NORM:-1}"
 export MEGATRON_DSA_INDEXER_KEY_BLOCK_SIZE="${MEGATRON_DSA_INDEXER_KEY_BLOCK_SIZE:-4096}"
 export MEGATRON_DSA_SORT_TOPK_INDICES="${MEGATRON_DSA_SORT_TOPK_INDICES:-0}"
 export MEGATRON_DSA_COMPACT_TOPK_INDICES="${MEGATRON_DSA_COMPACT_TOPK_INDICES:-1}"
@@ -89,7 +117,7 @@ export MEGATRON_HISA_CANDIDATE_SLOT_GROUP="${MEGATRON_HISA_CANDIDATE_SLOT_GROUP:
 export MEGATRON_HISA_SELECTOR_BACKEND="${MEGATRON_HISA_SELECTOR_BACKEND:-bmm}"
 export MEGATRON_HISA_SELECTOR_CUDA="${MEGATRON_HISA_SELECTOR_CUDA:-1}"
 export MEGATRON_HISA_SELECTOR_ROW_CHUNK="${MEGATRON_HISA_SELECTOR_ROW_CHUNK:-512}"
-export MEGATRON_HISA_BMM_FP32_ACCUM_TENSORCORES="${MEGATRON_HISA_BMM_FP32_ACCUM_TENSORCORES:-1}"
+export MEGATRON_HISA_BMM_FP32_ACCUM_TENSORCORES="${MEGATRON_HISA_BMM_FP32_ACCUM_TENSORCORES:-0}"
 export MEGATRON_HISA_SELECTED_SCORE_BWD_HEAD_GROUP="${MEGATRON_HISA_SELECTED_SCORE_BWD_HEAD_GROUP:-8}"
 export MEGATRON_HISA_SELECTED_SCORE_BWD_WARP_GROUPED="${MEGATRON_HISA_SELECTED_SCORE_BWD_WARP_GROUPED:-1}"
 export MEGATRON_HISA_ASSUME_SORTED_POSITIONS="${MEGATRON_HISA_ASSUME_SORTED_POSITIONS:-1}"
@@ -219,7 +247,7 @@ if [[ -z "${DECODER_FIRST_PIPELINE_NUM_LAYERS:-}" ]]; then
 fi
 
 if [[ "$PP" -eq 4 && -z "${PIPELINE_MODEL_PARALLEL_LAYOUT:-}" && -z "${NUM_LAYERS_PER_VIRTUAL_PIPELINE_STAGE:-}" && -z "${NUM_VIRTUAL_STAGES_PER_PIPELINE_RANK:-}" ]]; then
-    PIPELINE_MODEL_PARALLEL_LAYOUT="Et*9|t*7|t*7|t*7|t*8|t*8|t*8|t*7L"
+    PIPELINE_MODEL_PARALLEL_LAYOUT="Et*5|t*5|t*4|t|t*5|t*5|t*5|t|t*5|t*5|t*4|t|t*5|t*5|t*4|tL"
 fi
 
 MODEL_PARALLEL_ARGS=(
@@ -372,8 +400,10 @@ MOE_ARGS=(
     --moe-router-score-function sigmoid
     --moe-router-enable-expert-bias
     --moe-router-bias-update-rate "${MOE_ROUTER_BIAS_UPDATE_RATE:-1e-3}"
-    --moe-router-expert-bias-update-method "${MOE_ROUTER_EXPERT_BIAS_UPDATE_METHOD:-sign}"
+    --moe-router-expert-bias-update-method "${MOE_ROUTER_EXPERT_BIAS_UPDATE_METHOD:-quantile}"
     --moe-router-quantile-bias-iters "${MOE_ROUTER_QUANTILE_BIAS_ITERS:-5}"
+    --moe-router-quantile-bias-application "${MOE_ROUTER_QUANTILE_BIAS_APPLICATION:-current_batch}"
+    --moe-router-quantile-bias-warmup-steps "${MOE_ROUTER_QUANTILE_BIAS_WARMUP_STEPS:-0}"
     --moe-router-dtype fp32
     --moe-aux-loss-coeff "${MOE_AUX_LOSS_COEFF:-1e-4}"
     --moe-token-dispatcher-type alltoall
@@ -473,7 +503,7 @@ fi
 # ======================
 TRAINING_ARGS=(
     --micro-batch-size "${MICRO_BATCH_SIZE:-4}"
-    --global-batch-size "${GLOBAL_BATCH_SIZE:-64}"
+    --global-batch-size "${GLOBAL_BATCH_SIZE:-128}"
     --train-samples "${TRAIN_SAMPLES:-32000000}"
     --lr-decay-samples "${LR_DECAY_SAMPLES:-31968645}"
     --lr-warmup-samples "${LR_WARMUP_SAMPLES:-31348}"
@@ -537,6 +567,11 @@ if [[ "$USE_STREAMBP" == "1" ]]; then
     fi
     if [[ -n "${STREAMBP_MOE_MLP_CHUNKS:-}" ]]; then
         STREAMBP_ARGS+=(--streambp-moe-mlp-chunks "$STREAMBP_MOE_MLP_CHUNKS")
+    fi
+    if [[ -n "${STREAMBP_MOE_MLP_BACKWARD_CHUNKS:-}" ]]; then
+        STREAMBP_ARGS+=(
+            --streambp-moe-mlp-backward-chunks "$STREAMBP_MOE_MLP_BACKWARD_CHUNKS"
+        )
     fi
     if [[ "${STREAMBP_SKIP_MOE:-0}" == "1" ]]; then
         STREAMBP_ARGS+=(--streambp-skip-moe)
@@ -813,8 +848,71 @@ if [[ "${DRY_RUN:-0}" == "1" ]]; then
     exit 0
 fi
 
+prebuild_torch_cuda_ext() {
+    local label="$1"
+    local ext_name="$2"
+    local module="$3"
+    local ext_dir="$HOME/.cache/torch_extensions/py312_cu130/$ext_name"
+
+    if [[ -f "$ext_dir/lock" && ! -f "$ext_dir/$ext_name.so" ]]; then
+        echo "Removing stale $label CUDA extension lock at $ext_dir/lock" >&2
+        rm -f "$ext_dir/lock"
+    fi
+    echo "Prebuilding/loading $label CUDA extension before torchrun..." >&2
+    CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" \
+    TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-10.0}" \
+    PREBUILD_EXT_LABEL="$label" \
+    PREBUILD_EXT_MODULE="$module" \
+    uv run --no-sync python - <<'PY'
+import importlib
+import os
+
+label = os.environ["PREBUILD_EXT_LABEL"]
+module = importlib.import_module(os.environ["PREBUILD_EXT_MODULE"])
+get_ext = getattr(module, "get_ext")
+get_ext()
+print(f"{label} CUDA extension ready", flush=True)
+PY
+}
+
+if [[ "${PREBUILD_HISA_EXT:-1}" == "1" && "${INDEXCACHE:-1}" == "1" ]]; then
+    prebuild_torch_cuda_ext \
+        "HISA" \
+        "megatron_hisa_indexer" \
+        "megatron.core.extensions.hisa_indexer.kernels.build"
+fi
+
+if [[ "${PREBUILD_QUANT_EXTS:-1}" == "1" ]]; then
+    if [[ "${USE_HIGGS:-1}" == "1" ]]; then
+        prebuild_torch_cuda_ext \
+            "HIGGS" \
+            "megatron_higgs_kv" \
+            "megatron.core.quantization.higgs.kernels.build"
+    fi
+    if [[ "${INDEXCACHE:-1}" == "1" ]]; then
+        prebuild_torch_cuda_ext \
+            "IndexCache" \
+            "megatron_indexcache_kv" \
+            "megatron.core.quantization.indexcache.kernels.build"
+    fi
+    if [[ "${TURBOQUANT:-0}" == "1" ]]; then
+        prebuild_torch_cuda_ext \
+            "TurboQuant" \
+            "megatron_turboquant_kv" \
+            "megatron.core.quantization.turboquant.kernels.build"
+    fi
+fi
+
 if [[ -n "${SLURM_JOB_ID:-}" && "${USE_SRUN:-1}" == "1" ]]; then
-    srun --mpi=pmix -l "${CMD[@]}"
+    if [[ "${SUPPRESS_UNBATCHED_P2P_WARN:-1}" == "1" ]]; then
+        srun --mpi=pmix -l "${CMD[@]}" 2> >(grep -Fv "Warning: An unbatched P2P op (send/recv) was called on this ProcessGroup" >&2)
+    else
+        srun --mpi=pmix -l "${CMD[@]}"
+    fi
 else
-    "${CMD[@]}"
+    if [[ "${SUPPRESS_UNBATCHED_P2P_WARN:-1}" == "1" ]]; then
+        "${CMD[@]}" 2> >(grep -Fv "Warning: An unbatched P2P op (send/recv) was called on this ProcessGroup" >&2)
+    else
+        "${CMD[@]}"
+    fi
 fi

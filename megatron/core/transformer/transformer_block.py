@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
+import os
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import List, Optional, Set, Tuple, Union, cast
@@ -82,6 +83,37 @@ else:
 
 
 logger = logging.getLogger(__name__)
+
+
+def _env_pp_rank_set(name: str) -> set[int | str]:
+    value = os.getenv(name, "").strip()
+    if not value:
+        return set()
+    ranks: set[int | str] = set()
+    for raw_item in value.replace(";", ",").split(","):
+        item = raw_item.strip().lower()
+        if not item:
+            continue
+        if item in {"last", "final"}:
+            ranks.add("last")
+            continue
+        try:
+            ranks.add(int(item))
+        except ValueError:
+            logger.warning("Ignoring invalid %s entry: %r", name, raw_item)
+    return ranks
+
+
+def _streambp_skipped_for_pipeline_rank() -> bool:
+    skip_ranks = _env_pp_rank_set("MEGATRON_STREAMBP_SKIP_PP_RANKS")
+    if not skip_ranks:
+        return False
+    try:
+        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+        pp_world_size = parallel_state.get_pipeline_model_parallel_world_size()
+    except Exception:
+        return False
+    return pp_rank in skip_ranks or ("last" in skip_ranks and pp_rank == pp_world_size - 1)
 
 
 def get_num_layers_to_build(
@@ -499,6 +531,8 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             return False, "inference"
         if mhc_manager is not None:
             return False, "mhc"
+        if _streambp_skipped_for_pipeline_rank():
+            return False, "skip_pp_rank"
         is_moe_layer = getattr(layer, "is_moe_layer", False)
         if self.config.streambp_skip_moe and is_moe_layer:
             return False, "skip_moe"
@@ -1055,6 +1089,9 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                                 chunk_size=self.config.streambp_chunk_size,
                                 chunk_forward=self._streambp_chunk_forward_for_mode(streambp_mode),
                                 moe_mlp_chunks=self.config.streambp_moe_mlp_chunks,
+                                moe_mlp_backward_chunks=(
+                                    self.config.streambp_moe_mlp_backward_chunks
+                                ),
                                 context_factory=make_inner_quantization_context,
                                 full_replay=streambp_mode.startswith("full_replay"),
                                 attention_mask=attention_mask,

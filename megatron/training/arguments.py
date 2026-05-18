@@ -2670,6 +2670,7 @@ def _add_network_size_args(parser):
         "streambp_chunk_forward",
         "streambp_moe_chunk_forward",
         "streambp_moe_mlp_chunks",
+        "streambp_moe_mlp_backward_chunks",
         "streambp_skip_moe",
         "streambp_skip_dsa",
         "streambp_validate",
@@ -3644,6 +3645,19 @@ def _add_training_args(parser):
         help=(
             "Split hybrid StreamBP MoE MLP replay into this many large chunks. "
             "This reduces TE FP8/FP4 unpadding peak memory without fully chunking MoE replay."
+        ),
+    )
+    group.add_argument(
+        "--streambp-moe-mlp-backward-chunks",
+        type=int,
+        default=(
+            int(os.getenv("MEGATRON_STREAMBP_MOE_MLP_BACKWARD_CHUNKS"))
+            if os.getenv("MEGATRON_STREAMBP_MOE_MLP_BACKWARD_CHUNKS") is not None
+            else None
+        ),
+        help=(
+            "Optional backward-only chunk count for hybrid StreamBP MoE MLP replay. "
+            "Unset reuses --streambp-moe-mlp-chunks."
         ),
     )
     group.add_argument(

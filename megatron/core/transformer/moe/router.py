@@ -210,6 +210,11 @@ class TopKRouter(Router):
                     torch.tensor(0.0, dtype=torch.float32, device=torch.cuda.current_device()),
                     persistent=False,
                 )
+                self.register_buffer(
+                    'quantile_expert_bias_current_batch_steps',
+                    torch.tensor(0.0, dtype=torch.float32, device=torch.cuda.current_device()),
+                    persistent=False,
+                )
         else:
             self.local_tokens_per_expert = None
             self.expert_bias = None
@@ -768,42 +773,108 @@ class TopKRouter(Router):
             dim=0,
         )
 
-    def _apply_quantile_expert_bias(
+    def _quantile_bias_enabled(self) -> bool:
+        return (
+            self.enable_expert_bias
+            and self.config.moe_router_expert_bias_update_method == "quantile"
+            and self.training
+        )
+
+    def _should_apply_current_batch_quantile_bias(self) -> bool:
+        if not self._quantile_bias_enabled():
+            return False
+        application = self.config.moe_router_quantile_bias_application
+        if application == "current_batch":
+            return True
+        if application != "warmup":
+            return False
+        steps = getattr(self, "quantile_expert_bias_current_batch_steps", None)
+        if steps is None:
+            return False
+        return bool(steps.item() < self.config.moe_router_quantile_bias_warmup_steps)
+
+    def _compute_quantile_candidate_bias(
+        self, scores: torch.Tensor, padding_mask: Optional[torch.Tensor] = None
+    ) -> Optional[torch.Tensor]:
+        """Compute the Quantile Balancing expert bias from a score matrix."""
+        if self.score_function != "sigmoid":
+            raise ValueError("Quantile expert bias currently requires sigmoid router scores.")
+
+        valid_scores = self._gather_valid_quantile_scores(scores, padding_mask)
+        num_tokens, num_experts = valid_scores.shape
+        if num_tokens == 0:
+            return None
+
+        alpha_rank = min(self.topk + 1, num_experts)
+        target_rank = int(math.floor(num_tokens * self.topk / num_experts))
+        target_rank = max(0, min(target_rank, num_tokens - 1))
+
+        # The article formulates routing as scores - beta. This codebase stores
+        # DeepSeek-style additive expert_bias, so expert_bias == -beta.
+        beta = -self.expert_bias.detach().float().view(1, num_experts)
+        for _ in range(self.config.moe_router_quantile_bias_iters):
+            alpha = torch.topk(valid_scores - beta, k=alpha_rank, dim=1).values[:, -1:]
+            beta = torch.topk(valid_scores - alpha, k=target_rank + 1, dim=0).values[-1:]
+
+        return (-beta.squeeze(0)).to(dtype=torch.float32)
+
+    def _record_quantile_candidate_bias(self, candidate_bias: torch.Tensor) -> None:
+        self.quantile_expert_bias_sum += candidate_bias
+        self.quantile_expert_bias_steps += 1.0
+        if self.config.moe_router_quantile_bias_application == "warmup":
+            self.quantile_expert_bias_current_batch_steps += 1.0
+
+    def _get_current_batch_quantile_bias(
         self, logits: torch.Tensor, padding_mask: Optional[torch.Tensor] = None
+    ) -> Optional[torch.Tensor]:
+        """Return an immediate QB bias for this routing call, preserving StreamBP replay."""
+        if not self._quantile_bias_enabled():
+            return None
+
+        replay = current_streambp_moe_aux_replay()
+        if replay is not None:
+            return replay.get_quantile_bias(self)
+
+        if not self._should_apply_current_batch_quantile_bias():
+            return None
+
+        with torch.no_grad():
+            scores = torch.sigmoid(logits.float())
+            candidate_bias = self._compute_quantile_candidate_bias(scores, padding_mask)
+            if candidate_bias is None:
+                return None
+
+            capture = current_streambp_moe_aux_capture()
+            if capture is not None and not torch.is_grad_enabled():
+                capture.record_quantile_bias(self, candidate_bias)
+            self._record_quantile_candidate_bias(candidate_bias)
+            return candidate_bias
+
+    def _apply_quantile_expert_bias(
+        self,
+        logits: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+        *,
+        skip: bool = False,
     ) -> None:
-        """Update expert bias with Quantile Balancing after routing used the old bias."""
+        """Update expert bias with delayed Quantile Balancing after routing."""
+        application = self.config.moe_router_quantile_bias_application
         if (
-            not self.enable_expert_bias
-            or self.config.moe_router_expert_bias_update_method != "quantile"
+            skip
+            or not self._quantile_bias_enabled()
+            or application == "current_batch"
+            or (application == "warmup" and self._should_apply_current_batch_quantile_bias())
             or not self.training
             or not torch.is_grad_enabled()
         ):
             return
 
         with torch.no_grad():
-            if self.score_function != "sigmoid":
-                raise ValueError("Quantile expert bias currently requires sigmoid router scores.")
-
             scores = torch.sigmoid(logits.float())
-            valid_scores = self._gather_valid_quantile_scores(scores, padding_mask)
-            num_tokens, num_experts = valid_scores.shape
-            if num_tokens == 0:
+            candidate_bias = self._compute_quantile_candidate_bias(scores, padding_mask)
+            if candidate_bias is None:
                 return
-
-            alpha_rank = min(self.topk + 1, num_experts)
-            target_rank = int(math.floor(num_tokens * self.topk / num_experts))
-            target_rank = max(0, min(target_rank, num_tokens - 1))
-
-            # The article formulates routing as scores - beta. This codebase stores
-            # DeepSeek-style additive expert_bias, so expert_bias == -beta.
-            beta = -self.expert_bias.detach().float().view(1, num_experts)
-            for _ in range(self.config.moe_router_quantile_bias_iters):
-                alpha = torch.topk(valid_scores - beta, k=alpha_rank, dim=1).values[:, -1:]
-                beta = torch.topk(valid_scores - alpha, k=target_rank + 1, dim=0).values[-1:]
-
-            candidate_bias = (-beta.squeeze(0)).to(dtype=torch.float32)
-            self.quantile_expert_bias_sum += candidate_bias
-            self.quantile_expert_bias_steps += 1.0
+            self._record_quantile_candidate_bias(candidate_bias)
 
     def routing(self, logits: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
         """Top-k routing function
@@ -829,6 +900,15 @@ class TopKRouter(Router):
         # Apply Z-Loss
         logits = self.apply_z_loss(logits, padding_mask=padding_mask)
 
+        current_batch_quantile_bias = self._get_current_batch_quantile_bias(
+            logits, padding_mask=padding_mask
+        )
+        expert_bias = (
+            current_batch_quantile_bias
+            if current_batch_quantile_bias is not None
+            else self.expert_bias
+        )
+
         # Calculate probs and routing_map for token dispatching
         if self.routing_type == "sinkhorn":
             probs, routing_map = self.sinkhorn_load_balancing(logits)
@@ -841,12 +921,16 @@ class TopKRouter(Router):
                 group_topk=self.config.moe_router_group_topk,
                 scaling_factor=self.config.moe_router_topk_scaling_factor,
                 score_function=self.score_function,
-                expert_bias=self.expert_bias,
+                expert_bias=expert_bias,
                 fused=self.config.moe_router_fusion,
                 router_replay=self.router_replay,
             )
 
-        self._apply_quantile_expert_bias(logits, padding_mask=padding_mask)
+        self._apply_quantile_expert_bias(
+            logits,
+            padding_mask=padding_mask,
+            skip=current_batch_quantile_bias is not None,
+        )
 
         # Apply token dropping to probs and routing_map.
         if self.config.moe_expert_capacity_factor is not None:

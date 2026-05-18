@@ -12,6 +12,8 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transfor
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
+    GPUTensorPool,
+    fine_grained_offloading_use_pinned_cpu_backup,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
@@ -23,6 +25,34 @@ from tests.unit_tests.test_utilities import Utils
 EPSILON = 0.30
 EPSILON_A2A = 0.30
 DELTA = 20  # MiB
+
+
+def test_fine_grained_offload_pin_memory_is_size_aware(monkeypatch):
+    monkeypatch.setenv("MEGATRON_FINE_OFFLOAD_PIN_MEMORY", "auto")
+    monkeypatch.setenv("MEGATRON_FINE_OFFLOAD_PINNED_MAX_MB", "1")
+
+    assert fine_grained_offloading_use_pinned_cpu_backup((256,), torch.float16)
+    assert not fine_grained_offloading_use_pinned_cpu_backup((1024, 1024), torch.float16)
+
+    monkeypatch.setenv("MEGATRON_FINE_OFFLOAD_PIN_MEMORY", "never")
+    assert not fine_grained_offloading_use_pinned_cpu_backup((256,), torch.float16)
+
+    monkeypatch.setenv("MEGATRON_FINE_OFFLOAD_PIN_MEMORY", "always")
+    assert fine_grained_offloading_use_pinned_cpu_backup((1024, 1024), torch.float16)
+
+
+def test_cpu_tensor_pool_tracks_pageable_cpu_backups_separately():
+    pool = GPUTensorPool(device="cpu", pin_memory=True)
+
+    tensor = pool.allocate((2, 3), dtype=torch.float32, pin_memory=False)
+    assert not tensor.is_pinned()
+    pool.free(tensor)
+
+    reused = pool.allocate((2, 3), dtype=torch.float32, pin_memory=False)
+    assert reused is tensor
+    assert not reused.is_pinned()
+
+    pool.clear()
 
 
 def _reset_cuda_memory() -> None:

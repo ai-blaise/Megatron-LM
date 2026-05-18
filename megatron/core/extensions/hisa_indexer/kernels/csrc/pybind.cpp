@@ -124,6 +124,29 @@ void launch_dsa_sparse_kv_bwd_sorted_from_scores(
     int head_dim, int value_dim, int topk_count, float softmax_scale,
     int scalar_dtype, int topk_dtype, int grad_dtype, cudaStream_t stream);
 
+void launch_dsa_indexer_rope_fwd(
+    const void* x, const void* freqs, void* out, int64_t total_rows,
+    int seqlen, int batch, int heads, int head_dim, int pe_dim,
+    int freq_seqlen, int freq_batch, int freq_heads, int64_t freq_stride_s,
+    int64_t freq_stride_b, int64_t freq_stride_h, int64_t freq_stride_d,
+    int x_dtype, int freqs_dtype, float mscale, int interleaved,
+    cudaStream_t stream);
+
+void launch_dsa_indexer_rope_fwd_inplace(
+    void* x, const void* freqs, int64_t total_rows, int seqlen, int batch,
+    int heads, int head_dim, int pe_dim, int freq_seqlen, int freq_batch,
+    int freq_heads, int64_t freq_stride_s, int64_t freq_stride_b,
+    int64_t freq_stride_h, int64_t freq_stride_d, int x_dtype,
+    int freqs_dtype, float mscale, int interleaved, cudaStream_t stream);
+
+void launch_dsa_indexer_rope_bwd(
+    const void* grad_out, const void* freqs, void* grad_x,
+    int64_t total_rows, int seqlen, int batch, int heads, int head_dim,
+    int pe_dim, int freq_seqlen, int freq_batch, int freq_heads,
+    int64_t freq_stride_s, int64_t freq_stride_b, int64_t freq_stride_h,
+    int64_t freq_stride_d, int grad_dtype, int freqs_dtype, float mscale,
+    int interleaved, cudaStream_t stream);
+
 }  // namespace hisa_indexer
 }  // namespace megatron
 
@@ -956,6 +979,315 @@ int dtype_code(torch::ScalarType dtype) {
   TORCH_CHECK(false, "unsupported dtype for DSA sparse K/V backward: ", dtype);
 }
 
+void check_dsa_indexer_rope_common(
+    torch::Tensor x_or_grad,
+    torch::Tensor freqs,
+    torch::Tensor out,
+    int64_t pe_dim) {
+  HISA_CHECK_CUDA(x_or_grad);
+  HISA_CHECK_CUDA(freqs);
+  HISA_CHECK_CUDA(out);
+
+  HISA_CHECK_CONTIG(x_or_grad);
+  HISA_CHECK_CONTIG(out);
+
+  TORCH_CHECK(x_or_grad.dim() == 4, "DSA indexer RoPE input must be [S, B, H, D]");
+  TORCH_CHECK(freqs.dim() == 4, "DSA indexer RoPE freqs must be [S, B|1, H|1, pe_dim]");
+  TORCH_CHECK(out.sizes() == x_or_grad.sizes(), "DSA indexer RoPE output shape mismatch");
+  TORCH_CHECK(out.scalar_type() == x_or_grad.scalar_type(),
+              "DSA indexer RoPE output dtype must match input dtype");
+  TORCH_CHECK(
+      x_or_grad.scalar_type() == torch::kFloat32 ||
+          x_or_grad.scalar_type() == torch::kBFloat16 ||
+          x_or_grad.scalar_type() == torch::kFloat16,
+      "DSA indexer RoPE supports fp32/bf16/fp16 inputs");
+  TORCH_CHECK(
+      freqs.scalar_type() == torch::kFloat32 ||
+          freqs.scalar_type() == torch::kBFloat16 ||
+          freqs.scalar_type() == torch::kFloat16,
+      "DSA indexer RoPE supports fp32/bf16/fp16 freqs");
+
+  const int64_t S = x_or_grad.size(0);
+  const int64_t B = x_or_grad.size(1);
+  const int64_t H = x_or_grad.size(2);
+  const int64_t D = x_or_grad.size(3);
+  TORCH_CHECK(D > 0 && D <= 256, "DSA indexer RoPE head_dim must be in (0, 256]");
+  TORCH_CHECK(pe_dim > 0 && pe_dim <= D, "DSA indexer RoPE pe_dim must be in (0, head_dim]");
+  TORCH_CHECK((pe_dim % 2) == 0, "DSA indexer RoPE pe_dim must be even");
+  TORCH_CHECK(freqs.size(3) == pe_dim, "DSA indexer RoPE freqs last dim must equal pe_dim");
+  TORCH_CHECK(freqs.size(0) == 1 || freqs.size(0) == S,
+              "DSA indexer RoPE freqs sequence dim must be 1 or match input");
+  TORCH_CHECK(freqs.size(1) == 1 || freqs.size(1) == B,
+              "DSA indexer RoPE freqs batch dim must be 1 or match input");
+  TORCH_CHECK(freqs.size(2) == 1 || freqs.size(2) == H,
+              "DSA indexer RoPE freqs head dim must be 1 or match input");
+}
+
+void dsa_indexer_rope_fwd(
+    torch::Tensor x,
+    torch::Tensor freqs,
+    torch::Tensor out,
+    int64_t pe_dim,
+    double mscale,
+    bool interleaved) {
+  check_dsa_indexer_rope_common(x, freqs, out, pe_dim);
+
+  const int S = static_cast<int>(x.size(0));
+  const int B = static_cast<int>(x.size(1));
+  const int H = static_cast<int>(x.size(2));
+  const int D = static_cast<int>(x.size(3));
+  const int64_t total_rows = static_cast<int64_t>(S) * B * H;
+  if (total_rows == 0) {
+    return;
+  }
+
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  megatron::hisa_indexer::launch_dsa_indexer_rope_fwd(
+      x.data_ptr(),
+      freqs.data_ptr(),
+      out.data_ptr(),
+      total_rows,
+      S,
+      B,
+      H,
+      D,
+      static_cast<int>(pe_dim),
+      static_cast<int>(freqs.size(0)),
+      static_cast<int>(freqs.size(1)),
+      static_cast<int>(freqs.size(2)),
+      freqs.stride(0),
+      freqs.stride(1),
+      freqs.stride(2),
+      freqs.stride(3),
+      dtype_code(x.scalar_type()),
+      dtype_code(freqs.scalar_type()),
+      static_cast<float>(mscale),
+      interleaved ? 1 : 0,
+      stream);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void dsa_indexer_rope_fwd_inplace(
+    torch::Tensor x,
+    torch::Tensor freqs,
+    int64_t pe_dim,
+    double mscale,
+    bool interleaved) {
+  check_dsa_indexer_rope_common(x, freqs, x, pe_dim);
+
+  const int S = static_cast<int>(x.size(0));
+  const int B = static_cast<int>(x.size(1));
+  const int H = static_cast<int>(x.size(2));
+  const int D = static_cast<int>(x.size(3));
+  const int64_t total_rows = static_cast<int64_t>(S) * B * H;
+  if (total_rows == 0) {
+    return;
+  }
+
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  megatron::hisa_indexer::launch_dsa_indexer_rope_fwd_inplace(
+      x.data_ptr(),
+      freqs.data_ptr(),
+      total_rows,
+      S,
+      B,
+      H,
+      D,
+      static_cast<int>(pe_dim),
+      static_cast<int>(freqs.size(0)),
+      static_cast<int>(freqs.size(1)),
+      static_cast<int>(freqs.size(2)),
+      freqs.stride(0),
+      freqs.stride(1),
+      freqs.stride(2),
+      freqs.stride(3),
+      dtype_code(x.scalar_type()),
+      dtype_code(freqs.scalar_type()),
+      static_cast<float>(mscale),
+      interleaved ? 1 : 0,
+      stream);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void check_dsa_indexer_rope_flat_common(
+    torch::Tensor x_or_grad,
+    torch::Tensor freqs,
+    torch::Tensor out,
+    int64_t heads,
+    int64_t head_dim,
+    int64_t pe_dim) {
+  HISA_CHECK_CUDA(x_or_grad);
+  HISA_CHECK_CUDA(freqs);
+  HISA_CHECK_CUDA(out);
+
+  HISA_CHECK_CONTIG(x_or_grad);
+  HISA_CHECK_CONTIG(out);
+
+  TORCH_CHECK(x_or_grad.dim() == 3, "flat DSA indexer RoPE input must be [S, B, H*D]");
+  TORCH_CHECK(freqs.dim() == 4, "flat DSA indexer RoPE freqs must be [S, B|1, H|1, pe_dim]");
+  TORCH_CHECK(out.sizes() == x_or_grad.sizes(), "flat DSA indexer RoPE output shape mismatch");
+  TORCH_CHECK(out.scalar_type() == x_or_grad.scalar_type(),
+              "flat DSA indexer RoPE output dtype must match input dtype");
+  TORCH_CHECK(
+      x_or_grad.scalar_type() == torch::kFloat32 ||
+          x_or_grad.scalar_type() == torch::kBFloat16 ||
+          x_or_grad.scalar_type() == torch::kFloat16,
+      "flat DSA indexer RoPE supports fp32/bf16/fp16 inputs");
+  TORCH_CHECK(
+      freqs.scalar_type() == torch::kFloat32 ||
+          freqs.scalar_type() == torch::kBFloat16 ||
+          freqs.scalar_type() == torch::kFloat16,
+      "flat DSA indexer RoPE supports fp32/bf16/fp16 freqs");
+
+  const int64_t S = x_or_grad.size(0);
+  const int64_t B = x_or_grad.size(1);
+  TORCH_CHECK(heads > 0, "flat DSA indexer RoPE heads must be positive");
+  TORCH_CHECK(head_dim > 0 && head_dim <= 256,
+              "flat DSA indexer RoPE head_dim must be in (0, 256]");
+  TORCH_CHECK(x_or_grad.size(2) == heads * head_dim,
+              "flat DSA indexer RoPE last dim must equal heads * head_dim");
+  TORCH_CHECK(pe_dim > 0 && pe_dim <= head_dim,
+              "flat DSA indexer RoPE pe_dim must be in (0, head_dim]");
+  TORCH_CHECK((pe_dim % 2) == 0, "flat DSA indexer RoPE pe_dim must be even");
+  TORCH_CHECK(freqs.size(3) == pe_dim, "flat DSA indexer RoPE freqs last dim must equal pe_dim");
+  TORCH_CHECK(freqs.size(0) == 1 || freqs.size(0) == S,
+              "flat DSA indexer RoPE freqs sequence dim must be 1 or match input");
+  TORCH_CHECK(freqs.size(1) == 1 || freqs.size(1) == B,
+              "flat DSA indexer RoPE freqs batch dim must be 1 or match input");
+  TORCH_CHECK(freqs.size(2) == 1 || freqs.size(2) == heads,
+              "flat DSA indexer RoPE freqs head dim must be 1 or match heads");
+}
+
+void dsa_indexer_rope_fwd_inplace_flat(
+    torch::Tensor x,
+    torch::Tensor freqs,
+    int64_t heads,
+    int64_t head_dim,
+    int64_t pe_dim,
+    double mscale,
+    bool interleaved) {
+  check_dsa_indexer_rope_flat_common(x, freqs, x, heads, head_dim, pe_dim);
+
+  const int S = static_cast<int>(x.size(0));
+  const int B = static_cast<int>(x.size(1));
+  const int64_t total_rows = static_cast<int64_t>(S) * B * heads;
+  if (total_rows == 0) {
+    return;
+  }
+
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  megatron::hisa_indexer::launch_dsa_indexer_rope_fwd_inplace(
+      x.data_ptr(),
+      freqs.data_ptr(),
+      total_rows,
+      S,
+      B,
+      static_cast<int>(heads),
+      static_cast<int>(head_dim),
+      static_cast<int>(pe_dim),
+      static_cast<int>(freqs.size(0)),
+      static_cast<int>(freqs.size(1)),
+      static_cast<int>(freqs.size(2)),
+      freqs.stride(0),
+      freqs.stride(1),
+      freqs.stride(2),
+      freqs.stride(3),
+      dtype_code(x.scalar_type()),
+      dtype_code(freqs.scalar_type()),
+      static_cast<float>(mscale),
+      interleaved ? 1 : 0,
+      stream);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void dsa_indexer_rope_bwd_flat(
+    torch::Tensor grad_out,
+    torch::Tensor freqs,
+    torch::Tensor grad_x,
+    int64_t heads,
+    int64_t head_dim,
+    int64_t pe_dim,
+    double mscale,
+    bool interleaved) {
+  check_dsa_indexer_rope_flat_common(grad_out, freqs, grad_x, heads, head_dim, pe_dim);
+
+  const int S = static_cast<int>(grad_out.size(0));
+  const int B = static_cast<int>(grad_out.size(1));
+  const int64_t total_rows = static_cast<int64_t>(S) * B * heads;
+  if (total_rows == 0) {
+    return;
+  }
+
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  megatron::hisa_indexer::launch_dsa_indexer_rope_bwd(
+      grad_out.data_ptr(),
+      freqs.data_ptr(),
+      grad_x.data_ptr(),
+      total_rows,
+      S,
+      B,
+      static_cast<int>(heads),
+      static_cast<int>(head_dim),
+      static_cast<int>(pe_dim),
+      static_cast<int>(freqs.size(0)),
+      static_cast<int>(freqs.size(1)),
+      static_cast<int>(freqs.size(2)),
+      freqs.stride(0),
+      freqs.stride(1),
+      freqs.stride(2),
+      freqs.stride(3),
+      dtype_code(grad_out.scalar_type()),
+      dtype_code(freqs.scalar_type()),
+      static_cast<float>(mscale),
+      interleaved ? 1 : 0,
+      stream);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void dsa_indexer_rope_bwd(
+    torch::Tensor grad_out,
+    torch::Tensor freqs,
+    torch::Tensor grad_x,
+    int64_t pe_dim,
+    double mscale,
+    bool interleaved) {
+  check_dsa_indexer_rope_common(grad_out, freqs, grad_x, pe_dim);
+
+  const int S = static_cast<int>(grad_out.size(0));
+  const int B = static_cast<int>(grad_out.size(1));
+  const int H = static_cast<int>(grad_out.size(2));
+  const int D = static_cast<int>(grad_out.size(3));
+  const int64_t total_rows = static_cast<int64_t>(S) * B * H;
+  if (total_rows == 0) {
+    return;
+  }
+
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  megatron::hisa_indexer::launch_dsa_indexer_rope_bwd(
+      grad_out.data_ptr(),
+      freqs.data_ptr(),
+      grad_x.data_ptr(),
+      total_rows,
+      S,
+      B,
+      H,
+      D,
+      static_cast<int>(pe_dim),
+      static_cast<int>(freqs.size(0)),
+      static_cast<int>(freqs.size(1)),
+      static_cast<int>(freqs.size(2)),
+      freqs.stride(0),
+      freqs.stride(1),
+      freqs.stride(2),
+      freqs.stride(3),
+      dtype_code(grad_out.scalar_type()),
+      dtype_code(freqs.scalar_type()),
+      static_cast<float>(mscale),
+      interleaved ? 1 : 0,
+      stream);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 int topk_dtype_code(torch::ScalarType dtype) {
   if (dtype == torch::kInt16) {
     return 0;
@@ -1486,4 +1818,24 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "dsa_sparse_kv_bwd_sorted_from_scores",
       &dsa_sparse_kv_bwd_sorted_from_scores,
       "Sparse DSA sorted-segment K/V backward from forward-saved scores (CUDA)");
+  m.def(
+      "dsa_indexer_rope_fwd",
+      &dsa_indexer_rope_fwd,
+      "DSA indexer RoPE full-head writer forward (CUDA)");
+  m.def(
+      "dsa_indexer_rope_fwd_inplace",
+      &dsa_indexer_rope_fwd_inplace,
+      "DSA indexer RoPE full-head writer in-place forward (CUDA)");
+  m.def(
+      "dsa_indexer_rope_fwd_inplace_flat",
+      &dsa_indexer_rope_fwd_inplace_flat,
+      "DSA indexer RoPE flat projected in-place forward (CUDA)");
+  m.def(
+      "dsa_indexer_rope_bwd_flat",
+      &dsa_indexer_rope_bwd_flat,
+      "DSA indexer RoPE flat projected backward (CUDA)");
+  m.def(
+      "dsa_indexer_rope_bwd",
+      &dsa_indexer_rope_bwd,
+      "DSA indexer RoPE full-head writer backward (CUDA)");
 }

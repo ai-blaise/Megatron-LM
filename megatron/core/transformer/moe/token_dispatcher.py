@@ -36,6 +36,7 @@ from megatron.core.transformer.moe.moe_utils import (
 )
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.tensor_audit import tensor_audit
 
 logger = logging.getLogger(__name__)
 
@@ -625,6 +626,15 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             else:
                 self.routing_map = pad_routing_map(self.routing_map, pad_multiple)
         self.tokens_per_expert = self.preprocess(self.routing_map)
+        tensor_audit(
+            "moe_dispatcher/preprocess",
+            hidden=hidden_states,
+            probs=probs,
+            routing_map=self.routing_map,
+            tokens_per_expert=self.tokens_per_expert,
+            input_splits=getattr(self, "input_splits", None),
+            output_splits=getattr(self, "output_splits", None),
+        )
 
         if self.shared_experts is not None:
             self.shared_experts.pre_forward_comm(hidden_states.view(self.hidden_shape))
@@ -647,6 +657,14 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             num_out_tokens=self.num_out_tokens,
             fused=self.config.moe_permute_fusion,
             drop_and_pad=self.drop_and_pad,
+        )
+        tensor_audit(
+            "moe_dispatcher/after_permute1",
+            permuted_tokens=permutated_local_input_tokens,
+            permuted_probs=permuted_probs,
+            reverse_map=self.reversed_local_input_permutation_mapping,
+            tokens_per_expert=self.tokens_per_expert,
+            num_out_tokens=self.num_out_tokens,
         )
         return permutated_local_input_tokens, permuted_probs
 
@@ -674,6 +692,16 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         )
         global_probs = all_to_all(
             self.ep_group, permuted_probs, self.output_splits, self.input_splits
+        )
+        tensor_audit(
+            "moe_dispatcher/after_ep_alltoall",
+            input_tokens=permutated_local_input_tokens,
+            input_probs=permuted_probs,
+            global_tokens=global_input_tokens,
+            global_probs=global_probs,
+            input_splits=self.input_splits,
+            output_splits=self.output_splits,
+            tokens_per_expert=self.tokens_per_expert,
         )
 
         return global_input_tokens, global_probs
@@ -705,6 +733,13 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             global_probs = gather_from_sequence_parallel_region(
                 global_probs, group=self.tp_group, output_split_sizes=output_split_sizes
             )
+        tensor_audit(
+            "moe_dispatcher/after_tp_gather",
+            global_tokens=global_input_tokens,
+            global_probs=global_probs,
+            output_splits_tp=self.output_splits_tp,
+            tokens_per_expert=self.tokens_per_expert,
+        )
 
         # Permutation 2: Sort tokens by local expert.
         self.tokens_per_expert = self._maybe_dtoh_and_synchronize(
@@ -747,6 +782,13 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             "before_finish", self.tokens_per_expert
         )
         self.tokens_per_expert = None
+        tensor_audit(
+            "moe_dispatcher/dispatch_output",
+            global_tokens=global_input_tokens,
+            global_probs=global_probs,
+            tokens_per_expert=tokens_per_expert,
+            global_tokens_per_local_expert=self.num_global_tokens_per_local_expert,
+        )
         return global_input_tokens, tokens_per_expert, global_probs
 
     def combine_preprocess(self, hidden_states):

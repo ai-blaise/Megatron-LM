@@ -6,6 +6,7 @@ import pytest
 import os
 import sys
 import json
+import warnings
 from types import SimpleNamespace
 
 # Add parent directory to path for imports
@@ -13,6 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 
+from megatron.core.datasets.utils import Split
 from megatron.training.datasets.sft_dataset import IGNORE_INDEX, SFTDataset, SFTLowLevelDataset
 
 
@@ -99,7 +101,20 @@ class _FakeTokenizer:
         )
 
 
-def test_sft_dataset_returns_true_padding_mask_not_loss_mask_or_pad_id():
+class _AmbiguousPadTokenizer:
+    eod = 2
+    pad = 2
+    unique_identifiers = {"class": "AmbiguousPadTokenizer"}
+
+    def tokenize_conversation(self, conversation, return_target, add_generation_prompt):
+        del conversation, return_target, add_generation_prompt
+        return (
+            np.asarray([11, 12, 2], dtype=np.int64),
+            np.asarray([IGNORE_INDEX, 12, 2], dtype=np.int64),
+        )
+
+
+def _make_sft_dataset(tokenizer, sequence_length=8):
     dataset = SFTDataset.__new__(SFTDataset)
     dataset.dataset = [[
         {"role": "system", "content": "s"},
@@ -108,8 +123,8 @@ def test_sft_dataset_returns_true_padding_mask_not_loss_mask_or_pad_id():
     ]]
     dataset.indices = np.asarray([0], dtype=np.int64)
     dataset.config = SimpleNamespace(
-        tokenizer=_FakeTokenizer(),
-        sequence_length=8,
+        tokenizer=tokenizer,
+        sequence_length=sequence_length,
         hybrid_context_parallel=False,
         data_parallel_size=1,
         context_parallel_size=1,
@@ -118,6 +133,11 @@ def test_sft_dataset_returns_true_padding_mask_not_loss_mask_or_pad_id():
         create_attention_mask=False,
         reset_attention_mask=False,
     )
+    return dataset
+
+
+def test_sft_dataset_returns_true_padding_mask_not_loss_mask_or_pad_id():
+    dataset = _make_sft_dataset(_FakeTokenizer())
 
     sample = dataset[0]
 
@@ -134,3 +154,39 @@ def test_sft_dataset_returns_true_padding_mask_not_loss_mask_or_pad_id():
     ]
     assert sample["padding_mask"][1].item() is False
     assert sample["loss_mask"].tolist()[:2] == [0.0, 1.0]
+
+
+def test_sft_dataset_masks_padding_positions_not_ambiguous_pad_id():
+    dataset = _make_sft_dataset(_AmbiguousPadTokenizer(), sequence_length=5)
+
+    sample = dataset[0]
+
+    assert sample["labels"].tolist() == [12, 2, 2, 2, 2]
+    assert sample["padding_mask"].tolist() == [False, False, False, True, True]
+    assert sample["loss_mask"].tolist() == [1.0, 1.0, 0.0, 0.0, 0.0]
+
+
+def test_sft_dataset_does_not_warn_for_ambiguous_pad_id():
+    config = SimpleNamespace(
+        random_seed=1234,
+        sequence_length=5,
+        split="100,0,0",
+        split_matrix=[(0, 1.0), None, None],
+        tokenizer=_AmbiguousPadTokenizer(),
+        allow_ambiguous_pad_tokens=False,
+    )
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        SFTDataset(
+            [[{"role": "assistant", "content": "x"}]],
+            "mock",
+            np.asarray([0]),
+            1,
+            Split.train,
+            config,
+        )
+
+    assert not any(
+        "pad token id in the tokenizer collides" in str(warning.message) for warning in caught
+    )

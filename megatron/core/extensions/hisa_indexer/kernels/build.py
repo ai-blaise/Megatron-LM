@@ -92,6 +92,7 @@ def _build_ext():
         str(_CSRC / "hisa_score_bwd.cu"),
         str(_CSRC / "hisa_selected_score_bwd.cu"),
         str(_CSRC / "dsa_sparse_kv_bwd.cu"),
+        str(_CSRC / "dsa_indexer_rope.cu"),
     ]
     fused_path = _CSRC / "hisa_score_bwd_fused.cu"
     if fused_path.exists():

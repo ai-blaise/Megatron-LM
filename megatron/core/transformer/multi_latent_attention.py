@@ -2,6 +2,7 @@
 
 
 import math
+import os
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import NoReturn, Optional, Union
@@ -16,6 +17,63 @@ except ImportError:
     HAVE_EINOPS = False
 
 
+def _env_flag_enabled(name: str, default: str = "0") -> bool:
+    value = os.getenv(name, default)
+    return value.lower() in ("1", "true", "yes", "on")
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def _maybe_trim_cuda_cache_before_mla_key_cat(
+    k_no_pe: torch.Tensor,
+    k_pos_emb: torch.Tensor,
+) -> None:
+    """Release cached CUDA blocks before the large MLA key materialization.
+
+    StreamBP DSA replay builds the full-context MLA key for every attention
+    replay chunk. The allocator can be sitting on multiple GiB of reserved but
+    unallocated blocks at this boundary, which is enough to make the full key
+    cat fail even though the raw working set would fit. Keep this conditional
+    so steady-state runs only pay the synchronization cost near the memory cliff.
+    """
+
+    if not _env_flag_enabled("MEGATRON_MLA_TRIM_CACHE_BEFORE_KEY_CAT", "1"):
+        return
+    if not (torch.cuda.is_available() and k_no_pe.is_cuda and k_pos_emb.is_cuda):
+        return
+
+    key_bytes = (
+        k_no_pe.numel() * k_no_pe.element_size()
+        + k_pos_emb.numel() * k_pos_emb.element_size()
+    )
+    mib = 1024 * 1024
+    margin_bytes = _env_int("MEGATRON_MLA_KEY_CAT_TRIM_MARGIN_MB", 1024) * mib
+    cached_threshold = _env_int("MEGATRON_MLA_KEY_CAT_TRIM_CACHED_MB", 512) * mib
+
+    free_bytes, _ = torch.cuda.mem_get_info()
+    cached_bytes = max(
+        0, torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+    )
+    if free_bytes < key_bytes + margin_bytes and cached_bytes > cached_threshold:
+        tensor_audit(
+            "mla/key_cat_empty_cache",
+            k_no_pe=k_no_pe,
+            k_pos_emb=k_pos_emb,
+            key_bytes_mb=key_bytes // mib,
+            free_mb=free_bytes // mib,
+            cached_mb=cached_bytes // mib,
+        )
+        torch.cuda.empty_cache()
+
+
 from megatron.core import tensor_parallel
 from megatron.core.extensions.transformer_engine import split_te_layernorm_column_parallel_linear
 from megatron.core.models.common.embeddings import (
@@ -28,6 +86,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_audit import tensor_audit
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.mappings import (
     gather_from_sequence_parallel_region,
@@ -355,6 +414,7 @@ class MultiLatentAttention(Attention):
                 )
             streambp_qkv_query_indices = streambp_query_indices
 
+        self._dsa_split_qk_parts = None
         with off_interface(self.offload_qkv_linear, hidden_states, "qkv_linear") as hidden_states:
             query, key, value, q_compressed, kv_compressed, gate = self.get_query_key_value_tensors(
                 hidden_states,
@@ -422,6 +482,10 @@ class MultiLatentAttention(Attention):
                         )
 
                     query, streambp_query_positions = select_streambp_query_tensor(query)
+                    if self._dsa_split_qk_parts is not None:
+                        split_q_pe, split_k_pe = self._dsa_split_qk_parts
+                        split_q_pe, _ = select_streambp_query_tensor(split_q_pe)
+                        self._dsa_split_qk_parts = (split_q_pe, split_k_pe)
 
                     if gate is not None:
                         if gate.size(0) != query.size(0):
@@ -469,6 +533,11 @@ class MultiLatentAttention(Attention):
                 else:
                     if query.size(0) != streambp_query_indices.numel():
                         query = query[streambp_start:streambp_end]
+                    if self._dsa_split_qk_parts is not None:
+                        split_q_pe, split_k_pe = self._dsa_split_qk_parts
+                        if split_q_pe.size(0) != query.size(0):
+                            split_q_pe = split_q_pe[streambp_start:streambp_end]
+                        self._dsa_split_qk_parts = (split_q_pe, split_k_pe)
                     streambp_query_positions = streambp_query_indices.to(device=query.device)
                     streambp_key_positions = torch.arange(
                         streambp_prefix_end,
@@ -535,6 +604,8 @@ class MultiLatentAttention(Attention):
                     # query representation.
                     extra_kwargs["x"] = hidden_states_for_dsa
                     extra_kwargs["qr"] = q_compressed_for_dsa
+                    if self._dsa_split_qk_parts is not None:
+                        extra_kwargs["dsa_split_qk"] = self._dsa_split_qk_parts
                     if chunk_range is not None:
                         extra_kwargs["streambp_positions"] = (
                             streambp_query_positions,
@@ -1408,16 +1479,59 @@ class MLASelfAttention(MultiLatentAttention):
                     mla_rotary_interleaved=True,
                 )
 
-                # query: [num_tokens, n, (qk_head_dim + v_head_dim)]
-                query = torch.cat([q_no_pe, q_pos_emb], dim=-1)
-
-                # key: [num_tokens, n, (qk_head_dim + v_head_dim)]
-                if k_pos_emb.ndim == 4:
-                    k_pos_emb = k_pos_emb.expand(-1, -1, self.num_attention_heads_per_partition, -1)
+                use_split_dsa_qk = (
+                    self.training
+                    and inference_context is None
+                    and self.config.experimental_attention_variant == "dsa"
+                    and _env_flag_enabled("MEGATRON_DSA_SPLIT_QK", "1")
+                )
+                if use_split_dsa_qk:
+                    self._dsa_split_qk_parts = (q_pos_emb, k_pos_emb)
+                    query = q_no_pe
+                    key = k_no_pe
+                    tensor_audit(
+                        "mla/qkv_split_inputs",
+                        q_no_pe=q_no_pe,
+                        q_pos_emb=q_pos_emb,
+                        k_no_pe=k_no_pe,
+                        k_pos_emb=k_pos_emb,
+                        streambp_slice=q_streambp_slice,
+                        streambp_indices=(
+                            None
+                            if q_streambp_indices is None
+                            else tuple(q_streambp_indices.shape)
+                        ),
+                    )
                 else:
-                    assert k_pos_emb.ndim == 3
-                    k_pos_emb = k_pos_emb.expand(-1, self.num_attention_heads_per_partition, -1)
-                key = torch.cat([k_no_pe, k_pos_emb], dim=-1)
+                    # query: [num_tokens, n, (qk_head_dim + v_head_dim)]
+                    query = torch.cat([q_no_pe, q_pos_emb], dim=-1)
+
+                    # key: [num_tokens, n, (qk_head_dim + v_head_dim)]
+                    if k_pos_emb.ndim == 4:
+                        k_pos_emb = k_pos_emb.expand(
+                            -1, -1, self.num_attention_heads_per_partition, -1
+                        )
+                    else:
+                        assert k_pos_emb.ndim == 3
+                        k_pos_emb = k_pos_emb.expand(
+                            -1, self.num_attention_heads_per_partition, -1
+                        )
+                    tensor_audit(
+                        "mla/qkv_cat_inputs",
+                        q_no_pe=q_no_pe,
+                        q_pos_emb=q_pos_emb,
+                        k_no_pe=k_no_pe,
+                        k_pos_emb=k_pos_emb,
+                        streambp_slice=q_streambp_slice,
+                        streambp_indices=(
+                            None
+                            if q_streambp_indices is None
+                            else tuple(q_streambp_indices.shape)
+                        ),
+                    )
+                    _maybe_trim_cuda_cache_before_mla_key_cat(k_no_pe, k_pos_emb)
+                    key = torch.cat([k_no_pe, k_pos_emb], dim=-1)
+                    tensor_audit("mla/key_cat_output", key=key)
 
             query = query.contiguous()
             key = key.contiguous()

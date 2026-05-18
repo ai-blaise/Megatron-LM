@@ -483,6 +483,13 @@ class TransformerConfig(ModelParallelConfig):
     without using fully chunked MoE replay.
     """
 
+    streambp_moe_mlp_backward_chunks: Optional[int] = None
+    """Optional backward-only chunk count for hybrid StreamBP MoE MLP replay.
+
+    None reuses streambp_moe_mlp_chunks. Setting this larger than streambp_moe_mlp_chunks
+    reduces backward recompute peak memory without increasing no-grad forward replay chunks.
+    """
+
     streambp_skip_moe: bool = False
     """If True, do not apply StreamBP to MoE transformer layers."""
 
@@ -872,6 +879,16 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_router_quantile_bias_iters: int = 5
     """Number of alternating alpha/beta quantile iterations for Quantile Balancing."""
+
+    moe_router_quantile_bias_application: Literal['delayed', 'current_batch', 'warmup'] = 'delayed'
+    """How Quantile Balancing bias is applied.
+    - "delayed": existing behavior; compute from the current scores but use it after finalize.
+    - "current_batch": compute before top-k and use it for the current routing decision.
+    - "warmup": use current-batch routing for a fixed number of router applications, then delayed.
+    """
+
+    moe_router_quantile_bias_warmup_steps: int = 0
+    """Number of per-router quantile applications using current-batch routing in warmup mode."""
 
     moe_router_quantile_bias_sync_scores: bool = True
     """All-gather valid router scores across TP/CP/DP before Quantile Balancing.
@@ -1639,6 +1656,11 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError("streambp_logits_chunk_size must be positive when set")
             if self.streambp_moe_mlp_chunks <= 0:
                 raise ValueError("streambp_moe_mlp_chunks must be positive")
+            if (
+                self.streambp_moe_mlp_backward_chunks is not None
+                and self.streambp_moe_mlp_backward_chunks <= 0
+            ):
+                raise ValueError("streambp_moe_mlp_backward_chunks must be positive when set")
             if self.streambp_profile_limit <= 0:
                 raise ValueError("streambp_profile_limit must be positive")
 
@@ -2102,6 +2124,16 @@ class TransformerConfig(ModelParallelConfig):
             )
         if self.moe_router_quantile_bias_iters < 1:
             raise ValueError("--moe-router-quantile-bias-iters must be >= 1.")
+        if self.moe_router_quantile_bias_warmup_steps < 0:
+            raise ValueError("--moe-router-quantile-bias-warmup-steps must be >= 0.")
+        if (
+            self.moe_router_quantile_bias_application == "warmup"
+            and self.moe_router_quantile_bias_warmup_steps == 0
+        ):
+            raise ValueError(
+                "--moe-router-quantile-bias-application warmup requires "
+                "--moe-router-quantile-bias-warmup-steps > 0."
+            )
 
         if self.num_moe_experts and self.fp8:
             # TE version below 1.7.0 will raise Error when handle zeros tokens for expert

@@ -14,15 +14,19 @@ from __future__ import annotations
 import os
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Optional, Sequence
 
 import torch
 from torch import Tensor
 
+from megatron.core.tensor_audit import tensor_audit
 from megatron.core.packed_seq_params import PackedSeqParams
 
 STREAMBP_PENDING_CHUNKS_ATTR = "_streambp_pending_chunks"
+_STREAMBP_FUSED_LCE_LOGGED = False
+_STREAMBP_FUSED_LCE_REJECTION_LOGGED = False
 
 ChunkRange = tuple[int, int]
 ContextFactory = Optional[Callable[[], Any]]
@@ -52,6 +56,41 @@ def _maybe_trim_cuda_cache_before_moe_replay() -> None:
     cached_threshold_mb = int(os.getenv("MEGATRON_STREAMBP_MOE_REPLAY_TRIM_CACHED_MB", "512"))
     if free_bytes < free_threshold_mb * mib and cached > cached_threshold_mb * mib:
         torch.cuda.empty_cache()
+
+
+def _suppress_fine_grained_offload_forced_release_context():
+    """Keep replay tensors' storage alive while preserving CPU offload hooks."""
+    if _env_flag("MEGATRON_FINE_OFFLOAD_FORCE_RELEASE_IN_STREAMBP_REPLAY"):
+        return nullcontext()
+    names_spec = os.getenv("MEGATRON_FINE_OFFLOAD_STREAMBP_REPLAY_KEEP_STORAGES", "core_attn")
+    names = [name for name in names_spec.replace(",", " ").split() if name]
+    if not names or names == ["none"]:
+        return nullcontext()
+    try:
+        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+            fine_grained_offloading_suppress_forced_release,
+        )
+    except Exception:
+        return nullcontext()
+    return fine_grained_offloading_suppress_forced_release(names=names)
+
+
+@contextmanager
+def _suppress_fine_grained_offload_replay_context():
+    """Bypass fine-grained offload markers inside StreamBP replay graphs."""
+    try:
+        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+            fine_grained_offloading_suppress_offload,
+        )
+    except Exception:
+        with _suppress_fine_grained_offload_forced_release_context():
+            yield
+        return
+    with (
+        fine_grained_offloading_suppress_offload(),
+        _suppress_fine_grained_offload_forced_release_context(),
+    ):
+        yield
 
 
 def _distributed_rank() -> int:
@@ -220,6 +259,7 @@ class StreamBPMoeAuxState:
     def __init__(self) -> None:
         self._stats: dict[int, dict[str, StreamBPMoeAuxStats]] = {}
         self._chunk_stats: dict[int, dict[str, list[StreamBPMoeAuxStats]]] = {}
+        self._quantile_bias: dict[int, list[Tensor]] = {}
         self._replay_chunk_index: Optional[int] = None
 
     def record(self, router: Any, aux_loss_type: str, stats: StreamBPMoeAuxStats) -> None:
@@ -268,8 +308,36 @@ class StreamBPMoeAuxState:
             with_padding_mask=full_stats.with_padding_mask,
         )
 
+    def record_quantile_bias(self, router: Any, bias: Tensor) -> None:
+        """Record the routing bias used by a StreamBP MoE no-grad forward chunk."""
+        self._quantile_bias.setdefault(id(router), []).append(bias.detach())
+
+    def get_quantile_bias(self, router: Any) -> Optional[Tensor]:
+        """Return the recorded routing bias for the current replay chunk."""
+        biases = self._quantile_bias.get(id(router))
+        if not biases:
+            return None
+        if self._replay_chunk_index is None:
+            if len(biases) != 1:
+                raise ValueError(
+                    "StreamBP MoE quantile replay requested full bias but captured "
+                    f"{len(biases)} chunk biases"
+                )
+            return biases[0]
+        if self._replay_chunk_index >= len(biases):
+            raise ValueError(
+                f"Missing StreamBP MoE quantile bias chunk {self._replay_chunk_index}; "
+                f"captured {len(biases)} chunks"
+            )
+        return biases[self._replay_chunk_index]
+
     def has_router(self, router: Any) -> bool:
-        return id(router) in self._stats or id(router) in self._chunk_stats
+        router_id = id(router)
+        return (
+            router_id in self._stats
+            or router_id in self._chunk_stats
+            or router_id in self._quantile_bias
+        )
 
 
 _MOE_AUX_CAPTURE_STACK: list[StreamBPMoeAuxState] = []
@@ -389,7 +457,9 @@ def _concat_streambp_chunk_outputs(outputs: list[Any]) -> Any:
     if first is None:
         return None
     if torch.is_tensor(first):
-        return torch.cat(outputs, dim=0)
+        result = torch.cat(outputs, dim=0)
+        outputs.clear()
+        return result
     if isinstance(first, tuple):
         return tuple(
             _concat_streambp_chunk_outputs([output[i] for output in outputs])
@@ -401,6 +471,78 @@ def _concat_streambp_chunk_outputs(outputs: list[Any]) -> Any:
             for i in range(len(first))
         ]
     raise TypeError(f"Unsupported StreamBP chunk output type: {type(first)}")
+
+
+def _copy_streambp_tensor_chunk(
+    destination: Optional[Tensor],
+    chunk: Tensor,
+    start: int,
+    end: int,
+    seq_len: int,
+) -> Tensor:
+    """Copy a sequence chunk into a full-sequence output buffer."""
+    if chunk.size(0) != end - start:
+        raise RuntimeError(
+            "StreamBP chunk output length mismatch: "
+            f"got {chunk.size(0)} for range [{start}, {end})"
+        )
+    if destination is None:
+        shape = list(chunk.shape)
+        shape[0] = seq_len
+        destination = torch.empty(
+            tuple(shape),
+            dtype=chunk.dtype,
+            device=chunk.device,
+            layout=chunk.layout,
+        )
+    destination.narrow(0, start, end - start).copy_(chunk)
+    return destination
+
+
+def _copy_sequence_tensor_ranges(
+    chunks: list[tuple[int, int, Tensor]],
+    start: int,
+    end: int,
+) -> Tensor:
+    """Concatenate sequence chunks without keeping every chunk plus a cat output live."""
+    if not chunks:
+        raise RuntimeError("StreamBP expected at least one sequence tensor chunk")
+    if len(chunks) == 1:
+        chunk_start, chunk_end, tensor = chunks[0]
+        if chunk_start != start or chunk_end != end:
+            raise RuntimeError(
+                "StreamBP single tensor chunk does not cover requested range "
+                f"[{start}, {end}); got [{chunk_start}, {chunk_end})"
+            )
+        chunks.clear()
+        return tensor
+
+    first_start, first_end, first = chunks[0]
+    if first_start != start:
+        raise RuntimeError(
+            f"StreamBP tensor chunks start at {first_start}, expected {start}"
+        )
+    shape = list(first.shape)
+    shape[0] = end - start
+    result = torch.empty(tuple(shape), dtype=first.dtype, device=first.device, layout=first.layout)
+    cursor = start
+    for chunk_start, chunk_end, chunk in chunks:
+        if chunk_start != cursor:
+            raise RuntimeError(
+                "StreamBP tensor chunks are not contiguous: "
+                f"expected {cursor}, got {chunk_start}"
+            )
+        if chunk.size(0) != chunk_end - chunk_start:
+            raise RuntimeError(
+                "StreamBP tensor chunk length mismatch: "
+                f"got {chunk.size(0)} for range [{chunk_start}, {chunk_end})"
+            )
+        result.narrow(0, chunk_start - start, chunk_end - chunk_start).copy_(chunk)
+        cursor = chunk_end
+    if cursor != end:
+        raise RuntimeError(f"StreamBP tensor chunks ended at {cursor}, expected {end}")
+    chunks.clear()
+    return result
 
 
 def validate_chunk_range(chunk_range: ChunkRange, seq_len: int) -> ChunkRange:
@@ -852,20 +994,32 @@ def _chunked_no_grad_forward(
     context_factory: ContextFactory,
 ) -> Tensor:
     """Run the no-grad StreamBP forward one query chunk at a time."""
-    outputs = []
+    seq_len = hidden_states.size(0)
+    output_buffer: Optional[Tensor] = None
+    fallback_outputs = []
     for chunk_index, chunk_range in enumerate(chunks):
+        start, end = chunk_range
         with _profile_streambp_chunk(f"streambp/no_grad_forward_chunk/{chunk_index}"):
-            outputs.append(
-                _call_layer(
-                    layer,
-                    hidden_states,
-                    kwargs,
-                    chunk_range=chunk_range,
-                    context_factory=context_factory,
-                    activation_recompute_phase=False,
-                )
+            output = _call_layer(
+                layer,
+                hidden_states,
+                kwargs,
+                chunk_range=chunk_range,
+                context_factory=context_factory,
+                activation_recompute_phase=False,
             )
-    return torch.cat(outputs, dim=0)
+            if torch.is_tensor(output):
+                output_buffer = _copy_streambp_tensor_chunk(
+                    output_buffer, output, start, end, seq_len
+                )
+                del output
+            else:
+                fallback_outputs.append(output)
+    if output_buffer is not None:
+        if fallback_outputs:
+            raise TypeError("Cannot mix tensor and non-tensor StreamBP chunk outputs")
+        return output_buffer
+    return _concat_streambp_chunk_outputs(fallback_outputs)
 
 
 def _reference_no_grad_forward(
@@ -923,11 +1077,14 @@ def _moe_chunk_attention_full_mlp_no_grad_forward(
     call_kwargs.pop("mhc_recompute_manager", None)
     with _maybe_context(context_factory):
         if moe_mlp_chunks == 1:
-            attention_outputs = []
+            seq_len = hidden_states.size(0)
+            attention_outputs: list[tuple[int, int, Tensor]] = []
             for chunk_index, chunk_range in enumerate(chunks):
+                chunk_start, chunk_end = chunk_range
                 with _profile_streambp_chunk(
                     f"streambp/no_grad_forward_moe_attention_chunk/{chunk_index}"
                 ):
+                    _maybe_trim_cuda_cache_before_moe_replay()
                     # Backward replay still recomputes this MoE layer once per chunk.
                     # TE's FP8 activation-recompute context keeps one bookkeeping entry
                     # per replayed forward, so seed that stack even though this hybrid
@@ -942,28 +1099,39 @@ def _moe_chunk_attention_full_mlp_no_grad_forward(
                         raise ValueError(
                             "StreamBP currently supports decoder-only MoE layers with context=None"
                         )
-                    attention_outputs.append(attention_output)
+                    attention_outputs.append((chunk_start, chunk_end, attention_output))
 
-            post_attention = torch.cat(attention_outputs, dim=0)
-            attention_outputs.clear()
-            del attention_outputs, attention_output
+            post_attention = _copy_sequence_tensor_ranges(attention_outputs, 0, seq_len)
+            del attention_outputs
+            tensor_audit(
+                "streambp/moe_no_grad/post_attention_full",
+                post_attention=post_attention,
+                layer=getattr(layer, "layer_number", "?"),
+            )
             with _profile_streambp_chunk("streambp/no_grad_forward_moe_mlp_full"):
                 _maybe_trim_cuda_cache_before_moe_replay()
                 with _te_activation_recompute_context(recompute_phase=False):
-                    return layer._forward_mlp(
+                    output = layer._forward_mlp(
                         post_attention,
                         call_kwargs.get("inference_context", None),
                         padding_mask=call_kwargs.get("padding_mask", None),
                     )
+            tensor_audit(
+                "streambp/moe_no_grad/mlp_output_full",
+                output=output,
+                layer=getattr(layer, "layer_number", "?"),
+            )
+            return output
 
         seq_len = hidden_states.size(0)
         chunk_size = chunks[0][1] - chunks[0][0] if chunks else seq_len
         padding_mask = call_kwargs.get("padding_mask", None)
-        mlp_outputs = []
+        mlp_output_buffer: Optional[Tensor] = None
+        fallback_mlp_outputs = []
         for mlp_chunk_index, (mlp_start, mlp_end) in enumerate(
             iter_streambp_num_chunks(seq_len, moe_mlp_chunks)
         ):
-            attention_outputs = []
+            attention_outputs: list[tuple[int, int, Tensor]] = []
             for attention_start, attention_end in _intersect_streambp_chunk_ranges(
                 chunks, mlp_start, mlp_end
             ):
@@ -972,6 +1140,7 @@ def _moe_chunk_attention_full_mlp_no_grad_forward(
                     "streambp/no_grad_forward_moe_attention_chunk/"
                     f"{attention_chunk_index}"
                 ):
+                    _maybe_trim_cuda_cache_before_moe_replay()
                     with _te_activation_recompute_context(recompute_phase=False):
                         attention_output, context = layer._forward_attention(
                             hidden_states=hidden_states,
@@ -982,34 +1151,51 @@ def _moe_chunk_attention_full_mlp_no_grad_forward(
                         raise ValueError(
                             "StreamBP currently supports decoder-only MoE layers with context=None"
                         )
-                    attention_outputs.append(attention_output)
-            if len(attention_outputs) == 1:
-                post_attention = attention_outputs[0]
-            else:
-                post_attention = torch.cat(attention_outputs, dim=0)
-            attention_outputs.clear()
-            del attention_outputs, attention_output
+                    attention_outputs.append((attention_start, attention_end, attention_output))
+            post_attention = _copy_sequence_tensor_ranges(attention_outputs, mlp_start, mlp_end)
+            del attention_outputs
             if post_attention.size(0) != mlp_end - mlp_start:
                 raise RuntimeError(
                     "StreamBP MoE no-grad forward produced attention chunk length "
                     f"{post_attention.size(0)} for MLP range [{mlp_start}, {mlp_end})"
                 )
+            tensor_audit(
+                "streambp/moe_no_grad/post_attention_chunk",
+                post_attention=post_attention,
+                mlp_chunk=mlp_chunk_index,
+                layer=getattr(layer, "layer_number", "?"),
+            )
             with _profile_streambp_chunk(
                 f"streambp/no_grad_forward_moe_mlp_chunk/{mlp_chunk_index}"
             ):
                 _maybe_trim_cuda_cache_before_moe_replay()
                 with _te_activation_recompute_context(recompute_phase=False):
-                    mlp_outputs.append(
-                        layer._forward_mlp(
-                            post_attention,
-                            call_kwargs.get("inference_context", None),
-                            padding_mask=_slice_padding_mask_for_sequence_chunk(
-                                padding_mask, mlp_start, mlp_end, seq_len
-                            ),
-                        )
+                    mlp_output = layer._forward_mlp(
+                        post_attention,
+                        call_kwargs.get("inference_context", None),
+                        padding_mask=_slice_padding_mask_for_sequence_chunk(
+                            padding_mask, mlp_start, mlp_end, seq_len
+                        ),
                     )
+                    tensor_audit(
+                        "streambp/moe_no_grad/mlp_output_chunk",
+                        output=mlp_output,
+                        mlp_chunk=mlp_chunk_index,
+                        layer=getattr(layer, "layer_number", "?"),
+                    )
+                    if torch.is_tensor(mlp_output):
+                        mlp_output_buffer = _copy_streambp_tensor_chunk(
+                            mlp_output_buffer, mlp_output, mlp_start, mlp_end, seq_len
+                        )
+                        del mlp_output
+                    else:
+                        fallback_mlp_outputs.append(mlp_output)
             del post_attention
-        return _concat_streambp_chunk_outputs(mlp_outputs)
+        if mlp_output_buffer is not None:
+            if fallback_mlp_outputs:
+                raise TypeError("Cannot mix tensor and non-tensor StreamBP MoE chunk outputs")
+            return mlp_output_buffer
+        return _concat_streambp_chunk_outputs(fallback_mlp_outputs)
 
 
 def _moe_chunk_attention_full_mlp_backward(
@@ -1021,6 +1207,7 @@ def _moe_chunk_attention_full_mlp_backward(
     *,
     context_factory: ContextFactory,
     moe_mlp_chunks: int,
+    moe_mlp_backward_chunks: Optional[int],
     moe_aux_stats: Optional[StreamBPMoeAuxState],
 ) -> None:
     """Replay MoE backward while keeping only one MLP chunk's attention graphs live."""
@@ -1033,16 +1220,23 @@ def _moe_chunk_attention_full_mlp_backward(
     seq_len = hidden_states.size(0)
     chunk_size = chunks[0][1] - chunks[0][0] if chunks else seq_len
     layer_number = getattr(layer, "layer_number", "?")
+    mlp_backward_chunks = moe_mlp_backward_chunks or moe_mlp_chunks
+
+    def forward_mlp_chunk_index_for_range(start: int) -> int:
+        if moe_mlp_chunks <= 1:
+            return 0
+        return min(moe_mlp_chunks - 1, (start * moe_mlp_chunks) // seq_len)
 
     with _maybe_context(context_factory):
-        if moe_mlp_chunks == 1:
-            attention_outputs = []
+        if mlp_backward_chunks == 1:
+            attention_outputs: list[tuple[int, int, Tensor]] = []
             for chunk_range in chunks:
-                start, _ = chunk_range
+                start, end = chunk_range
                 chunk_index = start // chunk_size
                 with _profile_streambp_chunk(
                     f"streambp/backward_replay_moe_attention_chunk/{chunk_index}"
                 ):
+                    _maybe_trim_cuda_cache_before_moe_replay()
                     with _te_activation_recompute_context(recompute_phase=True):
                         _debug_sync(
                             f"layer{layer_number}:bwd_moe_attention_chunk{chunk_index}:before"
@@ -1059,10 +1253,14 @@ def _moe_chunk_attention_full_mlp_backward(
                         raise ValueError(
                             "StreamBP currently supports decoder-only MoE layers with context=None"
                         )
-                    attention_outputs.append(attention_output)
-            post_attention = torch.cat(attention_outputs, dim=0)
-            attention_outputs.clear()
-            del attention_outputs, attention_output
+                    attention_outputs.append((start, end, attention_output))
+            post_attention = _copy_sequence_tensor_ranges(attention_outputs, 0, seq_len)
+            del attention_outputs
+            tensor_audit(
+                "streambp/moe_backward/post_attention_full",
+                post_attention=post_attention,
+                layer=layer_number,
+            )
             with _profile_streambp_chunk("streambp/backward_replay_moe_mlp_full"):
                 _maybe_trim_cuda_cache_before_moe_replay()
                 with (
@@ -1075,6 +1273,12 @@ def _moe_chunk_attention_full_mlp_backward(
                         call_kwargs.get("inference_context", None),
                         padding_mask=call_kwargs.get("padding_mask", None),
                     )
+                    tensor_audit(
+                        "streambp/moe_backward/mlp_output_full",
+                        output=output,
+                        grad_output=grad_output,
+                        layer=layer_number,
+                    )
                     _debug_sync(f"layer{layer_number}:bwd_moe_mlp_full:after")
             _debug_sync(f"layer{layer_number}:bwd_moe_full_autograd:before")
             torch.autograd.backward(output, grad_output)
@@ -1082,9 +1286,9 @@ def _moe_chunk_attention_full_mlp_backward(
         else:
             padding_mask = call_kwargs.get("padding_mask", None)
             for mlp_chunk_index, (mlp_start, mlp_end) in enumerate(
-                iter_streambp_num_chunks(seq_len, moe_mlp_chunks)
+                iter_streambp_num_chunks(seq_len, mlp_backward_chunks)
             ):
-                attention_outputs = []
+                attention_outputs: list[tuple[int, int, Tensor]] = []
                 for attention_start, attention_end in _intersect_streambp_chunk_ranges(
                     chunks, mlp_start, mlp_end
                 ):
@@ -1093,6 +1297,7 @@ def _moe_chunk_attention_full_mlp_backward(
                         "streambp/backward_replay_moe_attention_chunk/"
                         f"{attention_chunk_index}"
                     ):
+                        _maybe_trim_cuda_cache_before_moe_replay()
                         with _te_activation_recompute_context(recompute_phase=True):
                             _debug_sync(
                                 f"layer{layer_number}:bwd_moe_mlp_chunk{mlp_chunk_index}:"
@@ -1112,19 +1317,22 @@ def _moe_chunk_attention_full_mlp_backward(
                                 "StreamBP currently supports decoder-only MoE layers "
                                 "with context=None"
                             )
-                        attention_outputs.append(attention_output)
-                if len(attention_outputs) == 1:
-                    post_attention = attention_outputs[0]
-                else:
-                    post_attention = torch.cat(attention_outputs, dim=0)
-                attention_outputs.clear()
-                del attention_outputs, attention_output
+                        attention_outputs.append((attention_start, attention_end, attention_output))
+                post_attention = _copy_sequence_tensor_ranges(attention_outputs, mlp_start, mlp_end)
+                del attention_outputs
                 if post_attention.size(0) != mlp_end - mlp_start:
                     raise RuntimeError(
                         "StreamBP MoE replay produced attention chunk length "
                         f"{post_attention.size(0)} for MLP range "
                         f"[{mlp_start}, {mlp_end})"
                     )
+                tensor_audit(
+                    "streambp/moe_backward/post_attention_chunk",
+                    post_attention=post_attention,
+                    grad_chunk=grad_output[mlp_start:mlp_end],
+                    mlp_chunk=mlp_chunk_index,
+                    layer=layer_number,
+                )
                 with _profile_streambp_chunk(
                     f"streambp/backward_replay_moe_mlp_chunk/{mlp_chunk_index}"
                 ):
@@ -1132,7 +1340,7 @@ def _moe_chunk_attention_full_mlp_backward(
                     with (
                         replay_streambp_moe_aux_stats(
                             moe_aux_stats,
-                            chunk_index=mlp_chunk_index,
+                            chunk_index=forward_mlp_chunk_index_for_range(mlp_start),
                         ),
                         _te_activation_recompute_context(recompute_phase=True),
                     ):
@@ -1145,6 +1353,13 @@ def _moe_chunk_attention_full_mlp_backward(
                             padding_mask=_slice_padding_mask_for_sequence_chunk(
                                 padding_mask, mlp_start, mlp_end, seq_len
                             ),
+                        )
+                        tensor_audit(
+                            "streambp/moe_backward/mlp_output_chunk",
+                            output=chunk_output,
+                            grad_chunk=grad_output[mlp_start:mlp_end],
+                            mlp_chunk=mlp_chunk_index,
+                            layer=layer_number,
                         )
                         _debug_sync(
                             f"layer{layer_number}:bwd_moe_mlp_chunk{mlp_chunk_index}:after"
@@ -1192,6 +1407,7 @@ class _StreamBPLayerCheckpoint(torch.autograd.Function):
         chunk_size: Optional[int],
         chunk_forward: bool,
         moe_mlp_chunks: int,
+        moe_mlp_backward_chunks: Optional[int],
         layer: torch.nn.Module,
         context_factory: ContextFactory,
         kwargs: dict[str, Any],
@@ -1201,6 +1417,7 @@ class _StreamBPLayerCheckpoint(torch.autograd.Function):
         ctx.chunk_size = chunk_size
         ctx.chunk_forward = chunk_forward
         ctx.moe_mlp_chunks = moe_mlp_chunks
+        ctx.moe_mlp_backward_chunks = moe_mlp_backward_chunks
         ctx.context_factory = context_factory
         ctx.kwargs = kwargs
         ctx.save_for_backward(hidden_states)
@@ -1257,7 +1474,7 @@ class _StreamBPLayerCheckpoint(torch.autograd.Function):
             detached_hidden_states = hidden_states.detach().requires_grad_(
                 ctx.needs_input_grad[0]
             )
-            with torch.enable_grad():
+            with _suppress_fine_grained_offload_replay_context(), torch.enable_grad():
                 _moe_chunk_attention_full_mlp_backward(
                     ctx.layer,
                     detached_hidden_states,
@@ -1266,17 +1483,18 @@ class _StreamBPLayerCheckpoint(torch.autograd.Function):
                     ctx.kwargs,
                     context_factory=ctx.context_factory,
                     moe_mlp_chunks=ctx.moe_mlp_chunks,
+                    moe_mlp_backward_chunks=ctx.moe_mlp_backward_chunks,
                     moe_aux_stats=ctx.moe_aux_stats,
                 )
             hidden_grad = detached_hidden_states.grad if ctx.needs_input_grad[0] else None
-            return hidden_grad, None, None, None, None, None, None, None
+            return hidden_grad, None, None, None, None, None, None, None, None
 
         params = _unique_trainable_parameters(ctx.layer)
         marked = mark_streambp_pending_chunks(params, len(chunks))
 
         detached_hidden_states = hidden_states.detach().requires_grad_(ctx.needs_input_grad[0])
         try:
-            with torch.enable_grad():
+            with _suppress_fine_grained_offload_replay_context(), torch.enable_grad():
                 for chunk_range in chunks:
                     start, end = chunk_range
                     chunk_index = start // resolve_streambp_chunk_size(
@@ -1302,7 +1520,7 @@ class _StreamBPLayerCheckpoint(torch.autograd.Function):
         finally:
             clear_streambp_pending_chunks(marked)
 
-        return hidden_grad, None, None, None, None, None, None, None
+        return hidden_grad, None, None, None, None, None, None, None, None
 
 
 class _StreamBPFullLayerCheckpoint(torch.autograd.Function):
@@ -1346,7 +1564,7 @@ class _StreamBPFullLayerCheckpoint(torch.autograd.Function):
             torch.set_rng_state(ctx.cpu_rng_state)
             if ctx.cuda_device_index is not None and ctx.cuda_rng_state is not None:
                 torch.cuda.set_rng_state(ctx.cuda_rng_state, ctx.cuda_device_index)
-            with torch.enable_grad():
+            with _suppress_fine_grained_offload_replay_context(), torch.enable_grad():
                 output = _call_layer(
                     ctx.layer,
                     detached_hidden_states,
@@ -1366,6 +1584,7 @@ def streambp_checkpoint_layer(
     chunk_size: Optional[int],
     chunk_forward: bool = True,
     moe_mlp_chunks: int = 1,
+    moe_mlp_backward_chunks: Optional[int] = None,
     context_factory: ContextFactory = None,
     full_replay: bool = False,
     **kwargs: Any,
@@ -1391,6 +1610,7 @@ def streambp_checkpoint_layer(
         chunk_size,
         chunk_forward,
         moe_mlp_chunks,
+        moe_mlp_backward_chunks,
         layer,
         context_factory,
         kwargs,
@@ -1405,6 +1625,415 @@ def _call_output_layer(
     call_kwargs["input_"] = hidden_states
     logits, _ = output_layer(**call_kwargs)
     return logits
+
+
+@lru_cache(maxsize=1)
+def _load_streambp_fused_lce_entry():
+    if not torch.cuda.is_available():
+        return None
+    try:
+        device = torch.cuda.current_device()
+        if torch.cuda.get_device_capability(device)[0] != 10:
+            return None
+        from megatron.core.fusions.linear_cross_entropy.blackwell import entry as blackwell_entry
+
+        if not hasattr(blackwell_entry, "forward") or not hasattr(blackwell_entry, "backward"):
+            return None
+    except Exception:
+        return None
+    return blackwell_entry
+
+
+@lru_cache(maxsize=1)
+def _load_streambp_fused_lce() -> Optional[Callable[..., Tensor]]:
+    try:
+        blackwell_entry = _load_streambp_fused_lce_entry()
+        if blackwell_entry is None:
+            return None
+        from megatron.core.fusions.fused_linear_cross_entropy import linear_cross_entropy
+    except Exception:
+        return None
+    return linear_cross_entropy
+
+
+def _streambp_lce_sp_tile_size(local_seq_len: int) -> int:
+    raw = os.getenv("MEGATRON_STREAMBP_FUSED_LCE_SP_TILE_SIZE", "1024")
+    try:
+        tile_size = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            "MEGATRON_STREAMBP_FUSED_LCE_SP_TILE_SIZE must be an integer, "
+            f"got {raw!r}"
+        ) from exc
+    if tile_size <= 0:
+        raise ValueError("MEGATRON_STREAMBP_FUSED_LCE_SP_TILE_SIZE must be positive")
+    return min(tile_size, local_seq_len)
+
+
+def _streambp_lce_weight(
+    output_layer: torch.nn.Module, kwargs: dict[str, Any]
+) -> Optional[Tensor]:
+    weight = kwargs.get("weight")
+    if weight is None:
+        weight = getattr(output_layer, "weight", None)
+    return weight if isinstance(weight, Tensor) else None
+
+
+class _StreamBPFusedSPLinearCrossEntropy(torch.autograd.Function):
+    """Sequence-parallel fused LCE that streams TP all-gather tiles.
+
+    The Blackwell LCE entry points are still responsible for the tensor-core
+    linear/CE work.  This wrapper changes only the sequence-parallel host
+    schedule: it avoids saving one full all-gathered hidden tensor for backward
+    and bounds the backward scratch tensors to a local sequence tile.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        hidden_states: Tensor,
+        weight: Tensor,
+        labels: Tensor,
+        tp_group: Any,
+        tile_size: int,
+        ignore_index: int,
+    ) -> Tensor:
+        if tp_group is None:
+            raise RuntimeError("streaming sequence-parallel LCE requires a TP group")
+        if not (
+            torch.distributed.is_available() and torch.distributed.is_initialized()
+        ):
+            raise RuntimeError("streaming sequence-parallel LCE requires distributed init")
+
+        blackwell_entry = _load_streambp_fused_lce_entry()
+        if blackwell_entry is None:
+            raise RuntimeError("Blackwell fused LCE entry is unavailable")
+
+        tp_rank = torch.distributed.get_rank(tp_group)
+        tp_world_size = torch.distributed.get_world_size(tp_group)
+        local_seq_len = hidden_states.size(0)
+        if labels.size(1) != local_seq_len * tp_world_size:
+            raise ValueError(
+                "streaming sequence-parallel LCE label length mismatch: "
+                f"labels_s={labels.size(1)} local_s={local_seq_len} tp={tp_world_size}"
+            )
+
+        loss = torch.empty(labels.shape, device=hidden_states.device, dtype=torch.float32)
+        maximum = torch.empty(
+            (tp_world_size, local_seq_len, hidden_states.size(1)),
+            device=hidden_states.device,
+            dtype=torch.float32,
+        )
+        accumulate = torch.empty_like(maximum)
+        num_valid_tokens: list[Tensor] = []
+        chunks = iter_streambp_chunks(local_seq_len, tile_size)
+
+        for start, end in chunks:
+            local_hidden = hidden_states[start:end].contiguous()
+            global_hidden = torch.empty(
+                (tp_world_size * (end - start), *hidden_states.shape[1:]),
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
+            torch.distributed.all_gather_into_tensor(
+                global_hidden, local_hidden, group=tp_group
+            )
+            labels_chunk = _rank_concatenated_sequence_chunk(
+                labels,
+                start,
+                end,
+                local_seq_len=local_seq_len,
+                world_size=tp_world_size,
+            )
+            labels_t = labels_chunk.transpose(0, 1).contiguous()
+            (
+                logprobs,
+                maximum_chunk,
+                accumulate_chunk,
+                num_valid_chunk,
+                _,
+                _,
+                _,
+            ) = blackwell_entry.forward(
+                global_hidden,
+                weight,
+                labels_t,
+                tp_group,
+                "none",
+                ignore_index,
+                False,
+            )
+            _scatter_rank_concatenated_sequence_chunk(
+                loss,
+                logprobs.view_as(labels_t).transpose(0, 1).contiguous(),
+                start,
+                end,
+                local_seq_len=local_seq_len,
+                world_size=tp_world_size,
+            )
+            maximum[:, start:end, :] = maximum_chunk.view(
+                tp_world_size, end - start, hidden_states.size(1)
+            )
+            accumulate[:, start:end, :] = accumulate_chunk.view(
+                tp_world_size, end - start, hidden_states.size(1)
+            )
+            num_valid_tokens.append(num_valid_chunk)
+
+        ctx.tp_group = tp_group
+        ctx.tp_rank = tp_rank
+        ctx.tp_world_size = tp_world_size
+        ctx.tile_size = tile_size
+        ctx.ignore_index = ignore_index
+        ctx.save_for_backward(
+            hidden_states,
+            weight,
+            labels,
+            maximum,
+            accumulate,
+            torch.stack(num_valid_tokens),
+        )
+        tensor_audit(
+            "streambp_lce/sp_stream_forward_done",
+            hidden=hidden_states,
+            weight=weight,
+            labels=labels,
+            loss=loss,
+            tile_size=tile_size,
+            num_chunks=len(chunks),
+        )
+        return loss
+
+    @staticmethod
+    def backward(ctx, grad_loss: Tensor):
+        hidden_states, weight, labels, maximum, accumulate, num_valid_tokens = ctx.saved_tensors
+        blackwell_entry = _load_streambp_fused_lce_entry()
+        if blackwell_entry is None:
+            raise RuntimeError("Blackwell fused LCE entry is unavailable")
+
+        local_seq_len = hidden_states.size(0)
+        chunks = iter_streambp_chunks(local_seq_len, ctx.tile_size)
+        hidden_grad = torch.empty_like(hidden_states) if ctx.needs_input_grad[0] else None
+        weight_grad = torch.zeros_like(weight) if ctx.needs_input_grad[1] else None
+
+        for chunk_index, (start, end) in enumerate(chunks):
+            local_hidden = hidden_states[start:end].contiguous()
+            global_hidden = torch.empty(
+                (ctx.tp_world_size * (end - start), *hidden_states.shape[1:]),
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
+            torch.distributed.all_gather_into_tensor(
+                global_hidden, local_hidden, group=ctx.tp_group
+            )
+            labels_chunk = _rank_concatenated_sequence_chunk(
+                labels,
+                start,
+                end,
+                local_seq_len=local_seq_len,
+                world_size=ctx.tp_world_size,
+            )
+            grad_chunk = _rank_concatenated_sequence_chunk(
+                grad_loss,
+                start,
+                end,
+                local_seq_len=local_seq_len,
+                world_size=ctx.tp_world_size,
+            )
+            labels_t = labels_chunk.transpose(0, 1).contiguous()
+            grad_t = grad_chunk.transpose(0, 1).contiguous()
+            maximum_chunk = maximum[:, start:end, :].reshape(-1).contiguous()
+            accumulate_chunk = accumulate[:, start:end, :].reshape(-1).contiguous()
+
+            hidden_grad_chunk, weight_grad_chunk = blackwell_entry.backward(
+                grad_t.reshape(-1).contiguous(),
+                global_hidden,
+                weight,
+                labels_t,
+                maximum_chunk,
+                accumulate_chunk,
+                num_valid_tokens[chunk_index],
+                "none",
+                ctx.ignore_index,
+                ctx.tp_group,
+                ctx.tp_rank,
+                ctx.tp_world_size,
+                True,
+            )
+            if hidden_grad is not None:
+                hidden_grad[start:end] = hidden_grad_chunk
+            if weight_grad is not None:
+                weight_grad.add_(weight_grad_chunk)
+
+        tensor_audit(
+            "streambp_lce/sp_stream_backward_done",
+            hidden_grad=hidden_grad,
+            weight_grad=weight_grad,
+            tile_size=ctx.tile_size,
+            num_chunks=len(chunks),
+        )
+        return hidden_grad, weight_grad, None, None, None, None
+
+
+def _streambp_fused_lce_available(
+    output_layer: torch.nn.Module,
+    hidden_states: Tensor,
+    labels: Tensor,
+    output_layer_kwargs: dict[str, Any],
+    *,
+    sequence_parallel_output: bool,
+) -> bool:
+    if not _env_flag("MEGATRON_STREAMBP_FUSED_LCE", default=True):
+        return _log_streambp_fused_lce_rejection("disabled by MEGATRON_STREAMBP_FUSED_LCE=0")
+    if _load_streambp_fused_lce() is None:
+        return _log_streambp_fused_lce_rejection("Blackwell fused LCE extension is unavailable")
+    weight = _streambp_lce_weight(output_layer, output_layer_kwargs)
+    if weight is None:
+        return _log_streambp_fused_lce_rejection("output weight is unavailable")
+    if hidden_states.dim() != 3 or labels.dim() != 2 or weight.dim() != 2:
+        return _log_streambp_fused_lce_rejection(
+            "unexpected ranks: "
+            f"hidden={tuple(hidden_states.shape)} labels={tuple(labels.shape)} "
+            f"weight={tuple(weight.shape)}"
+        )
+    if not (hidden_states.is_cuda and labels.is_cuda and weight.is_cuda):
+        return _log_streambp_fused_lce_rejection(
+            "inputs are not all CUDA tensors: "
+            f"hidden_cuda={hidden_states.is_cuda} labels_cuda={labels.is_cuda} "
+            f"weight_cuda={weight.is_cuda}"
+        )
+    if hidden_states.device != labels.device or hidden_states.device != weight.device:
+        return _log_streambp_fused_lce_rejection(
+            "device mismatch: "
+            f"hidden={hidden_states.device} labels={labels.device} weight={weight.device}"
+        )
+    if hidden_states.dtype != weight.dtype:
+        return _log_streambp_fused_lce_rejection(
+            f"dtype mismatch: hidden={hidden_states.dtype} weight={weight.dtype}"
+        )
+    if hidden_states.dtype not in (torch.float16, torch.bfloat16):
+        return _log_streambp_fused_lce_rejection(f"unsupported dtype: {hidden_states.dtype}")
+    if (hidden_states.size(-1) * hidden_states.element_size()) % 128 != 0:
+        return _log_streambp_fused_lce_rejection(
+            f"hidden row bytes are not 128B aligned: {hidden_states.size(-1) * hidden_states.element_size()}"
+        )
+    if not weight.is_contiguous():
+        return _log_streambp_fused_lce_rejection(
+            f"output weight is not contiguous: stride={weight.stride()}"
+        )
+    if sequence_parallel_output:
+        world_size = _tp_world_size(output_layer)
+        if labels.size(1) != hidden_states.size(0) * world_size:
+            return _log_streambp_fused_lce_rejection(
+                "sequence-parallel label length mismatch: "
+                f"labels_s={labels.size(1)} hidden_s={hidden_states.size(0)} tp={world_size}"
+            )
+        return True
+    if labels.size(1) != hidden_states.size(0):
+        return _log_streambp_fused_lce_rejection(
+            f"label length mismatch: labels_s={labels.size(1)} hidden_s={hidden_states.size(0)}"
+        )
+    return True
+
+
+def _log_streambp_fused_lce_rejection(reason: str) -> bool:
+    global _STREAMBP_FUSED_LCE_REJECTION_LOGGED
+    if (
+        not _STREAMBP_FUSED_LCE_REJECTION_LOGGED
+        and _env_flag("MEGATRON_STREAMBP_FUSED_LCE_LOG_REJECTIONS", default=True)
+    ):
+        _STREAMBP_FUSED_LCE_REJECTION_LOGGED = True
+        print(f"StreamBP fused LCE unavailable: {reason}", flush=True)
+    return False
+
+
+def _streambp_fused_lce_loss(
+    output_layer: torch.nn.Module,
+    hidden_states: Tensor,
+    labels: Tensor,
+    output_layer_kwargs: dict[str, Any],
+    *,
+    sequence_parallel_output: bool,
+) -> Tensor:
+    linear_cross_entropy = _load_streambp_fused_lce()
+    if linear_cross_entropy is None:
+        raise RuntimeError("StreamBP fused linear cross entropy is not available")
+
+    weight = _streambp_lce_weight(output_layer, output_layer_kwargs)
+    if weight is None:
+        raise RuntimeError("StreamBP fused linear cross entropy requires an output weight")
+    if not hidden_states.is_contiguous():
+        hidden_states = hidden_states.contiguous()
+    if not labels.is_contiguous():
+        labels = labels.contiguous()
+
+    global _STREAMBP_FUSED_LCE_LOGGED
+    should_log = not _STREAMBP_FUSED_LCE_LOGGED
+    tp_group = getattr(output_layer, "tp_group", None)
+    if should_log and torch.distributed.is_available() and torch.distributed.is_initialized():
+        try:
+            if tp_group is not None and torch.distributed.get_rank(tp_group) != 0:
+                should_log = False
+        except Exception:
+            pass
+    if should_log:
+        _STREAMBP_FUSED_LCE_LOGGED = True
+        print(
+            "StreamBP fused LCE active: "
+            f"hidden={tuple(hidden_states.shape)} "
+            f"weight={tuple(weight.shape)} "
+            f"labels={tuple(labels.shape)} "
+            f"sequence_parallel={sequence_parallel_output} "
+            f"fwd_vocab_split={os.getenv('LCE_FWD_VOCAB_SPLIT_SIZE', '3072')} "
+            f"bwd_vocab_split={os.getenv('LCE_BWD_VOCAB_SPLIT_SIZE', '3072')}",
+            flush=True,
+        )
+
+    if sequence_parallel_output and _env_flag(
+        "MEGATRON_STREAMBP_FUSED_LCE_SP_STREAMING", default=True
+    ):
+        tensor_audit(
+            "streambp_lce/sp_stream_input",
+            hidden=hidden_states,
+            weight=weight,
+            labels=labels,
+            tile_size=_streambp_lce_sp_tile_size(hidden_states.size(0)),
+        )
+        return _StreamBPFusedSPLinearCrossEntropy.apply(
+            hidden_states,
+            weight,
+            labels,
+            getattr(output_layer, "tp_group", None),
+            _streambp_lce_sp_tile_size(hidden_states.size(0)),
+            -100,
+        )
+
+    tensor_audit(
+        "streambp_lce/fused_input",
+        hidden=hidden_states,
+        weight=weight,
+        labels=labels,
+        sequence_parallel=sequence_parallel_output,
+    )
+    # The fused LCE kernel consumes sequence-major labels to match [S, B, H]
+    # hidden order.  StreamBP keeps public loss tensors in [B, S].
+    labels_t = labels.transpose(0, 1).contiguous()
+    loss = linear_cross_entropy(
+        hidden_states,
+        weight,
+        labels_t,
+        tp_group=getattr(output_layer, "tp_group", None),
+        reduction="none",
+        ignore_index=-100,
+        sequence_parallel=sequence_parallel_output,
+    )
+    loss_out = loss.view_as(labels_t).transpose(0, 1).contiguous()
+    tensor_audit(
+        "streambp_lce/fused_output",
+        loss=loss_out,
+        labels_t=labels_t,
+        sequence_parallel=sequence_parallel_output,
+    )
+    return loss_out
 
 
 def _tp_world_size(output_layer: torch.nn.Module) -> int:
@@ -1478,16 +2107,28 @@ class _StreamBPLMHeadLoss(torch.autograd.Function):
             output_layer, hidden_states, labels
         )
         ctx.sequence_parallel_world_size = _tp_world_size(output_layer)
+        ctx.use_fused_lce = _streambp_fused_lce_available(
+            output_layer,
+            hidden_states,
+            labels,
+            output_layer_kwargs,
+            sequence_parallel_output=ctx.sequence_parallel_output,
+        )
         ctx.save_for_backward(hidden_states, labels)
+        tensor_audit(
+            "streambp_lce/forward_start",
+            hidden=hidden_states,
+            labels=labels,
+            chunk_size=chunk_size,
+            sequence_parallel=ctx.sequence_parallel_output,
+            fused_lce=ctx.use_fused_lce,
+        )
 
         losses: list[Tensor] = []
         full_loss = None
         local_seq_len = hidden_states.size(0)
         with torch.no_grad():
             for start, end in iter_streambp_chunks(hidden_states.size(0), chunk_size):
-                logits = _call_output_layer(
-                    output_layer, hidden_states[start:end], output_layer_kwargs
-                )
                 if ctx.sequence_parallel_output:
                     labels_chunk = _rank_concatenated_sequence_chunk(
                         labels,
@@ -1496,10 +2137,28 @@ class _StreamBPLMHeadLoss(torch.autograd.Function):
                         local_seq_len=local_seq_len,
                         world_size=ctx.sequence_parallel_world_size,
                     )
-                    loss_chunk = loss_func(labels_chunk, logits)
+                    if ctx.use_fused_lce:
+                        loss_chunk = _streambp_fused_lce_loss(
+                            output_layer,
+                            hidden_states[start:end],
+                            labels_chunk,
+                            output_layer_kwargs,
+                            sequence_parallel_output=True,
+                        )
+                    else:
+                        logits = _call_output_layer(
+                            output_layer, hidden_states[start:end], output_layer_kwargs
+                        )
+                        loss_chunk = loss_func(labels_chunk, logits)
                     if full_loss is None:
                         full_loss = torch.empty(
                             labels.shape, dtype=loss_chunk.dtype, device=loss_chunk.device
+                        )
+                        tensor_audit(
+                            "streambp_lce/full_loss_alloc",
+                            full_loss=full_loss,
+                            loss_chunk=loss_chunk,
+                            labels_chunk=labels_chunk,
                         )
                     _scatter_rank_concatenated_sequence_chunk(
                         full_loss,
@@ -1510,11 +2169,29 @@ class _StreamBPLMHeadLoss(torch.autograd.Function):
                         world_size=ctx.sequence_parallel_world_size,
                     )
                 else:
-                    losses.append(loss_func(labels[:, start:end], logits))
+                    labels_chunk = labels[:, start:end]
+                    if ctx.use_fused_lce:
+                        losses.append(
+                            _streambp_fused_lce_loss(
+                                output_layer,
+                                hidden_states[start:end],
+                                labels_chunk,
+                                output_layer_kwargs,
+                                sequence_parallel_output=False,
+                            )
+                        )
+                    else:
+                        logits = _call_output_layer(
+                            output_layer, hidden_states[start:end], output_layer_kwargs
+                        )
+                        losses.append(loss_func(labels_chunk, logits))
         if ctx.sequence_parallel_output:
             assert full_loss is not None
+            tensor_audit("streambp_lce/forward_done", full_loss=full_loss)
             return full_loss.contiguous()
-        return torch.cat(losses, dim=1).contiguous()
+        result = torch.cat(losses, dim=1).contiguous()
+        tensor_audit("streambp_lce/forward_done", full_loss=result)
+        return result
 
     @staticmethod
     def backward(ctx, grad_loss: Tensor):
@@ -1525,15 +2202,21 @@ class _StreamBPLMHeadLoss(torch.autograd.Function):
         marked = mark_streambp_pending_chunks(params, len(chunks))
 
         hidden_grad = torch.zeros_like(hidden_states) if ctx.needs_input_grad[0] else None
+        tensor_audit(
+            "streambp_lce/backward_start",
+            hidden=hidden_states,
+            labels=labels,
+            grad_loss=grad_loss,
+            hidden_grad=hidden_grad,
+            num_chunks=len(chunks),
+            fused_lce=ctx.use_fused_lce,
+        )
         local_seq_len = hidden_states.size(0)
         try:
             with torch.enable_grad():
                 for start, end in chunks:
                     hidden_chunk = hidden_states[start:end].detach().requires_grad_(
                         ctx.needs_input_grad[0]
-                    )
-                    logits = _call_output_layer(
-                        ctx.output_layer, hidden_chunk, ctx.output_layer_kwargs
                     )
                     if ctx.sequence_parallel_output:
                         labels_chunk = _rank_concatenated_sequence_chunk(
@@ -1553,7 +2236,28 @@ class _StreamBPLMHeadLoss(torch.autograd.Function):
                     else:
                         labels_chunk = labels[:, start:end]
                         grad_loss_chunk = grad_loss[:, start:end]
-                    loss = ctx.loss_func(labels_chunk, logits)
+                    if ctx.use_fused_lce:
+                        loss = _streambp_fused_lce_loss(
+                            ctx.output_layer,
+                            hidden_chunk,
+                            labels_chunk,
+                            ctx.output_layer_kwargs,
+                            sequence_parallel_output=ctx.sequence_parallel_output,
+                        )
+                    else:
+                        logits = _call_output_layer(
+                            ctx.output_layer, hidden_chunk, ctx.output_layer_kwargs
+                        )
+                        loss = ctx.loss_func(labels_chunk, logits)
+                    tensor_audit(
+                        "streambp_lce/backward_chunk",
+                        hidden_chunk=hidden_chunk,
+                        labels_chunk=labels_chunk,
+                        grad_loss_chunk=grad_loss_chunk,
+                        loss=loss,
+                        chunk_start=start,
+                        chunk_end=end,
+                    )
                     torch.autograd.backward(loss, grad_loss_chunk)
                     if hidden_grad is not None:
                         hidden_grad[start:end] = hidden_chunk.grad
@@ -1574,6 +2278,29 @@ def streambp_lm_head_loss(
 ) -> Tensor:
     """Compute GPT LM-head loss without materializing full-sequence logits."""
     chunks = iter_streambp_chunks(hidden_states.size(0), chunk_size)
+    sequence_parallel_output = _uses_sequence_parallel_output(output_layer, hidden_states, labels)
+    fused_lce_available = _streambp_fused_lce_available(
+        output_layer,
+        hidden_states,
+        labels,
+        output_layer_kwargs,
+        sequence_parallel_output=sequence_parallel_output,
+    )
+    if fused_lce_available and len(chunks) <= 1:
+        return _streambp_fused_lce_loss(
+            output_layer,
+            hidden_states,
+            labels,
+            output_layer_kwargs,
+            sequence_parallel_output=sequence_parallel_output,
+        )
+    if len(chunks) <= 1 and torch.is_grad_enabled() and not fused_lce_available:
+        fallback_chunk_size = int(
+            os.getenv("MEGATRON_STREAMBP_LCE_FALLBACK_CHUNK_SIZE", "8192")
+        )
+        if 0 < fallback_chunk_size < hidden_states.size(0):
+            chunk_size = fallback_chunk_size
+            chunks = iter_streambp_chunks(hidden_states.size(0), chunk_size)
     if len(chunks) <= 1 or not torch.is_grad_enabled():
         logits = _call_output_layer(output_layer, hidden_states, output_layer_kwargs)
         return loss_func(labels, logits)

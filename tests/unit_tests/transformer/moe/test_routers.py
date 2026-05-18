@@ -10,6 +10,10 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodu
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.moe_utils import get_updated_expert_bias, router_gating_linear
 from megatron.core.transformer.moe.router import Router
+from megatron.core.transformer.streambp import (
+    capture_streambp_moe_aux_stats,
+    replay_streambp_moe_aux_stats,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
@@ -265,6 +269,164 @@ class TestTop2Router:
             initial_counts.float() - expected
         ).abs().max()
         assert balanced_counts.sum().item() == valid_scores.shape[0] * 2
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_current_batch_quantile_bias_routes_current_scores(self):
+        """Current-batch QB should affect the same routing call without dropping tokens."""
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            num_moe_experts=4,
+            use_cpu_initialization=True,
+            moe_router_load_balancing_type="none",
+            moe_router_topk=2,
+            moe_aux_loss_coeff=0,
+            moe_router_score_function="sigmoid",
+            moe_router_enable_expert_bias=True,
+            moe_router_expert_bias_update_method="quantile",
+            moe_router_quantile_bias_application="current_batch",
+            moe_router_quantile_bias_iters=5,
+            moe_router_quantile_bias_sync_scores=False,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            add_bias_linear=False,
+        )
+        submodules = get_gpt_layer_local_submodules(num_experts=4, moe_grouped_gemm=False)
+        layer = MoELayer(config, submodules.mlp.submodules).cuda()
+        router = cast(Router, layer.router)
+
+        torch.manual_seed(1234)
+        logits = torch.randn(256, 4, device="cuda", dtype=torch.float32)
+        logits += torch.tensor([3.0, 2.0, 1.0, 0.0], device="cuda")
+        scores = torch.sigmoid(logits)
+        initial_counts = torch.bincount(
+            torch.topk(scores, k=2, dim=1).indices.reshape(-1), minlength=4
+        )
+
+        with torch.no_grad():
+            _, routing_map = router.routing(logits.view(-1, 1, 4))
+
+        assert router.quantile_expert_bias_steps.item() == 1.0
+        candidate_bias = router.quantile_expert_bias_sum / router.quantile_expert_bias_steps
+        expected_routing = torch.zeros_like(routing_map)
+        expected_indices = torch.topk(scores + candidate_bias, k=2, dim=1).indices
+        expected_routing.scatter_(1, expected_indices, True)
+
+        torch.testing.assert_close(routing_map, expected_routing)
+        routed_counts = routing_map.sum(dim=0)
+        expected = scores.shape[0] * 2 / 4
+
+        assert routed_counts.sum().item() == scores.shape[0] * 2
+        assert (routed_counts.float() - expected).abs().max() < (
+            initial_counts.float() - expected
+        ).abs().max()
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_current_batch_quantile_bias_replays_streambp_bias(self):
+        """StreamBP replay should reuse the captured full forward QB bias."""
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            num_moe_experts=4,
+            use_cpu_initialization=True,
+            moe_router_load_balancing_type="none",
+            moe_router_topk=2,
+            moe_aux_loss_coeff=0,
+            moe_router_score_function="sigmoid",
+            moe_router_enable_expert_bias=True,
+            moe_router_expert_bias_update_method="quantile",
+            moe_router_quantile_bias_application="current_batch",
+            moe_router_quantile_bias_iters=5,
+            moe_router_quantile_bias_sync_scores=False,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            add_bias_linear=False,
+        )
+        submodules = get_gpt_layer_local_submodules(num_experts=4, moe_grouped_gemm=False)
+        layer = MoELayer(config, submodules.mlp.submodules).cuda()
+        router = cast(Router, layer.router)
+
+        torch.manual_seed(4321)
+        logits = torch.randn(128, 4, device="cuda", dtype=torch.float32)
+        logits += torch.tensor([3.0, 2.0, 1.0, 0.0], device="cuda")
+
+        with torch.no_grad(), capture_streambp_moe_aux_stats() as state:
+            router.routing(logits.view(-1, 1, 4))
+
+        captured_bias = state.get_quantile_bias(router)
+        assert captured_bias is not None
+
+        # Make the chunk distribution different enough that recomputing current-batch
+        # quantiles would route differently. Replay must keep the captured bias instead.
+        chunk_logits = logits[:32] - torch.tensor([0.0, 0.5, 1.0, 1.5], device="cuda")
+        with replay_streambp_moe_aux_stats(state, chunk_index=0):
+            _, replay_routing_map = router.routing(chunk_logits.view(-1, 1, 4))
+
+        expected_routing = torch.zeros_like(replay_routing_map)
+        expected_indices = torch.topk(
+            torch.sigmoid(chunk_logits) + captured_bias, k=2, dim=1
+        ).indices
+        expected_routing.scatter_(1, expected_indices, True)
+
+        torch.testing.assert_close(replay_routing_map, expected_routing)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_quantile_bias_warmup_falls_back_to_delayed_updates(self):
+        """Warmup QB should be current-batch first, then resume delayed QB updates."""
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            num_moe_experts=4,
+            use_cpu_initialization=True,
+            moe_router_load_balancing_type="none",
+            moe_router_topk=2,
+            moe_aux_loss_coeff=0,
+            moe_router_score_function="sigmoid",
+            moe_router_enable_expert_bias=True,
+            moe_router_expert_bias_update_method="quantile",
+            moe_router_quantile_bias_application="warmup",
+            moe_router_quantile_bias_warmup_steps=1,
+            moe_router_quantile_bias_iters=5,
+            moe_router_quantile_bias_sync_scores=False,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            add_bias_linear=False,
+        )
+        submodules = get_gpt_layer_local_submodules(num_experts=4, moe_grouped_gemm=False)
+        layer = MoELayer(config, submodules.mlp.submodules).cuda()
+        router = cast(Router, layer.router)
+
+        torch.manual_seed(5678)
+        logits = torch.randn(128, 4, device="cuda", dtype=torch.float32)
+        logits += torch.tensor([3.0, 2.0, 1.0, 0.0], device="cuda")
+        scores = torch.sigmoid(logits)
+
+        with torch.no_grad():
+            _, warmup_routing_map = router.routing(logits.view(-1, 1, 4))
+
+        assert router.quantile_expert_bias_current_batch_steps.item() == 1.0
+        assert router.quantile_expert_bias_steps.item() == 1.0
+        warmup_bias = router.quantile_expert_bias_sum / router.quantile_expert_bias_steps
+        expected_warmup = torch.zeros_like(warmup_routing_map)
+        expected_warmup_indices = torch.topk(scores + warmup_bias, k=2, dim=1).indices
+        expected_warmup.scatter_(1, expected_warmup_indices, True)
+        torch.testing.assert_close(warmup_routing_map, expected_warmup)
+
+        # After the one-call warmup, routing should use the persisted expert_bias
+        # for this call while recording a delayed quantile update for finalize.
+        _, delayed_routing_map = router.routing(logits.view(-1, 1, 4))
+        expected_delayed = torch.zeros_like(delayed_routing_map)
+        expected_delayed_indices = torch.topk(scores + router.expert_bias, k=2, dim=1).indices
+        expected_delayed.scatter_(1, expected_delayed_indices, True)
+
+        torch.testing.assert_close(delayed_routing_map, expected_delayed)
+        assert router.quantile_expert_bias_steps.item() == 2.0
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

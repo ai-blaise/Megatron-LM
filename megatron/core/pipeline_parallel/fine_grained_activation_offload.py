@@ -1,7 +1,8 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import os
 from collections import deque
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from typing import Any, Dict, Tuple
 
 import torch
@@ -9,6 +10,9 @@ import torch
 # CPU offload implementation for pipeline parallelism
 DEBUG = False
 DEBUG_RANK = 0
+_SUPPRESS_FORCED_RELEASE_DEPTH = 0
+_SUPPRESS_FORCED_RELEASE_NAME_STACK = []
+_SUPPRESS_OFFLOAD_DEPTH = 0
 
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 
@@ -21,6 +25,175 @@ def debug_rank(message):
     assert torch.distributed.is_initialized()
     if torch.distributed.get_rank() == DEBUG_RANK:
         print(message)
+
+
+@contextmanager
+def fine_grained_offloading_suppress_forced_release(names=None):
+    """Temporarily keep offloaded tensors' CUDA storage alive after offload.
+
+    StreamBP replay builds a short-lived autograd graph inside backward. Some
+    fused CUDA/TE kernels in that replay can retain raw tensor storage pointers
+    outside PyTorch's saved-tensor hook bookkeeping. CPU offload is still useful
+    there, but force-resizing the source storage can invalidate those raw
+    pointers before the replay backward consumes them.
+    """
+    global _SUPPRESS_FORCED_RELEASE_DEPTH
+    if names is None:
+        _SUPPRESS_FORCED_RELEASE_DEPTH += 1
+    else:
+        _SUPPRESS_FORCED_RELEASE_NAME_STACK.append(set(names))
+    try:
+        yield
+    finally:
+        if names is None:
+            _SUPPRESS_FORCED_RELEASE_DEPTH -= 1
+        else:
+            _SUPPRESS_FORCED_RELEASE_NAME_STACK.pop()
+
+
+def fine_grained_offloading_forced_release_enabled(name=None) -> bool:
+    """Return whether manual CUDA storage release is currently allowed."""
+    if _SUPPRESS_FORCED_RELEASE_DEPTH > 0:
+        return False
+    if name is not None:
+        for suppressed_names in reversed(_SUPPRESS_FORCED_RELEASE_NAME_STACK):
+            if name in suppressed_names:
+                return False
+    return os.getenv("MEGATRON_FINE_OFFLOAD_FORCE_RELEASE", "1").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+@contextmanager
+def fine_grained_offloading_suppress_offload():
+    """Temporarily bypass fine-grained offload graph markers.
+
+    StreamBP builds short-lived replay autograd graphs inside pipeline backward.
+    Those inner graphs do not follow the outer pipeline chunk order, so they
+    cannot safely participate in the global fine-grained offload queue.
+    """
+    global _SUPPRESS_OFFLOAD_DEPTH
+    _SUPPRESS_OFFLOAD_DEPTH += 1
+    try:
+        yield
+    finally:
+        _SUPPRESS_OFFLOAD_DEPTH -= 1
+
+
+def fine_grained_offloading_offload_enabled() -> bool:
+    """Return whether fine-grained offload graph markers should be active."""
+    return _SUPPRESS_OFFLOAD_DEPTH == 0
+
+
+def fine_grained_offloading_use_contiguous_staging(src_tensor: torch.Tensor) -> bool:
+    """Return whether offload should make a contiguous GPU staging tensor.
+
+    A contiguous GPU staging copy can make D2H copies faster for strided saved
+    tensors, but it costs a second GPU allocation the size of the activation.
+    Near the memory limit that staging allocation can itself OOM before the
+    offload has a chance to free anything. In ``auto`` mode, only stage when
+    there is enough free memory beyond the tensor size plus a configurable
+    reserve.
+    """
+
+    mode = os.getenv("MEGATRON_FINE_OFFLOAD_CONTIGUOUS_STAGING", "auto").lower()
+    if mode in ("0", "false", "off", "no", "never"):
+        return False
+    if mode in ("1", "true", "on", "yes", "always"):
+        return True
+    if mode != "auto":
+        raise ValueError(
+            "MEGATRON_FINE_OFFLOAD_CONTIGUOUS_STAGING must be one of "
+            "auto/always/never"
+        )
+    if not src_tensor.is_cuda:
+        return True
+    try:
+        free_bytes, _ = torch.cuda.mem_get_info(src_tensor.device)
+    except RuntimeError:
+        return True
+    tensor_bytes = src_tensor.numel() * src_tensor.element_size()
+    reserve_mb = int(os.getenv("MEGATRON_FINE_OFFLOAD_STAGING_RESERVE_MB", "4096"))
+    reserve_bytes = reserve_mb * 1024 * 1024
+    return free_bytes > tensor_bytes + reserve_bytes
+
+
+def fine_grained_offloading_copy_to_cpu(
+    cpu_backup: torch.Tensor, src_tensor: torch.Tensor, non_blocking: bool
+) -> None:
+    """Copy an activation to CPU without requiring one giant GPU staging buffer."""
+
+    if not src_tensor.is_cuda or src_tensor.is_contiguous() or src_tensor.dim() == 0:
+        cpu_backup.copy_(src_tensor, non_blocking=non_blocking)
+        return
+
+    chunk_mb = int(os.getenv("MEGATRON_FINE_OFFLOAD_STRIDED_COPY_CHUNK_MB", "128"))
+    if chunk_mb <= 0:
+        cpu_backup.copy_(src_tensor, non_blocking=non_blocking)
+        return
+
+    split_dim = max(range(src_tensor.dim()), key=lambda dim: int(src_tensor.size(dim)))
+    split_len = int(src_tensor.size(split_dim))
+    if split_len <= 1:
+        cpu_backup.copy_(src_tensor, non_blocking=non_blocking)
+        return
+
+    tensor_bytes = src_tensor.numel() * src_tensor.element_size()
+    bytes_per_index = max(1, (tensor_bytes + split_len - 1) // split_len)
+    max_chunk_bytes = chunk_mb * 1024 * 1024
+    chunk_len = max(1, max_chunk_bytes // bytes_per_index)
+
+    # Keep chunked strided copies blocking by default. Some CUDA copy paths
+    # allocate an internal contiguous staging buffer for non-contiguous sources;
+    # host-serializing the chunks prevents those temporary buffers from piling
+    # up on a nearly full GPU.
+    chunk_non_blocking = os.getenv(
+        "MEGATRON_FINE_OFFLOAD_STRIDED_COPY_NON_BLOCKING", "0"
+    ).lower() in ("1", "true", "yes", "on")
+    for start in range(0, split_len, chunk_len):
+        length = min(chunk_len, split_len - start)
+        cpu_backup.narrow(split_dim, start, length).copy_(
+            src_tensor.narrow(split_dim, start, length),
+            non_blocking=chunk_non_blocking,
+        )
+
+
+def _fine_grained_offloading_tensor_nbytes(shape, dtype: torch.dtype) -> int:
+    numel = 1
+    for dim in shape:
+        numel *= int(dim)
+    return numel * torch.empty((), dtype=dtype).element_size()
+
+
+def fine_grained_offloading_use_pinned_cpu_backup(shape, dtype: torch.dtype) -> bool:
+    """Return whether a CPU activation backup should be page-locked.
+
+    Pinning every offloaded activation can make D2H/H2D transfers faster, but
+    large pinned allocations are accounted through the NVIDIA driver and shared
+    memory paths. At 32k context with many pipeline microbatches this can push a
+    single rank toward TiB-scale shmem and trigger the kernel OOM killer even
+    when ordinary host RAM is still available. Keep pinning for small tensors
+    where it helps transfer latency; use pageable CPU memory for large activation
+    backups.
+    """
+
+    mode = os.getenv("MEGATRON_FINE_OFFLOAD_PIN_MEMORY", "auto").lower()
+    if mode in ("0", "false", "off", "no", "never"):
+        return False
+    if mode in ("1", "true", "on", "yes", "always"):
+        return True
+    if mode != "auto":
+        raise ValueError(
+            "MEGATRON_FINE_OFFLOAD_PIN_MEMORY must be one of auto/always/never"
+        )
+
+    max_mb = int(os.getenv("MEGATRON_FINE_OFFLOAD_PINNED_MAX_MB", "64"))
+    if max_mb <= 0:
+        return False
+    return _fine_grained_offloading_tensor_nbytes(shape, dtype) <= max_mb * 1024 * 1024
 
 
 def print_offload_summary_table(total_offload_bytes: Dict[str, int]):
@@ -122,8 +295,8 @@ class GPUTensorPool:
         self.device = torch.device(device)
         self.pin_memory = pin_memory
 
-        # Maintain a separate pool for each (shape, dtype) combination
-        # Structure: {(shape, dtype): {'free': deque, 'all': list, 'allocated_count': int}}
+        # Maintain a separate pool for each (shape, dtype, pinned) combination
+        # Structure: {(shape, dtype, pinned): {'free': deque, 'all': list, 'allocated_count': int}}
         self._pools: Dict[Tuple, Dict[str, Any]] = {}
 
         # Statistics
@@ -138,9 +311,9 @@ class GPUTensorPool:
 
         debug_rank("GPUTensorPool: Initialized with dynamic allocation")
 
-    def _get_pool_key(self, shape: Tuple, dtype: torch.dtype) -> Tuple:
+    def _get_pool_key(self, shape: Tuple, dtype: torch.dtype, pin_memory: bool) -> Tuple:
         """Generate a unique key for the pool based on shape and dtype."""
-        return (shape, dtype)
+        return (shape, dtype, pin_memory)
 
     @staticmethod
     def _calculate_memory_size(shape: Tuple, dtype: torch.dtype) -> int:
@@ -151,7 +324,12 @@ class GPUTensorPool:
             numel *= dim
         return numel * element_size
 
-    def allocate(self, shape: Tuple, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    def allocate(
+        self,
+        shape: Tuple,
+        dtype: torch.dtype = torch.float32,
+        pin_memory: bool = None,
+    ) -> torch.Tensor:
         """
         Allocate a tensor with the specified shape and dtype.
 
@@ -164,7 +342,11 @@ class GPUTensorPool:
         """
         self._stats['allocation_requests'] += 1
 
-        pool_key = self._get_pool_key(shape, dtype)
+        if pin_memory is None:
+            pin_memory = self.pin_memory
+        pin_memory = bool(pin_memory)
+
+        pool_key = self._get_pool_key(shape, dtype, pin_memory)
 
         # Create pool for this (shape, dtype) if it doesn't exist
         if pool_key not in self._pools:
@@ -187,7 +369,7 @@ class GPUTensorPool:
             )
         else:
             # Allocate a new tensor
-            tensor = torch.empty(shape, dtype=dtype, device=self.device, pin_memory=self.pin_memory)
+            tensor = torch.empty(shape, dtype=dtype, device=self.device, pin_memory=pin_memory)
             pool['all'].append(tensor)
             self._stats['total_allocated'] += 1
             self._stats['pool_misses'] += 1
@@ -219,12 +401,13 @@ class GPUTensorPool:
 
         shape = tensor.shape
         dtype = tensor.dtype
+        pin_memory = tensor.is_pinned()
 
-        pool_key = self._get_pool_key(shape, dtype)
+        pool_key = self._get_pool_key(shape, dtype, pin_memory)
 
         if pool_key not in self._pools:
             raise ValueError(
-                f"No pool exists for shape={shape}, dtype={dtype}. "
+                f"No pool exists for shape={shape}, dtype={dtype}, pin_memory={pin_memory}. "
                 f"Available pools: {list(self._pools.keys())}"
             )
 
@@ -235,7 +418,7 @@ class GPUTensorPool:
         if not tensor_found:
             raise ValueError(
                 f"Attempting to free a tensor that doesn't belong to this pool "
-                f"(shape={shape}, dtype={dtype})"
+                f"(shape={shape}, dtype={dtype}, pin_memory={pin_memory})"
             )
 
         # Return tensor to the free queue
@@ -248,7 +431,9 @@ class GPUTensorPool:
             f"available in pool={len(pool['free'])}"
         )
 
-    def get_pool_status(self, shape: Tuple = None, dtype: torch.dtype = None) -> Dict[str, Any]:
+    def get_pool_status(
+        self, shape: Tuple = None, dtype: torch.dtype = None, pin_memory: bool = None
+    ) -> Dict[str, Any]:
         """
         Get the status of the memory pool.
 
@@ -260,10 +445,10 @@ class GPUTensorPool:
             Dictionary containing status information
         """
         if shape is not None:
-            if dtype is None:
-                raise ValueError("dtype must be specified when shape is provided")
+            if dtype is None or pin_memory is None:
+                raise ValueError("dtype and pin_memory must be specified when shape is provided")
 
-            pool_key = self._get_pool_key(shape, dtype)
+            pool_key = self._get_pool_key(shape, dtype, bool(pin_memory))
 
             if pool_key not in self._pools:
                 raise ValueError(f"No pool exists for shape={shape}, dtype={dtype}")
@@ -274,6 +459,7 @@ class GPUTensorPool:
             return {
                 'shape': shape,
                 'dtype': dtype,
+                'pin_memory': bool(pin_memory),
                 'total_count': total_count,
                 'allocated_count': pool['allocated_count'],
                 'free_count': len(pool['free']),
@@ -286,8 +472,8 @@ class GPUTensorPool:
             status = {'global_stats': self._stats.copy(), 'pools': {}}
 
             for pool_key in self._pools:
-                shape, dtype = pool_key
-                status['pools'][pool_key] = self.get_pool_status(shape, dtype)
+                shape, dtype, pin_memory = pool_key
+                status['pools'][pool_key] = self.get_pool_status(shape, dtype, pin_memory)
 
             return status
 
@@ -364,6 +550,10 @@ class OffloadTensorGroup:
     def wait_offload_event(self, stream):
         """Wait for the offload event."""
         stream.wait_event(self._offload_event)
+
+    def synchronize_offload_event(self):
+        """Synchronize host with the offload event."""
+        self._offload_event.synchronize()
 
     def record_reload_event(self, stream):
         """Record the reload event."""
@@ -734,17 +924,31 @@ class ChunkOffloadHandler:
         """Offload."""
         debug_rank("--------offload")
 
-        if not src_tensor.is_contiguous():
-            src_tensor = src_tensor.contiguous()
+        copy_src = src_tensor
+        if not src_tensor.is_contiguous() and fine_grained_offloading_use_contiguous_staging(
+            src_tensor
+        ):
+            copy_src = src_tensor.contiguous()
+
+        effective_pin_memory = bool(pin_memory) and fine_grained_offloading_use_pinned_cpu_backup(
+            src_tensor.shape, src_tensor.dtype
+        )
 
         if use_cpu_pool:
-            cpu_backup = self.cpu_tensor_pool.allocate(src_tensor.shape, dtype=src_tensor.dtype)
+            cpu_backup = self.cpu_tensor_pool.allocate(
+                src_tensor.shape, dtype=src_tensor.dtype, pin_memory=effective_pin_memory
+            )
         else:
             cpu_backup = torch.empty(
-                src_tensor.shape, dtype=src_tensor.dtype, device="cpu", pin_memory=pin_memory
+                src_tensor.shape,
+                dtype=src_tensor.dtype,
+                device="cpu",
+                pin_memory=effective_pin_memory,
             )
 
-        cpu_backup.copy_(src_tensor, non_blocking=pin_memory)
+        fine_grained_offloading_copy_to_cpu(
+            cpu_backup, copy_src, non_blocking=effective_pin_memory
+        )
         state = (src_tensor.device, cpu_backup, use_cpu_pool)
         return state
 
@@ -953,14 +1157,28 @@ class ChunkOffloadHandler:
         """Offload a group of tensors and optionally release their GPU memory."""
         debug_rank("----bulk_offload")
         if self.should_bulk_offload():
-            self._groups_to_reload.append(self._groups_to_offload[-1])
+            group_to_offload = self._groups_to_offload[-1]
+            self._groups_to_reload.append(group_to_offload)
             self.bulk_offload_group()
             # Manually release tensors not auto-freed by torch GC
-            if len(forced_released_tensors) > 0:
-                cur_stream = torch.cuda.current_stream()
-                for release_tensor in forced_released_tensors:
-                    if self.tensor_need_offloading_checker(release_tensor):
-                        # Ensure tensor is not in use before freeing
+            if (
+                len(forced_released_tensors) > 0
+                and fine_grained_offloading_forced_release_enabled(group_to_offload._name)
+            ):
+                release_tensors = [
+                    release_tensor
+                    for release_tensor in forced_released_tensors
+                    if self.tensor_need_offloading_checker(release_tensor)
+                ]
+                if release_tensors:
+                    # The D2H copies above are launched asynchronously on the offload
+                    # stream.  record_stream() protects normal allocator reuse, but
+                    # untyped_storage().resize_(0) is a host-side storage mutation and
+                    # can otherwise release storage before the offload stream has
+                    # finished reading it.
+                    group_to_offload.synchronize_offload_event()
+                    cur_stream = torch.cuda.current_stream()
+                    for release_tensor in release_tensors:
                         release_tensor.record_stream(cur_stream)
                         release_tensor.untyped_storage().resize_(0)
 
@@ -1099,6 +1317,8 @@ def fine_grained_offloading_group_commit(
     The tensors will be untyped_storage().resize_(0) after offloading.
     Note: specify the tensors only when they are not automatically released by torch gc.
     """
+    if not fine_grained_offloading_offload_enabled():
+        return tensor
     # Be permissive: callers may pass a tuple/list of outputs (e.g., (q, k, v)).
     # We only need to insert a single identity op into the autograd graph; applying
     # it to the first tensor output is sufficient and keeps callers' code minimal.
@@ -1166,6 +1386,8 @@ class FineGrainedOffloadingGroupStartFunction(torch.autograd.Function):
 
 def fine_grained_offloading_group_start(tensor, name=None):
     """Mark the start of a layer group and prepare for offload/reload."""
+    if not fine_grained_offloading_offload_enabled():
+        return tensor
     cur_forward_chunk = PipelineOffloadManager.get_instance().pop_forward_chunk(name=name)
     if cur_forward_chunk is None:
         return tensor
@@ -1215,14 +1437,15 @@ class FineGrainedActivationOffloadingInterface:
 
     def __enter__(self):
         """Enter context manager to enable activation offloading hooks."""
-        if self.offload:
+        self._offload_entered = self.offload and fine_grained_offloading_offload_enabled()
+        if self._offload_entered:
             self.tensor = fine_grained_offloading_group_start(self.tensor, self.name)
             PipelineOffloadManager.get_instance().__enter__()
         return self.tensor
 
     def __exit__(self, *args: Any):
         """Exit context manager to disable activation offloading hooks."""
-        if self.offload:
+        if getattr(self, "_offload_entered", False):
             PipelineOffloadManager.get_instance().__exit__()
 
     @staticmethod

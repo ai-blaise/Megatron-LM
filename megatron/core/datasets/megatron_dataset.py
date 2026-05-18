@@ -38,6 +38,9 @@ class MegatronDataset(ABC, torch.utils.data.Dataset):
         config (BlendedMegatronDatasetConfig): The config
     """
 
+    masks_padding_by_token_id = True
+    """Whether samples produced by this dataset mask padding by comparing token IDs."""
+
     def __init__(
         self,
         dataset: LowLevelDataset,
@@ -95,7 +98,11 @@ class MegatronDataset(ABC, torch.utils.data.Dataset):
                 pass
 
         if self._pad_token_id in _special_tokens_list:
-            if self.config.allow_ambiguous_pad_tokens:
+            if not self.masks_padding_by_token_id:
+                # Dataset implementations with explicit padding-position masks should not treat
+                # every occurrence of an ambiguous pad ID as padding.
+                self._pad_token_id = _PAD_TOKEN_ID
+            elif self.config.allow_ambiguous_pad_tokens:
                 # This will break training, but users must explicitly opt-in to this behavior.
                 warnings.warn(
                     "The pad token id in the tokenizer collides with another special token id. "

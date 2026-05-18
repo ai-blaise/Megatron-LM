@@ -529,6 +529,24 @@ def _activation_eco_input_may_be_storage_released(
     return False
 
 
+def _activation_eco_forced_release_group(
+    config: ModelParallelConfig,
+    *,
+    tp_comm_buffer_name: Optional[str],
+    is_expert: bool,
+) -> Optional[str]:
+    if not getattr(config, "fine_grained_activation_offloading", False):
+        return None
+    offload_modules = set(getattr(config, "offload_modules", None) or [])
+    if tp_comm_buffer_name == "proj" and "attn_proj" in offload_modules:
+        return "attn_proj"
+    if tp_comm_buffer_name == "qkv" and "qkv_linear" in offload_modules:
+        return "qkv_linear"
+    if is_expert and tp_comm_buffer_name == "fc1" and "expert_fc1" in offload_modules:
+        return "expert_fc1"
+    return None
+
+
 class TELinear(te.pytorch.Linear):
     """Wrapper for the Transformer-Engine's `Linear` layer.
 
@@ -737,6 +755,11 @@ class TELinear(te.pytorch.Linear):
                     self.config, "nvfp4_activation_eco_recompute_only", True
                 ),
                 clone_captured_input=_activation_eco_input_may_be_storage_released(
+                    self.config,
+                    tp_comm_buffer_name=tp_comm_buffer_name,
+                    is_expert=is_expert,
+                ),
+                forced_release_group=_activation_eco_forced_release_group(
                     self.config,
                     tp_comm_buffer_name=tp_comm_buffer_name,
                     is_expert=is_expert,
@@ -1686,6 +1709,11 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                         self.config, "nvfp4_activation_eco_recompute_only", True
                     ),
                     clone_captured_input=_activation_eco_input_may_be_storage_released(
+                        self.config,
+                        tp_comm_buffer_name=tp_comm_buffer_name,
+                        is_expert=is_expert,
+                    ),
+                    forced_release_group=_activation_eco_forced_release_group(
                         self.config,
                         tp_comm_buffer_name=tp_comm_buffer_name,
                         is_expert=is_expert,

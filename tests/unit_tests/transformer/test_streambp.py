@@ -2,11 +2,14 @@
 
 from contextlib import contextmanager
 import math
+import os
+from typing import Optional
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 
 from megatron.core.extensions.transformer_engine import TELinear, TENorm
@@ -28,6 +31,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+import megatron.core.transformer.streambp as streambp_module
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexer,
@@ -446,6 +450,7 @@ def test_streambp_moe_hybrid_can_split_mlp_replay_into_large_chunks():
             chunk_size=4,
             chunk_forward=False,
             moe_mlp_chunks=2,
+            moe_mlp_backward_chunks=4,
             mhc_recompute_manager=None,
         )
 
@@ -464,15 +469,26 @@ def test_streambp_moe_hybrid_can_split_mlp_replay_into_large_chunks():
         full_output.backward(grad_output)
         output.backward(grad_output)
 
-    assert layer.grad_attention_chunks == [(0, 4), (4, 5), (5, 8), (8, 10)]
-    assert layer.grad_mlp_shapes == [(5, 2, 3), (5, 2, 3)]
+    assert layer.grad_attention_chunks == [
+        (0, 3),
+        (3, 4),
+        (4, 6),
+        (6, 8),
+        (8, 9),
+        (9, 10),
+    ]
+    assert layer.grad_mlp_shapes == [(3, 2, 3), (3, 2, 3), (3, 2, 3), (1, 2, 3)]
     assert layer.grad_events == [
-        ("attention", 0, 4),
-        ("attention", 4, 5),
-        ("mlp", 5),
-        ("attention", 5, 8),
-        ("attention", 8, 10),
-        ("mlp", 5),
+        ("attention", 0, 3),
+        ("mlp", 3),
+        ("attention", 3, 4),
+        ("attention", 4, 6),
+        ("mlp", 3),
+        ("attention", 6, 8),
+        ("attention", 8, 9),
+        ("mlp", 3),
+        ("attention", 9, 10),
+        ("mlp", 1),
     ]
     assert recompute_phases == [
         False,
@@ -481,6 +497,10 @@ def test_streambp_moe_hybrid_can_split_mlp_replay_into_large_chunks():
         False,
         False,
         False,
+        True,
+        True,
+        True,
+        True,
         True,
         True,
         True,
@@ -625,6 +645,231 @@ def test_streambp_lm_head_loss_matches_full_logits_gradients():
 
     assert torch.allclose(streambp_hidden.grad, full_hidden.grad, atol=2e-5, rtol=2e-5)
     assert torch.allclose(streambp_head.weight.grad, full_head.weight.grad, atol=2e-5, rtol=2e-5)
+
+
+def test_streambp_lm_head_fused_lce_path_matches_full_logits_gradients():
+    torch.manual_seed(5680)
+    full_head = ToyOutputLayer(hidden_size=6, vocab_size=13)
+    streambp_head = ToyOutputLayer(hidden_size=6, vocab_size=13)
+    streambp_head.load_state_dict(full_head.state_dict())
+
+    labels = torch.randint(0, 13, (2, 9))
+    full_hidden = torch.randn(9, 2, 6, requires_grad=True)
+    streambp_hidden = full_hidden.detach().clone().requires_grad_(True)
+    fused_calls = []
+
+    def reference_fused_lce(
+        output_layer,
+        hidden_states,
+        labels_chunk,
+        output_layer_kwargs,
+        *,
+        sequence_parallel_output,
+    ):
+        assert not sequence_parallel_output
+        fused_calls.append((tuple(hidden_states.shape), tuple(labels_chunk.shape)))
+        weight = output_layer_kwargs.get("weight")
+        weight = output_layer.weight if weight is None else weight
+        logits = F.linear(hidden_states, weight)
+        return _toy_lm_loss(labels_chunk, logits)
+
+    full_logits, _ = full_head(input_=full_hidden)
+    full_loss = _toy_lm_loss(labels, full_logits)
+    with patch.object(
+        streambp_module, "_streambp_fused_lce_available", return_value=True
+    ), patch.object(streambp_module, "_streambp_fused_lce_loss", side_effect=reference_fused_lce):
+        streambp_loss = streambp_module.streambp_lm_head_loss(
+            streambp_head,
+            streambp_hidden,
+            labels,
+            loss_func=_toy_lm_loss,
+            chunk_size=4,
+        )
+
+        assert fused_calls == [
+            ((4, 2, 6), (2, 4)),
+            ((4, 2, 6), (2, 4)),
+            ((1, 2, 6), (2, 1)),
+        ]
+        assert torch.allclose(streambp_loss, full_loss, atol=1e-6, rtol=1e-6)
+
+        full_loss.mean().backward()
+        streambp_loss.mean().backward()
+
+    assert torch.allclose(streambp_hidden.grad, full_hidden.grad, atol=2e-5, rtol=2e-5)
+    assert torch.allclose(streambp_head.weight.grad, full_head.weight.grad, atol=2e-5, rtol=2e-5)
+
+
+def test_streambp_lm_head_single_chunk_fused_lce_avoids_logits_path():
+    torch.manual_seed(5682)
+    full_head = ToyOutputLayer(hidden_size=6, vocab_size=13)
+    streambp_head = ToyOutputLayer(hidden_size=6, vocab_size=13)
+    streambp_head.load_state_dict(full_head.state_dict())
+
+    labels = torch.randint(0, 13, (2, 9))
+    full_hidden = torch.randn(9, 2, 6, requires_grad=True)
+    streambp_hidden = full_hidden.detach().clone().requires_grad_(True)
+    fused_calls = []
+
+    def reference_fused_lce(
+        output_layer,
+        hidden_states,
+        labels_chunk,
+        output_layer_kwargs,
+        *,
+        sequence_parallel_output,
+    ):
+        assert not sequence_parallel_output
+        fused_calls.append((tuple(hidden_states.shape), tuple(labels_chunk.shape)))
+        weight = output_layer_kwargs.get("weight")
+        weight = output_layer.weight if weight is None else weight
+        return _toy_lm_loss(labels_chunk, F.linear(hidden_states, weight))
+
+    full_logits, _ = full_head(input_=full_hidden)
+    full_loss = _toy_lm_loss(labels, full_logits)
+    with patch.object(
+        streambp_module, "_streambp_fused_lce_available", return_value=True
+    ), patch.object(
+        streambp_module, "_streambp_fused_lce_loss", side_effect=reference_fused_lce
+    ), patch.object(
+        streambp_module, "_call_output_layer", side_effect=AssertionError("logits path used")
+    ):
+        streambp_loss = streambp_module.streambp_lm_head_loss(
+            streambp_head,
+            streambp_hidden,
+            labels,
+            loss_func=_toy_lm_loss,
+            chunk_size=9,
+        )
+
+        assert fused_calls == [((9, 2, 6), (2, 9))]
+        assert torch.allclose(streambp_loss, full_loss, atol=1e-6, rtol=1e-6)
+
+        full_loss.mean().backward()
+        streambp_loss.mean().backward()
+
+    assert torch.allclose(streambp_hidden.grad, full_hidden.grad, atol=2e-5, rtol=2e-5)
+    assert torch.allclose(streambp_head.weight.grad, full_head.weight.grad, atol=2e-5, rtol=2e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_streambp_lm_head_real_fused_lce_cuda_matches_unfused_gradients():
+    if torch.cuda.get_device_capability(torch.cuda.current_device())[0] != 10:
+        pytest.skip("Blackwell fused linear cross entropy requires compute capability 10.x")
+    if streambp_module._load_streambp_fused_lce() is None:
+        pytest.skip("Blackwell fused linear cross entropy extension is not available")
+
+    torch.manual_seed(5681)
+    full_head = ToyOutputLayer(hidden_size=64, vocab_size=31).cuda().bfloat16()
+    fused_head = ToyOutputLayer(hidden_size=64, vocab_size=31).cuda().bfloat16()
+    fused_head.load_state_dict(full_head.state_dict())
+
+    labels = torch.randint(0, 31, (2, 12), device="cuda")
+    full_hidden = torch.randn(12, 2, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    fused_hidden = full_hidden.detach().clone().requires_grad_(True)
+
+    with patch.dict(os.environ, {"MEGATRON_STREAMBP_FUSED_LCE": "0"}):
+        full_loss = streambp_module.streambp_lm_head_loss(
+            full_head,
+            full_hidden,
+            labels,
+            loss_func=_toy_lm_loss,
+            chunk_size=4,
+        )
+    with patch.dict(os.environ, {"MEGATRON_STREAMBP_FUSED_LCE": "1"}):
+        fused_loss = streambp_module.streambp_lm_head_loss(
+            fused_head,
+            fused_hidden,
+            labels,
+            loss_func=_toy_lm_loss,
+            chunk_size=4,
+        )
+
+    torch.testing.assert_close(fused_loss.float(), full_loss.float(), rtol=2e-2, atol=2e-2)
+
+    full_loss.float().mean().backward()
+    fused_loss.float().mean().backward()
+
+    torch.testing.assert_close(
+        fused_hidden.grad.float(), full_hidden.grad.float(), rtol=2e-2, atol=2e-2
+    )
+    torch.testing.assert_close(
+        fused_head.weight.grad.float(), full_head.weight.grad.float(), rtol=2e-2, atol=2e-2
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_streambp_lm_head_streaming_sp_fused_lce_matches_original_sp_fused_lce():
+    if torch.cuda.get_device_capability(torch.cuda.current_device())[0] != 10:
+        pytest.skip("Blackwell fused linear cross entropy requires compute capability 10.x")
+    if "RANK" not in os.environ:
+        pytest.skip("Run with torchrun --nproc-per-node>=2")
+    if not dist.is_initialized():
+        torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
+        dist.init_process_group(backend="nccl")
+    if dist.get_world_size() < 2:
+        pytest.skip("streaming SP fused LCE requires at least 2 ranks")
+    if streambp_module._load_streambp_fused_lce() is None:
+        pytest.skip("Blackwell fused linear cross entropy extension is not available")
+
+    rank = dist.get_rank()
+    world = dist.get_world_size()
+    torch.manual_seed(6000 + rank)
+    hidden_size = 64
+    local_vocab = 17
+    local_seq = 6
+    batch = 2
+    total_vocab = local_vocab * world
+
+    original_head = ToyOutputLayer(hidden_size=hidden_size, vocab_size=local_vocab).cuda().bfloat16()
+    streaming_head = ToyOutputLayer(hidden_size=hidden_size, vocab_size=local_vocab).cuda().bfloat16()
+    streaming_head.load_state_dict(original_head.state_dict())
+    for head in (original_head, streaming_head):
+        head.sequence_parallel = True
+        head.tp_group = dist.group.WORLD
+
+    hidden = torch.randn(
+        local_seq, batch, hidden_size, device="cuda", dtype=torch.bfloat16, requires_grad=True
+    )
+    hidden_stream = hidden.detach().clone().requires_grad_(True)
+    labels = torch.empty((batch, local_seq * world), device="cuda", dtype=torch.long)
+    if rank == 0:
+        labels.random_(0, total_vocab)
+    dist.broadcast(labels, src=0)
+
+    with patch.dict(os.environ, {"MEGATRON_STREAMBP_FUSED_LCE_SP_STREAMING": "0"}):
+        original_loss = streambp_module.streambp_lm_head_loss(
+            original_head,
+            hidden,
+            labels,
+            loss_func=_toy_lm_loss,
+            chunk_size=local_seq,
+        )
+    with patch.dict(
+        os.environ,
+        {
+            "MEGATRON_STREAMBP_FUSED_LCE_SP_STREAMING": "1",
+            "MEGATRON_STREAMBP_FUSED_LCE_SP_TILE_SIZE": "3",
+        },
+    ):
+        streaming_loss = streambp_module.streambp_lm_head_loss(
+            streaming_head,
+            hidden_stream,
+            labels,
+            loss_func=_toy_lm_loss,
+            chunk_size=local_seq,
+        )
+
+    torch.testing.assert_close(
+        streaming_loss.float(), original_loss.float(), rtol=2e-2, atol=2e-2
+    )
+    original_loss.float().mean().backward()
+    streaming_loss.float().mean().backward()
+    torch.testing.assert_close(hidden_stream.grad.float(), hidden.grad.float(), rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(
+        streaming_head.weight.grad.float(), original_head.weight.grad.float(), rtol=2e-2, atol=2e-2
+    )
+    dist.barrier()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -929,6 +1174,7 @@ def _build_moe_transformer_block_pair(
     moe_router_load_balancing_type: str = "aux_loss",
     streambp_moe_chunk_forward: bool = True,
     streambp_moe_mlp_chunks: int = 1,
+    streambp_moe_mlp_backward_chunks: Optional[int] = None,
 ):
     config_kwargs = dict(
         num_layers=1,
@@ -956,6 +1202,7 @@ def _build_moe_transformer_block_pair(
         streambp_logits_chunk_size=4,
         streambp_moe_chunk_forward=streambp_moe_chunk_forward,
         streambp_moe_mlp_chunks=streambp_moe_mlp_chunks,
+        streambp_moe_mlp_backward_chunks=streambp_moe_mlp_backward_chunks,
     )
     baseline = TransformerBlock(
         baseline_config, get_gpt_decoder_block_spec(baseline_config, False)
@@ -1059,6 +1306,24 @@ def test_streambp_moe_seq_aux_loss_split_mlp_replay_matches_baseline_gradients()
             moe_router_load_balancing_type="seq_aux_loss",
             streambp_moe_chunk_forward=False,
             streambp_moe_mlp_chunks=2,
+        )
+        _assert_matching_block_backward(baseline, streambp, with_padding_mask=False)
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_streambp_moe_seq_aux_loss_asymmetric_mlp_replay_matches_baseline_gradients():
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        torch.manual_seed(6813)
+        model_parallel_cuda_manual_seed(6813)
+        baseline, streambp = _build_moe_transformer_block_pair(
+            moe_aux_loss_coeff=0.01,
+            moe_router_load_balancing_type="seq_aux_loss",
+            streambp_moe_chunk_forward=False,
+            streambp_moe_mlp_chunks=2,
+            streambp_moe_mlp_backward_chunks=4,
         )
         _assert_matching_block_backward(baseline, streambp, with_padding_mask=False)
     finally:

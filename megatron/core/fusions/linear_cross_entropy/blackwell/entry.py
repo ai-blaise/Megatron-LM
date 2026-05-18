@@ -456,17 +456,26 @@ try:
             raise NotImplementedError(f"Unsupported backward method: {_backward_method}")
 
         if in_tp_mode:
-            dist.all_reduce(d_hidden, op=dist.ReduceOp.SUM, group=tp_group)
             if sequence_parallel:
                 partial_hidden_shape = (
                     global_hidden.shape[0] // tp_world_size,
                     *global_hidden.shape[1:],
                 )
                 partial_num_tokens = num_tokens // tp_world_size
-                d_hidden = d_hidden.view(-1, d_hidden.shape[-1])[
-                    tp_rank * partial_num_tokens : (tp_rank + 1) * partial_num_tokens, :
-                ]
-                d_hidden = d_hidden.view(partial_hidden_shape).clone()
+                partial_d_hidden = torch.empty(
+                    (partial_num_tokens, d_hidden.shape[-1]),
+                    device=d_hidden.device,
+                    dtype=d_hidden.dtype,
+                )
+                dist.reduce_scatter_tensor(
+                    partial_d_hidden,
+                    d_hidden.view(-1, d_hidden.shape[-1]),
+                    op=dist.ReduceOp.SUM,
+                    group=tp_group,
+                )
+                d_hidden = partial_d_hidden.view(partial_hidden_shape)
+            else:
+                dist.all_reduce(d_hidden, op=dist.ReduceOp.SUM, group=tp_group)
 
         # convert d_hidden to the original dtype
         d_hidden = d_hidden.type_as(global_hidden)

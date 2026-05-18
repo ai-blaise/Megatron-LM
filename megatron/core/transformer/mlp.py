@@ -47,6 +47,93 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+def _is_te_nvfp4_tensor(tensor: torch.Tensor) -> bool:
+    """Return True for Transformer Engine NVFP4 tensors without importing TE internals."""
+    return type(tensor).__name__ == "NVFP4Tensor"
+
+
+def _split_nvfp4_swiglu_dim0(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Split a 2D TE NVFP4 SwiGLU tensor along dim 0 without dequantizing it."""
+    if tensor.dim() != 2:
+        raise ValueError(
+            "Storage-aware NVFP4 SwiGLU splitting currently supports only 2D tensors, "
+            f"got shape {tuple(tensor.shape)}"
+        )
+
+    rows, hidden = tensor.shape
+    if rows % 2 != 0 or hidden % 16 != 0:
+        raise ValueError(f"Invalid NVFP4 SwiGLU tensor shape for split: {tuple(tensor.shape)}")
+
+    quantizer = getattr(tensor, "_quantizer", None)
+    if quantizer is None or not hasattr(quantizer, "get_scale_shape"):
+        raise ValueError("TE NVFP4 SwiGLU tensor is missing a usable quantizer")
+
+    tensor_cls = type(tensor)
+    half_rows = rows // 2
+
+    rowwise_data = getattr(tensor, "_rowwise_data", None)
+    rowwise_scale_inv = getattr(tensor, "_rowwise_scale_inv", None)
+    columnwise_data = getattr(tensor, "_columnwise_data", None)
+    columnwise_scale_inv = getattr(tensor, "_columnwise_scale_inv", None)
+
+    if rowwise_data is None:
+        raise ValueError("Cannot split an NVFP4 SwiGLU tensor without row-wise data")
+
+    def _slice_scale_with_padding(scale: torch.Tensor, start: int, stop: int, shape: torch.Size):
+        expected_shape = tuple(quantizer.get_scale_shape(shape, columnwise=False))
+        scale_slice = scale[start:stop]
+        if tuple(scale_slice.shape) == expected_shape:
+            return scale_slice
+
+        # TE pads row-wise scale outer dimensions to the hardware-required multiple. If
+        # a split cuts inside that padded region, repack the real scale rows at offset 0.
+        repacked = torch.empty(expected_shape, device=scale.device, dtype=scale.dtype)
+        repacked.zero_()
+        repacked[: scale_slice.shape[0], : scale_slice.shape[1]].copy_(scale_slice)
+        return repacked
+
+    outputs = []
+    for part_idx in range(2):
+        start = part_idx * half_rows
+        stop = start + half_rows
+        shape = torch.Size((half_rows, hidden))
+
+        kwargs = {
+            "shape": shape,
+            "dtype": tensor.dtype,
+            "rowwise_data": rowwise_data[start:stop],
+            "rowwise_scale_inv": (
+                _slice_scale_with_padding(rowwise_scale_inv, start, stop, shape)
+                if rowwise_scale_inv is not None
+                else None
+            ),
+            "columnwise_data": (
+                columnwise_data[:, start // 2 : stop // 2]
+                if columnwise_data is not None
+                else None
+            ),
+            "columnwise_scale_inv": (
+                columnwise_scale_inv[:, start // 16 : stop // 16]
+                if columnwise_scale_inv is not None
+                else None
+            ),
+            "amax_rowwise": getattr(tensor, "_amax_rowwise", None),
+            "amax_columnwise": getattr(tensor, "_amax_columnwise", None),
+            "fp4_dtype": getattr(tensor, "_fp4_dtype"),
+            "quantizer": quantizer,
+            "requires_grad": tensor.requires_grad,
+        }
+        outputs.append(tensor_cls(**kwargs))
+
+    return outputs[0], outputs[1]
+
+
+def _split_swiglu_tensor(tensor: torch.Tensor, dim: int) -> tuple[torch.Tensor, torch.Tensor]:
+    if _is_te_nvfp4_tensor(tensor) and dim == 0:
+        return _split_nvfp4_swiglu_dim0(tensor)
+    return torch.chunk(tensor, 2, dim=dim)
+
+
 class LinearFc1Interface(Protocol):
     """Interface for linear_fc1 module in MLP."""
 
@@ -428,7 +515,7 @@ def apply_swiglu_sharded_factory(
             w_key = key
             v_key = key
 
-        tensor_w, tensor_v = torch.chunk(t, 2, dim=swiglu_shard_axis)
+        tensor_w, tensor_v = _split_swiglu_tensor(t, dim=swiglu_shard_axis)
         return [
             ShardedTensor.from_rank_offsets(
                 w_key,

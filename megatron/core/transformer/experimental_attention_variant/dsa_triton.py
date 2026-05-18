@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 import torch
 from packaging import version
 
+from megatron.core.tensor_audit import tensor_audit
 from megatron.core.utils import null_decorator
 
 try:
@@ -1238,6 +1239,81 @@ def is_sparse_dsa_teacher_triton_supported(
     )
 
 
+def is_sparse_dsa_split_qk_triton_supported(
+    query_nope: torch.Tensor,
+    query_pe: torch.Tensor,
+    key_nope: torch.Tensor,
+    key_pe: torch.Tensor,
+    value: torch.Tensor,
+    topk_indices: torch.Tensor,
+    mask: torch.Tensor | None,
+    is_causal: bool,
+    query_positions: torch.Tensor | None = None,
+    key_positions: torch.Tensor | None = None,
+) -> bool:
+    """Return whether the fused selected-attention kernel can consume split MLA Q/K."""
+
+    if not (_env_enabled() and HAVE_TRITON):
+        return False
+    if mask is not None or not is_causal:
+        return False
+    if query_positions is not None and query_positions.dim() != 1:
+        return False
+    if key_positions is not None and key_positions.dim() != 1:
+        return False
+    if (query_positions is None) != (key_positions is None):
+        return False
+    if not (
+        query_nope.is_cuda
+        and query_pe.is_cuda
+        and key_nope.is_cuda
+        and key_pe.is_cuda
+        and value.is_cuda
+        and topk_indices.is_cuda
+    ):
+        return False
+    if query_nope.dtype not in (torch.float32, torch.bfloat16, torch.float16):
+        return False
+    if not (
+        query_pe.dtype == query_nope.dtype
+        and key_nope.dtype == query_nope.dtype
+        and key_pe.dtype == query_nope.dtype
+        and value.dtype == query_nope.dtype
+    ):
+        return False
+    if query_nope.dim() != 4 or query_pe.dim() != 4 or key_nope.dim() != 4:
+        return False
+    if key_pe.dim() != 4 or value.dim() != 4:
+        return False
+    if topk_indices.dim() != 3:
+        return False
+    q_len, bsz, num_heads, qk_dim = query_nope.shape
+    if query_pe.shape[:3] != (q_len, bsz, num_heads):
+        return False
+    sk = key_nope.size(0)
+    if key_nope.shape[1:3] != (bsz, num_heads):
+        return False
+    if value.shape[:3] != (sk, bsz, num_heads):
+        return False
+    if key_pe.shape[0] != sk or key_pe.shape[1] != bsz:
+        return False
+    if key_pe.size(2) not in (1, num_heads):
+        return False
+    if key_pe.size(-1) != query_pe.size(-1):
+        return False
+    if topk_indices.size(0) != bsz or topk_indices.size(1) != q_len:
+        return False
+    if qk_dim <= 0 or qk_dim > 256:
+        return False
+    if query_pe.size(-1) <= 0 or query_pe.size(-1) > 128:
+        return False
+    if value.size(-1) <= 0 or value.size(-1) > 256:
+        return False
+    if topk_indices.size(-1) <= 0 or topk_indices.size(-1) > sk:
+        return False
+    return True
+
+
 @triton.jit
 def _sparse_dsa_forward_kernel(
     query_ptr,
@@ -1731,6 +1807,474 @@ def _sparse_dsa_backward_kernel(
 
 
 @triton.jit
+def _sparse_dsa_split_qk_forward_kernel(
+    query_nope_ptr,
+    query_pe_ptr,
+    key_nope_ptr,
+    key_pe_ptr,
+    value_ptr,
+    topk_ptr,
+    query_pos_ptr,
+    key_pos_ptr,
+    output_ptr,
+    lse_ptr,
+    teacher_ptr,
+    teacher_score_ptr,
+    softmax_scale,
+    q_len: tl.constexpr,
+    bsz: tl.constexpr,
+    num_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    pos_dim: tl.constexpr,
+    value_dim: tl.constexpr,
+    key_pe_heads: tl.constexpr,
+    v_stride_s: tl.constexpr,
+    v_stride_b: tl.constexpr,
+    v_stride_h: tl.constexpr,
+    v_stride_d: tl.constexpr,
+    topk_count: tl.constexpr,
+    q_start,
+    BLOCK_Q: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_QD: tl.constexpr,
+    BLOCK_PD: tl.constexpr,
+    BLOCK_VD: tl.constexpr,
+    HAS_POSITIONS: tl.constexpr,
+    EMIT_TEACHER: tl.constexpr,
+    USE_TEACHER_SCORE_SCRATCH: tl.constexpr,
+):
+    q_block = tl.program_id(0)
+    head_batch_idx = tl.program_id(1)
+    head_idx = head_batch_idx % num_heads
+    batch_idx = head_batch_idx // num_heads
+    key_pe_head_idx = tl.minimum(head_idx, key_pe_heads - 1)
+
+    q_offsets = q_block * BLOCK_Q + tl.arange(0, BLOCK_Q)
+    qd_offsets = tl.arange(0, BLOCK_QD)
+    pd_offsets = tl.arange(0, BLOCK_PD)
+    vd_offsets = tl.arange(0, BLOCK_VD)
+    topk_offsets = tl.arange(0, BLOCK_K)
+    q_valid = q_offsets < q_len
+
+    query_nope = tl.load(
+        query_nope_ptr
+        + ((q_offsets[:, None] * bsz + batch_idx) * num_heads + head_idx) * head_dim
+        + qd_offsets[None, :],
+        mask=q_valid[:, None] & (qd_offsets[None, :] < head_dim),
+        other=0.0,
+    ).to(tl.float32)
+    query_pe = tl.load(
+        query_pe_ptr
+        + ((q_offsets[:, None] * bsz + batch_idx) * num_heads + head_idx) * pos_dim
+        + pd_offsets[None, :],
+        mask=q_valid[:, None] & (pd_offsets[None, :] < pos_dim),
+        other=0.0,
+    ).to(tl.float32)
+
+    m_i = tl.full((BLOCK_Q,), -float("inf"), tl.float32)
+    l_i = tl.full((BLOCK_Q,), 0.0, tl.float32)
+    acc = tl.zeros((BLOCK_Q, BLOCK_VD), tl.float32)
+    if HAS_POSITIONS:
+        q_abs = tl.load(query_pos_ptr + q_offsets, mask=q_valid, other=0)
+    else:
+        q_abs = q_start + q_offsets
+
+    for topk_start in tl.range(0, topk_count, BLOCK_K):
+        k_offsets = topk_start + topk_offsets
+        valid_topk = k_offsets < topk_count
+        selected = tl.load(
+            topk_ptr
+            + (batch_idx * q_len + q_offsets[:, None]) * topk_count
+            + k_offsets[None, :],
+            mask=q_valid[:, None] & valid_topk[None, :],
+            other=0,
+        ).to(tl.int32)
+        selected_valid = selected >= 0
+        safe_selected = tl.maximum(selected, 0)
+        if HAS_POSITIONS:
+            selected_abs = tl.load(
+                key_pos_ptr + safe_selected,
+                mask=q_valid[:, None] & valid_topk[None, :] & selected_valid,
+                other=0,
+            )
+            valid = (
+                q_valid[:, None]
+                & valid_topk[None, :]
+                & selected_valid
+                & (selected_abs <= q_abs[:, None])
+            )
+        else:
+            valid = (
+                q_valid[:, None]
+                & valid_topk[None, :]
+                & selected_valid
+                & (selected <= q_abs[:, None])
+            )
+
+        key_nope = tl.load(
+            key_nope_ptr
+            + ((safe_selected[:, :, None] * bsz + batch_idx) * num_heads + head_idx)
+            * head_dim
+            + qd_offsets[None, None, :],
+            mask=valid[:, :, None] & (qd_offsets[None, None, :] < head_dim),
+            other=0.0,
+        ).to(tl.float32)
+        key_pe = tl.load(
+            key_pe_ptr
+            + ((safe_selected[:, :, None] * bsz + batch_idx) * key_pe_heads + key_pe_head_idx)
+            * pos_dim
+            + pd_offsets[None, None, :],
+            mask=valid[:, :, None] & (pd_offsets[None, None, :] < pos_dim),
+            other=0.0,
+        ).to(tl.float32)
+        scores = (
+            tl.sum(key_nope * query_nope[:, None, :], axis=2)
+            + tl.sum(key_pe * query_pe[:, None, :], axis=2)
+        ) * softmax_scale
+        scores = tl.where(valid, scores, -float("inf"))
+        if EMIT_TEACHER and USE_TEACHER_SCORE_SCRATCH:
+            scratch_ptrs = (
+                teacher_score_ptr
+                + ((batch_idx * q_len + q_offsets[:, None]) * num_heads + head_idx)
+                * topk_count
+                + k_offsets[None, :]
+            )
+            tl.store(scratch_ptrs, scores, mask=q_valid[:, None] & valid_topk[None, :])
+
+        block_m = tl.max(scores, axis=1)
+        has_valid_block = block_m > -float("inf")
+        m_new = tl.where(has_valid_block, tl.maximum(m_i, block_m), m_i)
+        safe_m_i = tl.where(has_valid_block, m_i, 0.0)
+        safe_m_new = tl.where(has_valid_block, m_new, 0.0)
+        alpha = tl.where(has_valid_block, tl.exp(safe_m_i - safe_m_new), 1.0)
+        safe_scores = tl.where(valid, scores, safe_m_new[:, None])
+        probs = tl.exp(safe_scores - safe_m_new[:, None])
+        probs = tl.where(valid, probs, 0.0)
+
+        value = tl.load(
+            value_ptr
+            + safe_selected[:, :, None] * v_stride_s
+            + batch_idx * v_stride_b
+            + head_idx * v_stride_h
+            + vd_offsets[None, None, :] * v_stride_d,
+            mask=valid[:, :, None] & (vd_offsets[None, None, :] < value_dim),
+            other=0.0,
+        ).to(tl.float32)
+        acc = acc * alpha[:, None] + tl.sum(probs[:, :, None] * value, axis=1)
+        l_i = l_i * alpha + tl.sum(probs, axis=1)
+        m_i = m_new
+
+    output = acc / l_i[:, None]
+    row_lse = m_i + tl.log(l_i)
+    if EMIT_TEACHER:
+        for topk_start in tl.range(0, topk_count, BLOCK_K):
+            k_offsets = topk_start + topk_offsets
+            valid_topk = k_offsets < topk_count
+            if USE_TEACHER_SCORE_SCRATCH:
+                scores = tl.load(
+                    teacher_score_ptr
+                    + ((batch_idx * q_len + q_offsets[:, None]) * num_heads + head_idx)
+                    * topk_count
+                    + k_offsets[None, :],
+                    mask=q_valid[:, None] & valid_topk[None, :],
+                    other=-float("inf"),
+                )
+                valid = q_valid[:, None] & valid_topk[None, :] & (scores > -3.0e38)
+            else:
+                selected = tl.load(
+                    topk_ptr
+                    + (batch_idx * q_len + q_offsets[:, None]) * topk_count
+                    + k_offsets[None, :],
+                    mask=q_valid[:, None] & valid_topk[None, :],
+                    other=0,
+                ).to(tl.int32)
+                selected_valid = selected >= 0
+                safe_selected = tl.maximum(selected, 0)
+                if HAS_POSITIONS:
+                    selected_abs = tl.load(
+                        key_pos_ptr + safe_selected,
+                        mask=q_valid[:, None] & valid_topk[None, :] & selected_valid,
+                        other=0,
+                    )
+                    valid = (
+                        q_valid[:, None]
+                        & valid_topk[None, :]
+                        & selected_valid
+                        & (selected_abs <= q_abs[:, None])
+                    )
+                else:
+                    valid = (
+                        q_valid[:, None]
+                        & valid_topk[None, :]
+                        & selected_valid
+                        & (selected <= q_abs[:, None])
+                    )
+                key_nope = tl.load(
+                    key_nope_ptr
+                    + ((safe_selected[:, :, None] * bsz + batch_idx) * num_heads + head_idx)
+                    * head_dim
+                    + qd_offsets[None, None, :],
+                    mask=valid[:, :, None] & (qd_offsets[None, None, :] < head_dim),
+                    other=0.0,
+                ).to(tl.float32)
+                key_pe = tl.load(
+                    key_pe_ptr
+                    + ((safe_selected[:, :, None] * bsz + batch_idx) * key_pe_heads + key_pe_head_idx)
+                    * pos_dim
+                    + pd_offsets[None, None, :],
+                    mask=valid[:, :, None] & (pd_offsets[None, None, :] < pos_dim),
+                    other=0.0,
+                ).to(tl.float32)
+                scores = (
+                    tl.sum(key_nope * query_nope[:, None, :], axis=2)
+                    + tl.sum(key_pe * query_pe[:, None, :], axis=2)
+                ) * softmax_scale
+                scores = tl.where(valid, scores, -float("inf"))
+            final_probs = tl.exp(scores - row_lse[:, None])
+            final_probs = tl.where(valid, final_probs, 0.0)
+            tl.atomic_add(
+                teacher_ptr
+                + (batch_idx * q_len + q_offsets[:, None]) * topk_count
+                + k_offsets[None, :],
+                final_probs,
+                sem="relaxed",
+                mask=valid,
+            )
+
+    tl.store(
+        output_ptr
+        + ((q_offsets[:, None] * bsz + batch_idx) * num_heads + head_idx) * value_dim
+        + vd_offsets[None, :],
+        output,
+        mask=q_valid[:, None] & (vd_offsets[None, :] < value_dim),
+    )
+    tl.store(lse_ptr + (batch_idx * q_len + q_offsets) * num_heads + head_idx, row_lse, mask=q_valid)
+
+
+@triton.jit
+def _sparse_dsa_split_qk_backward_kernel(
+    query_nope_ptr,
+    query_pe_ptr,
+    key_nope_ptr,
+    key_pe_ptr,
+    value_ptr,
+    topk_ptr,
+    query_pos_ptr,
+    key_pos_ptr,
+    output_ptr,
+    lse_ptr,
+    teacher_score_ptr,
+    grad_output_ptr,
+    grad_query_nope_ptr,
+    grad_query_pe_ptr,
+    grad_key_nope_ptr,
+    grad_key_pe_ptr,
+    grad_value_ptr,
+    softmax_scale,
+    q_len: tl.constexpr,
+    bsz: tl.constexpr,
+    num_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    pos_dim: tl.constexpr,
+    value_dim: tl.constexpr,
+    key_pe_heads: tl.constexpr,
+    v_stride_s: tl.constexpr,
+    v_stride_b: tl.constexpr,
+    v_stride_h: tl.constexpr,
+    v_stride_d: tl.constexpr,
+    topk_count: tl.constexpr,
+    q_start,
+    BLOCK_Q: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_QD: tl.constexpr,
+    BLOCK_PD: tl.constexpr,
+    BLOCK_VD: tl.constexpr,
+    HAS_POSITIONS: tl.constexpr,
+    USE_SCORE_SCRATCH: tl.constexpr,
+):
+    q_block = tl.program_id(0)
+    head_batch_idx = tl.program_id(1)
+    head_idx = head_batch_idx % num_heads
+    batch_idx = head_batch_idx // num_heads
+    key_pe_head_idx = tl.minimum(head_idx, key_pe_heads - 1)
+
+    q_offsets = q_block * BLOCK_Q + tl.arange(0, BLOCK_Q)
+    qd_offsets = tl.arange(0, BLOCK_QD)
+    pd_offsets = tl.arange(0, BLOCK_PD)
+    vd_offsets = tl.arange(0, BLOCK_VD)
+    topk_offsets = tl.arange(0, BLOCK_K)
+    q_valid = q_offsets < q_len
+
+    query_nope = tl.load(
+        query_nope_ptr
+        + ((q_offsets[:, None] * bsz + batch_idx) * num_heads + head_idx) * head_dim
+        + qd_offsets[None, :],
+        mask=q_valid[:, None] & (qd_offsets[None, :] < head_dim),
+        other=0.0,
+    ).to(tl.float32)
+    query_pe = tl.load(
+        query_pe_ptr
+        + ((q_offsets[:, None] * bsz + batch_idx) * num_heads + head_idx) * pos_dim
+        + pd_offsets[None, :],
+        mask=q_valid[:, None] & (pd_offsets[None, :] < pos_dim),
+        other=0.0,
+    ).to(tl.float32)
+    grad_output = tl.load(
+        grad_output_ptr
+        + ((q_offsets[:, None] * bsz + batch_idx) * num_heads + head_idx) * value_dim
+        + vd_offsets[None, :],
+        mask=q_valid[:, None] & (vd_offsets[None, :] < value_dim),
+        other=0.0,
+    ).to(tl.float32)
+    output = tl.load(
+        output_ptr
+        + ((q_offsets[:, None] * bsz + batch_idx) * num_heads + head_idx) * value_dim
+        + vd_offsets[None, :],
+        mask=q_valid[:, None] & (vd_offsets[None, :] < value_dim),
+        other=0.0,
+    ).to(tl.float32)
+    row_lse = tl.load(
+        lse_ptr + (batch_idx * q_len + q_offsets) * num_heads + head_idx,
+        mask=q_valid,
+        other=0.0,
+    ).to(tl.float32)
+    delta = tl.sum(grad_output * output, axis=1)
+
+    grad_query_nope = tl.zeros((BLOCK_Q, BLOCK_QD), tl.float32)
+    grad_query_pe = tl.zeros((BLOCK_Q, BLOCK_PD), tl.float32)
+    if HAS_POSITIONS:
+        q_abs = tl.load(query_pos_ptr + q_offsets, mask=q_valid, other=0)
+    else:
+        q_abs = q_start + q_offsets
+
+    for topk_start in tl.range(0, topk_count, BLOCK_K):
+        k_offsets = topk_start + topk_offsets
+        valid_topk = k_offsets < topk_count
+        selected = tl.load(
+            topk_ptr
+            + (batch_idx * q_len + q_offsets[:, None]) * topk_count
+            + k_offsets[None, :],
+            mask=q_valid[:, None] & valid_topk[None, :],
+            other=0,
+        ).to(tl.int32)
+        selected_valid = selected >= 0
+        safe_selected = tl.maximum(selected, 0)
+        if HAS_POSITIONS:
+            selected_abs = tl.load(
+                key_pos_ptr + safe_selected,
+                mask=q_valid[:, None] & valid_topk[None, :] & selected_valid,
+                other=0,
+            )
+            valid = (
+                q_valid[:, None]
+                & valid_topk[None, :]
+                & selected_valid
+                & (selected_abs <= q_abs[:, None])
+            )
+        else:
+            valid = (
+                q_valid[:, None]
+                & valid_topk[None, :]
+                & selected_valid
+                & (selected <= q_abs[:, None])
+            )
+
+        key_nope = tl.load(
+            key_nope_ptr
+            + ((safe_selected[:, :, None] * bsz + batch_idx) * num_heads + head_idx)
+            * head_dim
+            + qd_offsets[None, None, :],
+            mask=valid[:, :, None] & (qd_offsets[None, None, :] < head_dim),
+            other=0.0,
+        ).to(tl.float32)
+        key_pe = tl.load(
+            key_pe_ptr
+            + ((safe_selected[:, :, None] * bsz + batch_idx) * key_pe_heads + key_pe_head_idx)
+            * pos_dim
+            + pd_offsets[None, None, :],
+            mask=valid[:, :, None] & (pd_offsets[None, None, :] < pos_dim),
+            other=0.0,
+        ).to(tl.float32)
+        if USE_SCORE_SCRATCH:
+            scores = tl.load(
+                teacher_score_ptr
+                + ((batch_idx * q_len + q_offsets[:, None]) * num_heads + head_idx)
+                * topk_count
+                + k_offsets[None, :],
+                mask=q_valid[:, None] & valid_topk[None, :],
+                other=-float("inf"),
+            ).to(tl.float32)
+            valid = valid & (scores > -3.0e38)
+        else:
+            scores = (
+                tl.sum(key_nope * query_nope[:, None, :], axis=2)
+                + tl.sum(key_pe * query_pe[:, None, :], axis=2)
+            ) * softmax_scale
+        scores = tl.where(valid, scores, -float("inf"))
+        probs = tl.exp(scores - row_lse[:, None])
+        probs = tl.where(valid, probs, 0.0)
+
+        value = tl.load(
+            value_ptr
+            + safe_selected[:, :, None] * v_stride_s
+            + batch_idx * v_stride_b
+            + head_idx * v_stride_h
+            + vd_offsets[None, None, :] * v_stride_d,
+            mask=valid[:, :, None] & (vd_offsets[None, None, :] < value_dim),
+            other=0.0,
+        ).to(tl.float32)
+
+        dp = tl.sum(value * grad_output[:, None, :], axis=2)
+        ds = probs * (dp - delta[:, None]) * softmax_scale
+        ds = tl.where(valid, ds, 0.0)
+        grad_query_nope += tl.sum(ds[:, :, None] * key_nope, axis=1)
+        grad_query_pe += tl.sum(ds[:, :, None] * key_pe, axis=1)
+
+        tl.atomic_add(
+            grad_key_nope_ptr
+            + ((safe_selected[:, :, None] * bsz + batch_idx) * num_heads + head_idx)
+            * head_dim
+            + qd_offsets[None, None, :],
+            ds[:, :, None] * query_nope[:, None, :],
+            sem="relaxed",
+            mask=valid[:, :, None] & (qd_offsets[None, None, :] < head_dim),
+        )
+        tl.atomic_add(
+            grad_key_pe_ptr
+            + ((safe_selected[:, :, None] * bsz + batch_idx) * key_pe_heads + key_pe_head_idx)
+            * pos_dim
+            + pd_offsets[None, None, :],
+            ds[:, :, None] * query_pe[:, None, :],
+            sem="relaxed",
+            mask=valid[:, :, None] & (pd_offsets[None, None, :] < pos_dim),
+        )
+        tl.atomic_add(
+            grad_value_ptr
+            + ((safe_selected[:, :, None] * bsz + batch_idx) * num_heads + head_idx)
+            * value_dim
+            + vd_offsets[None, None, :],
+            probs[:, :, None] * grad_output[:, None, :],
+            sem="relaxed",
+            mask=valid[:, :, None] & (vd_offsets[None, None, :] < value_dim),
+        )
+
+    tl.store(
+        grad_query_nope_ptr
+        + ((q_offsets[:, None] * bsz + batch_idx) * num_heads + head_idx) * head_dim
+        + qd_offsets[None, :],
+        grad_query_nope,
+        mask=q_valid[:, None] & (qd_offsets[None, :] < head_dim),
+    )
+    tl.store(
+        grad_query_pe_ptr
+        + ((q_offsets[:, None] * bsz + batch_idx) * num_heads + head_idx) * pos_dim
+        + pd_offsets[None, :],
+        grad_query_pe,
+        mask=q_valid[:, None] & (pd_offsets[None, :] < pos_dim),
+    )
+
+
+@triton.jit
 def _sparse_dsa_backward_key_block_kv_kernel(
     query_ptr,
     key_ptr,
@@ -2115,6 +2659,21 @@ class SparseDSAAttentionTriton(torch.autograd.Function):
             if emit_teacher and _teacher_score_scratch_enabled()
             else output
         )
+        tensor_audit(
+            "dsa_triton/forward_alloc",
+            query=query_flat,
+            key=key_flat,
+            value=value_flat,
+            topk=topk_flat,
+            output=output,
+            lse=lse,
+            teacher_probs=teacher_probs if emit_teacher else None,
+            teacher_score_scratch=teacher_score_scratch if emit_teacher else None,
+            q_len=q_len,
+            batch=bsz,
+            heads=num_heads,
+            topk_count=topk_count,
+        )
         block_q = _sparse_block_q()
         block_k = _forward_block_k(topk_count)
         backward_block_k = _backward_block_k(topk_count)
@@ -2320,6 +2879,22 @@ class SparseDSAAttentionTriton(torch.autograd.Function):
         grad_value = torch.zeros(
             (sk, bsz, num_heads, value_dim), device=value.device, dtype=kv_grad_dtype
         )
+        tensor_audit(
+            "dsa_triton/backward_alloc",
+            grad_output=grad_output,
+            grad_query=grad_query,
+            grad_key=grad_key,
+            grad_value=grad_value,
+            teacher_score_scratch=teacher_score_scratch
+            if teacher_score_scratch is not output
+            else None,
+            q_len=q_len,
+            key_len=sk,
+            batch=bsz,
+            heads=num_heads,
+            topk_count=ctx.topk_count,
+            kv_grad_dtype=str(kv_grad_dtype),
+        )
         if ctx.cuda_row_bwd_from_scores:
             grad_query.zero_()
             _dsa_sparse_backward_from_scores_row_cuda(
@@ -2522,6 +3097,278 @@ class SparseDSAAttentionTriton(torch.autograd.Function):
         )
 
 
+class SparseDSASplitQKAttentionTriton(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        query_nope: torch.Tensor,
+        query_pe: torch.Tensor,
+        key_nope: torch.Tensor,
+        key_pe: torch.Tensor,
+        value: torch.Tensor,
+        topk_indices: torch.Tensor,
+        softmax_scale: float,
+        q_start: int,
+        query_positions: torch.Tensor | None,
+        key_positions: torch.Tensor | None,
+        emit_teacher: bool,
+    ) -> torch.Tensor:
+        q_len, bsz, num_heads, head_dim = query_nope.shape
+        _, _, key_pe_heads, pos_dim = key_pe.shape
+        _, _, _, value_dim = value.shape
+        topk_indices = _maybe_narrow_topk_indices(topk_indices, key_nope.shape[0])
+        topk_count = topk_indices.shape[-1]
+
+        query_nope_flat = query_nope.contiguous()
+        query_pe_flat = query_pe.contiguous()
+        key_nope_flat = key_nope.contiguous()
+        key_pe_flat = key_pe.contiguous()
+        value_flat = value if value.stride(-1) == 1 else value.contiguous()
+        topk_flat = topk_indices.contiguous()
+        has_positions = query_positions is not None
+        if has_positions:
+            query_positions = query_positions.contiguous()
+            key_positions = key_positions.contiguous()
+        else:
+            query_positions = topk_flat
+            key_positions = topk_flat
+
+        output = torch.empty(
+            (q_len, bsz, num_heads, value_dim), device=query_nope.device, dtype=query_nope.dtype
+        )
+        lse = torch.empty((bsz * q_len, num_heads), device=query_nope.device, dtype=torch.float32)
+        teacher_probs = (
+            torch.zeros((bsz * q_len, topk_count), device=query_nope.device, dtype=torch.float32)
+            if emit_teacher
+            else output
+        )
+        teacher_score_scratch = (
+            torch.empty(
+                (bsz * q_len, num_heads, topk_count),
+                device=query_nope.device,
+                dtype=torch.float32,
+            )
+            if emit_teacher and _teacher_score_scratch_enabled()
+            else output
+        )
+        tensor_audit(
+            "dsa_triton/split_qk_forward_alloc",
+            query_nope=query_nope_flat,
+            query_pe=query_pe_flat,
+            key_nope=key_nope_flat,
+            key_pe=key_pe_flat,
+            value=value_flat,
+            topk=topk_flat,
+            output=output,
+            lse=lse,
+            teacher_probs=teacher_probs if emit_teacher else None,
+            teacher_score_scratch=teacher_score_scratch if emit_teacher else None,
+            q_len=q_len,
+            batch=bsz,
+            heads=num_heads,
+            topk_count=topk_count,
+        )
+
+        block_q = _sparse_block_q()
+        block_k = _forward_block_k(topk_count)
+        block_qd = triton.next_power_of_2(head_dim)
+        block_pd = triton.next_power_of_2(pos_dim)
+        block_vd = triton.next_power_of_2(value_dim)
+        grid = (triton.cdiv(q_len, block_q), num_heads * bsz)
+
+        _sparse_dsa_split_qk_forward_kernel[grid](
+            query_nope_flat,
+            query_pe_flat,
+            key_nope_flat,
+            key_pe_flat,
+            value_flat,
+            topk_flat,
+            query_positions,
+            key_positions,
+            output,
+            lse,
+            teacher_probs,
+            teacher_score_scratch,
+            float(softmax_scale),
+            q_len,
+            bsz,
+            num_heads,
+            head_dim,
+            pos_dim,
+            value_dim,
+            key_pe_heads,
+            value_flat.stride(0),
+            value_flat.stride(1),
+            value_flat.stride(2),
+            value_flat.stride(3),
+            topk_count,
+            int(q_start),
+            BLOCK_Q=block_q,
+            BLOCK_K=block_k,
+            BLOCK_QD=block_qd,
+            BLOCK_PD=block_pd,
+            BLOCK_VD=block_vd,
+            HAS_POSITIONS=has_positions,
+            EMIT_TEACHER=bool(emit_teacher),
+            USE_TEACHER_SCORE_SCRATCH=bool(
+                emit_teacher and _teacher_score_scratch_enabled()
+            ),
+            num_warps=4,
+        )
+
+        ctx.save_for_backward(
+            query_nope_flat,
+            query_pe_flat,
+            key_nope_flat,
+            key_pe_flat,
+            value_flat,
+            topk_flat,
+            query_positions,
+            key_positions,
+            output,
+            lse,
+            teacher_score_scratch,
+        )
+        ctx.softmax_scale = float(softmax_scale)
+        ctx.q_start = int(q_start)
+        ctx.has_positions = has_positions
+        ctx.num_heads = num_heads
+        ctx.bsz = bsz
+        ctx.head_dim = head_dim
+        ctx.pos_dim = pos_dim
+        ctx.value_dim = value_dim
+        ctx.key_pe_heads = key_pe_heads
+        ctx.topk_count = topk_count
+        ctx.backward_block_q = _sparse_backward_block_q()
+        ctx.backward_block_k = _backward_block_k(topk_count)
+        ctx.backward_num_warps = _num_warps_from_env(_DSA_TRITON_BWD_NUM_WARPS_ENV, 4)
+        ctx.block_qd = block_qd
+        ctx.block_pd = block_pd
+        ctx.block_vd = block_vd
+        ctx.backward_score_scratch = bool(
+            emit_teacher and _teacher_score_scratch_enabled() and _triton_bwd_score_scratch_enabled()
+        )
+
+        output = output.reshape(q_len, bsz, num_heads * value_dim)
+        if emit_teacher:
+            ctx.mark_non_differentiable(teacher_probs)
+            return output, teacher_probs
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor, grad_teacher: torch.Tensor | None = None):
+        (
+            query_nope,
+            query_pe,
+            key_nope,
+            key_pe,
+            value,
+            topk_indices,
+            query_positions,
+            key_positions,
+            output,
+            lse,
+            teacher_score_scratch,
+        ) = ctx.saved_tensors
+        q_len = query_nope.shape[0]
+        sk = key_nope.shape[0]
+        bsz = ctx.bsz
+        num_heads = ctx.num_heads
+        value_dim = ctx.value_dim
+
+        grad_output = grad_output.reshape(q_len, bsz, num_heads, value_dim).contiguous()
+        grad_query_nope = torch.empty_like(query_nope, dtype=torch.float32)
+        grad_query_pe = torch.empty_like(query_pe, dtype=torch.float32)
+        kv_grad_dtype = (
+            key_nope.dtype
+            if _bf16_grad_atomics_enabled()
+            and key_nope.dtype in (torch.bfloat16, torch.float16)
+            else torch.float32
+        )
+        grad_key_nope = torch.zeros(
+            (sk, bsz, num_heads, ctx.head_dim), device=key_nope.device, dtype=kv_grad_dtype
+        )
+        grad_key_pe = torch.zeros(
+            (sk, bsz, ctx.key_pe_heads, ctx.pos_dim), device=key_pe.device, dtype=kv_grad_dtype
+        )
+        grad_value = torch.zeros(
+            (sk, bsz, num_heads, value_dim), device=value.device, dtype=kv_grad_dtype
+        )
+        tensor_audit(
+            "dsa_triton/split_qk_backward_alloc",
+            grad_output=grad_output,
+            grad_query_nope=grad_query_nope,
+            grad_query_pe=grad_query_pe,
+            grad_key_nope=grad_key_nope,
+            grad_key_pe=grad_key_pe,
+            grad_value=grad_value,
+            teacher_score_scratch=teacher_score_scratch
+            if teacher_score_scratch is not output
+            else None,
+            q_len=q_len,
+            key_len=sk,
+            batch=bsz,
+            heads=num_heads,
+            topk_count=ctx.topk_count,
+            kv_grad_dtype=str(kv_grad_dtype),
+        )
+        grid = (triton.cdiv(q_len, ctx.backward_block_q), num_heads * bsz)
+        _sparse_dsa_split_qk_backward_kernel[grid](
+            query_nope,
+            query_pe,
+            key_nope,
+            key_pe,
+            value,
+            topk_indices,
+            query_positions,
+            key_positions,
+            output,
+            lse,
+            teacher_score_scratch,
+            grad_output,
+            grad_query_nope,
+            grad_query_pe,
+            grad_key_nope,
+            grad_key_pe,
+            grad_value,
+            ctx.softmax_scale,
+            q_len,
+            bsz,
+            num_heads,
+            ctx.head_dim,
+            ctx.pos_dim,
+            value_dim,
+            ctx.key_pe_heads,
+            value.stride(0),
+            value.stride(1),
+            value.stride(2),
+            value.stride(3),
+            ctx.topk_count,
+            ctx.q_start,
+            BLOCK_Q=ctx.backward_block_q,
+            BLOCK_K=ctx.backward_block_k,
+            BLOCK_QD=ctx.block_qd,
+            BLOCK_PD=ctx.block_pd,
+            BLOCK_VD=ctx.block_vd,
+            HAS_POSITIONS=ctx.has_positions,
+            USE_SCORE_SCRATCH=ctx.backward_score_scratch,
+            num_warps=ctx.backward_num_warps,
+        )
+        return (
+            grad_query_nope.to(query_nope.dtype),
+            grad_query_pe.to(query_pe.dtype),
+            grad_key_nope.to(key_nope.dtype),
+            grad_key_pe.to(key_pe.dtype),
+            grad_value.to(value.dtype),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
 def sparse_dsa_attention_triton(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -2570,6 +3417,70 @@ def sparse_dsa_attention_with_lse_triton(
         query_positions,
         key_positions,
         False,
+        True,
+    )
+
+
+def sparse_dsa_attention_split_qk_triton(
+    query_nope: torch.Tensor,
+    query_pe: torch.Tensor,
+    key_nope: torch.Tensor,
+    key_pe: torch.Tensor,
+    value: torch.Tensor,
+    topk_indices: torch.Tensor,
+    softmax_scale: float,
+    q_start: int = 0,
+    query_positions: torch.Tensor | None = None,
+    key_positions: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Fused sparse DSA attention over split MLA Q/K components.
+
+    This computes the exact materialized-cat score
+    ``cat(q_nope, q_pe) @ cat(k_nope, k_pe)`` without allocating either full
+    concatenated tensor. ``key_pe`` may be broadcast across heads with shape
+    ``[sk, batch, 1, pos_dim]``.
+    """
+
+    return SparseDSASplitQKAttentionTriton.apply(
+        query_nope,
+        query_pe,
+        key_nope,
+        key_pe,
+        value,
+        topk_indices,
+        softmax_scale,
+        q_start,
+        query_positions,
+        key_positions,
+        False,
+    )
+
+
+def sparse_dsa_attention_split_qk_with_teacher_triton(
+    query_nope: torch.Tensor,
+    query_pe: torch.Tensor,
+    key_nope: torch.Tensor,
+    key_pe: torch.Tensor,
+    value: torch.Tensor,
+    topk_indices: torch.Tensor,
+    softmax_scale: float,
+    q_start: int = 0,
+    query_positions: torch.Tensor | None = None,
+    key_positions: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Split-QK selected attention plus local teacher mass over selected top-k."""
+
+    return SparseDSASplitQKAttentionTriton.apply(
+        query_nope,
+        query_pe,
+        key_nope,
+        key_pe,
+        value,
+        topk_indices,
+        softmax_scale,
+        q_start,
+        query_positions,
+        key_positions,
         True,
     )
 

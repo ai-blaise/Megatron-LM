@@ -19,6 +19,15 @@ from megatron.core.datasets.utils import Split
 IGNORE_INDEX = -100
 
 
+def _build_loss_mask(labels: torch.Tensor, target_padding_mask: torch.Tensor) -> torch.Tensor:
+    """Build an SFT loss mask from explicit padding positions, not pad token IDs."""
+
+    loss_mask = torch.ones(labels.size(), dtype=torch.float32)
+    loss_mask[target_padding_mask] = 0.0
+    loss_mask[labels == IGNORE_INDEX] = 0.0
+    return loss_mask
+
+
 def _json_loads_maybe(value: Any, default: Any = None) -> Any:
     if value is None:
         return default
@@ -218,6 +227,8 @@ class SFTLowLevelDataset:
 class SFTDataset(MegatronDataset):
     """The dataset used during SFT"""
 
+    masks_padding_by_token_id = False
+
     def __init__(
         self,
         dataset: LowLevelDataset,
@@ -361,11 +372,10 @@ class SFTDataset(MegatronDataset):
         labels       = torch.tensor(pack_targets[1:], dtype=torch.int64)
         position_ids = torch.tensor(pack_positions[:-1], dtype=torch.int64)
         padding_mask = torch.tensor(pack_padding_mask[:-1], dtype=torch.bool)
+        target_padding_mask = torch.tensor(pack_padding_mask[1:], dtype=torch.bool)
 
         # Loss mask.
-        loss_mask = torch.ones(pack_length, dtype=torch.float32)
-        loss_mask[labels == pad] = 0.0  # Mask paddings
-        loss_mask[labels == IGNORE_INDEX] = 0.0  # mask prompts
+        loss_mask = _build_loss_mask(labels, target_padding_mask)
 
         # TODO(duncan): Optionally create an attention mask
         assert not self.config.create_attention_mask and not self.config.reset_attention_mask
@@ -544,12 +554,12 @@ class MockSFTDataset(SFTDataset):
             assert len(tokens_list) == pack_length + 1
             input_ids    = torch.tensor(tokens_list[:-1], dtype=torch.int64)
             labels       = torch.tensor(tokens_list[1:],  dtype=torch.int64)
+            target_padding_mask = torch.tensor(padding_mask[1:], dtype=torch.bool)
             padding_mask = torch.tensor(padding_mask[:-1], dtype=torch.bool)
             # Position IDs are sequential across the entire sequence including padding,
             # matching GPTDataset behavior for standard (non-packed) training.
             position_ids = torch.arange(pack_length, dtype=torch.int64)
-            loss_mask = torch.ones(pack_length, dtype=torch.float32)
-            loss_mask[labels == pad] = 0.0
+            loss_mask = _build_loss_mask(labels, target_padding_mask)
             return {
                 'tokens':       input_ids,
                 'labels':       labels,
@@ -588,13 +598,13 @@ class MockSFTDataset(SFTDataset):
         labels = torch.tensor(pack_tokens[1:], dtype=torch.int64)
         position_ids = torch.tensor(pack_positions[:-1], dtype=torch.int64)
         padding_mask = torch.tensor(pack_padding_mask[:-1], dtype=torch.bool)
+        target_padding_mask = torch.tensor(pack_padding_mask[1:], dtype=torch.bool)
 
         seq_len = len(input_ids)
         cu_seqlens = [0, seq_len]
 
         # Loss mask: mask padding tokens
-        loss_mask = torch.ones(seq_len, dtype=torch.float32)
-        loss_mask[labels == pad] = 0.0
+        loss_mask = _build_loss_mask(labels, target_padding_mask)
 
         cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32)
         max_seqlen = torch.tensor(seq_len, dtype=torch.int32)
