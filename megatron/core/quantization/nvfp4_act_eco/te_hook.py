@@ -263,6 +263,90 @@ def _stash_or_return_corrected_grad(
     return grad + correction
 
 
+def _stash_main_grad_correction(
+    param: torch.nn.Parameter,
+    correction: torch.Tensor,
+) -> bool:
+    """Stash activation-ECO correction for Megatron DDP main-grad consumption.
+
+    In Megatron's distributed optimizer path, parameters already own a
+    ``main_grad`` buffer.  That lets activation-ECO add its correction through
+    the DDP post-hook without waiting for the parameter's regular grad hook.
+    Doing this from the output-gradient hook releases the captured activation
+    before TE's grouped-linear backward allocates its larger work tensors.
+    """
+
+    main_grad = getattr(param, "main_grad", None)
+    if main_grad is None:
+        return False
+
+    correction = correction.to(main_grad.dtype).reshape(param.shape).detach()
+    pending = getattr(param, ACT_ECO_PENDING_GRAD_CORRECTION_ATTR, None)
+    if pending is None:
+        setattr(param, ACT_ECO_PENDING_GRAD_CORRECTION_ATTR, correction)
+    else:
+        if pending.shape == correction.shape and pending.dtype == correction.dtype:
+            pending.add_(correction)
+        else:
+            setattr(param, ACT_ECO_PENDING_GRAD_CORRECTION_ATTR, pending + correction)
+    return True
+
+
+def _add_activation_eco_bias_correction_to_main_grad_(
+    param: torch.nn.Parameter,
+    grad_y: torch.Tensor,
+    x_pre: torch.Tensor,
+    q_x: torch.Tensor,
+) -> bool:
+    """Accumulate activation-ECO correction directly into ``param.main_grad``.
+
+    The correction is ``grad_y.T @ (x_pre - q_x)``.  Materializing that full
+    matrix is expensive at 345B scale and caused near-OOM failures during
+    StreamBP replay.  When Megatron has already allocated ``main_grad``, write
+    the GEMM result there directly with ``addmm_``.
+    """
+
+    main_grad = getattr(param, "main_grad", None)
+    if main_grad is None:
+        return False
+
+    flat_grad = grad_y.reshape(-1, grad_y.shape[-1])
+    flat_x = x_pre.reshape(-1, x_pre.shape[-1])
+    flat_qx = q_x.reshape(-1, q_x.shape[-1])
+    if flat_grad.shape[0] != flat_x.shape[0] or flat_x.shape != flat_qx.shape:
+        raise RuntimeError(
+            "Activation-ECO correction shape mismatch: "
+            f"grad={tuple(flat_grad.shape)}, x={tuple(flat_x.shape)}, qx={tuple(flat_qx.shape)}"
+        )
+
+    target = main_grad.reshape(param.shape)
+    expected_shape = (flat_grad.shape[-1], flat_x.shape[-1])
+    if tuple(target.shape) != expected_shape:
+        raise RuntimeError(
+            "Activation-ECO correction target shape mismatch: "
+            f"main_grad={tuple(target.shape)}, expected={expected_shape}"
+        )
+
+    compute_dtype = target.dtype
+    grad_mat = flat_grad.to(compute_dtype)
+    err = flat_x.to(compute_dtype)
+    if err.data_ptr() == flat_x.data_ptr():
+        err = err.clone()
+    err.sub_(flat_qx.to(compute_dtype))
+    target.addmm_(grad_mat.transpose(0, 1), err)
+    return True
+
+
+def _remove_pending_entry(entries: deque, entry: dict) -> deque:
+    """Remove a captured activation-ECO entry by identity.
+
+    ``deque.remove`` compares dictionaries by value, which compares tensor
+    values and can raise "Boolean value of Tensor is ambiguous".
+    """
+
+    return deque(candidate for candidate in entries if candidate is not entry)
+
+
 def pop_act_eco_grad_correction(param: torch.nn.Parameter) -> torch.Tensor | None:
     correction = getattr(param, ACT_ECO_PENDING_GRAD_CORRECTION_ATTR, None)
     if correction is not None:
@@ -341,6 +425,43 @@ def install_act_eco_on_te_linear(
 
             @staticmethod
             def backward(ctx, dy):
+                param = te_linear.weight
+                if getattr(param, "main_grad", None) is not None:
+                    x_pre = entry["x_pre"]
+                    x_flat = x_pre.reshape(-1, x_pre.shape[-1])
+                    dy_flat = dy.reshape(-1, dy.shape[-1])
+                    _debug_sync(f"{module_label}:before_align")
+                    x_flat, dy_flat = _align_activation_and_grad_rows(
+                        x_flat,
+                        dy_flat,
+                        module_name=te_linear.__class__.__name__,
+                    )
+                    _debug_sync(f"{module_label}:after_align")
+                    q_x = _quant_dequant_activation(
+                        x_flat,
+                        config,
+                        backend=quantizer_backend,
+                    )
+                    _debug_sync(f"{module_label}:after_quant_dequant")
+                    if _add_activation_eco_bias_correction_to_main_grad_(
+                        param,
+                        dy_flat.to(correction_dtype),
+                        x_flat.to(correction_dtype),
+                        q_x.to(correction_dtype),
+                    ):
+                        cell["entries"] = _remove_pending_entry(cell["entries"], entry)
+                        _debug_sync(f"{module_label}:after_grad_addmm")
+                        return dy
+                    correction = activation_eco_bias_correction(
+                        dy_flat.to(correction_dtype),
+                        x_flat.to(correction_dtype),
+                        q_x.to(correction_dtype),
+                    )
+                    _debug_sync(f"{module_label}:after_correction_matmul")
+                    if _stash_main_grad_correction(param, correction):
+                        cell["entries"] = _remove_pending_entry(cell["entries"], entry)
+                        _debug_sync(f"{module_label}:after_grad_stash")
+                        return dy
                 entry["dy"] = dy.detach()
                 return dy
 
@@ -374,13 +495,24 @@ def install_act_eco_on_te_linear(
                 backend=quantizer_backend,
             )
             _debug_sync(f"{module_label}:after_quant_dequant")
-            correction = activation_eco_bias_correction(
-                dy_flat.to(correction_dtype),
-                x_flat.to(correction_dtype),
-                q_x.to(correction_dtype),
-            )
-            _debug_sync(f"{module_label}:after_correction_matmul")
-            corrected_grad = _stash_or_return_corrected_grad(param, corrected_grad, correction)
+            if getattr(param, "main_grad", None) is not None:
+                _add_activation_eco_bias_correction_to_main_grad_(
+                    param,
+                    dy_flat.to(correction_dtype),
+                    x_flat.to(correction_dtype),
+                    q_x.to(correction_dtype),
+                )
+                _debug_sync(f"{module_label}:after_grad_addmm")
+            else:
+                correction = activation_eco_bias_correction(
+                    dy_flat.to(correction_dtype),
+                    x_flat.to(correction_dtype),
+                    q_x.to(correction_dtype),
+                )
+                _debug_sync(f"{module_label}:after_correction_matmul")
+                corrected_grad = _stash_or_return_corrected_grad(
+                    param, corrected_grad, correction
+                )
             _debug_sync(f"{module_label}:after_grad_add")
         return corrected_grad
 
@@ -466,6 +598,56 @@ def install_act_eco_on_te_grouped_linear(
 
             @staticmethod
             def backward(ctx, dy):
+                pending_experts = list(entry["pending_experts"])
+                if pending_experts and all(
+                    getattr(getattr(te_grouped_linear, f"weight{idx}"), "main_grad", None)
+                    is not None
+                    for idx in pending_experts
+                ):
+                    dy_flat_all = dy.reshape(-1, dy.shape[-1])
+                    for expert_idx in pending_experts:
+                        offsets = entry["offsets"]
+                        start = offsets[expert_idx]
+                        end = offsets[expert_idx + 1]
+                        if end == start:
+                            continue
+                        param = getattr(te_grouped_linear, f"weight{expert_idx}")
+                        x_flat = entry["x_pre"][start:end].reshape(
+                            -1, entry["x_pre"].shape[-1]
+                        )
+                        dy_flat = dy_flat_all[start:end]
+                        _debug_sync(
+                            f"{module_label}.expert{expert_idx}:before_quant_dequant"
+                        )
+                        q_x = _quant_dequant_activation(
+                            x_flat,
+                            config,
+                            backend=quantizer_backend,
+                        )
+                        _debug_sync(
+                            f"{module_label}.expert{expert_idx}:after_quant_dequant"
+                        )
+                        if _add_activation_eco_bias_correction_to_main_grad_(
+                            param,
+                            dy_flat.to(correction_dtype),
+                            x_flat.to(correction_dtype),
+                            q_x.to(correction_dtype),
+                        ):
+                            _debug_sync(f"{module_label}.expert{expert_idx}:after_grad_addmm")
+                        else:
+                            correction = activation_eco_bias_correction(
+                                dy_flat.to(correction_dtype),
+                                x_flat.to(correction_dtype),
+                                q_x.to(correction_dtype),
+                            )
+                            _debug_sync(
+                                f"{module_label}.expert{expert_idx}:after_correction_matmul"
+                            )
+                            _stash_main_grad_correction(param, correction)
+                            _debug_sync(f"{module_label}.expert{expert_idx}:after_grad_stash")
+                    entry["pending_experts"].clear()
+                    cell["entries"] = _remove_pending_entry(cell["entries"], entry)
+                    return dy
                 entry["dy"] = dy.detach()
                 return dy
 
@@ -500,15 +682,24 @@ def install_act_eco_on_te_grouped_linear(
                         backend=quantizer_backend,
                     )
                     _debug_sync(f"{module_label}.expert{expert_idx}:after_quant_dequant")
-                    correction = activation_eco_bias_correction(
-                        dy_flat.to(correction_dtype),
-                        x_flat.to(correction_dtype),
-                        q_x.to(correction_dtype),
-                    )
-                    _debug_sync(f"{module_label}.expert{expert_idx}:after_correction_matmul")
-                    corrected_grad = _stash_or_return_corrected_grad(
-                        param, corrected_grad, correction
-                    )
+                    if getattr(param, "main_grad", None) is not None:
+                        _add_activation_eco_bias_correction_to_main_grad_(
+                            param,
+                            dy_flat.to(correction_dtype),
+                            x_flat.to(correction_dtype),
+                            q_x.to(correction_dtype),
+                        )
+                        _debug_sync(f"{module_label}.expert{expert_idx}:after_grad_addmm")
+                    else:
+                        correction = activation_eco_bias_correction(
+                            dy_flat.to(correction_dtype),
+                            x_flat.to(correction_dtype),
+                            q_x.to(correction_dtype),
+                        )
+                        _debug_sync(f"{module_label}.expert{expert_idx}:after_correction_matmul")
+                        corrected_grad = _stash_or_return_corrected_grad(
+                            param, corrected_grad, correction
+                        )
                     _debug_sync(f"{module_label}.expert{expert_idx}:after_grad_add")
 
             cell["entries"] = deque(

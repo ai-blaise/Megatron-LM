@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import functools
 import math
+import os
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
@@ -53,6 +54,36 @@ except ImportError:
     fused_topk_with_score_function = None
     fused_unpermute = None
     te_general_gemm = None
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.lower() in ("1", "true", "yes", "on")
+
+
+def _maybe_trim_cuda_cache_before_moe_sort(input: torch.Tensor, probs: Optional[torch.Tensor]) -> None:
+    """Release cached allocator blocks before TE MoE sort output allocation."""
+
+    if not input.is_cuda or not _env_flag("MEGATRON_MOE_SORT_TRIM_CACHE", default=True):
+        return
+
+    free_bytes, _ = torch.cuda.mem_get_info(input.device)
+    allocated = torch.cuda.memory_allocated(input.device)
+    reserved = torch.cuda.memory_reserved(input.device)
+    cached = max(0, reserved - allocated)
+
+    mib = 1024 * 1024
+    free_threshold_mb = int(os.getenv("MEGATRON_MOE_SORT_TRIM_FREE_MB", "65536"))
+    safety_mb = int(os.getenv("MEGATRON_MOE_SORT_TRIM_SAFETY_MB", "1024"))
+    cached_threshold_mb = int(os.getenv("MEGATRON_MOE_SORT_TRIM_CACHED_MB", "512"))
+    required_bytes = input.numel() * input.element_size()
+    if probs is not None:
+        required_bytes += probs.numel() * probs.element_size()
+    trim_threshold = max(free_threshold_mb * mib, required_bytes + safety_mb * mib)
+    if free_bytes < trim_threshold and cached > cached_threshold_mb * mib:
+        torch.cuda.empty_cache()
 
 
 def switch_load_balancing_loss_func(
@@ -551,6 +582,7 @@ def sort_chunks_by_idxs(
             raise ValueError(
                 "fused_sort_chunks_by_index is not available. Please install TE >= 2.1.0."
             )
+        _maybe_trim_cuda_cache_before_moe_sort(input, probs)
         return fused_sort_chunks_by_index(input, split_sizes, sorted_idxs), None
 
     if fused and probs is not None:
@@ -559,6 +591,7 @@ def sort_chunks_by_idxs(
                 "fused_sort_chunks_by_index_with_probs is not available. "
                 "Please install TE >= 2.1.0."
             )
+        _maybe_trim_cuda_cache_before_moe_sort(input, probs)
         return fused_sort_chunks_by_index_with_probs(input, probs, split_sizes, sorted_idxs)
 
     input = torch.split(input, split_sizes.tolist(), dim=0)

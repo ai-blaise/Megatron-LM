@@ -502,9 +502,7 @@ class DistributedDataParallel(_BaseDataParallel):
                     assert (
                         param.grad is not None
                     ), 'param.grad being None is not safe when overlap_grad_reduce is True'
-                if param.grad is not None and (
-                    not param.grad_added_to_main_grad or getattr(param, 'zero_out_wgrad', False)
-                ):
+                if param.grad is not None:
                     numeric_debug = None
                     debug_this_grad = False
                     if os.getenv("MEGATRON_NUMERIC_DEBUG_DDP_GRAD", "").lower() in (
@@ -541,14 +539,18 @@ class DistributedDataParallel(_BaseDataParallel):
                                 periodic=False,
                                 full_finite=True,
                             )
-                    param_name = getattr(self, "param_to_name", {}).get(param, "<unnamed>")
-                    _ddp_grad_debug_sync(
-                        "before_main_grad_add",
-                        param_name=param_name,
-                        param_grad=param.grad,
-                        main_grad=param.main_grad,
+                    should_add_param_grad = (
+                        not param.grad_added_to_main_grad or getattr(param, 'zero_out_wgrad', False)
                     )
-                    param.main_grad.add_(param.grad.data)
+                    param_name = getattr(self, "param_to_name", {}).get(param, "<unnamed>")
+                    if should_add_param_grad:
+                        _ddp_grad_debug_sync(
+                            "before_main_grad_add",
+                            param_name=param_name,
+                            param_grad=param.grad,
+                            main_grad=param.main_grad,
+                        )
+                        param.main_grad.add_(param.grad.data)
                     act_eco_correction = _pop_act_eco_grad_correction(param)
                     if act_eco_correction is not None:
                         _ddp_grad_debug_sync(
@@ -564,13 +566,14 @@ class DistributedDataParallel(_BaseDataParallel):
                             param_grad=act_eco_correction,
                             main_grad=param.main_grad,
                         )
-                    _ddp_grad_debug_sync(
-                        "after_main_grad_add",
-                        param_name=param_name,
-                        param_grad=param.grad,
-                        main_grad=param.main_grad,
-                    )
-                    if debug_this_grad:
+                    if should_add_param_grad:
+                        _ddp_grad_debug_sync(
+                            "after_main_grad_add",
+                            param_name=param_name,
+                            param_grad=param.grad,
+                            main_grad=param.main_grad,
+                        )
+                    if debug_this_grad and should_add_param_grad:
                         bad = numeric_debug.log_tensor(
                             f"ddp_grad.{param_name}.main_grad.after_add",
                             param.main_grad,

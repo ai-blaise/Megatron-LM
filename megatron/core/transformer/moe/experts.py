@@ -82,7 +82,7 @@ def _env_flag(name: str, default: bool = False) -> bool:
 
 
 def _maybe_trim_cuda_cache_before_moe_unpadding() -> None:
-    """Release cached allocator blocks before the large TE MoE unpadding output."""
+    """Release cached allocator blocks before large TE MoE padding/unpadding outputs."""
     if not torch.cuda.is_available():
         return
     if not _env_flag("MEGATRON_MOE_UNPADDING_TRIM_CACHE", default=True):
@@ -828,6 +828,7 @@ class TEGroupedMLP(MegatronModule):
         tokens_per_expert: list[int] = tokens_per_expert.tolist()
         if self.config.fp8 or self.config.fp4:
             actual_tokens_per_expert = tokens_per_expert
+            _maybe_trim_cuda_cache_before_moe_unpadding()
             permuted_local_hidden_states, tokens_per_expert = self.quantization_padding(
                 permuted_local_hidden_states, tokens_per_expert
             )

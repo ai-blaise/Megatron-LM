@@ -17,6 +17,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.nvfp4_act_eco.codec import Nvfp4ActEcoConfig
 import megatron.core.quantization.nvfp4_act_eco.te_hook as act_eco_te_hook
+import megatron.core.extensions.transformer_engine as te_extension_module
 from megatron.core.quantization.nvfp4_act_eco.te_hook import (
     install_act_eco_on_te_grouped_linear,
     install_act_eco_on_te_linear,
@@ -353,6 +354,58 @@ def test_streambp_moe_chunk_forward_override_only_affects_moe():
 
     assert block._streambp_chunk_forward_for_mode("chunked_moe") is False
     assert block._streambp_chunk_forward_for_mode("chunked_packed_dsa") is True
+
+
+def test_streambp_replay_quantized_te_input_context_restores(monkeypatch):
+    class Child(torch.nn.Module):
+        def __init__(self, enabled):
+            super().__init__()
+            self.save_original_input = enabled
+
+    layer = torch.nn.Module()
+    layer.enabled_child = Child(True)
+    layer.disabled_child = Child(False)
+
+    monkeypatch.setenv("MEGATRON_STREAMBP_REPLAY_SAVE_QUANTIZED_TE_INPUTS", "1")
+    with streambp_module._streambp_replay_save_quantized_te_inputs(layer):
+        assert layer.enabled_child.save_original_input is False
+        assert layer.disabled_child.save_original_input is False
+
+    assert layer.enabled_child.save_original_input is True
+    assert layer.disabled_child.save_original_input is False
+
+
+def test_streambp_replay_quantized_te_input_context_can_be_disabled(monkeypatch):
+    class Child(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.save_original_input = True
+
+    layer = torch.nn.Module()
+    layer.child = Child()
+
+    monkeypatch.setenv("MEGATRON_STREAMBP_REPLAY_SAVE_QUANTIZED_TE_INPUTS", "0")
+    with streambp_module._streambp_replay_save_quantized_te_inputs(layer):
+        assert layer.child.save_original_input is True
+
+    assert layer.child.save_original_input is True
+
+
+def test_te_grouped_wgrad_accum_env_only_affects_experts(monkeypatch):
+    cfg = SimpleNamespace(gradient_accumulation_fusion=False)
+
+    monkeypatch.setenv("MEGATRON_TE_GROUPED_LINEAR_FUSE_WGRAD_ACCUM", "1")
+    assert te_extension_module._te_grouped_linear_fuse_wgrad_accumulation(
+        cfg, is_expert=True
+    )
+    assert not te_extension_module._te_grouped_linear_fuse_wgrad_accumulation(
+        cfg, is_expert=False
+    )
+
+    monkeypatch.setenv("MEGATRON_TE_GROUPED_LINEAR_FUSE_WGRAD_ACCUM", "0")
+    assert not te_extension_module._te_grouped_linear_fuse_wgrad_accumulation(
+        cfg, is_expert=True
+    )
 
 
 def test_streambp_routes_full_replay_required_moe_to_hybrid_when_nonchunk_forward():
@@ -1569,7 +1622,7 @@ def test_act_eco_te_hook_queues_multiple_pending_forwards():
     torch.testing.assert_close(linear.weight.grad, expected, rtol=1e-6, atol=1e-6)
 
 
-def test_act_eco_te_hook_stashes_correction_for_ddp_main_grad():
+def test_act_eco_te_hook_adds_correction_to_ddp_main_grad():
     torch.manual_seed(9020)
     cfg = Nvfp4ActEcoConfig(block_size=16)
     linear = torch.nn.Linear(16, 4, bias=False)
@@ -1591,14 +1644,10 @@ def test_act_eco_te_hook_stashes_correction_for_ddp_main_grad():
 
     torch.testing.assert_close(linear.weight.grad, base_grad, rtol=1e-6, atol=1e-6)
     pending = pop_act_eco_grad_correction(linear.weight)
-    assert pending is not None
-    torch.testing.assert_close(pending, correction, rtol=1e-6, atol=1e-6)
-
-    linear.weight.main_grad.add_(linear.weight.grad)
-    linear.weight.main_grad.add_(pending.to(linear.weight.main_grad.dtype))
+    assert pending is None
     torch.testing.assert_close(
         linear.weight.main_grad,
-        base_grad + correction,
+        correction,
         rtol=1e-6,
         atol=1e-6,
     )
@@ -1725,7 +1774,7 @@ def test_act_eco_grouped_hook_applies_per_expert_correction():
     assert grouped.weight1.grad.shape == grouped.weight1.shape
 
 
-def test_act_eco_grouped_hook_stashes_correction_for_ddp_main_grad():
+def test_act_eco_grouped_hook_adds_correction_to_ddp_main_grad():
     class ToyGroupedLinear(torch.nn.Module):
         def __init__(self):
             super().__init__()
@@ -1764,12 +1813,10 @@ def test_act_eco_grouped_hook_stashes_correction_for_ddp_main_grad():
 
     torch.testing.assert_close(grouped.weight0.grad, base0, rtol=1e-6, atol=1e-6)
     torch.testing.assert_close(grouped.weight1.grad, base1, rtol=1e-6, atol=1e-6)
-    pending0 = pop_act_eco_grad_correction(grouped.weight0)
-    pending1 = pop_act_eco_grad_correction(grouped.weight1)
-    assert pending0 is not None
-    assert pending1 is not None
-    torch.testing.assert_close(pending0, corr0, rtol=1e-6, atol=1e-6)
-    torch.testing.assert_close(pending1, corr1, rtol=1e-6, atol=1e-6)
+    assert pop_act_eco_grad_correction(grouped.weight0) is None
+    assert pop_act_eco_grad_correction(grouped.weight1) is None
+    torch.testing.assert_close(grouped.weight0.main_grad, corr0, rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(grouped.weight1.main_grad, corr1, rtol=1e-6, atol=1e-6)
 
 
 def test_act_eco_grouped_hook_survives_released_input_storage_when_cloning():

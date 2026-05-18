@@ -39,7 +39,9 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return value.lower() in ("1", "true", "yes", "on")
 
 
-def _maybe_trim_cuda_cache_before_moe_replay() -> None:
+def _maybe_trim_cuda_cache_before_moe_replay(
+    *, force: bool = False, synchronize: bool = False
+) -> None:
     """Release cached allocator blocks when StreamBP MoE replay is near OOM."""
     if not torch.cuda.is_available():
         return
@@ -54,8 +56,22 @@ def _maybe_trim_cuda_cache_before_moe_replay() -> None:
     mib = 1024 * 1024
     free_threshold_mb = int(os.getenv("MEGATRON_STREAMBP_MOE_REPLAY_TRIM_FREE_MB", "2048"))
     cached_threshold_mb = int(os.getenv("MEGATRON_STREAMBP_MOE_REPLAY_TRIM_CACHED_MB", "512"))
-    if free_bytes < free_threshold_mb * mib and cached > cached_threshold_mb * mib:
+    if force or (free_bytes < free_threshold_mb * mib and cached > cached_threshold_mb * mib):
+        if synchronize and _env_flag("MEGATRON_STREAMBP_MOE_REPLAY_TRIM_SYNC", default=True):
+            torch.cuda.synchronize()
         torch.cuda.empty_cache()
+
+
+def _split_moe_mlp_attention_backward_enabled() -> bool:
+    """Run MoE replay as MLP backward followed by attention backward.
+
+    The default one-shot autograd path keeps the replayed attention graph and
+    replayed MoE MLP graph live through the same engine invocation. Splitting
+    the chain-rule application preserves gradients while allowing the MLP
+    internals to be released before the attention graph is consumed.
+    """
+
+    return _env_flag("MEGATRON_STREAMBP_SPLIT_MOE_MLP_ATTENTION_BACKWARD", default=True)
 
 
 def _suppress_fine_grained_offload_forced_release_context():
@@ -91,6 +107,34 @@ def _suppress_fine_grained_offload_replay_context():
         _suppress_fine_grained_offload_forced_release_context(),
     ):
         yield
+
+
+@contextmanager
+def _streambp_replay_save_quantized_te_inputs(layer: torch.nn.Module):
+    """Prefer TE's saved quantized input path inside StreamBP replay.
+
+    Some TE modules are configured to save the original BF16 input when
+    fine-grained offload is enabled. StreamBP suppresses that global offload
+    queue during replay, so saving the original input only pushes the TE
+    split-quantize allocation into backward where replay memory is tight.
+    During replay we can use TE's default saved quantized columnwise input
+    path instead and restore the module attributes afterwards.
+    """
+
+    if not _env_flag("MEGATRON_STREAMBP_REPLAY_SAVE_QUANTIZED_TE_INPUTS", default=True):
+        yield
+        return
+
+    saved = []
+    for module in layer.modules():
+        if getattr(module, "save_original_input", False):
+            saved.append((module, True))
+            module.save_original_input = False
+    try:
+        yield
+    finally:
+        for module, value in saved:
+            module.save_original_input = value
 
 
 def _distributed_rank() -> int:
@@ -1326,6 +1370,15 @@ def _moe_chunk_attention_full_mlp_backward(
                         f"{post_attention.size(0)} for MLP range "
                         f"[{mlp_start}, {mlp_end})"
                     )
+                split_mlp_attention_backward = (
+                    _split_moe_mlp_attention_backward_enabled()
+                    and post_attention.requires_grad
+                )
+                mlp_input = (
+                    post_attention.detach().requires_grad_(True)
+                    if split_mlp_attention_backward
+                    else post_attention
+                )
                 tensor_audit(
                     "streambp/moe_backward/post_attention_chunk",
                     post_attention=post_attention,
@@ -1343,12 +1396,13 @@ def _moe_chunk_attention_full_mlp_backward(
                             chunk_index=forward_mlp_chunk_index_for_range(mlp_start),
                         ),
                         _te_activation_recompute_context(recompute_phase=True),
+                        _streambp_replay_save_quantized_te_inputs(layer),
                     ):
                         _debug_sync(
                             f"layer{layer_number}:bwd_moe_mlp_chunk{mlp_chunk_index}:before"
                         )
                         chunk_output = layer._forward_mlp(
-                            post_attention,
+                            mlp_input,
                             call_kwargs.get("inference_context", None),
                             padding_mask=_slice_padding_mask_for_sequence_chunk(
                                 padding_mask, mlp_start, mlp_end, seq_len
@@ -1369,16 +1423,50 @@ def _moe_chunk_attention_full_mlp_backward(
                             "StreamBP split MoE MLP replay expects TransformerLayer._forward_mlp "
                             f"to return a Tensor, got {type(chunk_output)}"
                         )
+                    grad_chunk = grad_output[mlp_start:mlp_end]
+                    release_mlp_input_before_backward = _env_flag(
+                        "MEGATRON_STREAMBP_RELEASE_MLP_INPUT_BEFORE_BACKWARD", default=True
+                    )
+                    if release_mlp_input_before_backward and not split_mlp_attention_backward:
+                        del post_attention
                     _debug_sync(
                         f"layer{layer_number}:bwd_moe_mlp_chunk{mlp_chunk_index}:"
                         "autograd_before"
                     )
-                    torch.autograd.backward(chunk_output, grad_output[mlp_start:mlp_end])
+                    _maybe_trim_cuda_cache_before_moe_replay(force=True, synchronize=True)
+                    torch.autograd.backward(chunk_output, grad_chunk)
                     _debug_sync(
                         f"layer{layer_number}:bwd_moe_mlp_chunk{mlp_chunk_index}:"
                         "autograd_after"
                     )
-                    del chunk_output, post_attention
+                    del chunk_output, grad_chunk
+                    if split_mlp_attention_backward:
+                        attention_grad = mlp_input.grad
+                        tensor_audit(
+                            "streambp/moe_backward/mlp_input_grad",
+                            grad=attention_grad,
+                            mlp_chunk=mlp_chunk_index,
+                            layer=layer_number,
+                        )
+                        del mlp_input
+                        if attention_grad is None:
+                            raise RuntimeError(
+                                "StreamBP split MoE MLP replay did not produce an "
+                                "input gradient for the attention replay graph"
+                            )
+                        _debug_sync(
+                            f"layer{layer_number}:bwd_moe_mlp_chunk{mlp_chunk_index}:"
+                            "attention_autograd_before"
+                        )
+                        _maybe_trim_cuda_cache_before_moe_replay(force=True, synchronize=True)
+                        torch.autograd.backward(post_attention, attention_grad)
+                        _debug_sync(
+                            f"layer{layer_number}:bwd_moe_mlp_chunk{mlp_chunk_index}:"
+                            "attention_autograd_after"
+                        )
+                        del attention_grad, post_attention
+                    elif not release_mlp_input_before_backward:
+                        del post_attention
 
 
 def _full_layer_activation_checkpoint(

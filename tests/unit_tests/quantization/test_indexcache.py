@@ -674,6 +674,141 @@ def test_hisa_selector_row_chunking_is_exact(monkeypatch):
             torch.testing.assert_close(scores[row], expected, rtol=1e-5, atol=1e-5)
 
 
+def test_hisa_candidate_temp_budget_is_exact(monkeypatch):
+    config = IndexCacheHISAConfig(
+        enabled=True,
+        block_size=64,
+        compression_ratio=2.0,
+        forced_boundary_blocks=("first", "last"),
+    )
+    torch.manual_seed(20260529)
+    sq, bsz, heads, context_len, topk = 128, 1, 8, 512, 16
+    q = torch.randn(sq, bsz, heads, HEAD_DIM)
+    k = torch.randn(context_len, bsz, HEAD_DIM)
+    weights = torch.rand(sq, bsz, heads) + 0.1
+
+    monkeypatch.setenv("MEGATRON_HISA_CANDIDATE_SLOT_GROUP", "8")
+    monkeypatch.setenv("MEGATRON_HISA_CANDIDATE_MAX_TEMP_MB", "0")
+    base = indexcache_hisa_topk_with_scores(
+        q,
+        weights,
+        k,
+        topk,
+        config=config,
+        q_start=0,
+        is_causal=False,
+        mask=None,
+        query_positions=None,
+        key_positions=None,
+        return_scores=True,
+    )
+    assert base is not None
+
+    monkeypatch.setenv("MEGATRON_HISA_CANDIDATE_MAX_TEMP_MB", "1")
+    budgeted = indexcache_hisa_topk_with_scores(
+        q,
+        weights,
+        k,
+        topk,
+        config=config,
+        q_start=0,
+        is_causal=False,
+        mask=None,
+        query_positions=None,
+        key_positions=None,
+        return_scores=True,
+    )
+    assert budgeted is not None
+
+    base_indices, base_scores = base
+    budgeted_indices, budgeted_scores = budgeted
+    torch.testing.assert_close(
+        budgeted_indices.reshape(-1, topk).sort(dim=-1).values,
+        base_indices.reshape(-1, topk).sort(dim=-1).values,
+    )
+    for row in range(sq * bsz):
+        base_order = base_indices.reshape(-1, topk)[row]
+        row_indices = budgeted_indices.reshape(-1, topk)[row]
+        base_lookup = {
+            int(idx.item()): base_scores[row, pos].item()
+            for pos, idx in enumerate(base_order)
+        }
+        expected = torch.tensor(
+            [base_lookup[int(idx.item())] for idx in row_indices],
+            dtype=budgeted_scores.dtype,
+            device=budgeted_scores.device,
+        )
+        torch.testing.assert_close(budgeted_scores[row], expected, rtol=1e-5, atol=1e-5)
+
+
+def test_hisa_compact_candidate_topk_matches_incremental(monkeypatch):
+    config = IndexCacheHISAConfig(
+        enabled=True,
+        block_size=64,
+        compression_ratio=2.0,
+        forced_boundary_blocks=("first", "last"),
+    )
+    torch.manual_seed(20260531)
+    sq, bsz, heads, context_len, topk = 128, 1, 8, 512, 16
+    q = torch.randn(sq, bsz, heads, HEAD_DIM)
+    k = torch.randn(context_len, bsz, HEAD_DIM)
+    weights = torch.rand(sq, bsz, heads) + 0.1
+
+    monkeypatch.setenv("MEGATRON_HISA_CANDIDATE_SLOT_GROUP", "8")
+    monkeypatch.setenv("MEGATRON_HISA_CANDIDATE_MAX_TEMP_MB", "1")
+    monkeypatch.setenv("MEGATRON_HISA_COMPACT_CANDIDATE_TOPK", "0")
+    incremental = indexcache_hisa_topk_with_scores(
+        q,
+        weights,
+        k,
+        topk,
+        config=config,
+        q_start=0,
+        is_causal=False,
+        mask=None,
+        query_positions=None,
+        key_positions=None,
+        return_scores=True,
+    )
+    assert incremental is not None
+
+    monkeypatch.setenv("MEGATRON_HISA_COMPACT_CANDIDATE_TOPK", "1")
+    compact = indexcache_hisa_topk_with_scores(
+        q,
+        weights,
+        k,
+        topk,
+        config=config,
+        q_start=0,
+        is_causal=False,
+        mask=None,
+        query_positions=None,
+        key_positions=None,
+        return_scores=True,
+    )
+    assert compact is not None
+
+    incremental_indices, incremental_scores = incremental
+    compact_indices, compact_scores = compact
+    torch.testing.assert_close(
+        compact_indices.reshape(-1, topk).sort(dim=-1).values,
+        incremental_indices.reshape(-1, topk).sort(dim=-1).values,
+    )
+    for row in range(sq * bsz):
+        incremental_order = incremental_indices.reshape(-1, topk)[row]
+        compact_order = compact_indices.reshape(-1, topk)[row]
+        incremental_lookup = {
+            int(idx.item()): incremental_scores[row, pos].item()
+            for pos, idx in enumerate(incremental_order)
+        }
+        expected = torch.tensor(
+            [incremental_lookup[int(idx.item())] for idx in compact_order],
+            dtype=compact_scores.dtype,
+            device=compact_scores.device,
+        )
+        torch.testing.assert_close(compact_scores[row], expected, rtol=1e-5, atol=1e-5)
+
+
 def test_hisa_candidate_slot_grouping_is_exact_for_causal_prefix(monkeypatch):
     config = IndexCacheHISAConfig(
         enabled=True,
@@ -880,6 +1015,78 @@ def test_hisa_bmm_selector_backend_matches_cuda_sets(monkeypatch):
                 bmm_scores[row, bmm_lookup[tok]],
                 rtol=1e-5,
                 atol=2e-5,
+            )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_hisa_bmm_dense_cublasdx_refine_matches_bmm(monkeypatch):
+    if torch.cuda.get_device_capability() < (10, 0):
+        pytest.skip("Dense cuBLASDx HISA candidate refine requires Blackwell.")
+
+    import megatron.core.quantization.indexcache.hisa as hisa_module
+
+    ext = hisa_module._try_load_hisa_cuda_ext()
+    if ext is None or not hasattr(ext, "hisa_selector_dense_cublasdx_refine_fwd"):
+        pytest.skip("Dense cuBLASDx HISA candidate refine extension unavailable.")
+
+    config = IndexCacheHISAConfig(
+        enabled=True,
+        block_size=4,
+        compression_ratio=2.0,
+        forced_boundary_blocks=("first", "last"),
+    )
+    torch.manual_seed(20260530)
+    sq, heads, context_len, topk = 8, 64, 48, 8
+    q = torch.randn(sq, heads, HEAD_DIM, device="cuda", dtype=torch.float32) * 0.05
+    k = torch.randn(context_len, HEAD_DIM, device="cuda", dtype=torch.float32) * 0.05
+    weights = torch.rand(sq, heads, device="cuda", dtype=torch.float32) + 0.1
+    q_start = 32
+    prefix_lens = torch.arange(q_start + 1, q_start + sq + 1, device="cuda").clamp(
+        0, context_len
+    )
+
+    monkeypatch.setenv("MEGATRON_HISA_SELECTOR_BACKEND", "bmm")
+    monkeypatch.setenv("MEGATRON_HISA_BMM_CUBLASDX_REFINE", "0")
+    bmm_indices, bmm_scores = indexcache_hisa_select_with_scores(
+        q,
+        weights,
+        k,
+        topk,
+        config=config,
+        prefix_lens=prefix_lens,
+    )
+    monkeypatch.setenv("MEGATRON_HISA_BMM_CUBLASDX_REFINE", "1")
+    cublasdx_indices, cublasdx_scores = indexcache_hisa_select_with_scores(
+        q,
+        weights,
+        k,
+        topk,
+        config=config,
+        prefix_lens=prefix_lens,
+    )
+
+    assert cublasdx_indices is not None and cublasdx_scores is not None
+    for row in range(sq):
+        torch.testing.assert_close(
+            cublasdx_indices[row].long().sort().values.cpu(),
+            bmm_indices[row].long().sort().values.cpu(),
+            rtol=0,
+            atol=0,
+        )
+        cublasdx_lookup = {
+            int(tok.item()): pos
+            for pos, tok in enumerate(cublasdx_indices[row])
+            if tok.item() >= 0
+        }
+        bmm_lookup = {
+            int(tok.item()): pos for pos, tok in enumerate(bmm_indices[row]) if tok.item() >= 0
+        }
+        for tok, cublasdx_pos in cublasdx_lookup.items():
+            torch.testing.assert_close(
+                cublasdx_scores[row, cublasdx_pos],
+                bmm_scores[row, bmm_lookup[tok]],
+                rtol=3e-4,
+                atol=3e-4,
             )
 
 

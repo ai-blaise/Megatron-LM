@@ -547,6 +547,21 @@ def _activation_eco_forced_release_group(
     return None
 
 
+def _te_grouped_linear_fuse_wgrad_accumulation(config: ModelParallelConfig, *, is_expert: bool) -> bool:
+    """Return whether TE GroupedLinear should accumulate wgrad into main_grad."""
+
+    if getattr(config, "gradient_accumulation_fusion", False):
+        return True
+    if not is_expert:
+        return False
+    return os.getenv("MEGATRON_TE_GROUPED_LINEAR_FUSE_WGRAD_ACCUM", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
 class TELinear(te.pytorch.Linear):
     """Wrapper for the Transformer-Engine's `Linear` layer.
 
@@ -1667,12 +1682,16 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 tp_size = 1
                 tp_group_for_te = None
 
+            fuse_wgrad_accumulation = _te_grouped_linear_fuse_wgrad_accumulation(
+                self.config, is_expert=is_expert
+            )
+
             super().__init__(
                 num_gemms=num_gemms,
                 in_features=input_size,
                 out_features=output_size,
                 sequence_parallel=self.config.sequence_parallel,
-                fuse_wgrad_accumulation=self.config.gradient_accumulation_fusion,
+                fuse_wgrad_accumulation=fuse_wgrad_accumulation,
                 tp_group=tp_group_for_te if torch.distributed.is_initialized() else None,
                 tp_size=tp_size,
                 get_rng_state_tracker=(

@@ -54,6 +54,10 @@ _HISA_KL_GRAD_TRITON_ENV = "MEGATRON_HISA_KL_GRAD_TRITON"
 _DSA_TEACHER_FROM_LSE_ENV = "MEGATRON_DSA_TEACHER_FROM_LSE"
 _DSA_TEACHER_SCORE_SCRATCH_ENV = "MEGATRON_DSA_TEACHER_SCORE_SCRATCH"
 _DSA_TRITON_BWD_SCORE_SCRATCH_ENV = "MEGATRON_DSA_TRITON_BWD_SCORE_SCRATCH"
+_DSA_BACKWARD_TRIM_CACHE_ENV = "MEGATRON_DSA_BACKWARD_TRIM_CACHE"
+_DSA_BACKWARD_TRIM_SAFETY_MB_ENV = "MEGATRON_DSA_BACKWARD_TRIM_SAFETY_MB"
+_DSA_BACKWARD_TRIM_CACHED_MB_ENV = "MEGATRON_DSA_BACKWARD_TRIM_CACHED_MB"
+_DSA_BACKWARD_TRIM_SYNC_ENV = "MEGATRON_DSA_BACKWARD_TRIM_SYNC"
 
 
 def _env_enabled() -> bool:
@@ -110,6 +114,39 @@ def _bf16_grad_atomics_enabled() -> bool:
     # accumulation in fp32 so W4A4KV4 + IndexCache FP8 semantics are unchanged.
     raw = os.getenv(_DSA_TRITON_BF16_GRAD_ATOMICS_ENV, "0").strip().lower()
     return raw not in {"0", "false", "off", "no"}
+
+
+def _dtype_element_size(dtype: torch.dtype) -> int:
+    return torch.empty((), dtype=dtype).element_size()
+
+
+def _maybe_trim_cuda_cache_for_dsa_backward(required_bytes: int) -> None:
+    """Release cached allocator blocks before DSA's dense grad buffers near OOM.
+
+    StreamBP replay can allocate and free large MLP temporaries after its outer
+    cache trim. If those blocks remain cached, the following DSA backward can
+    fail a small dense grad allocation despite having enough reclaimable cache.
+    Keep this conditional so normal iterations do not pay an empty_cache sync.
+    """
+
+    raw = os.getenv(_DSA_BACKWARD_TRIM_CACHE_ENV, "1").strip().lower()
+    if raw in {"0", "false", "off", "no"} or not torch.cuda.is_available():
+        return
+
+    free_bytes, _ = torch.cuda.mem_get_info()
+    allocated = torch.cuda.memory_allocated()
+    reserved = torch.cuda.memory_reserved()
+    cached = max(0, reserved - allocated)
+
+    mib = 1024 * 1024
+    safety_mb = int(os.getenv(_DSA_BACKWARD_TRIM_SAFETY_MB_ENV, "1024"))
+    cached_threshold_mb = int(os.getenv(_DSA_BACKWARD_TRIM_CACHED_MB_ENV, "512"))
+    needed_bytes = max(0, required_bytes) + safety_mb * mib
+    if free_bytes < needed_bytes and cached > cached_threshold_mb * mib:
+        sync_raw = os.getenv(_DSA_BACKWARD_TRIM_SYNC_ENV, "1").strip().lower()
+        if sync_raw not in {"0", "false", "off", "no"}:
+            torch.cuda.synchronize()
+        torch.cuda.empty_cache()
 
 
 def _key_block_kv_backward_enabled() -> bool:
@@ -2873,11 +2910,19 @@ class SparseDSAAttentionTriton(torch.autograd.Function):
             if _bf16_grad_atomics_enabled() and key.dtype in (torch.bfloat16, torch.float16)
             else torch.float32
         )
-        grad_key = torch.zeros(
-            (sk, bsz, num_heads, head_dim), device=key.device, dtype=kv_grad_dtype
+        _maybe_trim_cuda_cache_for_dsa_backward(
+            query.numel() * _dtype_element_size(torch.float32)
+            + (key.numel() + value.numel()) * _dtype_element_size(kv_grad_dtype)
         )
+        _maybe_trim_cuda_cache_for_dsa_backward(
+            (key.numel() + value.numel()) * _dtype_element_size(kv_grad_dtype)
+        )
+        _maybe_trim_cuda_cache_for_dsa_backward(value.numel() * _dtype_element_size(kv_grad_dtype))
         grad_value = torch.zeros(
             (sk, bsz, num_heads, value_dim), device=value.device, dtype=kv_grad_dtype
+        )
+        grad_key = torch.zeros(
+            (sk, bsz, num_heads, head_dim), device=key.device, dtype=kv_grad_dtype
         )
         tensor_audit(
             "dsa_triton/backward_alloc",
@@ -3277,22 +3322,38 @@ class SparseDSASplitQKAttentionTriton(torch.autograd.Function):
         value_dim = ctx.value_dim
 
         grad_output = grad_output.reshape(q_len, bsz, num_heads, value_dim).contiguous()
-        grad_query_nope = torch.empty_like(query_nope, dtype=torch.float32)
-        grad_query_pe = torch.empty_like(query_pe, dtype=torch.float32)
         kv_grad_dtype = (
             key_nope.dtype
             if _bf16_grad_atomics_enabled()
             and key_nope.dtype in (torch.bfloat16, torch.float16)
             else torch.float32
         )
+        query_grad_dtype = (
+            query_nope.dtype
+            if _bf16_grad_atomics_enabled()
+            and query_nope.dtype in (torch.bfloat16, torch.float16)
+            else torch.float32
+        )
+        _maybe_trim_cuda_cache_for_dsa_backward(
+            (query_nope.numel() + query_pe.numel()) * _dtype_element_size(query_grad_dtype)
+            + (key_nope.numel() + key_pe.numel() + value.numel())
+            * _dtype_element_size(kv_grad_dtype)
+        )
+        grad_query_nope = torch.empty_like(query_nope, dtype=query_grad_dtype)
+        grad_query_pe = torch.empty_like(query_pe, dtype=query_grad_dtype)
+        _maybe_trim_cuda_cache_for_dsa_backward(
+            (key_nope.numel() + key_pe.numel() + value.numel())
+            * _dtype_element_size(kv_grad_dtype)
+        )
+        _maybe_trim_cuda_cache_for_dsa_backward(value.numel() * _dtype_element_size(kv_grad_dtype))
+        grad_value = torch.zeros(
+            (sk, bsz, num_heads, value_dim), device=value.device, dtype=kv_grad_dtype
+        )
         grad_key_nope = torch.zeros(
             (sk, bsz, num_heads, ctx.head_dim), device=key_nope.device, dtype=kv_grad_dtype
         )
         grad_key_pe = torch.zeros(
             (sk, bsz, ctx.key_pe_heads, ctx.pos_dim), device=key_pe.device, dtype=kv_grad_dtype
-        )
-        grad_value = torch.zeros(
-            (sk, bsz, num_heads, value_dim), device=value.device, dtype=kv_grad_dtype
         )
         tensor_audit(
             "dsa_triton/split_qk_backward_alloc",
@@ -3311,6 +3372,7 @@ class SparseDSASplitQKAttentionTriton(torch.autograd.Function):
             heads=num_heads,
             topk_count=ctx.topk_count,
             kv_grad_dtype=str(kv_grad_dtype),
+            query_grad_dtype=str(query_grad_dtype),
         )
         grid = (triton.cdiv(q_len, ctx.backward_block_q), num_heads * bsz)
         _sparse_dsa_split_qk_backward_kernel[grid](

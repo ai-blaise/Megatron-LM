@@ -62,6 +62,14 @@ void launch_hisa_selector_nvfp4_cublasdx_tiled_fwd(
     int topk_tokens, int candidate_capacity, int force_first, int force_last,
     int force_last_minus_one, cudaStream_t stream);
 
+void launch_hisa_selector_dense_cublasdx_refine_fwd(
+    const float* q, const float* k, const float* weights,
+    const int32_t* prefix_lens, const int32_t* top_blocks,
+    float* candidate_scores, int32_t* candidate_indices,
+    int32_t* topk_indices, float* selected_scores,
+    int Q, int H, int D, int L, int block_size, int top_block_count,
+    int topk_tokens, int candidate_capacity, cudaStream_t stream);
+
 void launch_hisa_selector_nvfp4_cublasdx_fp8_fwd(
     const float* q, const uint8_t* packed_values,
     const int32_t* packed_scales, const float* block_reps,
@@ -669,6 +677,99 @@ void hisa_selector_nvfp4_cublasdx_tiled_fwd(
       static_cast<int>(effective_block_topk), static_cast<int>(topk_tokens),
       candidate_capacity, force_first ? 1 : 0, force_last ? 1 : 0,
       force_last_minus_one ? 1 : 0, stream);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void hisa_selector_dense_cublasdx_refine_fwd(
+    torch::Tensor q,
+    torch::Tensor k,
+    torch::Tensor weights,
+    torch::Tensor prefix_lens,
+    torch::Tensor top_blocks,
+    torch::Tensor candidate_scores,
+    torch::Tensor candidate_indices,
+    torch::Tensor topk_indices,
+    torch::Tensor selected_scores,
+    int64_t block_size,
+    int64_t topk_tokens) {
+  HISA_CHECK_CUDA(q);
+  HISA_CHECK_CUDA(k);
+  HISA_CHECK_CUDA(weights);
+  HISA_CHECK_CUDA(prefix_lens);
+  HISA_CHECK_CUDA(top_blocks);
+  HISA_CHECK_CUDA(candidate_scores);
+  HISA_CHECK_CUDA(candidate_indices);
+  HISA_CHECK_CUDA(topk_indices);
+  HISA_CHECK_CUDA(selected_scores);
+
+  HISA_CHECK_CONTIG(q);
+  HISA_CHECK_CONTIG(k);
+  HISA_CHECK_CONTIG(weights);
+  HISA_CHECK_CONTIG(prefix_lens);
+  HISA_CHECK_CONTIG(top_blocks);
+  HISA_CHECK_CONTIG(candidate_scores);
+  HISA_CHECK_CONTIG(candidate_indices);
+  HISA_CHECK_CONTIG(topk_indices);
+  HISA_CHECK_CONTIG(selected_scores);
+
+  HISA_CHECK_DTYPE(q, torch::kFloat32);
+  HISA_CHECK_DTYPE(k, torch::kFloat32);
+  HISA_CHECK_DTYPE(weights, torch::kFloat32);
+  HISA_CHECK_DTYPE(prefix_lens, torch::kInt32);
+  HISA_CHECK_DTYPE(top_blocks, torch::kInt32);
+  HISA_CHECK_DTYPE(candidate_scores, torch::kFloat32);
+  HISA_CHECK_DTYPE(candidate_indices, torch::kInt32);
+  HISA_CHECK_DTYPE(topk_indices, torch::kInt32);
+  HISA_CHECK_DTYPE(selected_scores, torch::kFloat32);
+
+  TORCH_CHECK(q.dim() == 3, "q must be [Q, H, D]");
+  TORCH_CHECK(k.dim() == 2, "k must be [L, D]");
+  TORCH_CHECK(weights.dim() == 2, "weights must be [Q, H]");
+  TORCH_CHECK(prefix_lens.dim() == 1, "prefix_lens must be [Q]");
+  TORCH_CHECK(top_blocks.dim() == 2, "top_blocks must be [Q, TB]");
+  TORCH_CHECK(candidate_scores.dim() == 2, "candidate_scores must be [Q, C]");
+  TORCH_CHECK(candidate_indices.dim() == 2, "candidate_indices must be [Q, C]");
+  TORCH_CHECK(topk_indices.dim() == 2, "topk_indices must be [Q, K]");
+  TORCH_CHECK(selected_scores.dim() == 2, "selected_scores must be [Q, K]");
+
+  const int Q = q.size(0);
+  const int H = q.size(1);
+  const int D = q.size(2);
+  const int L = k.size(0);
+  const int K = topk_indices.size(1);
+  const int candidate_capacity = candidate_scores.size(1);
+  const int top_block_count = top_blocks.size(1);
+
+  TORCH_CHECK(H == 64, "dense cuBLASDx HISA refine requires 64 indexer heads");
+  TORCH_CHECK(D == 128, "dense cuBLASDx HISA refine requires head_dim=128");
+  TORCH_CHECK(k.size(1) == D, "k dim must match q head dim");
+  TORCH_CHECK(weights.size(0) == Q && weights.size(1) == H, "weights must be [Q, H]");
+  TORCH_CHECK(prefix_lens.size(0) == Q, "prefix_lens must be [Q]");
+  TORCH_CHECK(top_blocks.size(0) == Q, "top_blocks row count mismatch");
+  TORCH_CHECK(candidate_indices.size(0) == Q && candidate_indices.size(1) == candidate_capacity,
+              "candidate_indices must match candidate_scores shape");
+  TORCH_CHECK(selected_scores.size(0) == Q && selected_scores.size(1) == K,
+              "selected_scores must match topk_indices shape");
+  TORCH_CHECK(topk_tokens == K, "topk_tokens must equal topk_indices.size(1)");
+  TORCH_CHECK(candidate_capacity >= K, "candidate scratch must be at least topk_tokens");
+  TORCH_CHECK((candidate_capacity & (candidate_capacity - 1)) == 0,
+              "candidate scratch width must be a power of two");
+  TORCH_CHECK(block_size > 0, "block_size must be positive");
+  TORCH_CHECK(top_block_count > 0, "top_blocks must have at least one slot");
+
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  megatron::hisa_indexer::launch_hisa_selector_dense_cublasdx_refine_fwd(
+      q.data_ptr<float>(),
+      k.data_ptr<float>(),
+      weights.data_ptr<float>(),
+      prefix_lens.data_ptr<int32_t>(),
+      top_blocks.data_ptr<int32_t>(),
+      candidate_scores.data_ptr<float>(),
+      candidate_indices.data_ptr<int32_t>(),
+      topk_indices.data_ptr<int32_t>(),
+      selected_scores.data_ptr<float>(),
+      Q, H, D, L, static_cast<int>(block_size), top_block_count,
+      static_cast<int>(topk_tokens), candidate_capacity, stream);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -1790,6 +1891,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "hisa_selector_nvfp4_cublasdx_tiled_fwd",
       &hisa_selector_nvfp4_cublasdx_tiled_fwd,
       "Tiled HISA selector forward from packed NVFP4 IndexCache rows (cuBLASDx/CuTe)");
+  m.def(
+      "hisa_selector_dense_cublasdx_refine_fwd",
+      &hisa_selector_dense_cublasdx_refine_fwd,
+      "Dense HISA candidate refinement from BMM-selected blocks (cuBLASDx/CuTe)");
   m.def(
       "hisa_selector_nvfp4_cublasdx_fp8_fwd",
       &hisa_selector_nvfp4_cublasdx_fp8_fwd,

@@ -1371,6 +1371,148 @@ __global__ void hisa_selector_tiled_topk_cub4096_kernel(
   }
 }
 
+template <class GEMM>
+__global__ void hisa_selector_dense_cublasdx_score_tiles_kernel(
+    const float* __restrict__ q,                  // [Q, 64, 128]
+    const float* __restrict__ k,                  // [L, 128]
+    const float* __restrict__ weights,            // [Q, 64]
+    const int32_t* __restrict__ prefix_lens,      // [Q]
+    const int32_t* __restrict__ top_blocks,       // [Q, TB]
+    float* __restrict__ candidate_scores,         // [Q, candidate_capacity]
+    int32_t* __restrict__ candidate_indices,      // [Q, candidate_capacity]
+    int Q, int L, int block_size, int top_block_count,
+    int candidate_capacity) {
+  const int row = blockIdx.x;
+  const int tile_id = blockIdx.y;
+  const int tid = threadIdx.x;
+  if (row >= Q) {
+    return;
+  }
+
+  const int tile_start = tile_id * kCublasDxTileN;
+  if (tile_start >= candidate_capacity) {
+    return;
+  }
+
+  extern __shared__ __align__(16) unsigned char smem_raw[];
+  auto gemm_smem = reinterpret_cast<void*>(smem_raw);
+  auto [smem_a, smem_b, smem_c] = cublasdx::slice_shared_memory<GEMM>(gemm_smem);
+  auto a_shared = cublasdx::make_tensor(smem_a, GEMM::get_layout_smem_a());
+  auto b_shared = cublasdx::make_tensor(smem_b, GEMM::get_layout_smem_b());
+  auto c_shared = cublasdx::make_tensor(smem_c, GEMM::get_layout_smem_c());
+
+  const int prefix_len = max(0, min(static_cast<int>(prefix_lens[row]), L));
+  const float* q_row = q + static_cast<int64_t>(row) * kCublasDxIndexerHeads * kHeadDim;
+  const float* w_row = weights + static_cast<int64_t>(row) * kCublasDxIndexerHeads;
+
+  for (int idx = tid; idx < kCublasDxIndexerHeads * kHeadDim; idx += blockDim.x) {
+    const int h = idx / kHeadDim;
+    const int d = idx - h * kHeadDim;
+    a_shared(h, d) = q_row[static_cast<int64_t>(h) * kHeadDim + d];
+  }
+
+  for (int idx = tid; idx < kHeadDim * kCublasDxTileN; idx += blockDim.x) {
+    const int d = idx / kCublasDxTileN;
+    const int n = idx - d * kCublasDxTileN;
+    const int candidate_pos = tile_start + n;
+    float value = 0.0f;
+    if (candidate_pos < candidate_capacity) {
+      const int slot = candidate_pos / block_size;
+      const int offset = candidate_pos - slot * block_size;
+      int token = -1;
+      if (slot < top_block_count) {
+        const int block_id =
+            top_blocks[static_cast<int64_t>(row) * top_block_count + slot];
+        token = block_id >= 0 ? block_id * block_size + offset : -1;
+      }
+      if (token >= 0 && token < prefix_len && token < L) {
+        value = k[static_cast<int64_t>(token) * kHeadDim + d];
+      }
+    }
+    b_shared(d, n) = value;
+  }
+  for (int idx = tid; idx < kCublasDxIndexerHeads * kCublasDxTileN; idx += blockDim.x) {
+    const int h = idx / kCublasDxTileN;
+    const int n = idx - h * kCublasDxTileN;
+    c_shared(h, n) = 0.0f;
+  }
+  __syncthreads();
+
+  GEMM().execute(1.0f, a_shared, b_shared, 0.0f, c_shared);
+  __syncthreads();
+
+  for (int n = tid; n < kCublasDxTileN; n += blockDim.x) {
+    const int candidate_pos = tile_start + n;
+    if (candidate_pos >= candidate_capacity) {
+      continue;
+    }
+    const int slot = candidate_pos / block_size;
+    const int offset = candidate_pos - slot * block_size;
+    int32_t token_idx = -1;
+    float score = -INFINITY;
+    if (slot < top_block_count) {
+      const int block_id =
+          top_blocks[static_cast<int64_t>(row) * top_block_count + slot];
+      const int token = block_id >= 0 ? block_id * block_size + offset : -1;
+      if (token >= 0 && token < prefix_len && token < L) {
+        float accum = 0.0f;
+        for (int h = 0; h < kCublasDxIndexerHeads; ++h) {
+          const float dot = c_shared(h, n);
+          if (dot > 0.0f) {
+            accum += dot * w_row[h];
+          }
+        }
+        score = accum;
+        token_idx = token;
+      }
+    }
+    candidate_scores[static_cast<int64_t>(row) * candidate_capacity + candidate_pos] = score;
+    candidate_indices[static_cast<int64_t>(row) * candidate_capacity + candidate_pos] =
+        token_idx;
+  }
+}
+
+void launch_hisa_selector_dense_cublasdx_refine_fwd(
+    const float* q, const float* k, const float* weights,
+    const int32_t* prefix_lens, const int32_t* top_blocks,
+    float* candidate_scores, int32_t* candidate_indices,
+    int32_t* topk_indices, float* selected_scores,
+    int Q, int H, int D, int L, int block_size, int top_block_count,
+    int topk_tokens, int candidate_capacity, cudaStream_t stream) {
+  if (H != kCublasDxIndexerHeads || D != kHeadDim) {
+    C10_THROW_ERROR(ValueError, "dense cuBLASDx HISA refine requires H=64 and D=128");
+  }
+  using GEMM = HisaSelectorGemm64x16;
+  const dim3 block = GEMM::block_dim;
+  const size_t score_smem = cublasdx::get_shared_storage_size<GEMM>();
+  if (score_smem > 48 * 1024) {
+    C10_CUDA_CHECK(cudaFuncSetAttribute(
+        hisa_selector_dense_cublasdx_score_tiles_kernel<GEMM>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        static_cast<int>(score_smem)));
+  }
+
+  const int tile_count = (candidate_capacity + kCublasDxTileN - 1) / kCublasDxTileN;
+  dim3 score_grid(Q, tile_count);
+  hisa_selector_dense_cublasdx_score_tiles_kernel<GEMM>
+      <<<score_grid, block, score_smem, stream>>>(
+          q, k, weights, prefix_lens, top_blocks, candidate_scores,
+          candidate_indices, Q, L, block_size, top_block_count,
+          candidate_capacity);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  if (candidate_capacity <= 4096) {
+    hisa_selector_tiled_topk_cub4096_kernel<<<Q, 128, 0, stream>>>(
+        candidate_scores, candidate_indices, topk_indices, selected_scores, Q,
+        candidate_capacity, topk_tokens);
+  } else {
+    hisa_selector_tiled_topk_kernel<<<Q, 128, 0, stream>>>(
+        candidate_scores, candidate_indices, topk_indices, selected_scores, Q,
+        candidate_capacity, topk_tokens);
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 void launch_hisa_selector_nvfp4_cublasdx_tiled_fwd(
     const float* q, const uint8_t* packed_values,
     const int32_t* packed_scales, const float* block_reps,
