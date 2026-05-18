@@ -1784,6 +1784,154 @@ class DSAIndexer(MegatronModule):
         weights = _BroadcastFromTensorParallelOwner.apply(weights, owner_global_rank, tp_group)
         return q, weights
 
+    def _project_query_positions_sp_owner_broadcast_before_topk(
+        self,
+        x: torch.Tensor,
+        qr: torch.Tensor,
+        rotary_pos_emb,
+        mscale: float,
+        query_positions: torch.Tensor,
+        query_base: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Project gathered-query rows from SP owners without gathering hidden states.
+
+        StreamBP DSA replay passes query rows ordered by global sequence position,
+        typically grouped as one local chunk per TP rank.  Projecting from the
+        owning rank and broadcasting the compact indexer tensors preserves the
+        trainable-indexer path while avoiding a full hidden/QR all-gather before
+        HISA and selected-attention kernels run.
+        """
+
+        tp_group = self.pg_collection.tp
+        tp_size = tp_group.size()
+        local_seq_len = x.size(0)
+        if tp_size <= 1:
+            local_indices = query_positions.to(device=x.device, dtype=torch.long)
+            q, weights = self._project_query_before_topk(
+                x.index_select(0, local_indices),
+                qr.index_select(0, local_indices)
+                if qr.size(0) == x.size(0)
+                else qr.index_select(0, local_indices - int(local_indices.min().item())),
+                self._index_rotary_pos_emb(rotary_pos_emb, local_indices),
+                mscale,
+            )
+            return q, weights
+        if local_seq_len <= 0:
+            raise ValueError("DSA StreamBP SP query projection received empty local shard")
+
+        query_positions = query_positions.to(device=x.device, dtype=torch.long).contiguous()
+        if query_positions.dim() != 1 or query_positions.numel() == 0:
+            raise ValueError(
+                "DSA StreamBP query positions must be a non-empty 1D tensor, got "
+                f"{tuple(query_positions.shape)}"
+            )
+        max_position = local_seq_len * tp_size
+        if bool((query_positions < 0).any().item()) or bool(
+            (query_positions >= max_position).any().item()
+        ):
+            raise ValueError(
+                "DSA StreamBP query positions exceed the TP-gathered prefix: "
+                f"max_position={max_position}, positions_shape={tuple(query_positions.shape)}"
+            )
+
+        owners = torch.div(query_positions, local_seq_len, rounding_mode="floor")
+        local_offsets = query_positions - owners * local_seq_len
+        if query_base is None:
+            query_base = int(local_offsets.min().item())
+        else:
+            query_base = int(query_base)
+
+        def select_qr(offsets: torch.Tensor, segment_start: int, segment_end: int) -> torch.Tensor:
+            if qr.size(0) == x.size(0):
+                return qr.index_select(0, offsets)
+            if qr.size(0) == query_positions.numel():
+                row_indices = torch.arange(
+                    segment_start,
+                    segment_end,
+                    device=qr.device,
+                    dtype=torch.long,
+                )
+                return qr.index_select(0, row_indices)
+            relative_offsets = offsets - query_base
+            if bool((relative_offsets < 0).any().item()) or bool(
+                (relative_offsets >= qr.size(0)).any().item()
+            ):
+                raise ValueError(
+                    "Cannot align StreamBP DSA QR rows with local owner offsets: "
+                    f"qr_len={qr.size(0)}, query_base={query_base}, "
+                    f"offset_min={int(offsets.min().item())}, "
+                    f"offset_max={int(offsets.max().item())}"
+                )
+            return qr.index_select(0, relative_offsets.to(device=qr.device))
+
+        q_segments = []
+        weight_segments = []
+        start = 0
+        num_positions = query_positions.numel()
+        while start < num_positions:
+            owner_rank = int(owners[start].item())
+            end = start + 1
+            while end < num_positions and int(owners[end].item()) == owner_rank:
+                end += 1
+
+            offsets = local_offsets[start:end]
+            positions = query_positions[start:end]
+            if tp_group.rank() == owner_rank:
+                local_x = x.index_select(0, offsets.to(device=x.device))
+                local_qr = select_qr(offsets, start, end)
+                if positions.numel() > 1 and bool(
+                    (positions[1:] != positions[:-1] + 1).any().item()
+                ):
+                    query_rotary_pos_emb = self._index_rotary_pos_emb(rotary_pos_emb, positions)
+                else:
+                    query_rotary_pos_emb = self._slice_rotary_pos_emb(
+                        rotary_pos_emb,
+                        int(positions[0].item()),
+                        int(positions[-1].item()) + 1,
+                    )
+                q_segment, weights_segment = self._project_query_before_topk(
+                    local_x,
+                    local_qr,
+                    query_rotary_pos_emb,
+                    mscale,
+                )
+            else:
+                segment_len = end - start
+                q_segment = torch.empty(
+                    segment_len,
+                    x.size(1),
+                    self.index_n_heads,
+                    self.index_head_dim,
+                    device=x.device,
+                    dtype=x.dtype,
+                    requires_grad=True,
+                )
+                weights_segment = torch.empty(
+                    segment_len,
+                    x.size(1),
+                    self.index_n_heads,
+                    device=x.device,
+                    dtype=x.dtype,
+                    requires_grad=True,
+                )
+
+            owner_global_rank = torch.distributed.get_global_rank(tp_group, owner_rank)
+            q_segments.append(
+                _BroadcastFromTensorParallelOwner.apply(
+                    q_segment, owner_global_rank, tp_group
+                )
+            )
+            weight_segments.append(
+                _BroadcastFromTensorParallelOwner.apply(
+                    weights_segment, owner_global_rank, tp_group
+                )
+            )
+            start = end
+
+        if len(q_segments) == 1:
+            return q_segments[0], weight_segments[0]
+        return torch.cat(q_segments, dim=0), torch.cat(weight_segments, dim=0)
+
     def forward_before_topk(
         self,
         x: torch.Tensor,
@@ -3878,21 +4026,42 @@ class DSAttention(MegatronModule):
 
         indexer_loss_coeff = getattr(self.config, 'dsa_indexer_loss_coeff', 0.0)
         chunk_size = int(self.config.dsa_chunk_size)
-        chunk_indexer_q = (
-            streambp_positions is None
+        use_sp_project_before_gather = (
+            _env_flag_enabled(_DSA_SP_PROJECT_BEFORE_GATHER_ENV, "1")
+            and self.config.sequence_parallel
+            and self.indexer.pg_collection.tp.size() > 1
             and packed_seq_params is None
             and chunk_size > 0
-            and sq > chunk_size
             and _env_flag_enabled(_DSA_CHUNK_INDEXER_PROJ_ENV, "1")
+        )
+        streambp_sp_project_before_gather = (
+            streambp_positions is not None
+            and use_sp_project_before_gather
+            and streambp_query_positions is not None
+            and streambp_key_positions is not None
+            and x.size(0) * self.indexer.pg_collection.tp.size() == skv
+            and streambp_key_positions.numel() == skv
+        )
+        chunk_indexer_q = (
+            packed_seq_params is None
+            and chunk_size > 0
+            and _env_flag_enabled(_DSA_CHUNK_INDEXER_PROJ_ENV, "1")
+            and (
+                (streambp_positions is None and sq > chunk_size)
+                or streambp_sp_project_before_gather
+            )
         )
         if chunk_indexer_q:
             sp_project_before_gather = (
-                _env_flag_enabled(_DSA_SP_PROJECT_BEFORE_GATHER_ENV, "1")
-                and self.config.sequence_parallel
-                and self.indexer.pg_collection.tp.size() > 1
-                and x.size(0) * self.indexer.pg_collection.tp.size() == sq
-                and chunk_size > 0
-                and x.size(0) % chunk_size == 0
+                use_sp_project_before_gather
+                and (
+                    streambp_sp_project_before_gather
+                    or (
+                        streambp_positions is None
+                        and x.size(0) * self.indexer.pg_collection.tp.size() == sq
+                        and x.size(0) % chunk_size == 0
+                    )
+                )
             )
             if sp_project_before_gather:
                 (
@@ -3922,6 +4091,29 @@ class DSAttention(MegatronModule):
                         q_start,
                         q_end,
                     )
+                if streambp_sp_project_before_gather:
+                    streambp_query_positions_for_provider = streambp_query_positions
+                    local_seq_len = indexer_x.size(0)
+                    tp_size = self.indexer.pg_collection.tp.size()
+                    streambp_query_base = int(
+                        (
+                            streambp_query_positions_for_provider
+                            % (local_seq_len * tp_size)
+                            % local_seq_len
+                        )
+                        .min()
+                        .item()
+                    )
+
+                    def q_weights_provider(q_start: int, q_end: int):
+                        return self.indexer._project_query_positions_sp_owner_broadcast_before_topk(
+                            indexer_x,
+                            indexer_qr,
+                            indexer_rotary_pos_emb,
+                            indexer_mscale,
+                            streambp_query_positions_for_provider[q_start:q_end],
+                            query_base=streambp_query_base,
+                        )
 
             else:
                 (

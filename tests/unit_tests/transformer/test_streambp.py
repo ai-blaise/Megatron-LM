@@ -1031,6 +1031,177 @@ def test_streambp_dsa_rectangular_chunk_matches_full_attention(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_streambp_dsa_sequence_parallel_replay_uses_compact_hisa_path(monkeypatch):
+    if "RANK" not in os.environ or int(os.environ.get("WORLD_SIZE", "1")) < 2:
+        pytest.skip("Run with torchrun --nproc-per-node=2")
+    monkeypatch.setenv("MEGATRON_DSA_STREAMING_INDEXER_TOPK", "0")
+    monkeypatch.setenv("MEGATRON_DSA_CHUNK_INDEXER_PROJ", "1")
+    monkeypatch.setenv("MEGATRON_HISA_SELECTOR_BACKEND", "bmm")
+    monkeypatch.setenv("MEGATRON_HISA_FUSED_INDEXER_LOSS", "1")
+    monkeypatch.setenv("MEGATRON_DSA_STREAM_TRITON_ATTENTION_CHUNKS", "1")
+    Utils.initialize_model_parallel(tensor_model_parallel_size=2, pipeline_model_parallel_size=1)
+    try:
+        rank = dist.get_rank()
+        tp_size = dist.get_world_size()
+        torch.manual_seed(97531)
+        model_parallel_cuda_manual_seed(97531)
+        config = MLATransformerConfig(
+            num_layers=1,
+            hidden_size=256,
+            num_attention_heads=8,
+            use_cpu_initialization=True,
+            tensor_model_parallel_size=2,
+            sequence_parallel=True,
+            q_lora_rank=64,
+            kv_lora_rank=64,
+            qk_head_dim=64,
+            qk_pos_emb_head_dim=32,
+            v_head_dim=64,
+            rope_type="rope",
+            rotary_base=10000,
+            rotary_percent=1.0,
+            dsa_indexer_n_heads=4,
+            dsa_indexer_head_dim=128,
+            dsa_indexer_topk=4,
+            dsa_indexer_loss_coeff=0.01,
+            dsa_indexer_use_sparse_loss=False,
+            dsa_chunk_size=8,
+            dsa_indexcache_quantization="nvfp4_e2m1_ue8m0",
+            dsa_indexcache_hisa_enabled=True,
+            dsa_indexcache_hisa_block_size=4,
+            dsa_indexcache_hisa_block_topk=2,
+            dsa_indexcache_hisa_compression_ratio=2.0,
+        )
+        indexer_spec = ModuleSpec(
+            module=DSAIndexer,
+            submodules=DSAIndexerSubmodules(
+                linear_wq_b=ModuleSpec(module=TELinear),
+                linear_wk=ModuleSpec(module=TELinear),
+                k_norm=ModuleSpec(module=TENorm),
+                linear_weights_proj=ModuleSpec(module=TELinear),
+            ),
+        )
+
+        def build_attn():
+            return (
+                DSAttention(
+                    config=config,
+                    submodules=DSAttentionSubmodules(indexer=indexer_spec),
+                    layer_number=1,
+                    attn_mask_type=AttnMaskType.causal,
+                    attention_type="self",
+                    pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                        required_pgs=["tp", "cp"]
+                    ),
+                )
+                .cuda()
+                .bfloat16()
+                .train()
+            )
+
+        baseline = build_attn()
+        optimized = build_attn()
+        for param in baseline.parameters():
+            dist.broadcast(param.data, src=0)
+        optimized.load_state_dict(baseline.state_dict())
+
+        local_prefix = 6
+        start, end = 2, 6
+        query_len = (end - start) * tp_size
+        key_len = local_prefix * tp_size
+        batch_size = 1
+        heads = config.num_attention_heads // tp_size
+
+        torch.manual_seed(314159 + rank)
+        local_x = torch.randn(
+            local_prefix,
+            batch_size,
+            config.hidden_size,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        local_qr = torch.randn(
+            end - start,
+            batch_size,
+            config.q_lora_rank,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        torch.manual_seed(271828)
+        query = torch.randn(
+            query_len,
+            batch_size,
+            heads,
+            config.qk_head_dim,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        key = torch.randn(
+            key_len,
+            batch_size,
+            heads,
+            config.qk_head_dim,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        value = torch.randn(
+            key_len,
+            batch_size,
+            heads,
+            config.v_head_dim,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        rank_offsets = torch.arange(tp_size, device="cuda", dtype=torch.long) * local_prefix
+        local_positions = torch.arange(start, end, device="cuda", dtype=torch.long)
+        query_positions = (rank_offsets[:, None] + local_positions[None, :]).reshape(-1)
+        key_positions = torch.arange(key_len, device="cuda", dtype=torch.long)
+
+        def run(attn, *, sp_project_before_gather: str):
+            from megatron.core.transformer.experimental_attention_variant.dsa import (
+                DSAIndexerAuxLossState,
+            )
+
+            monkeypatch.setenv("MEGATRON_DSA_SP_PROJECT_BEFORE_GATHER", sp_project_before_gather)
+            DSAIndexerAuxLossState.clear()
+            out = attn(
+                query=query,
+                key=key,
+                value=value,
+                attention_mask=None,
+                x=local_x,
+                qr=local_qr,
+                attn_mask_type=AttnMaskType.causal,
+                streambp_positions=(query_positions, key_positions),
+            )
+            aux_loss = DSAIndexerAuxLossState.total()
+            assert aux_loss is not None
+            (out.float().square().mean() + aux_loss.float()).backward()
+            grads = [param.grad.detach().clone() for param in attn.indexer.parameters()]
+            return out.detach(), aux_loss.detach(), grads
+
+        with patch(
+            "megatron.core.transformer.experimental_attention_variant.dsa.hadamard_transform",
+            _mock_hadamard_transform,
+        ):
+            baseline_out, baseline_aux, baseline_grads = run(
+                baseline, sp_project_before_gather="0"
+            )
+            optimized_out, optimized_aux, optimized_grads = run(
+                optimized, sp_project_before_gather="1"
+            )
+
+        torch.testing.assert_close(optimized_out, baseline_out, rtol=3e-3, atol=3e-3)
+        torch.testing.assert_close(optimized_aux, baseline_aux, rtol=3e-3, atol=3e-3)
+        for optimized_grad, baseline_grad in zip(optimized_grads, baseline_grads):
+            torch.testing.assert_close(
+                optimized_grad.float(), baseline_grad.float(), rtol=5e-3, atol=5e-3
+            )
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_streambp_packed_dsa_chunk_matches_full_attention(monkeypatch):
     monkeypatch.setenv("MEGATRON_DSA_STREAMING_INDEXER_TOPK", "0")
     Utils.initialize_model_parallel(1, 1)
