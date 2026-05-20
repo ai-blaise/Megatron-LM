@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_DIR="${REPO_DIR:-"$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"}"
+cd "$REPO_DIR"
+
+export DRY_RUN=1
+export WANDB_EXP_NAME="${WANDB_EXP_NAME:-aws-handoff-dryrun}"
+
+export NNODES="${NNODES:-4}"
+export GPUS_PER_NODE="${GPUS_PER_NODE:-8}"
+export NODE_RANK="${NODE_RANK:-0}"
+export MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
+export MASTER_PORT="${MASTER_PORT:-29673}"
+
+export TP="${TP:-4}"
+export PP="${PP:-4}"
+export CP="${CP:-1}"
+export EP="${EP:-4}"
+export ETP="${ETP:-1}"
+export ENABLE_VPP="${ENABLE_VPP:-1}"
+export MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-4}"
+export GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-32}"
+export SEQ_LENGTH="${SEQ_LENGTH:-16384}"
+export DSA_INDEXER_TOPK="${DSA_INDEXER_TOPK:-512}"
+
+export SPINQUANT="${SPINQUANT:-1}"
+export USE_HIGGS="${USE_HIGGS:-1}"
+export TURBOQUANT="${TURBOQUANT:-0}"
+export INDEXCACHE="${INDEXCACHE:-1}"
+export DSA_INDEXCACHE_HISA="${DSA_INDEXCACHE_HISA:-1}"
+export DSA_INDEXCACHE_QUANTIZATION="${DSA_INDEXCACHE_QUANTIZATION:-nvfp4_e2m1_ue8m0}"
+export NVFP4_ACTIVATION_ECO="${NVFP4_ACTIVATION_ECO:-1}"
+export FLASH_ADAMW_ECO="${FLASH_ADAMW_ECO:-1}"
+
+export MOE_TOKEN_DISPATCHER_TYPE="${MOE_TOKEN_DISPATCHER_TYPE:-flex}"
+export MOE_FLEX_DISPATCHER_BACKEND="${MOE_FLEX_DISPATCHER_BACKEND:-deepep}"
+export MEGATRON_DEEPEP_COMPACT_LOCAL_PERMUTE="${MEGATRON_DEEPEP_COMPACT_LOCAL_PERMUTE:-1}"
+
+examples/sft/run_sft_deepseek_nvfp4.sh

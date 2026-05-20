@@ -314,7 +314,7 @@ fi
 ENABLE_VPP="${ENABLE_VPP:-1}"
 if [[ "$PP" -eq 4 && -z "${PIPELINE_MODEL_PARALLEL_LAYOUT:-}" && -z "${NUM_LAYERS_PER_VIRTUAL_PIPELINE_STAGE:-}" && -z "${NUM_VIRTUAL_STAGES_PER_PIPELINE_RANK:-}" ]]; then
     if [[ "$ENABLE_VPP" == "1" ]]; then
-        PIPELINE_MODEL_PARALLEL_LAYOUT="Et*5|t*5|t*4|t*3|t*4|t*4|t*4|t*3|t*4|t*4|t*4|t*3|t*4|t*4|t*3|t*3L"
+        PIPELINE_MODEL_PARALLEL_LAYOUT="Et*5|t*4|t*4|t*3|t*4|t*4|t*4|t*4|t*4|t*4|t*4|t*4|t*3|t*4|t*3|t*3L"
     else
         PIPELINE_MODEL_PARALLEL_LAYOUT="Et*16|t*15|t*15|t*15L"
     fi
