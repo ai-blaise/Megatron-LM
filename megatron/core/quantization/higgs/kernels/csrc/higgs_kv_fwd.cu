@@ -100,16 +100,13 @@ __global__ void higgs_kv_fwd_kernel(
   __shared__ float reduce_scratch[64];  // block_reduce_sum partials
   __shared__ float scale_sh;
   __shared__ float rot_norm_sh;
-  // Per-pair codebook indices in SMEM: 256 entries; the even thread of
-  // each pair writes its 4-bit index here, and the odd thread reads it
-  // back after a __syncthreads. Using SMEM avoids relying on global-store
-  // ordering between threads of the same pair.
-  __shared__ uint32_t pair_idx_sh[kNumPairs];
 
   const scalar_t* x_row = x + row * row_stride;
   scalar_t* out_row = out + row * row_stride;
   uint8_t* indices_row = indices + row * kNumPairs;
   uint8_t* mask_row = ste_mask + row * kLatentDim;
+  (void)codebook;
+  (void)codebook_norm_sq;
 
   // region: rotate -- forward orthonormal FWHT
   HG_REGION_BEGIN(rotate);
@@ -137,44 +134,34 @@ __global__ void higgs_kv_fwd_kernel(
     rotated_save[row * kLatentDim + tid] = __float2bfloat16(xrot);
   }
 
-  // region: normalize -- per-coord scale division, write to unswizzled SMEM
-  // so the even thread of each pair can read its partner.
+  // region: normalize -- per-coord scale division. Adjacent pair values are
+  // exchanged with warp shuffles, matching the accepted OP HIGGS B200 path.
   HG_REGION_BEGIN(normalize);
   const float xnorm = xrot / fmaxf(scale, 1.0e-30f);
-  __syncthreads();  // sync before reusing buf
-  buf[tid] = xnorm;
-  __syncthreads();
   HG_REGION_END(normalize);
 
   // region: quant -- pair-wise codebook nearest-neighbour lookup
   HG_REGION_BEGIN(quant);
+  uint32_t cb_idx = 0;
+  const float x1 = __shfl_xor_sync(0xffffffff, xnorm, 1);
   if ((tid & 1) == 0) {
-    const float x0 = buf[tid];
-    const float x1 = buf[tid + 1];
-    const uint32_t idx =
-        nearest_codebook_index(codebook, codebook_norm_sq, x0, x1);
-    pair_idx_sh[tid >> 1] = idx;
-    indices_row[tid >> 1] = static_cast<uint8_t>(idx);
+    cb_idx = nearest_codebook_index_const(xnorm, x1);
+    indices_row[tid >> 1] = static_cast<uint8_t>(cb_idx);
   }
+  const uint32_t peer_idx = __shfl_xor_sync(0xffffffff, cb_idx, 1);
+  const uint32_t cb_idx_pair = (tid & 1) ? peer_idx : cb_idx;
 
   // Saturating-STE mask is 1 everywhere by construction for the EDEN2-16
   // lattice (no bounded support). We still write the mask so the backward
   // kernel reads it uniformly and so future bounded-codebook variants can
   // change saturation behaviour without changing the slot layout.
   mask_row[tid] = static_cast<uint8_t>(1);
-  __syncthreads();  // make pair_idx_sh visible to all threads of every pair
   HG_REGION_END(quant);
 
   // region: recon_unit -- codebook lookup back to per-thread coord
   HG_REGION_BEGIN(recon_unit);
-  // Recompute the codebook coord this thread owns: pair (tid>>1), coord (tid&1).
-  // Reads its codebook index from SMEM (written above by the even thread
-  // of the pair, after a block-wide sync) so both threads of a pair see
-  // the same value without relying on global-store ordering.
-  const int pair_idx = tid >> 1;
   const int coord = tid & 1;
-  const uint32_t cb_idx = pair_idx_sh[pair_idx];
-  const float recon_unit = __ldg(&codebook[cb_idx * kPairDim + coord]);
+  const float recon_unit = eden2_16_codebook_value(cb_idx_pair, coord);
   if (recon_unit_save != nullptr) {
     recon_unit_save[row * kLatentDim + tid] = __float2bfloat16(recon_unit);
   }

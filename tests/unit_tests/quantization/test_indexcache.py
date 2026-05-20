@@ -1091,6 +1091,75 @@ def test_hisa_bmm_dense_cublasdx_refine_matches_bmm(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_hisa_bmm_dense_cublasdx_refine_matches_bmm_production_block(monkeypatch):
+    if torch.cuda.get_device_capability() < (10, 0):
+        pytest.skip("Dense cuBLASDx HISA candidate refine requires Blackwell.")
+
+    import megatron.core.quantization.indexcache.hisa as hisa_module
+
+    ext = hisa_module._try_load_hisa_cuda_ext()
+    if ext is None or not hasattr(ext, "hisa_selector_dense_cublasdx_refine_fwd"):
+        pytest.skip("Dense cuBLASDx HISA candidate refine extension unavailable.")
+
+    config = IndexCacheHISAConfig(
+        enabled=True,
+        block_size=128,
+        compression_ratio=4.0,
+        forced_boundary_blocks=("first", "last"),
+    )
+    torch.manual_seed(20260531)
+    sq, heads, context_len, topk = 8, 64, 512, 64
+    q = torch.randn(sq, heads, HEAD_DIM, device="cuda", dtype=torch.float32) * 0.05
+    k = torch.randn(context_len, HEAD_DIM, device="cuda", dtype=torch.float32) * 0.05
+    weights = torch.rand(sq, heads, device="cuda", dtype=torch.float32) + 0.1
+    prefix_lens = torch.full((sq,), context_len, device="cuda", dtype=torch.long)
+
+    monkeypatch.setenv("MEGATRON_HISA_SELECTOR_BACKEND", "bmm")
+    monkeypatch.setenv("MEGATRON_HISA_BMM_CUBLASDX_REFINE", "0")
+    bmm_indices, bmm_scores = indexcache_hisa_select_with_scores(
+        q,
+        weights,
+        k,
+        topk,
+        config=config,
+        prefix_lens=prefix_lens,
+    )
+    monkeypatch.setenv("MEGATRON_HISA_BMM_CUBLASDX_REFINE", "1")
+    cublasdx_indices, cublasdx_scores = indexcache_hisa_select_with_scores(
+        q,
+        weights,
+        k,
+        topk,
+        config=config,
+        prefix_lens=prefix_lens,
+    )
+
+    assert cublasdx_indices is not None and cublasdx_scores is not None
+    for row in range(sq):
+        torch.testing.assert_close(
+            cublasdx_indices[row].long().sort().values.cpu(),
+            bmm_indices[row].long().sort().values.cpu(),
+            rtol=0,
+            atol=0,
+        )
+        cublasdx_lookup = {
+            int(tok.item()): pos
+            for pos, tok in enumerate(cublasdx_indices[row])
+            if tok.item() >= 0
+        }
+        bmm_lookup = {
+            int(tok.item()): pos for pos, tok in enumerate(bmm_indices[row]) if tok.item() >= 0
+        }
+        for tok, cublasdx_pos in cublasdx_lookup.items():
+            torch.testing.assert_close(
+                cublasdx_scores[row, cublasdx_pos],
+                bmm_scores[row, bmm_lookup[tok]],
+                rtol=3e-4,
+                atol=3e-4,
+            )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_nvfp4_indexcache_sidecar_survives_batch_view():
     if torch.cuda.get_device_capability() < (10, 0):
         pytest.skip("NVFP4 packed CUDA sidecar requires Blackwell.")
@@ -1404,6 +1473,83 @@ def test_hisa_deepgemm_selector_backend_matches_fp4_oracle(monkeypatch):
                 rtol=2e-4,
                 atol=2e-4,
             )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_hisa_deepgemm_selector_production_config_scores_match_fp4_oracle(monkeypatch):
+    if torch.cuda.get_device_capability() < (10, 0):
+        pytest.skip("DeepGEMM FP4 HISA selector requires Blackwell.")
+    cuda_home = ROOT / ".venv" / "lib" / "python3.12" / "site-packages" / "nvidia" / "cu13"
+    if cuda_home.exists():
+        monkeypatch.setenv("CUDA_HOME", str(cuda_home))
+        monkeypatch.setenv("CUDA_PATH", str(cuda_home))
+    try:
+        from deep_gemm.utils import cast_back_from_fp4, per_token_cast_to_fp4
+    except (AssertionError, ImportError, RuntimeError, OSError):
+        pytest.skip("DeepGEMM is unavailable.")
+
+    config = IndexCacheHISAConfig(
+        enabled=True,
+        block_size=128,
+        compression_ratio=4.0,
+        topk_tokens=64,
+        forced_boundary_blocks=("first", "last"),
+        fallback_to_dense_if_short=False,
+    )
+    torch.manual_seed(20260601)
+    sq, heads, context_len, topk = 8, 64, 512, 64
+    q = (torch.randn(sq, heads, HEAD_DIM, device="cuda", dtype=torch.float32) * 0.2).to(
+        torch.bfloat16
+    )
+    raw_k = (
+        torch.randn(context_len, 2, HEAD_DIM, device="cuda", dtype=torch.float32) * 0.2
+    ).to(torch.bfloat16)
+    quant_k = apply_indexcache_kv(raw_k, _make_nvfp4_cfg())[:, 1]
+    if get_indexcache_nvfp4_packed_tensors(quant_k) is None:
+        pytest.skip("NVFP4 packed IndexCache sidecar unavailable.")
+    weights = torch.rand(sq, heads, device="cuda", dtype=torch.float32) + 0.1
+    prefix_lens = torch.full((sq,), context_len, device="cuda", dtype=torch.long)
+
+    monkeypatch.setenv("MEGATRON_HISA_SELECTOR_BACKEND", "deepgemm")
+    deep_indices, deep_scores = indexcache_hisa_select_with_scores(
+        q,
+        weights,
+        quant_k,
+        topk,
+        config=config,
+        prefix_lens=prefix_lens,
+    )
+
+    assert deep_indices is not None and deep_scores is not None
+    assert deep_indices.shape == (sq, topk)
+    assert deep_scores.shape == (sq, topk)
+    assert bool(((deep_indices >= 0) & (deep_indices < context_len)).all().item())
+
+    q_fp4_values, q_fp4_scales = per_token_cast_to_fp4(
+        q.reshape(-1, HEAD_DIM),
+        use_ue8m0=True,
+        gran_k=32,
+        use_packed_ue8m0=True,
+    )
+    q_sim = cast_back_from_fp4(
+        q_fp4_values,
+        q_fp4_scales,
+        gran_k=32,
+        use_packed_ue8m0=True,
+    ).view(sq, heads, HEAD_DIM)
+    selected_k = quant_k.index_select(0, deep_indices.reshape(-1).long()).view(
+        sq, topk, HEAD_DIM
+    )
+    oracle_selected_scores = (
+        torch.relu(torch.einsum("qhd,qkd->qkh", q_sim.float(), selected_k.float()))
+        * weights.unsqueeze(1)
+    ).sum(dim=-1)
+    torch.testing.assert_close(
+        deep_scores,
+        oracle_selected_scores,
+        rtol=2e-4,
+        atol=2e-4,
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

@@ -5,10 +5,10 @@ training on AWS with 4 nodes / 32 B200 GPUs.
 
 The main repo branch is `flashtraining`. At the time this was written:
 
-- `HEAD`: `13a98acec249962431e9f30c96c86ceb77c3319a`
-- branch status: ahead of `origin/flashtraining` by 2 commits
-- uncommitted files: `examples/sft/launch_sft_deepseek_nvfp4_tmux.sh`,
-  `examples/sft/run_sft_deepseek_nvfp4.sh`, `goal.md`
+- `HEAD`: `73d23053ea6b12bae893ab217cd327e67348a112`
+- branch status: `flashtraining...origin/flashtraining`
+- uncommitted files include HIGGS kernel changes, HISA launcher defaults,
+  `goal.md`, and this kernel audit note.
 
 ## Read Order
 
@@ -25,6 +25,9 @@ The main repo branch is `flashtraining`. At the time this was written:
    `uv sync`.
 5. `run_history.md`
    Condensed history of the failures and why the current choices exist.
+6. `kernel_port_audit.md`
+   What was inspected from `optimization-playground`, what was ported, and
+   what was deliberately not wired into training.
 
 ## Current Most Important Finding
 

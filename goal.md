@@ -1,161 +1,160 @@
-# Corsaire-1 Training Progress
+# Corsaire-1 Kernel Port / AWS Handoff Progress
 
-Last updated: 2026-05-20 12:31 UTC
+Last updated: 2026-05-20 16:10 UTC
 
 ## Current Objective
 
-Get the 2-node / 16xB200 DeepSeek V3.2 REAP/NVFP4 SFT run stable and fast enough for the real `corsaire-1-research-preview` training run. Current practical target is still to maximize tokens trained inside the remaining wall-clock budget, with quality-sensitive settings preserved where possible.
+Prepare the 32xB200 AWS handoff while auditing `optimization-playground` kernels against the active Megatron training stack. Port only kernels or switches that are both correct and measurably useful on our active paths.
 
-## Last Run Outcome
+## Active Training Shape To Preserve
 
-- Session / W&B name: `corsaire-1-research-preview`
-- Launcher: `examples/sft/launch_sft_deepseek_nvfp4_tmux.sh`
-- Shape:
-  - `TP=4`
-  - `PP=4`
-  - `CP=1`
-  - `DP=1`
-  - `EP=4`
-  - `ETP=1`
-  - `VPP=on`
-  - `MBS=4`
-  - `GBS=16`
-  - `grad_accum=4`
-  - `seq_len=16384`
+- Launcher entrypoint: `examples/sft/launch_sft_deepseek_nvfp4_tmux.sh`
+- Inner script: `examples/sft/run_sft_deepseek_nvfp4.sh`
+- W&B/session name convention: `corsaire-1-research-preview`
+- Current important shape defaults:
+  - `TP=4`, `PP=4`, `CP=1`, `EP=4`
+  - `SEQ_LENGTH=16384`
   - `DSA_INDEXER_TOPK=512`
-- VPP layout:
-  - `Et*5|t*4|t*4|t*3|t*4|t*4|t*4|t*4|t*4|t*4|t*4|t*4|t*3|t*4|t*3|t*3L`
-  - PP layer balance: PP0=16+embed, PP1=16, PP2=15, PP3=14+loss.
-- StreamBP / chunking:
   - `USE_STREAMBP=1`
-  - local sequence under sequence parallel: `4096`
-  - layer StreamBP chunk: `2048`
-  - DSA chunk: `2048`
-  - MoE forward chunks: `1`
-  - MoE backward MLP chunks: `4`
-  - MoE attention backward chunk: `2048`
-- Activation/offload:
-  - activation offload enabled for `expert_fc1 core_attn attn_proj qkv_linear moe_act attn_norm mlp_norm mlp_residual moe_shared`
-  - temp offload enabled for `mlp_residual moe_shared`
-  - activation ECO enabled, recompute-only, TE backend, BF16 correction.
+  - `STREAMBP_MOE_MLP_CHUNKS=1`
+  - `STREAMBP_MOE_MLP_BACKWARD_CHUNKS=4`
+  - `MEGATRON_DSA_SPLIT_QK_REENTRANT_KV_BWD=1`
+  - `MEGATRON_DSA_SPLIT_QK_REENTRANT_KV_BWD_CHUNK=8192`
+  - `MEGATRON_HISA_SELECTOR_BACKEND=deepgemm`
+  - `MEGATRON_HISA_BMM_CUBLASDX_REFINE=1`
+  - `MEGATRON_HISA_FUSED_INDEXER_LOSS=1`
+  - `MEGATRON_HISA_TARGET_TRITON=1`
+  - `MEGATRON_HISA_KL_GRAD_TRITON=1`
 
-## Latest Observations
+## What Was Ported / Changed
 
-- The MBS=4/GBS=16 run crashed before completing step 1.
-- It was not an OOM.
-- Root cause was node0 rank3 / local_rank3, during StreamBP MoE split replay:
-  - `streambp.py:1951 -> streambp.py:1771 -> transformer_layer.py:928 -> moe_layer.py:531 -> moe_layer.py:419 -> temp_activation_offload.py:63`
-  - Failure call was `maybe_temp_cpu_reload(shared_expert_output) -> tensor.to(device, non_blocking=...)`.
-  - Error: `torch.AcceleratorError: CUDA error: unspecified launch failure`.
-  - Immediately before the traceback, logs showed:
-    - `DeepEP timeout check failed: rank = 3, thread = 0, value = 1024`
-    - `DeepEP timeout check failed: rank = 3, thread = 1, value = 1024`
-    - `DeepEP timeout check failed: rank = 3, thread = 2, value = 1024`
-    - `DeepEP timeout check failed: rank = 3, thread = 3, value = 0`
-  - Node1 later showed TCPStore broken-pipe and NCCL remote-process-exited errors only because node0 had already died.
-- MBS=4 substantially improved memory and backward speed versus MBS=8:
-  - It reached backward at ~530s after step start instead of ~1385s.
-  - PP2/PP3 early backward VMBs were ~80-170s instead of ~400-800s.
-  - Node1 stayed around ~120-137G used with ~45-63G free before node0 died.
-- Bottleneck/failure shifted to node0 PP0/PP1:
-  - PP0 bwd `vmb=0` took ~687s.
-  - PP1 bwd `vmb=0` took ~407s.
-  - PP1 bwd `vmb=2` raised PP1 to ~124.3G allocated / ~137.3G reserved.
-  - Node0 GPUs 4-7 reached ~142G used with ~40G free before the crash.
+### HIGGS Dense 2-Bit KV Fake Quant
 
-## Previous MBS=8/GBS=32 Outcome
+Source inspected:
 
-- The MBS=8/GBS=32 run crashed before completing step 1.
-- Root cause was node1 PP2, ranks 8-11, in StreamBP attention backward into DSA reentrant backward:
-  - `streambp.py:1951 -> streambp.py:1831 -> streambp.py:220 -> streambp.py:173 -> dsa_triton.py:4135 -> tensor_parallel/random.py:845`
-  - rank11 was first observed failure.
-  - rank11 tried to allocate 1.62 GiB on GPU3 with only ~48 MiB free.
-  - ranks 8/9 tried 832 MiB with <1 GiB free.
-  - PyTorch allocated memory was ~165-166 GiB and reserved-but-unallocated was ~6.8-7.5 GiB.
-- Node0 did not cause the crash. Node0 later hit NCCL watchdog/abort because node1 had already OOMed.
-- The run had 4 real microbatches and 16 virtual microbatches.
-- It reached backward at ~23 minutes after step start.
-- Backward entry memory was still healthy:
-  - PP0: ~77.8G allocated, ~97.5G reserved.
-  - PP1: ~91.3G allocated, ~110.7G reserved.
-  - PP3: ~81.7G allocated, ~101.2G reserved.
-- Deeper backward was extremely slow:
-  - PP3 bwd `vmb=0` took ~411s.
-  - PP3 bwd `vmb=1` took ~590s.
-  - PP3 bwd `vmb=2` took ~591s.
-  - PP3 bwd `vmb=3` took ~383s.
-  - PP3 bwd `vmb=4` took ~1863s and raised PP3 to ~144.7G allocated / ~162.8G reserved.
-  - PP2 bwd `vmb=0` took ~609s.
-  - PP2 bwd `vmb=1` took ~600s.
-  - PP2 bwd `vmb=2` took ~807s and raised PP2 to ~152.7G allocated / ~168.6G reserved.
-  - PP2 started `bwd vmb=3` at ~152.3G allocated / ~168.6G reserved, then OOMed shortly after.
-- Current read from MBS=8: that shape is neither memory-safe nor time-viable without deeper lifecycle fixes. The dominant failure path was PP2 DSA backward under StreamBP replay, with PP3 also showing pathological slow backward VMBs.
+- `/tmp/optimization-playground/docs/developer_guide/kernel_results/higgs.md`
+- `/tmp/optimization-playground/python/sglang/jit_kernel/csrc/quantization/higgs_dense_2bit_kv.cuh`
 
-## Recent Probe Results
+Megatron files changed:
 
-- `MBS=32, GBS=32`
-  - Invalid with VPP on.
-  - Reason: VPP interleaved scheduler requires `microbatch_group_size_per_vp_stage >= PP` and `<= num_microbatches`; with `DP=1`, `GBS/MBS=1`, so `num_microbatches=1`, while PP=4.
-- `MBS=32, GBS=128`
-  - Legal with VPP on because `GBS/MBS=4`.
-  - Failed during PP0 forward before useful backward data.
-  - Failure stack hit MoE forward:
-    - `StreamBP -> _forward_mlp -> moe_layer.postprocess -> maybe_temp_cpu_reload(shared_expert_output)`
-  - GPU0 on node0 spiked near the ceiling (~171G used, ~11G free).
-  - Takeaway: MBS=32 is too large with the current MoE shared-expert temp offload/reload path.
-- Earlier `MBS=4, GBS=16`
-  - Looked stable in early forward and had very large memory headroom.
-  - User requested scaling curiosity probes before it reached backward.
+- `megatron/core/quantization/higgs/kernels/csrc/higgs_kv.cuh`
+- `megatron/core/quantization/higgs/kernels/csrc/higgs_kv_fwd.cu`
 
-## Important Fixes Already Made
+Implemented:
 
-- Fixed StreamBP chunk default for sequence parallel:
-  - Old hard default `8192` exceeded local sequence length `4096` and could silently disable useful chunking.
-  - Current default computes local sequence and uses chunk `2048`.
-- Fixed activation offload forced-release corruption:
-  - `untyped_storage().resize_(0)` is skipped for view tensors (`tensor._base is not None`).
-  - This prevents StreamBP chunk views from zeroing the full hidden-state base tensor.
-- Rebalanced PP layout away from overloaded PP2/PP3:
-  - Current gentler balance is PP0=16+embed, PP1=16, PP2=15, PP3=14+loss.
+- static constant EDEN2-16 codebook/norm arrays;
+- constant-codebook nearest-code lookup;
+- warp-shuffle pair exchange instead of shared-memory pair handoff;
+- swizzled shared-memory indexing in the FWHT helper.
 
-## Current Decision Gate
+Why:
 
-Do not relaunch the same MBS=8 shape unchanged. It failed at PP2 DSA backward and would be far too slow even if it completed.
+- OP accepted path showed this exact optimization was useful on B200 for HIGGS store-like kernels.
+- Our active training path is fake-quant forward/backward rather than OP's compressed store-only path, so this was adapted conservatively without changing API or saved backward tensors.
 
-Do not relaunch MBS=4 unchanged either. It is much closer, but currently dies in temp offload reload of `shared_expert_output` during StreamBP MoE replay on node0 rank3.
+Validation:
 
-Next useful actions should target the actual combined hot path, not isolated single-tensor edits:
+- `test_cuda_forward_matches_reference`
+- `test_cuda_backward_matches_reference`
+- `test_cuda_backward_matches_reference_under_bf16_noise`
+- Result: 3 passed.
 
-1. First fix or disable the fragile temp offload path for `moe_shared` during StreamBP replay:
-   - The crash is at `maybe_temp_cpu_reload(shared_expert_output)`.
-   - Options to discuss before relaunch:
-     - remove `moe_shared` from `TEMP_ACTIVATION_OFFLOAD_MODULES` only;
-     - make `maybe_temp_cpu_reload` synchronous/safe for StreamBP replay;
-     - add stream/event synchronization around the host-to-device reload and shared expert combine.
-2. Revisit PP layout with the new evidence:
-   - MBS=4 moved the fatal issue from node1 PP2 OOM to node0 PP0/PP1 replay/offload fragility.
-   - PP0/PP1 are now throughput bottlenecks.
-3. Inspect StreamBP attention backward plus DSA reentrant backward as one lifecycle:
-   - avoid retaining/reloading tensors across the nested reentrant graph longer than needed;
-   - confirm offload finalizers clear both forward and backward caches as soon as the owning VMB is done;
-   - identify which tensors survive from PP2 bwd `vmb=2` into `vmb=3`.
-4. Next candidate launch shape, when we decide to run:
-   - `MBS=4`
-   - `GBS=16`
-   - This keeps `GBS/MBS=4`, so VPP still has 4 real microbatches / 16 virtual microbatches, but cuts per-microbatch activation pressure roughly in half versus `MBS=8/GBS=32`.
-   - It also halves tokens per optimizer step, so wall-clock token throughput only improves if the step becomes more than 2x faster or, at minimum, becomes stable enough to run.
-   - MBS=4/GBS=16 had early headroom but was not run to full backward after the newer fixes.
-   - MBS=8/GBS=32 is too close to the ceiling in PP2.
-5. Avoid raising StreamBP chunk count as the first response unless there is no other path.
+Benchmark result, extension-to-extension:
 
-## Constraints / Preferences
+- Forward at 16k rows: 0.161 ms -> 0.147 ms, about 1.10x.
+- Forward+backward at 16k rows: 0.316 ms -> 0.305 ms, about 1.04x.
+- Forward at 32k rows: 0.293 ms -> 0.268 ms, about 1.09x.
+- Forward+backward at 32k rows: 0.572 ms -> 0.549 ms, about 1.04x.
+- Peak allocator memory unchanged. This is a small real kernel win, not the OOM fix.
 
-- Do not disable VPP for real throughput runs.
-- Do not turn off indexer training unless explicitly chosen as a quality tradeoff.
-- Avoid increasing StreamBP chunk count as the first lever because it heavily hurts step time.
-- Prefer fixing tensor lifetimes/offload boundaries and kernel/system paths.
-- Keep run name `corsaire-1-research-preview`.
-- Use `uv run --no-sync` for Python/tests.
-- Use both node logs when diagnosing:
-  - Node0: `/home/sjpat/logs/corsaire-1-research-preview_node0.log`
-  - Node1: `/home/sjpat/logs/corsaire-1-research-preview_node1.log`
+### HISA / NVFP4 IndexCache
+
+Source inspected:
+
+- `/tmp/optimization-playground/docs/developer_guide/kernel_results/nvfp4_hisa_indexcache.md`
+- `/tmp/optimization-playground/docs/developer_guide/kernel_results/nvfp4_indexcache_dequant.md`
+- `/tmp/optimization-playground/python/sglang/srt/layers/attention/nsa/hisa_tilelang_kernels/hisa.py`
+- `/tmp/optimization-playground/python/sglang/jit_kernel/nvfp4_indexer.py`
+
+Megatron files changed:
+
+- `examples/sft/run_sft_deepseek_nvfp4.sh`
+- `examples/sft/launch_sft_deepseek_nvfp4_tmux.sh`
+- `artifacts/hisa_selector_backend_bench.py`
+
+Decision:
+
+- Use `MEGATRON_HISA_SELECTOR_BACKEND=deepgemm` by default.
+- Keep exact BMM available by overriding `MEGATRON_HISA_SELECTOR_BACKEND=bmm`; when using BMM, `MEGATRON_HISA_BMM_CUBLASDX_REFINE=1` is the preferred exact refine path.
+
+Why:
+
+- OP's fastest HISA path is an SGLang paged/packed TileLang/DeepGEMM setup. The local `deepgemm` backend is the closest active Megatron path to that DeepSeek-style selector.
+- This intentionally validates against the FP4-Q HISA score oracle, not the old exact BMM selector. That is now the intended semantic target.
+- BMM+CuBLASDx refine remains the safe exact fallback.
+
+Validation:
+
+- `test_hisa_deepgemm_selector_backend_matches_fp4_oracle`
+- `test_hisa_deepgemm_selector_production_config_scores_match_fp4_oracle`
+- `test_hisa_bmm_dense_cublasdx_refine_matches_bmm`
+- `test_hisa_bmm_dense_cublasdx_refine_matches_bmm_production_block`
+- Result: passed.
+
+Benchmarks at `sk=16384`, `topk=512`, `heads=64`, `head_dim=128`, `row_chunk=512`:
+
+- rows 512:
+  - `bmm`: 9.55 ms, 0.160 GiB peak
+  - `bmm_cublasdx_refine`: 6.53 ms, 0.094 GiB peak, exact set match
+- rows 1024:
+  - `bmm`: 13.95 ms, 0.179 GiB peak
+  - `bmm_cublasdx_refine`: 12.57 ms, 0.116 GiB peak, exact set match
+- rows 2048:
+  - `bmm`: 29.21 ms, 0.209 GiB peak
+  - `bmm_cublasdx_refine`: 24.61 ms, 0.151 GiB peak, 0.9995 set match due likely near-tie behavior
+- DeepGEMM was 2.1-8.0 ms across these rows but is a semantics tradeoff because it scores FP4-Q, not the exact current selector.
+
+## Pipeline Schedule Options From `nvfp4-indexer`
+
+`origin/nvfp4-indexer` is already an ancestor of current `flashtraining`; its pipeline schedule commits are present locally.
+
+Available selectors:
+
+- `auto`: current behavior, which resolves to non-interleaved or interleaved 1F1B depending on VPP.
+- `interleaved_1f1b`: current VPP-style production path.
+- `gpipe_fill_drain`: correctness baseline; likely poor for our memory because it runs all forwards before draining backwards.
+- `zero_bubble`: non-virtual ZB; currently rejects fine-grained activation offload, CPU offload, Transformer Engine, overlapped grad reduce, overlapped param gather, and MoE EP overlap. Not viable for the current stack without a large compatibility pass.
+- `zero_bubble_v`: V-shaped ZB; same compatibility blockers as `zero_bubble`, and requires exactly two virtual stages.
+- `dualpipe_v`: conservative sequential DeepSeek-style V topology. It requires exactly two virtual stages and training-only runs with untied embeddings. It rejects P2P overlap and MoE EP overlap, but does not have the same TE/offload rejection as ZB in the current code.
+
+Most plausible later probe:
+
+```bash
+PIPELINE_PARALLEL_SCHEDULE=dualpipe_v \
+NUM_VIRTUAL_STAGES_PER_PIPELINE_RANK=2 \
+ENABLE_VPP=0 \
+EVAL_INTERVAL=0
+```
+
+This should be treated as a schedule probe, not a default flip. The static verifier for PP=4/VP=2 reports a sequential V topology with entry/loss on rank 0 and bridge on rank 3.
+
+## What Was Not Ported
+
+- OP GatedNorm: active Megatron training already has a CuTe GatedNorm forward and training-specific backward/saved tensor behavior. OP result is forward/inference-focused, not a drop-in.
+- OP G1 gate/o_proj fusion: inference-only FP4 projection fusion. Training needs gate backward semantics.
+- OP layersplit / flashsampling / warpdecode: serving/inference paths, not active in SFT training.
+- OP HISA DeepGEMM as launcher default: too much selector semantic drift without a deliberate quality decision.
+
+## Artifacts
+
+- `artifacts/higgs_fake_quant_bench.py`
+- `artifacts/higgs_fake_quant_bench_current.jsonl`
+- `artifacts/higgs_fake_quant_bench_current_large.jsonl`
+- `artifacts/higgs_fake_quant_bench_baseline_HEAD_cuda.jsonl`
+- `artifacts/higgs_fake_quant_bench_baseline_HEAD_cuda_large.jsonl`
+- `artifacts/hisa_selector_backend_bench.py`
+- `artifacts/hisa_selector_backend_bench_smoke.jsonl`
+- `artifacts/hisa_selector_backend_bench_sk16384.jsonl`
+- `artifacts/hisa_selector_backend_bench_bmm_variants_sk16384.jsonl`
+
+Do not use `artifacts/higgs_fake_quant_bench_baseline_HEAD.jsonl` as a baseline; that run silently used Python fallback because `ninja` was not on `PATH`.
