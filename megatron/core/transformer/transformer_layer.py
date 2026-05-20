@@ -26,6 +26,10 @@ from megatron.core.transformer.enums import CudaGraphScope, LayerType
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.module import GraphableMegatronModule
+from megatron.core.transformer.temp_activation_offload import (
+    maybe_temp_cpu_offload,
+    maybe_temp_cpu_reload,
+)
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.streambp import (
     ChunkRange,
@@ -517,6 +521,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             and "mlp_norm" in self.config.offload_modules
             and not isinstance(self.pre_mlp_layernorm, IdentityOp)
         )
+        self.offload_mlp_residual = (
+            self.config.fine_grained_activation_offloading
+            and "mlp_residual" in self.config.offload_modules
+        )
 
         # @jcasper how should we handle nvfuser?
         # Set bias+dropout+add fusion grad_enable execution handler.
@@ -859,6 +867,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         # Optional Layer norm post the cross-attention.
         pre_mlp_layernorm_output = self._forward_pre_mlp_layernorm(hidden_states)
+        if self.is_moe_layer and self.offload_mlp_residual:
+            residual = maybe_temp_cpu_offload(
+                residual, "mlp_residual", enabled=True, training=self.training
+            )
+            if torch.is_tensor(residual) and residual.device.type == "cpu":
+                hidden_states = None
 
         nvtx_range_push(suffix="mlp")
         # Potentially chunk the MLP computation during prefill to minimize the peak activation size
@@ -914,6 +928,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output, padding_mask=padding_mask)
 
         nvtx_range_pop(suffix="mlp")
+        if torch.is_tensor(residual) and residual.device.type == "cpu":
+            residual = maybe_temp_cpu_reload(residual, mlp_output_with_bias[0].device, "mlp_residual")
 
         if (
             self.is_moe_layer

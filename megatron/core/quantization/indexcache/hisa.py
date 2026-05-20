@@ -11,6 +11,7 @@ score-formula backward.
 
 from __future__ import annotations
 
+import gc
 import math
 import os
 from dataclasses import dataclass
@@ -27,6 +28,7 @@ _HISA_SELECTOR_CUDA_ENV = "MEGATRON_HISA_SELECTOR_CUDA"
 _HISA_SELECTOR_BACKEND_ENV = "MEGATRON_HISA_SELECTOR_BACKEND"
 _HISA_CANDIDATE_SLOT_GROUP_ENV = "MEGATRON_HISA_CANDIDATE_SLOT_GROUP"
 _HISA_CANDIDATE_MAX_TEMP_MB_ENV = "MEGATRON_HISA_CANDIDATE_MAX_TEMP_MB"
+_HISA_CANDIDATE_FREE_MEM_RESERVE_MB_ENV = "MEGATRON_HISA_CANDIDATE_FREE_MEM_RESERVE_MB"
 _HISA_COMPACT_CANDIDATE_TOPK_ENV = "MEGATRON_HISA_COMPACT_CANDIDATE_TOPK"
 _HISA_SELECTOR_ROW_CHUNK_ENV = "MEGATRON_HISA_SELECTOR_ROW_CHUNK"
 _HISA_ASSUME_SORTED_POSITIONS_ENV = "MEGATRON_HISA_ASSUME_SORTED_POSITIONS"
@@ -297,6 +299,13 @@ def _hisa_selector_backend() -> str:
         "nvfp4_fp8_cublasdx",
     ):
         raw = "packed_cublasdx_fp8"
+    if raw in (
+        "deepgemm",
+        "packed_deepgemm",
+        "nvfp4_deepgemm",
+        "fp4_deepgemm",
+    ):
+        raw = "deepgemm"
     if raw not in (
         "auto",
         "cuda",
@@ -305,10 +314,11 @@ def _hisa_selector_backend() -> str:
         "packed_cublasdx",
         "packed_cublasdx_tiled",
         "packed_cublasdx_fp8",
+        "deepgemm",
     ):
         raise ValueError(
             f"{_HISA_SELECTOR_BACKEND_ENV} must be one of auto, cuda, bmm, packed_cuda, "
-            f"packed_cublasdx, packed_cublasdx_tiled, packed_cublasdx_fp8; "
+            f"packed_cublasdx, packed_cublasdx_tiled, packed_cublasdx_fp8, deepgemm; "
             f"got {raw!r}"
         )
     return raw
@@ -323,13 +333,54 @@ def _hisa_candidate_slot_group() -> int:
 
 
 def _hisa_candidate_max_temp_bytes() -> int:
-    raw = os.getenv(_HISA_CANDIDATE_MAX_TEMP_MB_ENV, "128").strip().lower()
+    raw = os.getenv(_HISA_CANDIDATE_MAX_TEMP_MB_ENV, "32").strip().lower()
     if raw in ("0", "false", "off", "no", ""):
         return 0
     value_mb = int(raw)
     if value_mb < 0:
         raise ValueError(f"{_HISA_CANDIDATE_MAX_TEMP_MB_ENV} must be non-negative, got {value_mb}")
     return value_mb * 1024 * 1024
+
+
+def _hisa_candidate_free_mem_reserve_bytes() -> int:
+    raw = os.getenv(_HISA_CANDIDATE_FREE_MEM_RESERVE_MB_ENV, "64").strip().lower()
+    if raw in ("0", "false", "off", "no", ""):
+        return 0
+    value_mb = int(raw)
+    if value_mb < 0:
+        raise ValueError(
+            f"{_HISA_CANDIDATE_FREE_MEM_RESERVE_MB_ENV} must be non-negative, got {value_mb}"
+        )
+    return value_mb * 1024 * 1024
+
+
+def _hisa_maybe_trim_cuda_cache(required_bytes: int, device: torch.device) -> None:
+    """Release cached CUDA blocks before tight HISA scratch allocations.
+
+    HISA runs inside already-large DSA/PP forward waves. When the allocator has
+    enough cached-but-unallocated memory, a small candidate scratch can still
+    fail if the driver-visible free pool is nearly empty. Only trim when the
+    expected scratch plus the configured reserve will not fit.
+    """
+
+    if required_bytes <= 0 or not torch.cuda.is_available() or device.type != "cuda":
+        return
+    try:
+        with torch.cuda.device(device):
+            free_bytes, _ = torch.cuda.mem_get_info()
+            allocated = torch.cuda.memory_allocated(device)
+            reserved = torch.cuda.memory_reserved(device)
+    except (RuntimeError, AssertionError):
+        return
+    reserve_bytes = _hisa_candidate_free_mem_reserve_bytes()
+    if int(free_bytes) >= int(required_bytes) + int(reserve_bytes):
+        return
+    cached_bytes = max(0, int(reserved) - int(allocated))
+    if cached_bytes <= 0:
+        return
+    gc.collect()
+    with torch.cuda.device(device):
+        torch.cuda.empty_cache()
 
 
 def _hisa_compact_candidate_topk_enabled() -> bool:
@@ -350,8 +401,20 @@ def _hisa_effective_candidate_slot_group(
 
     slot_group = max(1, int(requested_slot_group))
     max_temp_bytes = _hisa_candidate_max_temp_bytes()
+    if torch.cuda.is_available():
+        try:
+            free_bytes, _ = torch.cuda.mem_get_info()
+        except (RuntimeError, AssertionError):
+            free_bytes = 0
+        if free_bytes > 0:
+            reserve_bytes = _hisa_candidate_free_mem_reserve_bytes()
+            free_cap = max(0, int(free_bytes) - int(reserve_bytes))
+            if max_temp_bytes > 0:
+                max_temp_bytes = min(max_temp_bytes, free_cap)
+            else:
+                max_temp_bytes = free_cap
     if max_temp_bytes <= 0:
-        return slot_group
+        return 1
     try:
         k_element_size = torch.empty((), dtype=k_dtype).element_size()
     except TypeError:
@@ -439,7 +502,7 @@ def _selected_hisa_scores(
     sq, _, head_dim = q_rows.shape
     topk_k = topk_indices.shape[-1]
     row_chunk = _hisa_selector_row_chunk(sq)
-    score_chunks = []
+    scores_out = q_rows.new_empty((sq, topk_k), dtype=torch.float32)
     for row_start in range(0, sq, row_chunk):
         row_end = min(row_start + row_chunk, sq)
         q_chunk = q_rows[row_start:row_end]
@@ -450,8 +513,8 @@ def _selected_hisa_scores(
         selected_k = k_rows.index_select(0, safe_idx).view(row_end - row_start, topk_k, head_dim)
         dot = torch.einsum("qhd,qkd->qkh", q_chunk, selected_k)
         scores = (torch.relu(dot) * weights_chunk.unsqueeze(1)).sum(dim=-1)
-        score_chunks.append(scores.masked_fill(~valid, float("-inf")))
-    return torch.cat(score_chunks, dim=0)
+        scores_out[row_start:row_end] = scores.masked_fill(~valid, float("-inf"))
+    return scores_out
 
 
 def _hisa_dense_cublasdx_candidate_topk(
@@ -523,8 +586,8 @@ def _hisa_grouped_candidate_topk(
     sq, _, head_dim = q_rows.shape
     row_chunk = _hisa_selector_row_chunk(sq)
     if row_chunk < sq:
-        index_chunks = []
-        score_chunks = []
+        indices_out = torch.empty((sq, int(topk_k)), device=q_rows.device, dtype=torch.int32)
+        scores_out = q_rows.new_empty((sq, int(topk_k)), dtype=torch.float32)
         for row_start in range(0, sq, row_chunk):
             row_end = min(row_start + row_chunk, sq)
             indices, scores = _hisa_grouped_candidate_topk(
@@ -536,9 +599,9 @@ def _hisa_grouped_candidate_topk(
                 topk_k,
                 block_size,
             )
-            index_chunks.append(indices)
-            score_chunks.append(scores)
-        return torch.cat(index_chunks, dim=0), torch.cat(score_chunks, dim=0)
+            indices_out[row_start:row_end] = indices
+            scores_out[row_start:row_end] = scores
+        return indices_out, scores_out
 
     sk = k_rows.shape[0]
     cublasdx_result = _hisa_dense_cublasdx_candidate_topk(
@@ -567,10 +630,28 @@ def _hisa_grouped_candidate_topk(
     if _hisa_compact_candidate_topk_enabled():
         candidate_width = int(top_blocks.shape[1]) * int(block_size)
         candidate_capacity = max(int(topk_k), candidate_width)
-        all_scores = q_rows.new_full((sq, candidate_capacity), float("-inf"))
-        all_indices = torch.full(
-            (sq, candidate_capacity), -1, device=q_rows.device, dtype=torch.int32
+        slot_width = max(1, int(slot_group)) * int(block_size)
+        try:
+            k_element_size = torch.empty((), dtype=k_rows.dtype).element_size()
+        except TypeError:
+            k_element_size = 4
+        score_scratch_bytes = int(sq) * candidate_capacity * 4
+        # Per slot group: candidate K, QK scores, candidate score vector,
+        # candidate indices/safe indices, and validity masks. This is an
+        # intentionally conservative estimate for deciding whether to return
+        # cached CUDA blocks before entering the HISA refinement loop.
+        group_scratch_bytes = int(sq) * slot_width * (
+            int(head_dim) * int(k_element_size)
+            + int(q_rows.shape[1]) * 4
+            + 4
+            + 8
+            + 2
         )
+        _hisa_maybe_trim_cuda_cache(
+            score_scratch_bytes + group_scratch_bytes,
+            q_rows.device,
+        )
+        all_scores = q_rows.new_full((sq, candidate_capacity), float("-inf"))
         for slot_start in range(0, top_blocks.shape[1], slot_group):
             slot_end = min(slot_start + slot_group, top_blocks.shape[1])
             block_ids = top_blocks[:, slot_start:slot_end].to(torch.int32)
@@ -584,7 +665,7 @@ def _hisa_grouped_candidate_topk(
                 & (cand_idx < sk)
             )
             candidate_indices = cand_idx.reshape(sq, -1)
-            safe_idx = candidate_indices.clamp(0, max(sk - 1, 0)).reshape(-1)
+            safe_idx = candidate_indices.clamp(0, max(sk - 1, 0)).to(torch.long).reshape(-1)
             candidate_k = k_rows.index_select(0, safe_idx).view(sq, -1, head_dim)
 
             cand_dot = _hisa_bmm_fp32_accum(q_rows, candidate_k.transpose(1, 2))
@@ -592,18 +673,26 @@ def _hisa_grouped_candidate_topk(
             cand_scores = torch.bmm(weights_rows.unsqueeze(1), cand_dot).squeeze(1)
             valid_flat = valid.reshape(sq, -1)
             cand_scores = cand_scores.masked_fill(~valid_flat, float("-inf"))
-            candidate_indices = candidate_indices.masked_fill(~valid_flat, -1)
 
             dst_start = slot_start * block_size
             dst_end = dst_start + candidate_indices.shape[1]
             all_scores[:, dst_start:dst_end] = cand_scores
-            all_indices[:, dst_start:dst_end] = candidate_indices
 
         running_scores, gather_pos = torch.topk(
             all_scores, k=topk_k, dim=-1, sorted=False
         )
-        running_indices = all_indices.gather(1, gather_pos)
-        valid_final = torch.isfinite(running_scores)
+        slot_ids = torch.div(gather_pos, int(block_size), rounding_mode="floor")
+        offsets = (gather_pos - slot_ids * int(block_size)).to(torch.int32)
+        safe_slot_ids = slot_ids.clamp(0, max(int(top_blocks.shape[1]) - 1, 0))
+        selected_blocks = top_blocks.to(torch.int32).gather(1, safe_slot_ids)
+        running_indices = selected_blocks * int(block_size) + offsets
+        valid_final = (
+            torch.isfinite(running_scores)
+            & (gather_pos < candidate_width)
+            & (selected_blocks >= 0)
+            & (running_indices < prefix_lens.view(-1, 1))
+            & (running_indices < sk)
+        )
         return running_indices.masked_fill(~valid_final, -1), running_scores
 
     running_scores = q_rows.new_full((sq, topk_k), float("-inf"))
@@ -620,7 +709,7 @@ def _hisa_grouped_candidate_topk(
             & (cand_idx < sk)
         )
         candidate_indices = cand_idx.reshape(sq, -1)
-        safe_idx = candidate_indices.clamp(0, max(sk - 1, 0)).reshape(-1)
+        safe_idx = candidate_indices.clamp(0, max(sk - 1, 0)).to(torch.long).reshape(-1)
         candidate_k = k_rows.index_select(0, safe_idx).view(sq, -1, head_dim)
 
         # [Q, H, D] x [Q, D, G*B] -> [Q, H, G*B]. The default helper preserves
@@ -654,6 +743,9 @@ def _indexcache_hisa_topk_bmm_for_batch(
     prefix_lens: torch.Tensor,
     block_topk_counts: Optional[torch.Tensor],
     effective_block_topk: int,
+    k_b_precomputed: Optional[torch.Tensor] = None,
+    block_reps_precomputed: Optional[torch.Tensor] = None,
+    block_prefix_precomputed: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Tensor-core-friendly HISA selector for one batch item.
 
@@ -665,9 +757,40 @@ def _indexcache_hisa_topk_bmm_for_batch(
 
     sq_total = q_rows.shape[0]
     row_chunk = _hisa_selector_row_chunk(sq_total)
+    use_tc_inputs = (
+        _hisa_bmm_fp32_accum_tensorcores_enabled()
+        and q_rows.is_cuda
+        and k_rows.is_cuda
+        and q_rows.dtype == k_rows.dtype
+        and q_rows.dtype in (torch.bfloat16, torch.float16)
+    )
     if sq_total > row_chunk:
-        index_chunks = []
-        score_chunks = []
+        k_b_once = (
+            k_rows.contiguous()
+            if use_tc_inputs
+            else (k_b_precomputed if k_b_precomputed is not None else k_rows.float())
+        )
+        block_size = int(config.block_size)
+        sk = k_b_once.shape[0]
+        block_count = int(math.ceil(sk / block_size))
+        reps_once = (
+            block_reps_precomputed
+            if block_reps_precomputed is not None
+            else _mean_pool_all_blocks(k_b_once, block_size)
+        )
+        if block_prefix_precomputed is None:
+            pad_len = block_count * block_size - sk
+            if pad_len:
+                padded_k = torch.cat((k_b_once, k_b_once.new_zeros((pad_len, k_b_once.shape[-1]))), dim=0)
+            else:
+                padded_k = k_b_once
+            block_prefix_once = padded_k.reshape(block_count, block_size, k_b_once.shape[-1]).cumsum(dim=1)
+            if pad_len:
+                del padded_k
+        else:
+            block_prefix_once = block_prefix_precomputed
+        indices_out = torch.empty((sq_total, int(topk_k)), device=q_rows.device, dtype=torch.int32)
+        scores_out = q_rows.new_empty((sq_total, int(topk_k)), dtype=torch.float32)
         for row_start in range(0, sq_total, row_chunk):
             row_end = min(row_start + row_chunk, sq_total)
             block_counts_chunk = (
@@ -684,21 +807,21 @@ def _indexcache_hisa_topk_bmm_for_batch(
                 prefix_lens=prefix_lens[row_start:row_end],
                 block_topk_counts=block_counts_chunk,
                 effective_block_topk=effective_block_topk,
+                k_b_precomputed=k_b_once,
+                block_reps_precomputed=reps_once,
+                block_prefix_precomputed=block_prefix_once,
             )
-            index_chunks.append(indices)
-            score_chunks.append(scores)
-        return torch.cat(index_chunks, dim=0), torch.cat(score_chunks, dim=0)
+            indices_out[row_start:row_end] = indices
+            scores_out[row_start:row_end] = scores
+        return indices_out, scores_out
 
-    use_tc_inputs = (
-        _hisa_bmm_fp32_accum_tensorcores_enabled()
-        and q_rows.is_cuda
-        and k_rows.is_cuda
-        and q_rows.dtype == k_rows.dtype
-        and q_rows.dtype in (torch.bfloat16, torch.float16)
-    )
     q_b = q_rows.contiguous() if use_tc_inputs else q_rows.float()
     w_b = weights_rows.float()
-    k_b = k_rows.contiguous() if use_tc_inputs else k_rows.float()
+    k_b = (
+        k_rows.contiguous()
+        if use_tc_inputs and k_b_precomputed is None
+        else (k_b_precomputed if k_b_precomputed is not None else k_rows.float())
+    )
     sq, _, head_dim = q_b.shape
     sk = k_b.shape[0]
     block_size = int(config.block_size)
@@ -711,7 +834,11 @@ def _indexcache_hisa_topk_bmm_for_batch(
         row_block_counts = torch.div(
             prefix_lens + block_size - 1, block_size, rounding_mode="floor"
         ).to(torch.int32)
-        reps = _mean_pool_all_blocks(k_b, block_size)
+        reps = (
+            block_reps_precomputed
+            if block_reps_precomputed is not None
+            else _mean_pool_all_blocks(k_b, block_size)
+        )
         block_dot = _hisa_bmm_fp32_accum(
             q_b.reshape(1, sq * q_b.shape[1], head_dim),
             reps.t().unsqueeze(0),
@@ -734,15 +861,18 @@ def _indexcache_hisa_topk_bmm_for_batch(
         safe_prefix = prefix_lens.clamp(0, sk)
         raw_counts = safe_prefix - starts
         offsets = (raw_counts - 1).clamp_min(0)
-        pad_len = block_count * block_size - sk
-        if pad_len:
-            padded_k = torch.cat((k_b, k_b.new_zeros((pad_len, head_dim))), dim=0)
+        if block_prefix_precomputed is not None:
+            block_prefix = block_prefix_precomputed
         else:
-            padded_k = k_b
-        # Prefix only within each HISA block. This avoids rebuilding a full
-        # sequence-length cumsum for every query chunk while preserving the
-        # exact causal partial-block correction.
-        block_prefix = padded_k.reshape(block_count, block_size, head_dim).cumsum(dim=1)
+            pad_len = block_count * block_size - sk
+            if pad_len:
+                padded_k = torch.cat((k_b, k_b.new_zeros((pad_len, head_dim))), dim=0)
+            else:
+                padded_k = k_b
+            # Prefix only within each HISA block. This avoids rebuilding a full
+            # sequence-length cumsum for every query chunk while preserving the
+            # exact causal partial-block correction.
+            block_prefix = padded_k.reshape(block_count, block_size, head_dim).cumsum(dim=1)
         sums = block_prefix[last_blocks, offsets]
         sums = torch.where(raw_counts.unsqueeze(-1) > 0, sums, torch.zeros_like(sums))
         counts = raw_counts.clamp_min(1).to(k_b.dtype).unsqueeze(-1)
@@ -1098,6 +1228,250 @@ def indexcache_hisa_packed_nvfp4_select_with_scores(
     return indices_i32, selected_scores
 
 
+def _indexcache_hisa_deepgemm_select_with_scores(
+    q_rows: torch.Tensor,
+    weights_rows: torch.Tensor,
+    k_rows: torch.Tensor,
+    topk: int,
+    *,
+    config: IndexCacheHISAConfig,
+    prefix_lens: torch.Tensor,
+    block_topk_counts: torch.Tensor,
+    effective_block_topk: int,
+) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+    """Select HISA candidates with DeepGEMM FP4 MQA scoring.
+
+    This backend intentionally uses the accepted OP-style selector math for the
+    candidate-refine stage: Q is quantized to FP4 and K is read from the NVFP4
+    IndexCache sidecar. The selected-score custom backward still treats top-k
+    as non-differentiable and propagates through the selected score formula for
+    the chosen token ids.
+    """
+
+    if not (q_rows.is_cuda and weights_rows.is_cuda and k_rows.is_cuda):
+        return None
+    if not (config.is_optimized and _is_blackwell_or_newer(q_rows.device)):
+        return None
+    if int(config.block_size) != 128:
+        return None
+    packed = get_indexcache_nvfp4_packed_tensors(k_rows)
+    if packed is None:
+        return None
+    try:
+        import deep_gemm  # type: ignore
+        from deep_gemm.utils import per_token_cast_to_fp4  # type: ignore
+    except (AssertionError, ImportError, RuntimeError, OSError):
+        return None
+
+    sq_total = q_rows.shape[0]
+    row_chunk = _hisa_selector_row_chunk(sq_total)
+    if sq_total > row_chunk:
+        index_chunks = []
+        score_chunks = []
+        for row_start in range(0, sq_total, row_chunk):
+            row_end = min(row_start + row_chunk, sq_total)
+            result = _indexcache_hisa_deepgemm_select_with_scores(
+                q_rows[row_start:row_end],
+                weights_rows[row_start:row_end],
+                k_rows,
+                topk,
+                config=config,
+                prefix_lens=prefix_lens[row_start:row_end],
+                block_topk_counts=block_topk_counts[row_start:row_end],
+                effective_block_topk=effective_block_topk,
+            )
+            if result is None:
+                return None
+            indices, scores = result
+            index_chunks.append(indices)
+            score_chunks.append(scores)
+        return torch.cat(index_chunks, dim=0), torch.cat(score_chunks, dim=0)
+
+    sq, heads, head_dim = q_rows.shape
+    if heads != 64 or head_dim != 128:
+        return None
+    sk = k_rows.shape[0]
+    topk_k = min(int(topk), sk)
+    if topk_k <= 0:
+        return None
+    block_size = int(config.block_size)
+    block_count = int(math.ceil(sk / block_size))
+    block_keep = min(int(effective_block_topk), block_count)
+    if block_keep <= 0 or block_keep * block_size < topk_k:
+        return None
+
+    q_b = q_rows.float()
+    w_b = weights_rows.float()
+    k_b = k_rows.float()
+    prefix_lens = prefix_lens.to(device=q_rows.device, dtype=torch.long).clamp(0, sk)
+    row_block_counts = torch.div(
+        prefix_lens + block_size - 1, block_size, rounding_mode="floor"
+    ).to(torch.int32)
+    if bool((row_block_counts <= 0).any().item()):
+        return None
+    partial_rows = (prefix_lens % block_size) != 0
+    if bool(partial_rows.any().item()) and "last" not in tuple(config.forced_boundary_blocks or ()):
+        return None
+
+    arange_blocks = torch.arange(block_count, device=q_rows.device, dtype=torch.int32)
+    with torch.no_grad():
+        reps = _mean_pool_all_blocks(k_b, block_size)
+        block_dot = _hisa_bmm_fp32_accum(
+            q_b.reshape(1, sq * heads, head_dim),
+            reps.t().unsqueeze(0),
+        ).reshape(sq, heads, block_count)
+        block_dot.relu_()
+        block_scores = torch.bmm(w_b.unsqueeze(1), block_dot).squeeze(1)
+        block_scores = block_scores.masked_fill(
+            arange_blocks.view(1, -1) >= row_block_counts.view(-1, 1),
+            float("-inf"),
+        )
+
+        last_blocks = (row_block_counts - 1).clamp_min(0)
+        starts = last_blocks * block_size
+        raw_counts = prefix_lens.to(torch.int32) - starts
+        offsets = (raw_counts - 1).clamp_min(0)
+        pad_len = block_count * block_size - sk
+        if pad_len:
+            padded_k = torch.cat((k_b, k_b.new_zeros((pad_len, head_dim))), dim=0)
+        else:
+            padded_k = k_b
+        block_prefix = padded_k.reshape(block_count, block_size, head_dim).cumsum(dim=1)
+        sums = block_prefix[last_blocks.long(), offsets.long()]
+        sums = torch.where(raw_counts.unsqueeze(-1) > 0, sums, torch.zeros_like(sums))
+        counts = raw_counts.clamp_min(1).to(k_b.dtype).unsqueeze(-1)
+        partial_reps = sums / counts
+        partial_dot = _hisa_bmm_fp32_accum(q_b, partial_reps.unsqueeze(-1)).squeeze(-1)
+        partial_scores = (torch.relu(partial_dot) * w_b).sum(dim=-1)
+        block_scores.scatter_(1, last_blocks.view(-1, 1).long(), partial_scores.view(-1, 1))
+
+        valid_rows = row_block_counts > 0
+        if "first" in config.forced_boundary_blocks:
+            block_scores[valid_rows, 0] = float("inf")
+        if "last" in config.forced_boundary_blocks:
+            block_scores.scatter_(
+                1,
+                last_blocks.view(-1, 1).long(),
+                torch.full((sq, 1), float("inf"), device=q_rows.device),
+            )
+        if "last_minus_one" in config.forced_boundary_blocks:
+            prev_blocks = (row_block_counts - 2).clamp_min(0)
+            has_prev = row_block_counts > 1
+            block_scores[has_prev] = block_scores[has_prev].scatter(
+                1,
+                prev_blocks[has_prev].view(-1, 1).long(),
+                torch.full((int(has_prev.sum().item()), 1), float("inf"), device=q_rows.device),
+            )
+
+        top_block_values, top_blocks = torch.topk(
+            block_scores, k=block_keep, dim=-1, sorted=False
+        )
+        top_blocks = top_blocks.masked_fill(
+            torch.isnan(top_block_values) | (top_block_values == float("-inf")), -1
+        ).to(torch.int32)
+        slot_ids = torch.arange(block_keep, device=q_rows.device).view(1, -1)
+        top_blocks = top_blocks.masked_fill(
+            slot_ids >= block_topk_counts.view(-1, 1), -1
+        )
+
+        # DeepGEMM has a contiguous candidate-length mask per row. Keep the
+        # selected partial causal block as the final valid slot so that its
+        # future tokens are masked without a separate candidate mask tensor.
+        valid_counts = block_topk_counts.clamp(0, block_keep).to(torch.int32)
+        if bool(partial_rows.any().item()):
+            top_blocks = top_blocks.clone()
+            for row in range(sq):
+                count = int(valid_counts[row].item())
+                if count <= 0:
+                    continue
+                last_block = int(last_blocks[row].item())
+                match = (top_blocks[row, :count] == last_block).nonzero(as_tuple=False)
+                if match.numel() == 0:
+                    return None
+                src = int(match[0, 0].item())
+                dst = count - 1
+                if src != dst:
+                    tmp = top_blocks[row, dst].clone()
+                    top_blocks[row, dst] = top_blocks[row, src]
+                    top_blocks[row, src] = tmp
+
+    packed_values, packed_scales, packed_row_offset, packed_row_stride = packed
+    k_values = packed_values[
+        packed_row_offset : packed_row_offset + sk * packed_row_stride : packed_row_stride
+    ].contiguous()
+    k_scales = packed_scales[
+        packed_row_offset : packed_row_offset + sk * packed_row_stride : packed_row_stride
+    ].contiguous()
+    page_size = 64
+    pages = int(math.ceil(sk / page_size))
+    fused_cache = torch.empty(
+        (pages, page_size, 1, head_dim // 2 + 4), device=q_rows.device, dtype=torch.uint8
+    )
+    fused_page_flat = fused_cache.view(pages, page_size * (head_dim // 2 + 4))
+    padded_values = torch.zeros(
+        (pages * page_size, head_dim // 2), device=q_rows.device, dtype=torch.uint8
+    )
+    padded_scales = torch.zeros((pages * page_size,), device=q_rows.device, dtype=torch.int32)
+    padded_values[:sk] = k_values.view(sk, head_dim // 2).view(torch.uint8)
+    padded_scales[:sk] = k_scales.view(sk)
+    fused_page_flat[:, : page_size * (head_dim // 2)] = padded_values.view(
+        pages, page_size * (head_dim // 2)
+    )
+    fused_page_flat[:, page_size * (head_dim // 2) :] = padded_scales.view(
+        pages, page_size
+    ).view(torch.uint8)
+
+    safe_blocks = top_blocks.clamp_min(0)
+    page_table = torch.empty((sq, block_keep * 2), device=q_rows.device, dtype=torch.int32)
+    page_table[:, 0::2] = safe_blocks * 2
+    page_table[:, 1::2] = safe_blocks * 2 + 1
+    raw_counts_i32 = (prefix_lens.to(torch.int32) - last_blocks * block_size).clamp(1, block_size)
+    context_lens = valid_counts * block_size
+    if bool(partial_rows.any().item()):
+        context_lens = torch.where(
+            partial_rows,
+            (valid_counts - 1).clamp_min(0) * block_size + raw_counts_i32,
+            context_lens,
+        )
+    context_lens = context_lens.clamp_min(0).view(sq, 1).contiguous().to(torch.int32)
+
+    q_values, q_scales = per_token_cast_to_fp4(
+        q_rows.reshape(-1, head_dim),
+        use_ue8m0=True,
+        gran_k=32,
+        use_packed_ue8m0=True,
+    )
+    q_in = (
+        q_values.view(torch.int8).view(sq, 1, heads, head_dim // 2).contiguous(),
+        q_scales.view(sq, 1, heads).contiguous(),
+    )
+    schedule_meta = deep_gemm.get_paged_mqa_logits_metadata(
+        context_lens, page_size, deep_gemm.get_num_sms()
+    )
+    logits = deep_gemm.fp8_fp4_paged_mqa_logits(
+        q=q_in,
+        kv_cache=fused_cache,
+        weights=w_b.contiguous(),
+        context_lens=context_lens,
+        block_table=page_table.contiguous(),
+        schedule_meta=schedule_meta,
+        max_context_len=block_keep * block_size,
+        clean_logits=False,
+        logits_dtype=torch.float32,
+        indices=None,
+    )
+    selected_scores, candidate_pos = torch.topk(logits, k=topk_k, dim=-1, sorted=False)
+    block_slot = torch.div(candidate_pos, block_size, rounding_mode="floor")
+    token_offset = candidate_pos - block_slot * block_size
+    topk_indices = top_blocks.gather(1, block_slot.to(torch.long)) * block_size + token_offset.to(
+        torch.int32
+    )
+    valid = torch.isfinite(selected_scores) & (candidate_pos < context_lens)
+    topk_indices = topk_indices.masked_fill(~valid, -1).to(torch.int32)
+    selected_scores = selected_scores.masked_fill(~valid, float("-inf")).float()
+    return topk_indices, selected_scores
+
+
 def indexcache_hisa_select_with_scores(
     q_rows: torch.Tensor,
     weights_rows: torch.Tensor,
@@ -1109,10 +1483,10 @@ def indexcache_hisa_select_with_scores(
 ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
     """Select HISA top-k and selected logits using the configured backend.
 
-    ``MEGATRON_HISA_SELECTOR_BACKEND=bmm`` uses batched matmul for candidate
-    scoring. That is the preferred Blackwell training path because it exposes
-    the selector's dominant work as large GEMM-like operations instead of scalar
-    CUDA loops. ``cuda`` preserves the extension-only path for debugging.
+    ``MEGATRON_HISA_SELECTOR_BACKEND=deepgemm`` uses FP4-quantized Q and the
+    packed NVFP4 IndexCache sidecar for the candidate-refine GEMM. ``bmm`` keeps
+    the exact BF16/FP32 candidate path for parity checks, and ``cuda`` preserves
+    the extension-only selector for debugging.
     """
 
     if not (q_rows.is_cuda and config.is_optimized and _is_blackwell_or_newer(q_rows.device)):
@@ -1175,6 +1549,18 @@ def indexcache_hisa_select_with_scores(
         if packed_result is not None:
             return packed_result
         return None
+
+    if backend == "deepgemm":
+        return _indexcache_hisa_deepgemm_select_with_scores(
+            q_rows,
+            weights_rows,
+            k_rows,
+            topk_k,
+            config=config,
+            prefix_lens=prefix_lens,
+            block_topk_counts=block_topk_counts,
+            effective_block_topk=effective_block_topk,
+        )
 
     if backend in ("auto", "bmm"):
         indices, scores = _indexcache_hisa_topk_bmm_for_batch(

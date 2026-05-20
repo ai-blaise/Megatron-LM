@@ -1321,6 +1321,92 @@ def test_hisa_packed_cublasdx_tiled_selector_backend_matches_bmm(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_hisa_deepgemm_selector_backend_matches_fp4_oracle(monkeypatch):
+    if torch.cuda.get_device_capability() < (10, 0):
+        pytest.skip("DeepGEMM FP4 HISA selector requires Blackwell.")
+    cuda_home = ROOT / ".venv" / "lib" / "python3.12" / "site-packages" / "nvidia" / "cu13"
+    if cuda_home.exists():
+        monkeypatch.setenv("CUDA_HOME", str(cuda_home))
+        monkeypatch.setenv("CUDA_PATH", str(cuda_home))
+    try:
+        from deep_gemm.utils import cast_back_from_fp4, per_token_cast_to_fp4
+    except (AssertionError, ImportError, RuntimeError, OSError):
+        pytest.skip("DeepGEMM is unavailable.")
+
+    config = IndexCacheHISAConfig(
+        enabled=True,
+        block_size=128,
+        compression_ratio=1.0,
+        forced_boundary_blocks=(),
+    )
+    torch.manual_seed(20260527)
+    sq, heads, context_len, topk = 8, 64, 256, 8
+    q = (torch.randn(sq, heads, HEAD_DIM, device="cuda", dtype=torch.float32) * 0.2).to(
+        torch.bfloat16
+    )
+    raw_k = (
+        torch.randn(context_len, 2, HEAD_DIM, device="cuda", dtype=torch.float32) * 0.2
+    ).to(torch.bfloat16)
+    quant_k = apply_indexcache_kv(raw_k, _make_nvfp4_cfg())[:, 1]
+    if get_indexcache_nvfp4_packed_tensors(quant_k) is None:
+        pytest.skip("NVFP4 packed IndexCache sidecar unavailable.")
+    weights = torch.rand(sq, heads, device="cuda", dtype=torch.float32) + 0.1
+    prefix_lens = torch.full((sq,), context_len, device="cuda", dtype=torch.long)
+
+    monkeypatch.setenv("MEGATRON_HISA_SELECTOR_BACKEND", "deepgemm")
+    deep_indices, deep_scores = indexcache_hisa_select_with_scores(
+        q,
+        weights,
+        quant_k,
+        topk,
+        config=config,
+        prefix_lens=prefix_lens,
+    )
+
+    q_fp4_values, q_fp4_scales = per_token_cast_to_fp4(
+        q.reshape(-1, HEAD_DIM),
+        use_ue8m0=True,
+        gran_k=32,
+        use_packed_ue8m0=True,
+    )
+    q_sim = cast_back_from_fp4(
+        q_fp4_values,
+        q_fp4_scales,
+        gran_k=32,
+        use_packed_ue8m0=True,
+    ).view(sq, heads, HEAD_DIM)
+    oracle_scores = (
+        torch.relu(torch.einsum("qhd,kd->qkh", q_sim.float(), quant_k.float()))
+        * weights.unsqueeze(1)
+    ).sum(dim=-1)
+    oracle_top_scores, oracle_indices = torch.topk(
+        oracle_scores, k=topk, dim=-1, sorted=False
+    )
+
+    assert deep_indices is not None and deep_scores is not None
+    for row in range(sq):
+        torch.testing.assert_close(
+            deep_indices[row].long().sort().values.cpu(),
+            oracle_indices[row].long().sort().values.cpu(),
+            rtol=0,
+            atol=0,
+        )
+        deep_lookup = {
+            int(tok.item()): pos for pos, tok in enumerate(deep_indices[row]) if tok.item() >= 0
+        }
+        oracle_lookup = {
+            int(tok.item()): pos for pos, tok in enumerate(oracle_indices[row]) if tok.item() >= 0
+        }
+        for tok, deep_pos in deep_lookup.items():
+            torch.testing.assert_close(
+                deep_scores[row, deep_pos],
+                oracle_top_scores[row, oracle_lookup[tok]],
+                rtol=2e-4,
+                atol=2e-4,
+            )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_hisa_packed_cublasdx_fp8_selector_backend_matches_fp8_oracle(monkeypatch):
     if torch.cuda.get_device_capability() < (10, 0):
         pytest.skip("FP8 cuBLASDx packed NVFP4 HISA selector requires Blackwell.")

@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
+import os
 from abc import ABC, abstractmethod
 from typing import List, Optional, Tuple
 
@@ -8,6 +9,10 @@ import torch
 
 from megatron.core import utils
 from megatron.core.config import is_experimental_enabled
+from megatron.core.fusions.fused_deepep_permute import (
+    deepep_indices_permute,
+    deepep_indices_unpermute,
+)
 from megatron.core.fusions.fused_indices_converter import fused_indices_to_multihot
 from megatron.core.fusions.fused_pad_routing_map import fused_pad_routing_map
 from megatron.core.jit import jit_fuser
@@ -51,6 +56,38 @@ logger = logging.getLogger(__name__)
 """
 
 logger = logging.getLogger(__name__)
+
+
+def _deepep_compact_local_permute_enabled() -> bool:
+    value = os.getenv("MEGATRON_DEEPEP_COMPACT_LOCAL_PERMUTE", "1")
+    return value.strip().lower() not in ("0", "false", "off", "no")
+
+
+def _moe_combine_reduce_scatter_dtype(hidden_states: torch.Tensor, probs: torch.Tensor) -> torch.dtype:
+    """Select the dtype used for MoE combine reduce-scatter.
+
+    Router probabilities may be FP32 for stability, but the expert output itself
+    is usually BF16/FP16. Casting the whole expert output to router dtype before
+    TP reduce-scatter can allocate a multi-GB temporary in large dropless MoE
+    runs. Keep the historical router-dtype behavior unless explicitly configured.
+    """
+
+    raw = os.getenv("MEGATRON_MOE_COMBINE_REDUCE_SCATTER_DTYPE", "router").strip().lower()
+    if raw in ("input", "hidden", "expert", "model"):
+        return hidden_states.dtype
+    if raw in ("router", "probs", "prob", ""):
+        return probs.dtype
+    if raw in ("bf16", "bfloat16"):
+        return torch.bfloat16
+    if raw in ("fp16", "float16", "half"):
+        return torch.float16
+    if raw in ("fp32", "float32"):
+        return torch.float32
+    raise ValueError(
+        "MEGATRON_MOE_COMBINE_REDUCE_SCATTER_DTYPE must be one of "
+        "router, input, bf16, fp16, fp32; got "
+        f"{raw!r}"
+    )
 
 
 class MoETokenDispatcher:
@@ -340,8 +377,10 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         """
         # Unpermute the tokens across ranks.
         if self.tp_size > 1 or self.ep_size > 1:
+            reduce_dtype = _moe_combine_reduce_scatter_dtype(hidden_states, self.local_probs)
             hidden_states = reduce_scatter_to_sequence_parallel_region(
-                hidden_states.to(self.local_probs.dtype), group=self.tp_ep_group
+                hidden_states.to(reduce_dtype),
+                group=self.tp_ep_group,
             ).to(hidden_states.dtype)
         return hidden_states
 
@@ -824,8 +863,9 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                 input_split_sizes = None
             else:
                 input_split_sizes = self.output_splits_tp.tolist()
+            reduce_dtype = _moe_combine_reduce_scatter_dtype(hidden_states, self.probs)
             hidden_states = reduce_scatter_to_sequence_parallel_region(
-                hidden_states.to(self.probs.dtype),
+                hidden_states.to(reduce_dtype),
                 group=self.tp_group,
                 input_split_sizes=input_split_sizes,
             ).to(hidden_states.dtype)
@@ -1038,6 +1078,8 @@ class _HybridEPManager(_DispatchManager):
         self.token_probs: Optional[torch.Tensor] = None
         # Handle used for combine operation
         self.handle = None
+        self.compact_row_map = None
+        self.compact_local_permute = _deepep_compact_local_permute_enabled()
         # Used for padding the output for each expert
         self.pad_multiple = None
 
@@ -1193,6 +1235,10 @@ class _DeepepManager(_DispatchManager):
         self.token_probs: Optional[torch.Tensor] = None
         # Handle used for combine operation
         self.handle = None
+        # Compact local permute state. This is only valid between DeepEP dispatch
+        # postprocess and combine preprocess for the current MoE layer call.
+        self.compact_row_map = None
+        self.compact_local_permute = _deepep_compact_local_permute_enabled()
 
         if fused_dispatch is None:
             raise ImportError(
@@ -1329,6 +1375,34 @@ class _DeepepManager(_DispatchManager):
         return routing_map, tokens_per_expert
 
     def get_permuted_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.compact_local_permute:
+            self.hidden_shape_before_permute = hidden_states.shape
+            align_size = (
+                get_align_size_for_quantization(self.config)
+                if self.config.moe_router_padding_for_quantization
+                else 1
+            )
+            (
+                hidden_states,
+                permuted_probs,
+                self.compact_row_map,
+                padded_tokens_per_expert,
+            ) = deepep_indices_permute(
+                hidden_states,
+                self.dispatched_indices,
+                self.dispatched_probs,
+                self.tokens_per_expert,
+                align_size,
+            )
+            padded_tokens_per_expert._moe_quant_padding_applied = (
+                self.config.moe_router_padding_for_quantization and align_size > 1
+            )
+            padded_tokens_per_expert._moe_actual_tokens_per_expert = self.tokens_per_expert
+            self.tokens_per_expert = padded_tokens_per_expert
+            if self.router_dtype == "fp64":
+                permuted_probs = permuted_probs.to(torch.float64)
+            return hidden_states, permuted_probs
+
         if is_experimental_enabled() and self.permute_fusion:
             self.dispatched_routing_map, self.dispatched_probs = fused_indices_to_multihot(
                 self.dispatched_indices, self.dispatched_probs, self.num_local_experts
@@ -1364,6 +1438,13 @@ class _DeepepManager(_DispatchManager):
         return hidden_states, permuted_probs
 
     def get_restored_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.compact_row_map is not None:
+            hidden_states = deepep_indices_unpermute(
+                hidden_states, self.compact_row_map, self.hidden_shape_before_permute
+            )
+            self.compact_row_map = None
+            return hidden_states
+
         hidden_states = unpermute(
             hidden_states,
             self.reversed_mapping_for_combine,

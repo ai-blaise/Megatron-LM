@@ -83,6 +83,17 @@ def _debug_sync(label: str) -> None:
     torch.cuda.synchronize()
 
 
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        warnings.warn(f"Ignoring invalid integer value for {name}={value!r}", RuntimeWarning)
+        return default
+
+
 def _first_tensor(output):
     if isinstance(output, torch.Tensor):
         return output, None
@@ -297,6 +308,8 @@ def _add_activation_eco_bias_correction_to_main_grad_(
     grad_y: torch.Tensor,
     x_pre: torch.Tensor,
     q_x: torch.Tensor,
+    *,
+    correction_dtype: torch.dtype | None = None,
 ) -> bool:
     """Accumulate activation-ECO correction directly into ``param.main_grad``.
 
@@ -327,13 +340,40 @@ def _add_activation_eco_bias_correction_to_main_grad_(
             f"main_grad={tuple(target.shape)}, expected={expected_shape}"
         )
 
-    compute_dtype = target.dtype
-    grad_mat = flat_grad.to(compute_dtype)
-    err = flat_x.to(compute_dtype)
-    if err.data_ptr() == flat_x.data_ptr():
-        err = err.clone()
-    err.sub_(flat_qx.to(compute_dtype))
-    target.addmm_(grad_mat.transpose(0, 1), err)
+    compute_dtype = correction_dtype or flat_grad.dtype
+    row_chunk = _env_int("MEGATRON_ACT_ECO_CORRECTION_ROW_CHUNK", 2048)
+    out_chunk = _env_int("MEGATRON_ACT_ECO_CORRECTION_OUT_CHUNK", 2048)
+    in_chunk = _env_int("MEGATRON_ACT_ECO_CORRECTION_IN_CHUNK", 0)
+
+    num_rows = flat_grad.shape[0]
+    out_features = flat_grad.shape[-1]
+    in_features = flat_x.shape[-1]
+    row_chunk = num_rows if row_chunk <= 0 else min(row_chunk, num_rows)
+    out_chunk = out_features if out_chunk <= 0 else min(out_chunk, out_features)
+    in_chunk = in_features if in_chunk <= 0 else min(in_chunk, in_features)
+
+    for row_start in range(0, num_rows, row_chunk):
+        row_end = min(row_start + row_chunk, num_rows)
+        grad_rows = flat_grad[row_start:row_end]
+        x_rows = flat_x[row_start:row_end]
+        qx_rows = flat_qx[row_start:row_end]
+
+        for in_start in range(0, in_features, in_chunk):
+            in_end = min(in_start + in_chunk, in_features)
+            err = x_rows[:, in_start:in_end].to(compute_dtype)
+            if err.data_ptr() == x_rows[:, in_start:in_end].data_ptr():
+                err = err.clone()
+            err.sub_(qx_rows[:, in_start:in_end].to(compute_dtype))
+
+            for out_start in range(0, out_features, out_chunk):
+                out_end = min(out_start + out_chunk, out_features)
+                grad_tile = grad_rows[:, out_start:out_end].to(compute_dtype)
+                target_tile = target[out_start:out_end, in_start:in_end]
+                if target_tile.dtype == compute_dtype:
+                    target_tile.addmm_(grad_tile.transpose(0, 1), err)
+                else:
+                    update = torch.mm(grad_tile.transpose(0, 1), err)
+                    target_tile.add_(update.to(target_tile.dtype))
     return True
 
 
@@ -445,9 +485,10 @@ def install_act_eco_on_te_linear(
                     _debug_sync(f"{module_label}:after_quant_dequant")
                     if _add_activation_eco_bias_correction_to_main_grad_(
                         param,
-                        dy_flat.to(correction_dtype),
-                        x_flat.to(correction_dtype),
-                        q_x.to(correction_dtype),
+                        dy_flat,
+                        x_flat,
+                        q_x,
+                        correction_dtype=correction_dtype,
                     ):
                         cell["entries"] = _remove_pending_entry(cell["entries"], entry)
                         _debug_sync(f"{module_label}:after_grad_addmm")
@@ -498,9 +539,10 @@ def install_act_eco_on_te_linear(
             if getattr(param, "main_grad", None) is not None:
                 _add_activation_eco_bias_correction_to_main_grad_(
                     param,
-                    dy_flat.to(correction_dtype),
-                    x_flat.to(correction_dtype),
-                    q_x.to(correction_dtype),
+                    dy_flat,
+                    x_flat,
+                    q_x,
+                    correction_dtype=correction_dtype,
                 )
                 _debug_sync(f"{module_label}:after_grad_addmm")
             else:
@@ -629,9 +671,10 @@ def install_act_eco_on_te_grouped_linear(
                         )
                         if _add_activation_eco_bias_correction_to_main_grad_(
                             param,
-                            dy_flat.to(correction_dtype),
-                            x_flat.to(correction_dtype),
-                            q_x.to(correction_dtype),
+                            dy_flat,
+                            x_flat,
+                            q_x,
+                            correction_dtype=correction_dtype,
                         ):
                             _debug_sync(f"{module_label}.expert{expert_idx}:after_grad_addmm")
                         else:
@@ -685,9 +728,10 @@ def install_act_eco_on_te_grouped_linear(
                     if getattr(param, "main_grad", None) is not None:
                         _add_activation_eco_bias_correction_to_main_grad_(
                             param,
-                            dy_flat.to(correction_dtype),
-                            x_flat.to(correction_dtype),
-                            q_x.to(correction_dtype),
+                            dy_flat,
+                            x_flat,
+                            q_x,
+                            correction_dtype=correction_dtype,
                         )
                         _debug_sync(f"{module_label}.expert{expert_idx}:after_grad_addmm")
                     else:

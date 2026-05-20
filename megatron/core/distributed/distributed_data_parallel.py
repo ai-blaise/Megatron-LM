@@ -498,11 +498,29 @@ class DistributedDataParallel(_BaseDataParallel):
 
             if param in self.param_to_bucket_group:
                 assert param.requires_grad
+                act_eco_correction = _pop_act_eco_grad_correction(param)
+                grad_already_added_to_main_grad = (
+                    getattr(param, 'grad_added_to_main_grad', False)
+                    and not getattr(param, 'zero_out_wgrad', False)
+                )
                 if self.ddp_config.overlap_grad_reduce:
-                    assert (
-                        param.grad is not None
-                    ), 'param.grad being None is not safe when overlap_grad_reduce is True'
-                if param.grad is not None:
+                    if (
+                        param.grad is None
+                        and not grad_already_added_to_main_grad
+                        and act_eco_correction is None
+                    ):
+                        module_config = getattr(self.module, "config", None)
+                        if getattr(module_config, "use_streambp", False):
+                            return
+                        raise AssertionError(
+                            'param.grad being None is not safe when '
+                            'overlap_grad_reduce is True'
+                        )
+                if (
+                    param.grad is not None
+                    or grad_already_added_to_main_grad
+                    or act_eco_correction is not None
+                ):
                     numeric_debug = None
                     debug_this_grad = False
                     if os.getenv("MEGATRON_NUMERIC_DEBUG_DDP_GRAD", "").lower() in (
@@ -540,7 +558,11 @@ class DistributedDataParallel(_BaseDataParallel):
                                 full_finite=True,
                             )
                     should_add_param_grad = (
-                        not param.grad_added_to_main_grad or getattr(param, 'zero_out_wgrad', False)
+                        param.grad is not None
+                        and (
+                            not param.grad_added_to_main_grad
+                            or getattr(param, 'zero_out_wgrad', False)
+                        )
                     )
                     param_name = getattr(self, "param_to_name", {}).get(param, "<unnamed>")
                     if should_add_param_grad:
@@ -551,7 +573,6 @@ class DistributedDataParallel(_BaseDataParallel):
                             main_grad=param.main_grad,
                         )
                         param.main_grad.add_(param.grad.data)
-                    act_eco_correction = _pop_act_eco_grad_correction(param)
                     if act_eco_correction is not None:
                         _ddp_grad_debug_sync(
                             "before_act_eco_correction_add",

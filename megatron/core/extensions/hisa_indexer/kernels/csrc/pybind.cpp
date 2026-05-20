@@ -123,6 +123,29 @@ void launch_dsa_sparse_bwd_from_scores_row(
     float softmax_scale, int scalar_dtype, int topk_dtype, int grad_dtype,
     cudaStream_t stream);
 
+void launch_dsa_split_qk_bwd_row(
+    const void* query_nope, const void* query_pe, const void* key_nope,
+    const void* key_pe, const void* value, const void* topk_indices,
+    const int64_t* query_positions, const int64_t* key_positions,
+    const void* output, const float* lse, const void* grad_output,
+    void* grad_query_nope, void* grad_query_pe, void* grad_key_nope,
+    void* grad_key_pe, void* grad_value, int q_len, int bsz, int sk,
+    int num_heads, int head_dim, int pos_dim, int key_pe_heads,
+    int value_dim, int topk_count, int q_start, int kv_start, int kv_end,
+    int64_t query_nope_stride_s, int64_t query_nope_stride_b,
+    int64_t query_nope_stride_h, int64_t query_nope_stride_d,
+    int64_t key_nope_stride_s, int64_t key_nope_stride_b,
+    int64_t key_nope_stride_h, int64_t key_nope_stride_d,
+    int64_t value_stride_s, int64_t value_stride_b, int64_t value_stride_h,
+    int64_t value_stride_v,
+    int64_t grad_key_nope_stride_s, int64_t grad_key_nope_stride_b,
+    int64_t grad_key_nope_stride_h, int64_t grad_key_nope_stride_d,
+    int64_t grad_value_stride_s, int64_t grad_value_stride_b,
+    int64_t grad_value_stride_h, int64_t grad_value_stride_v,
+    float softmax_scale, int scalar_dtype, int topk_dtype, int grad_dtype,
+    int has_positions, int emit_query, int emit_key_nope, int emit_key_pe,
+    int emit_value, int warps, cudaStream_t stream);
+
 void launch_dsa_sparse_kv_bwd_sorted_from_scores(
     const void* query, const void* value, const void* topk_indices,
     const float* selected_scores, const void* output, const float* lse,
@@ -1753,6 +1776,233 @@ void dsa_sparse_bwd_from_scores_row(
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+void dsa_split_qk_bwd_row(
+    torch::Tensor query_nope,
+    torch::Tensor query_pe,
+    torch::Tensor key_nope,
+    torch::Tensor key_pe,
+    torch::Tensor value,
+    torch::Tensor topk_indices,
+    torch::Tensor query_positions,
+    torch::Tensor key_positions,
+    torch::Tensor output,
+    torch::Tensor lse,
+    torch::Tensor grad_output,
+    torch::Tensor grad_query_nope,
+    torch::Tensor grad_query_pe,
+    torch::Tensor grad_key_nope,
+    torch::Tensor grad_key_pe,
+    torch::Tensor grad_value,
+    double softmax_scale,
+    int64_t q_start,
+    int64_t kv_start,
+    int64_t kv_end,
+    bool has_positions,
+    bool emit_query,
+    bool emit_key_nope,
+    bool emit_key_pe,
+    bool emit_value,
+    int64_t warps) {
+  HISA_CHECK_CUDA(query_nope);
+  HISA_CHECK_CUDA(query_pe);
+  HISA_CHECK_CUDA(key_nope);
+  HISA_CHECK_CUDA(key_pe);
+  HISA_CHECK_CUDA(value);
+  HISA_CHECK_CUDA(topk_indices);
+  HISA_CHECK_CUDA(output);
+  HISA_CHECK_CUDA(lse);
+  HISA_CHECK_CUDA(grad_output);
+  HISA_CHECK_CUDA(grad_query_nope);
+  HISA_CHECK_CUDA(grad_query_pe);
+  HISA_CHECK_CUDA(grad_key_nope);
+  HISA_CHECK_CUDA(grad_key_pe);
+  HISA_CHECK_CUDA(grad_value);
+  if (has_positions) {
+    HISA_CHECK_CUDA(query_positions);
+    HISA_CHECK_CUDA(key_positions);
+    HISA_CHECK_DTYPE(query_positions, torch::kInt64);
+    HISA_CHECK_DTYPE(key_positions, torch::kInt64);
+    HISA_CHECK_CONTIG(query_positions);
+    HISA_CHECK_CONTIG(key_positions);
+  }
+
+  HISA_CHECK_CONTIG(query_pe);
+  HISA_CHECK_CONTIG(key_pe);
+  HISA_CHECK_CONTIG(topk_indices);
+  HISA_CHECK_CONTIG(output);
+  HISA_CHECK_CONTIG(lse);
+  HISA_CHECK_CONTIG(grad_output);
+  HISA_CHECK_CONTIG(grad_query_nope);
+  HISA_CHECK_CONTIG(grad_query_pe);
+  if (!emit_key_nope) {
+    HISA_CHECK_CONTIG(grad_key_nope);
+  }
+  HISA_CHECK_CONTIG(grad_key_pe);
+  if (!emit_value) {
+    HISA_CHECK_CONTIG(grad_value);
+  }
+
+  TORCH_CHECK(query_nope.dim() == 4, "query_nope must be [Q, B, H, D]");
+  TORCH_CHECK(query_pe.dim() == 4, "query_pe must be [Q, B, H, P]");
+  TORCH_CHECK(key_nope.dim() == 4, "key_nope must be [S, B, H, D]");
+  TORCH_CHECK(key_pe.dim() == 4, "key_pe must be [S, B, KPH, P]");
+  TORCH_CHECK(value.dim() == 4, "value must be [S, B, H, V]");
+  TORCH_CHECK(topk_indices.dim() == 3, "topk_indices must be [B, Q, K]");
+  TORCH_CHECK(output.dim() == 4, "output must be [Q, B, H, V]");
+  TORCH_CHECK(grad_output.dim() == 4, "grad_output must be [Q, B, H, V]");
+  TORCH_CHECK(lse.dim() == 2, "lse must be [B * Q, H]");
+
+  const int Q = query_nope.size(0);
+  const int B = query_nope.size(1);
+  const int H = query_nope.size(2);
+  const int D = query_nope.size(3);
+  const int P = query_pe.size(3);
+  const int S = key_nope.size(0);
+  const int KPH = key_pe.size(2);
+  const int V = value.size(3);
+  const int K = topk_indices.size(2);
+  const int local_S =
+      kv_end > 0 ? static_cast<int>(kv_end - kv_start) : S;
+
+  TORCH_CHECK(query_pe.size(0) == Q && query_pe.size(1) == B &&
+                  query_pe.size(2) == H,
+              "query_pe shape must match query_nope sequence/batch/head");
+  TORCH_CHECK(key_nope.size(1) == B && key_nope.size(2) == H && key_nope.size(3) == D,
+              "key_nope shape must match query_nope batch/head/head_dim");
+  TORCH_CHECK(key_pe.size(0) == S && key_pe.size(1) == B && key_pe.size(3) == P,
+              "key_pe shape must match key sequence/batch/pos_dim");
+  TORCH_CHECK(KPH > 0 && KPH <= H, "key_pe heads must be in [1, H]");
+  TORCH_CHECK(value.size(0) == S && value.size(1) == B && value.size(2) == H,
+              "value shape must match key sequence/batch/head");
+  TORCH_CHECK(topk_indices.size(0) == B && topk_indices.size(1) == Q,
+              "topk_indices must be [B, Q, K]");
+  TORCH_CHECK(output.size(0) == Q && output.size(1) == B && output.size(2) == H &&
+                  output.size(3) == V,
+              "output shape must be [Q, B, H, V]");
+  TORCH_CHECK(grad_output.size(0) == Q && grad_output.size(1) == B &&
+                  grad_output.size(2) == H && grad_output.size(3) == V,
+              "grad_output shape must match output");
+  TORCH_CHECK(lse.size(0) == B * Q && lse.size(1) == H,
+              "lse must be [B * Q, H]");
+  if (emit_query) {
+    TORCH_CHECK(grad_query_nope.sizes() == query_nope.sizes(),
+                "grad_query_nope shape must match query_nope");
+    TORCH_CHECK(grad_query_pe.sizes() == query_pe.sizes(),
+                "grad_query_pe shape must match query_pe");
+  }
+  if (emit_key_nope) {
+    TORCH_CHECK(grad_key_nope.size(0) == local_S && grad_key_nope.size(1) == B &&
+                    grad_key_nope.size(2) == H && grad_key_nope.size(3) == D,
+                "grad_key_nope shape must be [local_S, B, H, D]");
+  }
+  if (emit_key_pe) {
+    TORCH_CHECK(grad_key_pe.size(0) == local_S && grad_key_pe.size(1) == B &&
+                    grad_key_pe.size(2) == KPH && grad_key_pe.size(3) == P,
+                "grad_key_pe shape must be [local_S, B, KPH, P]");
+  }
+  if (emit_value) {
+    TORCH_CHECK(grad_value.size(0) == local_S && grad_value.size(1) == B &&
+                    grad_value.size(2) == H && grad_value.size(3) == V,
+                "grad_value shape must be [local_S, B, H, V]");
+  }
+  TORCH_CHECK(query_nope.scalar_type() == query_pe.scalar_type() &&
+                  query_nope.scalar_type() == key_nope.scalar_type() &&
+                  query_nope.scalar_type() == key_pe.scalar_type() &&
+                  query_nope.scalar_type() == value.scalar_type() &&
+                  query_nope.scalar_type() == output.scalar_type() &&
+                  query_nope.scalar_type() == grad_output.scalar_type(),
+              "query/key/value/output/grad_output must share dtype");
+  TORCH_CHECK(grad_query_nope.scalar_type() == grad_query_pe.scalar_type(),
+              "split-QK query grad buffers must share dtype");
+  if (emit_key_nope) {
+    TORCH_CHECK(grad_key_nope.scalar_type() == grad_query_nope.scalar_type(),
+                "grad_key_nope dtype must match query grad dtype");
+  }
+  if (emit_key_pe) {
+    TORCH_CHECK(grad_key_pe.scalar_type() == grad_query_nope.scalar_type(),
+                "grad_key_pe dtype must match query grad dtype");
+  }
+  if (emit_value) {
+    TORCH_CHECK(grad_value.scalar_type() == grad_query_nope.scalar_type(),
+                "grad_value dtype must match query grad dtype");
+  }
+  HISA_CHECK_DTYPE(lse, torch::kFloat32);
+  TORCH_CHECK(D > 0 && D <= 256, "split-QK DSA backward supports head_dim in (0, 256]");
+  TORCH_CHECK(P > 0 && P <= 256, "split-QK DSA backward supports pos_dim in (0, 256]");
+  TORCH_CHECK(V > 0 && V <= 256, "split-QK DSA backward supports value_dim in (0, 256]");
+  TORCH_CHECK(K > 0, "topk count must be positive");
+  TORCH_CHECK(kv_start >= 0 && (kv_end <= 0 || (kv_end > kv_start && kv_end <= S)),
+              "invalid split-QK KV range");
+  if (has_positions) {
+    TORCH_CHECK(query_positions.numel() == Q, "query_positions length must match Q");
+    TORCH_CHECK(key_positions.numel() == S, "key_positions length must match S");
+  }
+
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const int64_t effective_warps = warps <= 0 ? 8 : warps;
+  megatron::hisa_indexer::launch_dsa_split_qk_bwd_row(
+      query_nope.data_ptr(),
+      query_pe.data_ptr(),
+      key_nope.data_ptr(),
+      key_pe.data_ptr(),
+      value.data_ptr(),
+      topk_indices.data_ptr(),
+      has_positions ? query_positions.data_ptr<int64_t>() : nullptr,
+      has_positions ? key_positions.data_ptr<int64_t>() : nullptr,
+      output.data_ptr(),
+      lse.data_ptr<float>(),
+      grad_output.data_ptr(),
+      grad_query_nope.data_ptr(),
+      grad_query_pe.data_ptr(),
+      grad_key_nope.data_ptr(),
+      grad_key_pe.data_ptr(),
+      grad_value.data_ptr(),
+      Q,
+      B,
+      S,
+      H,
+      D,
+      P,
+      KPH,
+      V,
+      K,
+      static_cast<int>(q_start),
+      static_cast<int>(kv_start),
+      static_cast<int>(kv_end),
+      query_nope.stride(0),
+      query_nope.stride(1),
+      query_nope.stride(2),
+      query_nope.stride(3),
+      key_nope.stride(0),
+      key_nope.stride(1),
+      key_nope.stride(2),
+      key_nope.stride(3),
+      value.stride(0),
+      value.stride(1),
+      value.stride(2),
+      value.stride(3),
+      grad_key_nope.stride(0),
+      grad_key_nope.dim() > 1 ? grad_key_nope.stride(1) : 0,
+      grad_key_nope.dim() > 2 ? grad_key_nope.stride(2) : 0,
+      grad_key_nope.dim() > 3 ? grad_key_nope.stride(3) : 0,
+      grad_value.stride(0),
+      grad_value.dim() > 1 ? grad_value.stride(1) : 0,
+      grad_value.dim() > 2 ? grad_value.stride(2) : 0,
+      grad_value.dim() > 3 ? grad_value.stride(3) : 0,
+      static_cast<float>(softmax_scale),
+      dtype_code(query_nope.scalar_type()),
+      topk_dtype_code(topk_indices.scalar_type()),
+      dtype_code(grad_query_nope.scalar_type()),
+      has_positions ? 1 : 0,
+      emit_query ? 1 : 0,
+      emit_key_nope ? 1 : 0,
+      emit_key_pe ? 1 : 0,
+      emit_value ? 1 : 0,
+      static_cast<int>(effective_warps),
+      stream);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 void dsa_sparse_kv_bwd_sorted_from_scores(
     torch::Tensor query,
     torch::Tensor key,
@@ -1919,6 +2169,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "dsa_sparse_bwd_from_scores_row",
       &dsa_sparse_bwd_from_scores_row,
       "Sparse DSA row-owned backward from forward-saved scores (CUDA)");
+  m.def(
+      "dsa_split_qk_bwd_row",
+      &dsa_split_qk_bwd_row,
+      "Split-QK sparse DSA row-owned backward (CUDA)");
   m.def(
       "dsa_sparse_kv_bwd_sorted_from_scores",
       &dsa_sparse_kv_bwd_sorted_from_scores,

@@ -483,9 +483,9 @@ class MultiLatentAttention(Attention):
 
                     query, streambp_query_positions = select_streambp_query_tensor(query)
                     if self._dsa_split_qk_parts is not None:
-                        split_q_pe, split_k_pe = self._dsa_split_qk_parts
+                        split_q_pe, split_k_pe, *split_extra = self._dsa_split_qk_parts
                         split_q_pe, _ = select_streambp_query_tensor(split_q_pe)
-                        self._dsa_split_qk_parts = (split_q_pe, split_k_pe)
+                        self._dsa_split_qk_parts = (split_q_pe, split_k_pe, *split_extra)
 
                     if gate is not None:
                         if gate.size(0) != query.size(0):
@@ -534,10 +534,10 @@ class MultiLatentAttention(Attention):
                     if query.size(0) != streambp_query_indices.numel():
                         query = query[streambp_start:streambp_end]
                     if self._dsa_split_qk_parts is not None:
-                        split_q_pe, split_k_pe = self._dsa_split_qk_parts
+                        split_q_pe, split_k_pe, *split_extra = self._dsa_split_qk_parts
                         if split_q_pe.size(0) != query.size(0):
                             split_q_pe = split_q_pe[streambp_start:streambp_end]
-                        self._dsa_split_qk_parts = (split_q_pe, split_k_pe)
+                        self._dsa_split_qk_parts = (split_q_pe, split_k_pe, *split_extra)
                     streambp_query_positions = streambp_query_indices.to(device=query.device)
                     streambp_key_positions = torch.arange(
                         streambp_prefix_end,
@@ -548,8 +548,13 @@ class MultiLatentAttention(Attention):
                         if gate.size(0) != query.size(0):
                             gate = gate[streambp_start:streambp_end]
         if self.offload_qkv_linear:
+            forced_released_tensors = [hidden_states]
+            if self.config.experimental_attention_variant == "dsa":
+                # DSA consumes hidden_states_for_dsa after qkv_linear has committed, so
+                # releasing this storage here can invalidate the indexer key projection.
+                forced_released_tensors = []
             query = off_interface.group_commit(
-                query, name="qkv_linear", forced_released_tensors=[hidden_states]
+                query, name="qkv_linear", forced_released_tensors=forced_released_tensors
             )
 
         # ===================================================
@@ -575,9 +580,14 @@ class MultiLatentAttention(Attention):
                 causal=attn_mask_type == AttnMaskType.causal,
             )
 
-        # TODO: Currently, TE can only accept contiguous tensors for MLA
-        query = query.contiguous()
-        key = key.contiguous()
+        # TODO: Currently, TE can only accept contiguous tensors for MLA.
+        # Split-QK DSA can consume strided Q/K-noPE directly from packed MLA
+        # projections, which avoids retaining per-replay contiguous copies in
+        # StreamBP attention graphs.
+        if self.config.experimental_attention_variant != "dsa" or self._dsa_split_qk_parts is None:
+            query = query.contiguous()
+        if self.config.experimental_attention_variant != "dsa" or self._dsa_split_qk_parts is None:
+            key = key.contiguous()
 
         # Value is none during decode for absorption
         if value is not None:
@@ -649,10 +659,33 @@ class MultiLatentAttention(Attention):
                 # Only rearrange if not in absorption mode (Flash MLA handles format correctly)
                 if not inference_context.is_decode_only():
                     core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
+            dsa_release_tensors = []
+            if self.config.experimental_attention_variant == "dsa":
+                dsa_release_tensors.extend(
+                    [
+                        hidden_states_for_dsa,
+                        q_compressed_for_dsa,
+                        q_compressed,
+                        kv_compressed,
+                    ]
+                )
+                if self._dsa_split_qk_parts is not None:
+                    dsa_release_tensors.extend(self._dsa_split_qk_parts)
             if self.offload_core_attention and self.training:
                 core_attn_out = off_interface.group_commit(
-                    core_attn_out, name="core_attn", forced_released_tensors=[query, key, value]
+                    core_attn_out,
+                    name="core_attn",
+                    forced_released_tensors=[query, key, value] + dsa_release_tensors,
                 )
+            if self.config.experimental_attention_variant == "dsa":
+                hidden_states_for_dsa = None
+                q_compressed_for_dsa = None
+                q_compressed = None
+                kv_compressed = None
+                self._dsa_split_qk_parts = None
+            query = None
+            key = None
+            value = None
 
         # We are doing absorption with cache mla latents and decode mode.
         if self.cache_mla_latents and inference_context.is_decode_only():
@@ -833,6 +866,14 @@ class MLASelfAttention(MultiLatentAttention):
             tp_comm_buffer_name='kv_up_proj',
             tp_group=pg_collection.tp,
         )
+        if HAVE_TE and self.config.fp4 and is_te_min_version("2.7.0.dev0"):
+            # StreamBP + split-QK DSA can re-enter this TE Linear backward for
+            # value/key chunks. Reusing TE's saved NVFP4 input object anywhere
+            # on the retained K/V projection graph can leave a later WGRAD GEMM
+            # without a valid amax pointer, so keep BF16 inputs for the MLA
+            # K/V projections that sit behind the reentrant DSA key/value refs.
+            set_save_original_input(self.linear_kv_down_proj)
+            set_save_original_input(self.linear_kv_up_proj)
 
         #NOTE: MLA does not use Attention.forward(), so the standard G1 gate in attention.py
         # does not cover MLA, DSA, or FlashMLA. Build a separate gate projection here so
@@ -1486,7 +1527,7 @@ class MLASelfAttention(MultiLatentAttention):
                     and _env_flag_enabled("MEGATRON_DSA_SPLIT_QK", "1")
                 )
                 if use_split_dsa_qk:
-                    self._dsa_split_qk_parts = (q_pos_emb, k_pos_emb)
+                    self._dsa_split_qk_parts = (q_pos_emb, k_pos_emb, kv)
                     query = q_no_pe
                     key = k_no_pe
                     tensor_audit(

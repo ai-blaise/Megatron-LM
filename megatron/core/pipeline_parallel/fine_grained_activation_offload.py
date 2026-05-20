@@ -67,6 +67,16 @@ def fine_grained_offloading_forced_release_enabled(name=None) -> bool:
     )
 
 
+def _can_force_release_tensor_storage(tensor: torch.Tensor) -> bool:
+    """Return whether it is safe to resize this tensor's backing storage to zero."""
+    # resize_(0) acts on the whole storage, not just this tensor's logical view.
+    # StreamBP passes sequence chunks as views into the full hidden-state buffer;
+    # force-releasing such a view invalidates the remaining chunks and crashes
+    # later slices with "storage size 0". Only release tensors that own their
+    # storage directly.
+    return getattr(tensor, "_base", None) is None
+
+
 @contextmanager
 def fine_grained_offloading_suppress_offload():
     """Temporarily bypass fine-grained offload graph markers.
@@ -709,6 +719,33 @@ class PipelineOffloadManager:
         for chunk in self._cached_chunks_forward:
             chunk.do_offload = True
 
+    def debug_snapshot(self) -> str:
+        """Return a compact snapshot of offload chunk residency for progress logs."""
+
+        def chunk_state(chunk):
+            if chunk is None:
+                return "none"
+            return (
+                f"vp={getattr(chunk, 'vpp_rank', '?')}:"
+                f"idx={chunk._offloaded_group_index}/{chunk._max_group_size}:"
+                f"off={len(chunk._groups_to_offload)}:"
+                f"reload={len(chunk._groups_to_reload)}:"
+                f"pending={len(chunk._reloading_group)}"
+            )
+
+        staged = [] if self._stages is None else [len(stage) for stage in self._stages]
+        return (
+            f"q={len(self._queue)} "
+            f"cached_f={len(self._cached_chunks_forward)} "
+            f"cached_b={len(self._cached_chunks_backward)} "
+            f"idx_f={self._cached_chunks_index_forward} "
+            f"idx_b={self._cached_chunks_index_backward} "
+            f"staged={staged} "
+            f"delayed={len(self._delayed_offload_groups)} "
+            f"cur_f={chunk_state(self._cur_forward_chunk)} "
+            f"cur_b={chunk_state(self._cur_backward_chunk)}"
+        )
+
     def post_warmup_callback(self):
         """Callback after warmup."""
         # pylint: disable=bad-builtin
@@ -1165,11 +1202,19 @@ class ChunkOffloadHandler:
                 len(forced_released_tensors) > 0
                 and fine_grained_offloading_forced_release_enabled(group_to_offload._name)
             ):
-                release_tensors = [
-                    release_tensor
-                    for release_tensor in forced_released_tensors
-                    if self.tensor_need_offloading_checker(release_tensor)
-                ]
+                seen_release_tensors = set()
+                release_tensors = []
+                for release_tensor in forced_released_tensors:
+                    if not torch.is_tensor(release_tensor):
+                        continue
+                    tensor_id = id(release_tensor)
+                    if tensor_id in seen_release_tensors:
+                        continue
+                    seen_release_tensors.add(tensor_id)
+                    if not _can_force_release_tensor_storage(release_tensor):
+                        continue
+                    if self.tensor_need_offloading_checker(release_tensor):
+                        release_tensors.append(release_tensor)
                 if release_tensors:
                     # The D2H copies above are launched asynchronously on the offload
                     # stream.  record_stream() protects normal allocator reuse, but
@@ -1478,6 +1523,11 @@ class FineGrainedActivationOffloadingInterface:
         d2h_stream = PipelineOffloadManager.get_instance().d2h_stream
         torch.cuda.current_stream().record_event(event)
         torch.cuda.current_stream().wait_stream(d2h_stream)
+
+    @staticmethod
+    def debug_snapshot() -> str:
+        """Return a compact offload manager snapshot for diagnostics."""
+        return PipelineOffloadManager.get_instance().debug_snapshot()
 
     def reset():
         """Reset the chunk handler."""

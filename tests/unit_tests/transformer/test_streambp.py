@@ -45,6 +45,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.streambp import (
     StreamBPMoeAuxState,
     StreamBPMoeAuxStats,
+    chunked_lm_head_loss,
     current_streambp_moe_aux_replay,
     iter_streambp_chunks,
     make_streambp_packed_seq_params,
@@ -565,6 +566,56 @@ def test_streambp_moe_hybrid_can_split_mlp_replay_into_large_chunks():
     assert torch.allclose(layer.weight.grad, full_layer.weight.grad)
 
 
+def test_streambp_moe_hybrid_can_split_attention_backward_chunks(monkeypatch):
+    monkeypatch.setenv("MEGATRON_STREAMBP_MOE_ATTENTION_BACKWARD_CHUNK_SIZE", "2")
+
+    full_layer = ToyMoeAttentionSplitLayer()
+    layer = ToyMoeAttentionSplitLayer()
+    layer.load_state_dict(full_layer.state_dict())
+    full_hidden_states = torch.randn(10, 2, 3, requires_grad=True)
+    hidden_states = full_hidden_states.detach().clone().requires_grad_(True)
+
+    full_output, _ = full_layer(full_hidden_states)
+    output, _ = streambp_checkpoint_layer(
+        layer,
+        hidden_states,
+        chunk_size=4,
+        chunk_forward=False,
+        moe_mlp_chunks=2,
+        moe_mlp_backward_chunks=2,
+        mhc_recompute_manager=None,
+    )
+
+    grad_output = torch.randn_like(output)
+    assert layer.no_grad_attention_chunks == [(0, 4), (4, 5), (5, 8), (8, 10)]
+    assert layer.no_grad_mlp_shapes == [(5, 2, 3), (5, 2, 3)]
+    assert torch.allclose(output, full_output)
+    full_output.backward(grad_output)
+    output.backward(grad_output)
+
+    assert layer.grad_attention_chunks == [
+        (0, 2),
+        (2, 4),
+        (4, 5),
+        (5, 6),
+        (6, 8),
+        (8, 10),
+    ]
+    assert layer.grad_mlp_shapes == [(5, 2, 3), (5, 2, 3)]
+    assert layer.grad_events == [
+        ("attention", 0, 2),
+        ("attention", 2, 4),
+        ("attention", 4, 5),
+        ("mlp", 5),
+        ("attention", 5, 6),
+        ("attention", 6, 8),
+        ("attention", 8, 10),
+        ("mlp", 5),
+    ]
+    assert torch.allclose(hidden_states.grad, full_hidden_states.grad)
+    assert torch.allclose(layer.weight.grad, full_layer.weight.grad)
+
+
 def test_streambp_moe_aux_replay_combines_full_counts_with_chunk_token_scale():
     state = StreamBPMoeAuxState()
     router = object()
@@ -698,6 +749,35 @@ def test_streambp_lm_head_loss_matches_full_logits_gradients():
 
     assert torch.allclose(streambp_hidden.grad, full_hidden.grad, atol=2e-5, rtol=2e-5)
     assert torch.allclose(streambp_head.weight.grad, full_head.weight.grad, atol=2e-5, rtol=2e-5)
+
+
+def test_chunked_lm_head_loss_works_without_layer_streambp():
+    torch.manual_seed(5679)
+    full_head = ToyOutputLayer(hidden_size=6, vocab_size=13)
+    chunked_head = ToyOutputLayer(hidden_size=6, vocab_size=13)
+    chunked_head.load_state_dict(full_head.state_dict())
+
+    labels = torch.randint(0, 13, (2, 9))
+    full_hidden = torch.randn(9, 2, 6, requires_grad=True)
+    chunked_hidden = full_hidden.detach().clone().requires_grad_(True)
+
+    full_logits, _ = full_head(input_=full_hidden)
+    full_loss = _toy_lm_loss(labels, full_logits)
+    chunked_loss = chunked_lm_head_loss(
+        chunked_head,
+        chunked_hidden,
+        labels,
+        loss_func=_toy_lm_loss,
+        chunk_size=4,
+    )
+
+    assert torch.allclose(chunked_loss, full_loss, atol=1e-6, rtol=1e-6)
+
+    full_loss.mean().backward()
+    chunked_loss.mean().backward()
+
+    assert torch.allclose(chunked_hidden.grad, full_hidden.grad, atol=2e-5, rtol=2e-5)
+    assert torch.allclose(chunked_head.weight.grad, full_head.weight.grad, atol=2e-5, rtol=2e-5)
 
 
 def test_streambp_lm_head_fused_lce_path_matches_full_logits_gradients():
@@ -1562,6 +1642,34 @@ def test_streambp_ddp_readiness_counter_waits_until_final_chunk():
     assert should_streambp_register_grad_ready(param) is False
     assert should_streambp_register_grad_ready(param) is True
     assert not hasattr(param, "_streambp_pending_chunks")
+
+
+def test_streambp_moe_hybrid_marks_attention_and_mlp_ddp_chunks_separately(monkeypatch):
+    class _HybridLayer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.self_attention = torch.nn.Linear(2, 2, bias=False)
+            self.mlp = torch.nn.Linear(2, 2, bias=False)
+
+    layer = _HybridLayer()
+    chunks = iter_streambp_chunks(10, 4)
+    monkeypatch.setenv("MEGATRON_STREAMBP_SPLIT_MOE_MLP_ATTENTION_BACKWARD", "1")
+    monkeypatch.setenv("MEGATRON_STREAMBP_MOE_ATTENTION_BACKWARD_CHUNK_SIZE", "4")
+
+    marked = streambp_module._streambp_moe_hybrid_pending_marks(
+        layer,
+        seq_len=10,
+        chunks=chunks,
+        moe_mlp_chunks=2,
+        moe_mlp_backward_chunks=2,
+    )
+
+    assert set(marked) == {layer.self_attention.weight, layer.mlp.weight}
+    assert should_streambp_register_grad_ready(layer.self_attention.weight) is False
+    assert should_streambp_register_grad_ready(layer.self_attention.weight) is False
+    assert should_streambp_register_grad_ready(layer.self_attention.weight) is True
+    assert should_streambp_register_grad_ready(layer.mlp.weight) is False
+    assert should_streambp_register_grad_ready(layer.mlp.weight) is True
 
 
 def test_streambp_rejects_non_overlap_flashadamw_gradient_release():

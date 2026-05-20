@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import os
 from unittest.mock import MagicMock
 
@@ -48,6 +49,8 @@ _DSA_CUDA_KV_BWD_TILE_K_ENV = "MEGATRON_DSA_CUDA_KV_BWD_TILE_K"
 _DSA_CUDA_BWD_FROM_SCORES_ENV = "MEGATRON_DSA_CUDA_BWD_FROM_SCORES"
 _DSA_CUDA_ROW_BWD_FROM_SCORES_ENV = "MEGATRON_DSA_CUDA_ROW_BWD_FROM_SCORES"
 _DSA_CUDA_SORTED_KV_BWD_ENV = "MEGATRON_DSA_CUDA_SORTED_KV_BWD"
+_DSA_CUDA_SPLIT_QK_ROW_BWD_ENV = "MEGATRON_DSA_CUDA_SPLIT_QK_ROW_BWD"
+_DSA_CUDA_SPLIT_QK_ROW_BWD_WARPS_ENV = "MEGATRON_DSA_CUDA_SPLIT_QK_ROW_BWD_WARPS"
 _HISA_TARGET_TRITON_ENV = "MEGATRON_HISA_TARGET_TRITON"
 _HISA_TARGET_BLOCK_K_ENV = "MEGATRON_HISA_TARGET_BLOCK_K"
 _HISA_KL_GRAD_TRITON_ENV = "MEGATRON_HISA_KL_GRAD_TRITON"
@@ -58,6 +61,43 @@ _DSA_BACKWARD_TRIM_CACHE_ENV = "MEGATRON_DSA_BACKWARD_TRIM_CACHE"
 _DSA_BACKWARD_TRIM_SAFETY_MB_ENV = "MEGATRON_DSA_BACKWARD_TRIM_SAFETY_MB"
 _DSA_BACKWARD_TRIM_CACHED_MB_ENV = "MEGATRON_DSA_BACKWARD_TRIM_CACHED_MB"
 _DSA_BACKWARD_TRIM_SYNC_ENV = "MEGATRON_DSA_BACKWARD_TRIM_SYNC"
+_DSA_SPLIT_QK_REENTRANT_KV_BWD_ENV = "MEGATRON_DSA_SPLIT_QK_REENTRANT_KV_BWD"
+_DSA_SPLIT_QK_REENTRANT_KV_BWD_CHUNK_ENV = "MEGATRON_DSA_SPLIT_QK_REENTRANT_KV_BWD_CHUNK"
+_DSA_SPLIT_QK_REENTRANT_DEFER_QUERY_GRADS_ENV = (
+    "MEGATRON_DSA_SPLIT_QK_REENTRANT_DEFER_QUERY_GRADS"
+)
+_DSA_SPLIT_QK_REENTRANT_PACK_KV_GRAD_ENV = "MEGATRON_DSA_SPLIT_QK_REENTRANT_PACK_KV_GRAD"
+_TE_REENTRANT_BACKWARD_ACTIVE_ENV = "MEGATRON_TE_REENTRANT_BACKWARD_ACTIVE"
+_TE_REENTRANT_BACKWARD_RETAIN_ENV = "MEGATRON_TE_REENTRANT_BACKWARD_RETAIN"
+
+
+@contextmanager
+def _te_reentrant_backward_guard(*, retain_graph: bool):
+    old_value = os.environ.get(_TE_REENTRANT_BACKWARD_ACTIVE_ENV)
+    old_retain = os.environ.get(_TE_REENTRANT_BACKWARD_RETAIN_ENV)
+    os.environ[_TE_REENTRANT_BACKWARD_ACTIVE_ENV] = "1"
+    os.environ[_TE_REENTRANT_BACKWARD_RETAIN_ENV] = "1" if retain_graph else "0"
+    try:
+        yield
+    finally:
+        if old_value is None:
+            os.environ.pop(_TE_REENTRANT_BACKWARD_ACTIVE_ENV, None)
+        else:
+            os.environ[_TE_REENTRANT_BACKWARD_ACTIVE_ENV] = old_value
+        if old_retain is None:
+            os.environ.pop(_TE_REENTRANT_BACKWARD_RETAIN_ENV, None)
+        else:
+            os.environ[_TE_REENTRANT_BACKWARD_RETAIN_ENV] = old_retain
+
+
+def _te_reentrant_checkpoint_retention_scope_active() -> bool:
+    try:
+        from megatron.core.tensor_parallel.random import (
+            te_reentrant_checkpoint_retention_scope_active,
+        )
+    except Exception:
+        return False
+    return te_reentrant_checkpoint_retention_scope_active()
 
 
 def _env_enabled() -> bool:
@@ -120,7 +160,7 @@ def _dtype_element_size(dtype: torch.dtype) -> int:
     return torch.empty((), dtype=dtype).element_size()
 
 
-def _maybe_trim_cuda_cache_for_dsa_backward(required_bytes: int) -> None:
+def _maybe_trim_cuda_cache_for_dsa_backward(required_bytes: int, *, force: bool = False) -> None:
     """Release cached allocator blocks before DSA's dense grad buffers near OOM.
 
     StreamBP replay can allocate and free large MLP temporaries after its outer
@@ -142,11 +182,36 @@ def _maybe_trim_cuda_cache_for_dsa_backward(required_bytes: int) -> None:
     safety_mb = int(os.getenv(_DSA_BACKWARD_TRIM_SAFETY_MB_ENV, "1024"))
     cached_threshold_mb = int(os.getenv(_DSA_BACKWARD_TRIM_CACHED_MB_ENV, "512"))
     needed_bytes = max(0, required_bytes) + safety_mb * mib
-    if free_bytes < needed_bytes and cached > cached_threshold_mb * mib:
+    if (force and cached > 0) or (
+        free_bytes < needed_bytes and cached > cached_threshold_mb * mib
+    ):
         sync_raw = os.getenv(_DSA_BACKWARD_TRIM_SYNC_ENV, "1").strip().lower()
         if sync_raw not in {"0", "false", "off", "no"}:
             torch.cuda.synchronize()
         torch.cuda.empty_cache()
+
+
+def _split_qk_reentrant_kv_backward_enabled() -> bool:
+    raw = os.getenv(_DSA_SPLIT_QK_REENTRANT_KV_BWD_ENV, "0").strip().lower()
+    return raw not in {"0", "false", "off", "no"}
+
+
+def _split_qk_reentrant_kv_backward_chunk(sk: int) -> int:
+    raw = os.getenv(_DSA_SPLIT_QK_REENTRANT_KV_BWD_CHUNK_ENV)
+    value = int(raw) if raw else sk
+    if value <= 0:
+        raise ValueError(f"{_DSA_SPLIT_QK_REENTRANT_KV_BWD_CHUNK_ENV} must be positive")
+    return min(value, sk)
+
+
+def _split_qk_reentrant_defer_query_grads_enabled() -> bool:
+    raw = os.getenv(_DSA_SPLIT_QK_REENTRANT_DEFER_QUERY_GRADS_ENV, "1").strip().lower()
+    return raw not in {"0", "false", "off", "no"}
+
+
+def _split_qk_reentrant_pack_kv_grad_enabled() -> bool:
+    raw = os.getenv(_DSA_SPLIT_QK_REENTRANT_PACK_KV_GRAD_ENV, "1").strip().lower()
+    return raw not in {"0", "false", "off", "no"}
 
 
 def _key_block_kv_backward_enabled() -> bool:
@@ -182,6 +247,19 @@ def _cuda_row_bwd_from_scores_requested() -> bool:
 def _cuda_sorted_kv_backward_requested() -> bool:
     raw = os.getenv(_DSA_CUDA_SORTED_KV_BWD_ENV, "0").strip().lower()
     return raw not in {"0", "false", "off", "no"}
+
+
+def _cuda_split_qk_row_backward_requested() -> bool:
+    raw = os.getenv(_DSA_CUDA_SPLIT_QK_ROW_BWD_ENV, "0").strip().lower()
+    return raw not in {"0", "false", "off", "no"}
+
+
+def _cuda_split_qk_row_backward_warps() -> int:
+    raw = os.getenv(_DSA_CUDA_SPLIT_QK_ROW_BWD_WARPS_ENV)
+    value = int(raw) if raw else 8
+    if value not in (4, 8, 16):
+        raise ValueError(f"{_DSA_CUDA_SPLIT_QK_ROW_BWD_WARPS_ENV} must be one of 4, 8, 16")
+    return value
 
 
 def _cuda_kv_backward_tile_q() -> int:
@@ -325,6 +403,49 @@ def _cuda_sorted_kv_backward_supported(
     return ext is not None and hasattr(ext, "dsa_sparse_kv_bwd_sorted_from_scores")
 
 
+def _cuda_split_qk_row_backward_supported(
+    query_nope: torch.Tensor,
+    query_pe: torch.Tensor,
+    key_nope: torch.Tensor,
+    key_pe: torch.Tensor,
+    value: torch.Tensor,
+    topk_indices: torch.Tensor,
+    query_positions: torch.Tensor | None,
+    key_positions: torch.Tensor | None,
+) -> bool:
+    if not _cuda_split_qk_row_backward_requested():
+        return False
+    if not (
+        query_nope.is_cuda
+        and query_pe.is_cuda
+        and key_nope.is_cuda
+        and key_pe.is_cuda
+        and value.is_cuda
+        and topk_indices.is_cuda
+    ):
+        return False
+    if query_positions is not None or key_positions is not None:
+        if query_positions is None or key_positions is None:
+            return False
+        if not (query_positions.is_cuda and key_positions.is_cuda):
+            return False
+        if query_positions.dtype != torch.long or key_positions.dtype != torch.long:
+            return False
+    if query_nope.dtype not in (torch.float32, torch.bfloat16, torch.float16):
+        return False
+    if not (
+        query_pe.dtype == query_nope.dtype
+        and key_nope.dtype == query_nope.dtype
+        and key_pe.dtype == query_nope.dtype
+        and value.dtype == query_nope.dtype
+    ):
+        return False
+    if topk_indices.dtype not in (torch.int16, torch.int32, torch.int64):
+        return False
+    ext = _try_load_dsa_cuda_ext()
+    return ext is not None and hasattr(ext, "dsa_split_qk_bwd_row")
+
+
 def _dsa_sparse_kv_backward_cuda(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -458,6 +579,74 @@ def _dsa_sparse_kv_backward_sorted_from_scores_cuda(
         grad_key,
         grad_value,
         float(softmax_scale),
+    )
+
+
+def _dsa_split_qk_backward_row_cuda(
+    query_nope: torch.Tensor,
+    query_pe: torch.Tensor,
+    key_nope: torch.Tensor,
+    key_pe: torch.Tensor,
+    value: torch.Tensor,
+    topk_indices: torch.Tensor,
+    query_positions: torch.Tensor | None,
+    key_positions: torch.Tensor | None,
+    output: torch.Tensor,
+    lse: torch.Tensor,
+    grad_output: torch.Tensor,
+    grad_query_nope: torch.Tensor,
+    grad_query_pe: torch.Tensor,
+    grad_key_nope: torch.Tensor,
+    grad_key_pe: torch.Tensor,
+    grad_value: torch.Tensor,
+    softmax_scale: float,
+    q_start: int,
+    kv_start: int,
+    kv_end: int,
+    emit_query: bool,
+    emit_key_nope: bool,
+    emit_key_pe: bool,
+    emit_value: bool,
+) -> None:
+    ext = _try_load_dsa_cuda_ext()
+    if ext is None or not hasattr(ext, "dsa_split_qk_bwd_row"):
+        raise RuntimeError("DSA split-QK row backward CUDA extension is unavailable")
+    has_positions = query_positions is not None or key_positions is not None
+    if has_positions:
+        if query_positions is None or key_positions is None:
+            raise ValueError("query_positions and key_positions must both be provided")
+        query_positions = query_positions.contiguous()
+        key_positions = key_positions.contiguous()
+    else:
+        query_positions = torch.empty(0, device=topk_indices.device, dtype=torch.long)
+        key_positions = query_positions
+    ext.dsa_split_qk_bwd_row(
+        query_nope,
+        query_pe,
+        key_nope,
+        key_pe,
+        value,
+        topk_indices,
+        query_positions,
+        key_positions,
+        output,
+        lse,
+        grad_output,
+        grad_query_nope,
+        grad_query_pe,
+        grad_key_nope,
+        grad_key_pe,
+        grad_value,
+        float(softmax_scale),
+        int(q_start),
+        int(kv_start),
+        int(kv_end),
+        bool(has_positions),
+        bool(emit_query),
+        bool(emit_key_nope),
+        bool(emit_key_pe),
+        bool(emit_value),
+        int(_cuda_split_qk_row_backward_warps()),
     )
 
 
@@ -1287,6 +1476,7 @@ def is_sparse_dsa_split_qk_triton_supported(
     is_causal: bool,
     query_positions: torch.Tensor | None = None,
     key_positions: torch.Tensor | None = None,
+    kv_nope_value_ref: torch.Tensor | None = None,
 ) -> bool:
     """Return whether the fused selected-attention kernel can consume split MLA Q/K."""
 
@@ -1331,6 +1521,13 @@ def is_sparse_dsa_split_qk_triton_supported(
     if key_nope.shape[1:3] != (bsz, num_heads):
         return False
     if value.shape[:3] != (sk, bsz, num_heads):
+        return False
+    if kv_nope_value_ref is not None and (
+        kv_nope_value_ref.dim() != 4
+        or kv_nope_value_ref.shape[:3] != (sk, bsz, num_heads)
+        or kv_nope_value_ref.size(-1) != qk_dim + value.size(-1)
+        or kv_nope_value_ref.device != key_nope.device
+    ):
         return False
     if key_pe.shape[0] != sk or key_pe.shape[1] != bsz:
         return False
@@ -1865,6 +2062,14 @@ def _sparse_dsa_split_qk_forward_kernel(
     pos_dim: tl.constexpr,
     value_dim: tl.constexpr,
     key_pe_heads: tl.constexpr,
+    query_nope_stride_s: tl.constexpr,
+    query_nope_stride_b: tl.constexpr,
+    query_nope_stride_h: tl.constexpr,
+    query_nope_stride_d: tl.constexpr,
+    key_nope_stride_s: tl.constexpr,
+    key_nope_stride_b: tl.constexpr,
+    key_nope_stride_h: tl.constexpr,
+    key_nope_stride_d: tl.constexpr,
     v_stride_s: tl.constexpr,
     v_stride_b: tl.constexpr,
     v_stride_h: tl.constexpr,
@@ -1895,8 +2100,10 @@ def _sparse_dsa_split_qk_forward_kernel(
 
     query_nope = tl.load(
         query_nope_ptr
-        + ((q_offsets[:, None] * bsz + batch_idx) * num_heads + head_idx) * head_dim
-        + qd_offsets[None, :],
+        + q_offsets[:, None] * query_nope_stride_s
+        + batch_idx * query_nope_stride_b
+        + head_idx * query_nope_stride_h
+        + qd_offsets[None, :] * query_nope_stride_d,
         mask=q_valid[:, None] & (qd_offsets[None, :] < head_dim),
         other=0.0,
     ).to(tl.float32)
@@ -1950,9 +2157,10 @@ def _sparse_dsa_split_qk_forward_kernel(
 
         key_nope = tl.load(
             key_nope_ptr
-            + ((safe_selected[:, :, None] * bsz + batch_idx) * num_heads + head_idx)
-            * head_dim
-            + qd_offsets[None, None, :],
+            + safe_selected[:, :, None] * key_nope_stride_s
+            + batch_idx * key_nope_stride_b
+            + head_idx * key_nope_stride_h
+            + qd_offsets[None, None, :] * key_nope_stride_d,
             mask=valid[:, :, None] & (qd_offsets[None, None, :] < head_dim),
             other=0.0,
         ).to(tl.float32)
@@ -2048,9 +2256,10 @@ def _sparse_dsa_split_qk_forward_kernel(
                     )
                 key_nope = tl.load(
                     key_nope_ptr
-                    + ((safe_selected[:, :, None] * bsz + batch_idx) * num_heads + head_idx)
-                    * head_dim
-                    + qd_offsets[None, None, :],
+                    + safe_selected[:, :, None] * key_nope_stride_s
+                    + batch_idx * key_nope_stride_b
+                    + head_idx * key_nope_stride_h
+                    + qd_offsets[None, None, :] * key_nope_stride_d,
                     mask=valid[:, :, None] & (qd_offsets[None, None, :] < head_dim),
                     other=0.0,
                 ).to(tl.float32)
@@ -2115,12 +2324,22 @@ def _sparse_dsa_split_qk_backward_kernel(
     pos_dim: tl.constexpr,
     value_dim: tl.constexpr,
     key_pe_heads: tl.constexpr,
+    query_nope_stride_s: tl.constexpr,
+    query_nope_stride_b: tl.constexpr,
+    query_nope_stride_h: tl.constexpr,
+    query_nope_stride_d: tl.constexpr,
+    key_nope_stride_s: tl.constexpr,
+    key_nope_stride_b: tl.constexpr,
+    key_nope_stride_h: tl.constexpr,
+    key_nope_stride_d: tl.constexpr,
     v_stride_s: tl.constexpr,
     v_stride_b: tl.constexpr,
     v_stride_h: tl.constexpr,
     v_stride_d: tl.constexpr,
     topk_count: tl.constexpr,
     q_start,
+    KV_START: tl.constexpr,
+    KV_END: tl.constexpr,
     BLOCK_Q: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_QD: tl.constexpr,
@@ -2128,6 +2347,10 @@ def _sparse_dsa_split_qk_backward_kernel(
     BLOCK_VD: tl.constexpr,
     HAS_POSITIONS: tl.constexpr,
     USE_SCORE_SCRATCH: tl.constexpr,
+    EMIT_QUERY_GRADS: tl.constexpr,
+    EMIT_KEY_NOPE_GRAD: tl.constexpr,
+    EMIT_KEY_PE_GRAD: tl.constexpr,
+    EMIT_VALUE_GRAD: tl.constexpr,
 ):
     q_block = tl.program_id(0)
     head_batch_idx = tl.program_id(1)
@@ -2144,8 +2367,10 @@ def _sparse_dsa_split_qk_backward_kernel(
 
     query_nope = tl.load(
         query_nope_ptr
-        + ((q_offsets[:, None] * bsz + batch_idx) * num_heads + head_idx) * head_dim
-        + qd_offsets[None, :],
+        + q_offsets[:, None] * query_nope_stride_s
+        + batch_idx * query_nope_stride_b
+        + head_idx * query_nope_stride_h
+        + qd_offsets[None, :] * query_nope_stride_d,
         mask=q_valid[:, None] & (qd_offsets[None, :] < head_dim),
         other=0.0,
     ).to(tl.float32)
@@ -2218,9 +2443,10 @@ def _sparse_dsa_split_qk_backward_kernel(
 
         key_nope = tl.load(
             key_nope_ptr
-            + ((safe_selected[:, :, None] * bsz + batch_idx) * num_heads + head_idx)
-            * head_dim
-            + qd_offsets[None, None, :],
+            + safe_selected[:, :, None] * key_nope_stride_s
+            + batch_idx * key_nope_stride_b
+            + head_idx * key_nope_stride_h
+            + qd_offsets[None, None, :] * key_nope_stride_d,
             mask=valid[:, :, None] & (qd_offsets[None, None, :] < head_dim),
             other=0.0,
         ).to(tl.float32)
@@ -2264,51 +2490,67 @@ def _sparse_dsa_split_qk_backward_kernel(
         dp = tl.sum(value * grad_output[:, None, :], axis=2)
         ds = probs * (dp - delta[:, None]) * softmax_scale
         ds = tl.where(valid, ds, 0.0)
-        grad_query_nope += tl.sum(ds[:, :, None] * key_nope, axis=1)
-        grad_query_pe += tl.sum(ds[:, :, None] * key_pe, axis=1)
+        if EMIT_QUERY_GRADS:
+            grad_query_nope += tl.sum(ds[:, :, None] * key_nope, axis=1)
+            grad_query_pe += tl.sum(ds[:, :, None] * key_pe, axis=1)
 
-        tl.atomic_add(
-            grad_key_nope_ptr
-            + ((safe_selected[:, :, None] * bsz + batch_idx) * num_heads + head_idx)
-            * head_dim
-            + qd_offsets[None, None, :],
-            ds[:, :, None] * query_nope[:, None, :],
-            sem="relaxed",
-            mask=valid[:, :, None] & (qd_offsets[None, None, :] < head_dim),
-        )
-        tl.atomic_add(
-            grad_key_pe_ptr
-            + ((safe_selected[:, :, None] * bsz + batch_idx) * key_pe_heads + key_pe_head_idx)
-            * pos_dim
-            + pd_offsets[None, None, :],
-            ds[:, :, None] * query_pe[:, None, :],
-            sem="relaxed",
-            mask=valid[:, :, None] & (pd_offsets[None, None, :] < pos_dim),
-        )
-        tl.atomic_add(
-            grad_value_ptr
-            + ((safe_selected[:, :, None] * bsz + batch_idx) * num_heads + head_idx)
-            * value_dim
-            + vd_offsets[None, None, :],
-            probs[:, :, None] * grad_output[:, None, :],
-            sem="relaxed",
-            mask=valid[:, :, None] & (vd_offsets[None, None, :] < value_dim),
-        )
+        if EMIT_KEY_NOPE_GRAD or EMIT_KEY_PE_GRAD or EMIT_VALUE_GRAD:
+            grad_selected = safe_selected
+            kv_valid = valid
+            if KV_END > 0:
+                kv_valid = kv_valid & (safe_selected >= KV_START) & (safe_selected < KV_END)
+                grad_selected = safe_selected - KV_START
 
-    tl.store(
-        grad_query_nope_ptr
-        + ((q_offsets[:, None] * bsz + batch_idx) * num_heads + head_idx) * head_dim
-        + qd_offsets[None, :],
-        grad_query_nope,
-        mask=q_valid[:, None] & (qd_offsets[None, :] < head_dim),
-    )
-    tl.store(
-        grad_query_pe_ptr
-        + ((q_offsets[:, None] * bsz + batch_idx) * num_heads + head_idx) * pos_dim
-        + pd_offsets[None, :],
-        grad_query_pe,
-        mask=q_valid[:, None] & (pd_offsets[None, :] < pos_dim),
-    )
+            if EMIT_KEY_NOPE_GRAD:
+                tl.atomic_add(
+                    grad_key_nope_ptr
+                    + ((grad_selected[:, :, None] * bsz + batch_idx) * num_heads + head_idx)
+                    * head_dim
+                    + qd_offsets[None, None, :],
+                    ds[:, :, None] * query_nope[:, None, :],
+                    sem="relaxed",
+                    mask=kv_valid[:, :, None] & (qd_offsets[None, None, :] < head_dim),
+                )
+            if EMIT_KEY_PE_GRAD:
+                tl.atomic_add(
+                    grad_key_pe_ptr
+                    + (
+                        (grad_selected[:, :, None] * bsz + batch_idx)
+                        * key_pe_heads
+                        + key_pe_head_idx
+                    )
+                    * pos_dim
+                    + pd_offsets[None, None, :],
+                    ds[:, :, None] * query_pe[:, None, :],
+                    sem="relaxed",
+                    mask=kv_valid[:, :, None] & (pd_offsets[None, None, :] < pos_dim),
+                )
+            if EMIT_VALUE_GRAD:
+                tl.atomic_add(
+                    grad_value_ptr
+                    + ((grad_selected[:, :, None] * bsz + batch_idx) * num_heads + head_idx)
+                    * value_dim
+                    + vd_offsets[None, None, :] * v_stride_d,
+                    probs[:, :, None] * grad_output[:, None, :],
+                    sem="relaxed",
+                    mask=kv_valid[:, :, None] & (vd_offsets[None, None, :] < value_dim),
+                )
+
+    if EMIT_QUERY_GRADS:
+        tl.store(
+            grad_query_nope_ptr
+            + ((q_offsets[:, None] * bsz + batch_idx) * num_heads + head_idx) * head_dim
+            + qd_offsets[None, :],
+            grad_query_nope,
+            mask=q_valid[:, None] & (qd_offsets[None, :] < head_dim),
+        )
+        tl.store(
+            grad_query_pe_ptr
+            + ((q_offsets[:, None] * bsz + batch_idx) * num_heads + head_idx) * pos_dim
+            + pd_offsets[None, :],
+            grad_query_pe,
+            mask=q_valid[:, None] & (pd_offsets[None, :] < pos_dim),
+        )
 
 
 @triton.jit
@@ -3156,6 +3398,7 @@ class SparseDSASplitQKAttentionTriton(torch.autograd.Function):
         q_start: int,
         query_positions: torch.Tensor | None,
         key_positions: torch.Tensor | None,
+        kv_nope_value_ref: torch.Tensor | None,
         emit_teacher: bool,
     ) -> torch.Tensor:
         q_len, bsz, num_heads, head_dim = query_nope.shape
@@ -3164,9 +3407,17 @@ class SparseDSASplitQKAttentionTriton(torch.autograd.Function):
         topk_indices = _maybe_narrow_topk_indices(topk_indices, key_nope.shape[0])
         topk_count = topk_indices.shape[-1]
 
-        query_nope_flat = query_nope.contiguous()
+        # Q-noPE is also a view into the packed MLA query projection.  The DSA
+        # kernels only require contiguous last dimension, so keep the strided
+        # view and avoid retaining a per-replay query copy.
+        query_nope_flat = (
+            query_nope if query_nope.stride(-1) == 1 else query_nope.contiguous()
+        )
         query_pe_flat = query_pe.contiguous()
-        key_nope_flat = key_nope.contiguous()
+        # K-noPE is normally a view into packed MLA KV storage.  Keeping the
+        # strided view avoids retaining a full-prefix contiguous copy in each
+        # StreamBP DSA replay graph.
+        key_nope_flat = key_nope if key_nope.stride(-1) == 1 else key_nope.contiguous()
         key_pe_flat = key_pe.contiguous()
         value_flat = value if value.stride(-1) == 1 else value.contiguous()
         topk_flat = topk_indices.contiguous()
@@ -3242,6 +3493,14 @@ class SparseDSASplitQKAttentionTriton(torch.autograd.Function):
             pos_dim,
             value_dim,
             key_pe_heads,
+            query_nope_flat.stride(0),
+            query_nope_flat.stride(1),
+            query_nope_flat.stride(2),
+            query_nope_flat.stride(3),
+            key_nope_flat.stride(0),
+            key_nope_flat.stride(1),
+            key_nope_flat.stride(2),
+            key_nope_flat.stride(3),
             value_flat.stride(0),
             value_flat.stride(1),
             value_flat.stride(2),
@@ -3293,6 +3552,15 @@ class SparseDSASplitQKAttentionTriton(torch.autograd.Function):
         ctx.backward_score_scratch = bool(
             emit_teacher and _teacher_score_scratch_enabled() and _triton_bwd_score_scratch_enabled()
         )
+        # Keep the original autograd inputs for the opt-in StreamBP memory path.
+        # save_for_backward returns detached saved tensors to custom backward, but
+        # the reentrant path must propagate chunked K/V grads into the upstream
+        # MLA projection graph immediately instead of returning dense K/V grads
+        # to the outer autograd engine.
+        ctx._key_nope_autograd_ref = key_nope
+        ctx._key_pe_autograd_ref = key_pe
+        ctx._value_autograd_ref = value
+        ctx._kv_nope_value_autograd_ref = kv_nope_value_ref
 
         output = output.reshape(q_len, bsz, num_heads * value_dim)
         if emit_teacher:
@@ -3328,19 +3596,642 @@ class SparseDSASplitQKAttentionTriton(torch.autograd.Function):
             and key_nope.dtype in (torch.bfloat16, torch.float16)
             else torch.float32
         )
+        value_grad_dtype = (
+            value.dtype
+            if _bf16_grad_atomics_enabled()
+            and value.dtype in (torch.bfloat16, torch.float16)
+            else kv_grad_dtype
+        )
         query_grad_dtype = (
             query_nope.dtype
             if _bf16_grad_atomics_enabled()
             and query_nope.dtype in (torch.bfloat16, torch.float16)
             else torch.float32
         )
-        _maybe_trim_cuda_cache_for_dsa_backward(
-            (query_nope.numel() + query_pe.numel()) * _dtype_element_size(query_grad_dtype)
-            + (key_nope.numel() + key_pe.numel() + value.numel())
-            * _dtype_element_size(kv_grad_dtype)
+        use_reentrant_kv_backward = (
+            _split_qk_reentrant_kv_backward_enabled()
+            and (ctx.needs_input_grad[2] or ctx.needs_input_grad[3] or ctx.needs_input_grad[4])
         )
-        grad_query_nope = torch.empty_like(query_nope, dtype=query_grad_dtype)
-        grad_query_pe = torch.empty_like(query_pe, dtype=query_grad_dtype)
+        cuda_split_qk_row_backward = (
+            query_grad_dtype == kv_grad_dtype
+            and _cuda_split_qk_row_backward_supported(
+                query_nope,
+                query_pe,
+                key_nope,
+                key_pe,
+                value,
+                topk_indices,
+                query_positions if ctx.has_positions else None,
+                key_positions if ctx.has_positions else None,
+            )
+        )
+        defer_query_grads = (
+            use_reentrant_kv_backward and _split_qk_reentrant_defer_query_grads_enabled()
+        )
+        query_grad_required_bytes = (
+            (query_nope.numel() + query_pe.numel()) * _dtype_element_size(query_grad_dtype)
+        )
+        _maybe_trim_cuda_cache_for_dsa_backward(
+            (0 if defer_query_grads else query_grad_required_bytes)
+            + (key_nope.numel() + key_pe.numel()) * _dtype_element_size(kv_grad_dtype)
+            + value.numel() * _dtype_element_size(value_grad_dtype)
+        )
+        unused_grad = torch.empty(0, device=query_nope.device, dtype=query_grad_dtype)
+        grad_query_nope = (
+            unused_grad if defer_query_grads else torch.empty_like(query_nope, dtype=query_grad_dtype)
+        )
+        grad_query_pe = (
+            unused_grad if defer_query_grads else torch.empty_like(query_pe, dtype=query_grad_dtype)
+        )
+        grid = (triton.cdiv(q_len, ctx.backward_block_q), num_heads * bsz)
+
+        if use_reentrant_kv_backward:
+            tensor_audit(
+                "dsa_triton/split_qk_backward_reentrant_query_alloc",
+                grad_output=grad_output,
+                grad_query_nope=None if defer_query_grads else grad_query_nope,
+                grad_query_pe=None if defer_query_grads else grad_query_pe,
+                teacher_score_scratch=teacher_score_scratch
+                if teacher_score_scratch is not output
+                else None,
+                q_len=q_len,
+                key_len=sk,
+                batch=bsz,
+                heads=num_heads,
+                topk_count=ctx.topk_count,
+                kv_grad_dtype=str(kv_grad_dtype),
+                query_grad_dtype=str(query_grad_dtype),
+                defer_query_grads=defer_query_grads,
+            )
+
+            key_nope_ref = ctx._key_nope_autograd_ref
+            key_pe_ref = ctx._key_pe_autograd_ref
+            value_ref = ctx._value_autograd_ref
+            kv_nope_value_ref = ctx._kv_nope_value_autograd_ref
+            use_packed_kv_grad = (
+                _split_qk_reentrant_pack_kv_grad_enabled()
+                and cuda_split_qk_row_backward
+                and kv_nope_value_ref is not None
+                and kv_nope_value_ref.requires_grad
+                and kv_nope_value_ref.dim() == 4
+                and kv_nope_value_ref.size(0) == sk
+                and kv_nope_value_ref.size(1) == bsz
+                and kv_nope_value_ref.size(2) == num_heads
+                and kv_nope_value_ref.size(3) == ctx.head_dim + value_dim
+                and kv_grad_dtype == value_grad_dtype
+                and not ctx.backward_score_scratch
+            )
+            chunk_size = _split_qk_reentrant_kv_backward_chunk(sk)
+            query_grads_done = False
+            for kv_start in range(0, sk, chunk_size):
+                kv_end = min(sk, kv_start + chunk_size)
+                local_s = kv_end - kv_start
+                reentrant_tensors = []
+                reentrant_grads = []
+                reentrant_required_bytes = 0
+                grad_value_chunk = None
+                grad_value_for_ref = None
+                grad_key_nope_chunk = None
+                grad_key_pe_chunk = None
+
+                def _append_reentrant_backward(ref, grad):
+                    # Backward executes with grad mode disabled; create the
+                    # slice under enable_grad so SliceBackward connects this
+                    # chunk to the retained projection graph.
+                    with torch.enable_grad():
+                        ref_slice = ref[kv_start:kv_end]
+                    if not ref_slice.requires_grad:
+                        return False
+                    reentrant_tensors.append(ref_slice)
+                    reentrant_grads.append(grad)
+                    return True
+
+                emit_key_nope = ctx.needs_input_grad[2] and key_nope_ref.requires_grad
+                emit_key_pe = ctx.needs_input_grad[3] and key_pe_ref.requires_grad
+                emit_value = ctx.needs_input_grad[4] and value_ref.requires_grad
+
+                if use_packed_kv_grad and (emit_key_nope or emit_value):
+                    _maybe_trim_cuda_cache_for_dsa_backward(
+                        local_s
+                        * bsz
+                        * num_heads
+                        * (ctx.head_dim + value_dim)
+                        * _dtype_element_size(kv_grad_dtype)
+                    )
+                    grad_kv_chunk = torch.zeros(
+                        (local_s, bsz, num_heads, ctx.head_dim + value_dim),
+                        device=key_nope.device,
+                        dtype=kv_grad_dtype,
+                    )
+                    grad_key_nope_chunk = (
+                        grad_kv_chunk[..., : ctx.head_dim] if emit_key_nope else unused_grad
+                    )
+                    grad_value_chunk = (
+                        grad_kv_chunk[..., ctx.head_dim :] if emit_value else unused_grad
+                    )
+                    grad_key_pe_chunk = (
+                        torch.zeros(
+                            (local_s, bsz, ctx.key_pe_heads, ctx.pos_dim),
+                            device=key_pe.device,
+                            dtype=kv_grad_dtype,
+                        )
+                        if emit_key_pe
+                        else unused_grad
+                    )
+                    tensor_audit(
+                        "dsa_triton/split_qk_backward_reentrant_packed_kv_alloc",
+                        grad_kv=grad_kv_chunk,
+                        grad_key_pe=grad_key_pe_chunk if emit_key_pe else None,
+                        kv_start=kv_start,
+                        kv_end=kv_end,
+                        q_len=q_len,
+                        batch=bsz,
+                        heads=num_heads,
+                        topk_count=ctx.topk_count,
+                        kv_grad_dtype=str(kv_grad_dtype),
+                    )
+                    _dsa_split_qk_backward_row_cuda(
+                        query_nope,
+                        query_pe,
+                        key_nope,
+                        key_pe,
+                        value,
+                        topk_indices,
+                        query_positions if ctx.has_positions else None,
+                        key_positions if ctx.has_positions else None,
+                        output,
+                        lse,
+                        grad_output,
+                        unused_grad,
+                        unused_grad,
+                        grad_key_nope_chunk,
+                        grad_key_pe_chunk,
+                        grad_value_chunk,
+                        ctx.softmax_scale,
+                        ctx.q_start,
+                        kv_start,
+                        kv_end,
+                        emit_query=False,
+                        emit_key_nope=emit_key_nope,
+                        emit_key_pe=emit_key_pe,
+                        emit_value=emit_value,
+                    )
+                    grad_kv_for_ref = (
+                        grad_kv_chunk
+                        if grad_kv_chunk.dtype == kv_nope_value_ref.dtype
+                        else grad_kv_chunk.to(kv_nope_value_ref.dtype)
+                    )
+                    if _append_reentrant_backward(kv_nope_value_ref, grad_kv_for_ref):
+                        reentrant_required_bytes += (
+                            local_s
+                            * bsz
+                            * num_heads
+                            * (ctx.head_dim + value_dim)
+                            * _dtype_element_size(kv_nope_value_ref.dtype)
+                        )
+                    if emit_key_pe:
+                        if _append_reentrant_backward(
+                            key_pe_ref, grad_key_pe_chunk.to(key_pe_ref.dtype)
+                        ):
+                            reentrant_required_bytes += (
+                                local_s
+                                * bsz
+                                * ctx.key_pe_heads
+                                * ctx.pos_dim
+                                * _dtype_element_size(key_pe_ref.dtype)
+                            )
+                    if reentrant_tensors:
+                        retain_reentrant_graph = (
+                            _te_reentrant_checkpoint_retention_scope_active() or kv_end < sk
+                        )
+                        with torch.enable_grad(), _te_reentrant_backward_guard(
+                            retain_graph=retain_reentrant_graph
+                        ):
+                            _maybe_trim_cuda_cache_for_dsa_backward(
+                                reentrant_required_bytes, force=True
+                            )
+                            torch.autograd.backward(
+                                reentrant_tensors,
+                                reentrant_grads,
+                                retain_graph=retain_reentrant_graph,
+                            )
+                    if grad_kv_for_ref is not grad_kv_chunk:
+                        del grad_kv_for_ref
+                    del grad_kv_chunk, grad_key_nope_chunk, grad_value_chunk
+                    if emit_key_pe:
+                        del grad_key_pe_chunk
+                    del reentrant_tensors, reentrant_grads
+                    continue
+
+                if ctx.needs_input_grad[4] and value_ref.requires_grad:
+                    _maybe_trim_cuda_cache_for_dsa_backward(
+                        local_s
+                        * bsz
+                        * num_heads
+                        * value_dim
+                        * _dtype_element_size(value_grad_dtype)
+                    )
+                    grad_value_chunk = torch.zeros(
+                        (local_s, bsz, num_heads, value_dim),
+                        device=value.device,
+                        dtype=value_grad_dtype,
+                    )
+                    tensor_audit(
+                        "dsa_triton/split_qk_backward_reentrant_value_alloc",
+                        grad_value=grad_value_chunk,
+                        kv_start=kv_start,
+                        kv_end=kv_end,
+                        q_len=q_len,
+                        batch=bsz,
+                        heads=num_heads,
+                        topk_count=ctx.topk_count,
+                        kv_grad_dtype=str(kv_grad_dtype),
+                        value_grad_dtype=str(value_grad_dtype),
+                    )
+                    # The CUDA row kernel is used for K/V chunks only. Its
+                    # split positional query-gradient emission is not yet
+                    # numerically equivalent, so query grads are produced by
+                    # the existing Triton query-only pass below.
+                    emit_query_this_chunk = (
+                        (not query_grads_done)
+                        and not defer_query_grads
+                        and not cuda_split_qk_row_backward
+                    )
+                    if cuda_split_qk_row_backward and not ctx.backward_score_scratch:
+                        _dsa_split_qk_backward_row_cuda(
+                            query_nope,
+                            query_pe,
+                            key_nope,
+                            key_pe,
+                            value,
+                            topk_indices,
+                            query_positions if ctx.has_positions else None,
+                            key_positions if ctx.has_positions else None,
+                            output,
+                            lse,
+                            grad_output,
+                            grad_query_nope,
+                            grad_query_pe,
+                            unused_grad,
+                            unused_grad,
+                            grad_value_chunk,
+                            ctx.softmax_scale,
+                            ctx.q_start,
+                            kv_start,
+                            kv_end,
+                            emit_query=emit_query_this_chunk,
+                            emit_key_nope=False,
+                            emit_key_pe=False,
+                            emit_value=True,
+                        )
+                    else:
+                        _sparse_dsa_split_qk_backward_kernel[grid](
+                            query_nope,
+                            query_pe,
+                            key_nope,
+                            key_pe,
+                            value,
+                            topk_indices,
+                            query_positions,
+                            key_positions,
+                            output,
+                            lse,
+                            teacher_score_scratch,
+                            grad_output,
+                            grad_query_nope,
+                            grad_query_pe,
+                            unused_grad,
+                            unused_grad,
+                            grad_value_chunk,
+                            ctx.softmax_scale,
+                            q_len,
+                            bsz,
+                            num_heads,
+                            ctx.head_dim,
+                            ctx.pos_dim,
+                            value_dim,
+                            ctx.key_pe_heads,
+                            query_nope.stride(0),
+                            query_nope.stride(1),
+                            query_nope.stride(2),
+                            query_nope.stride(3),
+                            key_nope.stride(0),
+                            key_nope.stride(1),
+                            key_nope.stride(2),
+                            key_nope.stride(3),
+                            value.stride(0),
+                            value.stride(1),
+                            value.stride(2),
+                            value.stride(3),
+                            ctx.topk_count,
+                            ctx.q_start,
+                            kv_start,
+                            kv_end,
+                            BLOCK_Q=ctx.backward_block_q,
+                            BLOCK_K=ctx.backward_block_k,
+                            BLOCK_QD=ctx.block_qd,
+                            BLOCK_PD=ctx.block_pd,
+                            BLOCK_VD=ctx.block_vd,
+                            HAS_POSITIONS=ctx.has_positions,
+                            USE_SCORE_SCRATCH=ctx.backward_score_scratch,
+                            EMIT_QUERY_GRADS=emit_query_this_chunk,
+                            EMIT_KEY_NOPE_GRAD=False,
+                            EMIT_KEY_PE_GRAD=False,
+                            EMIT_VALUE_GRAD=True,
+                            num_warps=ctx.backward_num_warps,
+                        )
+                    if emit_query_this_chunk:
+                        query_grads_done = True
+                    grad_value_for_ref = (
+                        grad_value_chunk
+                        if grad_value_chunk.dtype == value_ref.dtype
+                        else grad_value_chunk.to(value_ref.dtype)
+                    )
+                    if _append_reentrant_backward(value_ref, grad_value_for_ref):
+                        reentrant_required_bytes += (
+                            local_s
+                            * bsz
+                            * num_heads
+                            * value_dim
+                            * _dtype_element_size(value_ref.dtype)
+                        )
+
+                if emit_key_nope or emit_key_pe:
+                    _maybe_trim_cuda_cache_for_dsa_backward(
+                        (
+                            (local_s * bsz * num_heads * ctx.head_dim if emit_key_nope else 0)
+                            + (
+                                local_s * bsz * ctx.key_pe_heads * ctx.pos_dim
+                                if emit_key_pe
+                                else 0
+                            )
+                        )
+                        * _dtype_element_size(kv_grad_dtype)
+                    )
+                    grad_key_nope_chunk = (
+                        torch.zeros(
+                            (local_s, bsz, num_heads, ctx.head_dim),
+                            device=key_nope.device,
+                            dtype=kv_grad_dtype,
+                        )
+                        if emit_key_nope
+                        else unused_grad
+                    )
+                    grad_key_pe_chunk = (
+                        torch.zeros(
+                            (local_s, bsz, ctx.key_pe_heads, ctx.pos_dim),
+                            device=key_pe.device,
+                            dtype=kv_grad_dtype,
+                        )
+                        if emit_key_pe
+                        else unused_grad
+                    )
+                    tensor_audit(
+                        "dsa_triton/split_qk_backward_reentrant_key_alloc",
+                        grad_key_nope=grad_key_nope_chunk if emit_key_nope else None,
+                        grad_key_pe=grad_key_pe_chunk if emit_key_pe else None,
+                        kv_start=kv_start,
+                        kv_end=kv_end,
+                        q_len=q_len,
+                        batch=bsz,
+                        heads=num_heads,
+                        topk_count=ctx.topk_count,
+                        kv_grad_dtype=str(kv_grad_dtype),
+                    )
+                    # Keep CUDA row backward on the K/V side only; query grads
+                    # are emitted by the Triton query-only pass below.
+                    emit_query_this_chunk = (
+                        (not query_grads_done)
+                        and not defer_query_grads
+                        and not cuda_split_qk_row_backward
+                    )
+                    if cuda_split_qk_row_backward and not ctx.backward_score_scratch:
+                        _dsa_split_qk_backward_row_cuda(
+                            query_nope,
+                            query_pe,
+                            key_nope,
+                            key_pe,
+                            value,
+                            topk_indices,
+                            query_positions if ctx.has_positions else None,
+                            key_positions if ctx.has_positions else None,
+                            output,
+                            lse,
+                            grad_output,
+                            grad_query_nope,
+                            grad_query_pe,
+                            grad_key_nope_chunk,
+                            grad_key_pe_chunk,
+                            unused_grad,
+                            ctx.softmax_scale,
+                            ctx.q_start,
+                            kv_start,
+                            kv_end,
+                            emit_query=emit_query_this_chunk,
+                            emit_key_nope=emit_key_nope,
+                            emit_key_pe=emit_key_pe,
+                            emit_value=False,
+                        )
+                    else:
+                        _sparse_dsa_split_qk_backward_kernel[grid](
+                            query_nope,
+                            query_pe,
+                            key_nope,
+                            key_pe,
+                            value,
+                            topk_indices,
+                            query_positions,
+                            key_positions,
+                            output,
+                            lse,
+                            teacher_score_scratch,
+                            grad_output,
+                            grad_query_nope,
+                            grad_query_pe,
+                            grad_key_nope_chunk,
+                            grad_key_pe_chunk,
+                            unused_grad,
+                            ctx.softmax_scale,
+                            q_len,
+                            bsz,
+                            num_heads,
+                            ctx.head_dim,
+                            ctx.pos_dim,
+                            value_dim,
+                            ctx.key_pe_heads,
+                            query_nope.stride(0),
+                            query_nope.stride(1),
+                            query_nope.stride(2),
+                            query_nope.stride(3),
+                            key_nope.stride(0),
+                            key_nope.stride(1),
+                            key_nope.stride(2),
+                            key_nope.stride(3),
+                            value.stride(0),
+                            value.stride(1),
+                            value.stride(2),
+                            value.stride(3),
+                            ctx.topk_count,
+                            ctx.q_start,
+                            kv_start,
+                            kv_end,
+                            BLOCK_Q=ctx.backward_block_q,
+                            BLOCK_K=ctx.backward_block_k,
+                            BLOCK_QD=ctx.block_qd,
+                            BLOCK_PD=ctx.block_pd,
+                            BLOCK_VD=ctx.block_vd,
+                            HAS_POSITIONS=ctx.has_positions,
+                            USE_SCORE_SCRATCH=ctx.backward_score_scratch,
+                            EMIT_QUERY_GRADS=emit_query_this_chunk,
+                            EMIT_KEY_NOPE_GRAD=emit_key_nope,
+                            EMIT_KEY_PE_GRAD=emit_key_pe,
+                            EMIT_VALUE_GRAD=False,
+                            num_warps=ctx.backward_num_warps,
+                        )
+                    if emit_query_this_chunk:
+                        query_grads_done = True
+                    if emit_key_nope:
+                        if _append_reentrant_backward(
+                            key_nope_ref, grad_key_nope_chunk.to(key_nope_ref.dtype)
+                        ):
+                            reentrant_required_bytes += (
+                                local_s
+                                * bsz
+                                * num_heads
+                                * ctx.head_dim
+                                * _dtype_element_size(key_nope_ref.dtype)
+                            )
+                    if emit_key_pe:
+                        if _append_reentrant_backward(
+                            key_pe_ref, grad_key_pe_chunk.to(key_pe_ref.dtype)
+                        ):
+                            reentrant_required_bytes += (
+                                local_s
+                                * bsz
+                                * ctx.key_pe_heads
+                                * ctx.pos_dim
+                                * _dtype_element_size(key_pe_ref.dtype)
+                            )
+
+                if reentrant_tensors:
+                    # Locally, DSA only needs retention while later K/V chunks
+                    # remain. Under StreamBP, the enclosing replay backward can
+                    # have additional reentrant consumers after this local loop,
+                    # so StreamBP owns the wider retention boundary.
+                    retain_reentrant_graph = (
+                        _te_reentrant_checkpoint_retention_scope_active() or kv_end < sk
+                    )
+                    with torch.enable_grad(), _te_reentrant_backward_guard(
+                        retain_graph=retain_reentrant_graph
+                    ):
+                        # SliceBackward materializes dense grads for the original
+                        # K/V tensors before the upstream TE projection consumes
+                        # them. Run one reentrant autograd traversal per KV chunk
+                        # so TE's retained NVFP4 state is not consumed once for
+                        # value and then re-entered immediately for key.
+                        _maybe_trim_cuda_cache_for_dsa_backward(
+                            reentrant_required_bytes, force=True
+                        )
+                        torch.autograd.backward(
+                            reentrant_tensors,
+                            reentrant_grads,
+                            retain_graph=retain_reentrant_graph,
+                        )
+                    if grad_value_for_ref is not None and grad_value_for_ref is not grad_value_chunk:
+                        del grad_value_for_ref
+                    if grad_value_chunk is not None:
+                        del grad_value_chunk
+                    if emit_key_nope:
+                        del grad_key_nope_chunk
+                    if emit_key_pe:
+                        del grad_key_pe_chunk
+                    del reentrant_tensors, reentrant_grads
+
+            if not query_grads_done:
+                _maybe_trim_cuda_cache_for_dsa_backward(query_grad_required_bytes)
+                grad_query_nope = torch.empty_like(query_nope, dtype=query_grad_dtype)
+                grad_query_pe = torch.empty_like(query_pe, dtype=query_grad_dtype)
+                tensor_audit(
+                    "dsa_triton/split_qk_backward_reentrant_deferred_query_alloc",
+                    grad_query_nope=grad_query_nope,
+                    grad_query_pe=grad_query_pe,
+                    q_len=q_len,
+                    batch=bsz,
+                    heads=num_heads,
+                    topk_count=ctx.topk_count,
+                    query_grad_dtype=str(query_grad_dtype),
+                )
+                _sparse_dsa_split_qk_backward_kernel[grid](
+                    query_nope,
+                    query_pe,
+                    key_nope,
+                    key_pe,
+                    value,
+                    topk_indices,
+                    query_positions,
+                    key_positions,
+                    output,
+                    lse,
+                    teacher_score_scratch,
+                    grad_output,
+                    grad_query_nope,
+                    grad_query_pe,
+                    unused_grad,
+                    unused_grad,
+                    unused_grad,
+                    ctx.softmax_scale,
+                    q_len,
+                    bsz,
+                    num_heads,
+                    ctx.head_dim,
+                    ctx.pos_dim,
+                    value_dim,
+                    ctx.key_pe_heads,
+                    query_nope.stride(0),
+                    query_nope.stride(1),
+                    query_nope.stride(2),
+                    query_nope.stride(3),
+                    key_nope.stride(0),
+                    key_nope.stride(1),
+                    key_nope.stride(2),
+                    key_nope.stride(3),
+                    value.stride(0),
+                    value.stride(1),
+                    value.stride(2),
+                    value.stride(3),
+                    ctx.topk_count,
+                    ctx.q_start,
+                    0,
+                    -1,
+                    BLOCK_Q=ctx.backward_block_q,
+                    BLOCK_K=ctx.backward_block_k,
+                    BLOCK_QD=ctx.block_qd,
+                    BLOCK_PD=ctx.block_pd,
+                    BLOCK_VD=ctx.block_vd,
+                    HAS_POSITIONS=ctx.has_positions,
+                    USE_SCORE_SCRATCH=ctx.backward_score_scratch,
+                    EMIT_QUERY_GRADS=True,
+                    EMIT_KEY_NOPE_GRAD=False,
+                    EMIT_KEY_PE_GRAD=False,
+                    EMIT_VALUE_GRAD=False,
+                    num_warps=ctx.backward_num_warps,
+                )
+
+            return (
+                grad_query_nope.to(query_nope.dtype),
+                grad_query_pe.to(query_pe.dtype),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+
         _maybe_trim_cuda_cache_for_dsa_backward(
             (key_nope.numel() + key_pe.numel() + value.numel())
             * _dtype_element_size(kv_grad_dtype)
@@ -3374,7 +4265,6 @@ class SparseDSASplitQKAttentionTriton(torch.autograd.Function):
             kv_grad_dtype=str(kv_grad_dtype),
             query_grad_dtype=str(query_grad_dtype),
         )
-        grid = (triton.cdiv(q_len, ctx.backward_block_q), num_heads * bsz)
         _sparse_dsa_split_qk_backward_kernel[grid](
             query_nope,
             query_pe,
@@ -3401,12 +4291,22 @@ class SparseDSASplitQKAttentionTriton(torch.autograd.Function):
             ctx.pos_dim,
             value_dim,
             ctx.key_pe_heads,
+            query_nope.stride(0),
+            query_nope.stride(1),
+            query_nope.stride(2),
+            query_nope.stride(3),
+            key_nope.stride(0),
+            key_nope.stride(1),
+            key_nope.stride(2),
+            key_nope.stride(3),
             value.stride(0),
             value.stride(1),
             value.stride(2),
             value.stride(3),
             ctx.topk_count,
             ctx.q_start,
+            0,
+            -1,
             BLOCK_Q=ctx.backward_block_q,
             BLOCK_K=ctx.backward_block_k,
             BLOCK_QD=ctx.block_qd,
@@ -3414,6 +4314,10 @@ class SparseDSASplitQKAttentionTriton(torch.autograd.Function):
             BLOCK_VD=ctx.block_vd,
             HAS_POSITIONS=ctx.has_positions,
             USE_SCORE_SCRATCH=ctx.backward_score_scratch,
+            EMIT_QUERY_GRADS=True,
+            EMIT_KEY_NOPE_GRAD=True,
+            EMIT_KEY_PE_GRAD=True,
+            EMIT_VALUE_GRAD=True,
             num_warps=ctx.backward_num_warps,
         )
         return (
@@ -3422,6 +4326,7 @@ class SparseDSASplitQKAttentionTriton(torch.autograd.Function):
             grad_key_nope.to(key_nope.dtype),
             grad_key_pe.to(key_pe.dtype),
             grad_value.to(value.dtype),
+            None,
             None,
             None,
             None,
@@ -3440,6 +4345,7 @@ def sparse_dsa_attention_triton(
     q_start: int = 0,
     query_positions: torch.Tensor | None = None,
     key_positions: torch.Tensor | None = None,
+    kv_nope_value_ref: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Fused sparse DSA attention over already-selected top-k key/value positions."""
 
@@ -3494,6 +4400,7 @@ def sparse_dsa_attention_split_qk_triton(
     q_start: int = 0,
     query_positions: torch.Tensor | None = None,
     key_positions: torch.Tensor | None = None,
+    kv_nope_value_ref: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Fused sparse DSA attention over split MLA Q/K components.
 
@@ -3514,6 +4421,7 @@ def sparse_dsa_attention_split_qk_triton(
         q_start,
         query_positions,
         key_positions,
+        kv_nope_value_ref,
         False,
     )
 
@@ -3529,6 +4437,7 @@ def sparse_dsa_attention_split_qk_with_teacher_triton(
     q_start: int = 0,
     query_positions: torch.Tensor | None = None,
     key_positions: torch.Tensor | None = None,
+    kv_nope_value_ref: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Split-QK selected attention plus local teacher mass over selected top-k."""
 
@@ -3543,6 +4452,7 @@ def sparse_dsa_attention_split_qk_with_teacher_triton(
         q_start,
         query_positions,
         key_positions,
+        kv_nope_value_ref,
         True,
     )
 

@@ -100,6 +100,51 @@ def _maybe_trim_cuda_cache_before_moe_unpadding() -> None:
         torch.cuda.empty_cache()
 
 
+def _maybe_trim_cuda_cache_before_moe_fc2(input_tensor: torch.Tensor) -> None:
+    """Release cached allocator blocks before TE grouped expert fc2 output allocation."""
+    if not input_tensor.is_cuda or not _env_flag("MEGATRON_MOE_EXPERT_FC2_TRIM_CACHE", default=True):
+        return
+
+    device = input_tensor.device
+    free_bytes, _ = torch.cuda.mem_get_info(device)
+    allocated = torch.cuda.memory_allocated(device)
+    reserved = torch.cuda.memory_reserved(device)
+    cached = max(0, reserved - allocated)
+
+    mib = 1024 * 1024
+    free_threshold_mb = int(os.getenv("MEGATRON_MOE_EXPERT_FC2_TRIM_FREE_MB", "8192"))
+    cached_threshold_mb = int(os.getenv("MEGATRON_MOE_EXPERT_FC2_TRIM_CACHED_MB", "256"))
+    if free_bytes < free_threshold_mb * mib and cached > cached_threshold_mb * mib:
+        if _env_flag("MEGATRON_MOE_EXPERT_FC2_TRIM_SYNC", default=True):
+            torch.cuda.synchronize(device)
+        torch.cuda.empty_cache()
+
+
+def _maybe_trim_cuda_cache_before_moe_fc1(input_tensor: torch.Tensor) -> None:
+    """Release cached allocator blocks before TE grouped expert fc1 quantization/output."""
+    if not input_tensor.is_cuda or not _env_flag("MEGATRON_MOE_EXPERT_FC1_TRIM_CACHE", default=True):
+        return
+
+    device = input_tensor.device
+    free_bytes, _ = torch.cuda.mem_get_info(device)
+    allocated = torch.cuda.memory_allocated(device)
+    reserved = torch.cuda.memory_reserved(device)
+    cached = max(0, reserved - allocated)
+
+    mib = 1024 * 1024
+    free_threshold_mb = int(os.getenv("MEGATRON_MOE_EXPERT_FC1_TRIM_FREE_MB", "8192"))
+    reserve_mb = int(os.getenv("MEGATRON_MOE_EXPERT_FC1_TRIM_RESERVE_MB", "2048"))
+    cached_threshold_mb = int(os.getenv("MEGATRON_MOE_EXPERT_FC1_TRIM_CACHED_MB", "256"))
+    input_bytes = input_tensor.numel() * input_tensor.element_size()
+    free_threshold_bytes = max(free_threshold_mb * mib, input_bytes + reserve_mb * mib)
+    if free_bytes < free_threshold_bytes and cached > cached_threshold_mb * mib:
+        if _env_flag("MEGATRON_MOE_EXPERT_FC1_TRIM_SYNC", default=True):
+            torch.cuda.synchronize(device)
+        if _env_flag("MEGATRON_MOE_EXPERT_FC1_TRIM_GC", default=True):
+            gc.collect()
+        torch.cuda.empty_cache()
+
+
 class GroupedMLP(MegatronModule):
     """An efficient implementation of the Experts layer using GroupedGEMM.
 
@@ -825,16 +870,29 @@ class TEGroupedMLP(MegatronModule):
             tokens=tokens_per_expert,
             num_local_experts=self.num_local_experts,
         )
+        already_quant_padded = bool(
+            getattr(tokens_per_expert, "_moe_quant_padding_applied", False)
+        )
+        actual_tokens_attr = getattr(tokens_per_expert, "_moe_actual_tokens_per_expert", None)
         tokens_per_expert: list[int] = tokens_per_expert.tolist()
         if self.config.fp8 or self.config.fp4:
-            actual_tokens_per_expert = tokens_per_expert
-            _maybe_trim_cuda_cache_before_moe_unpadding()
-            permuted_local_hidden_states, tokens_per_expert = self.quantization_padding(
-                permuted_local_hidden_states, tokens_per_expert
-            )
-            permuted_probs, _ = self.quantization_padding(
-                permuted_probs.unsqueeze(-1), actual_tokens_per_expert
-            )
+            if already_quant_padded:
+                actual_tokens_per_expert = (
+                    actual_tokens_attr.tolist()
+                    if isinstance(actual_tokens_attr, torch.Tensor)
+                    else tokens_per_expert
+                )
+                if permuted_probs.dim() == 1:
+                    permuted_probs = permuted_probs.unsqueeze(-1)
+            else:
+                actual_tokens_per_expert = tokens_per_expert
+                _maybe_trim_cuda_cache_before_moe_unpadding()
+                permuted_local_hidden_states, tokens_per_expert = self.quantization_padding(
+                    permuted_local_hidden_states, tokens_per_expert
+                )
+                permuted_probs, _ = self.quantization_padding(
+                    permuted_probs.unsqueeze(-1), actual_tokens_per_expert
+                )
             _tensor_audit(
                 "moe_expert/after_quant_padding",
                 hidden=permuted_local_hidden_states,
@@ -858,6 +916,7 @@ class TEGroupedMLP(MegatronModule):
         with off_interface(
             self.offload_expert_fc1, permuted_local_hidden_states, "expert_fc1"
         ) as permuted_local_hidden_states:
+            _maybe_trim_cuda_cache_before_moe_fc1(permuted_local_hidden_states)
             _tensor_audit(
                 "moe_expert/before_fc1",
                 hidden=permuted_local_hidden_states,
@@ -963,6 +1022,7 @@ class TEGroupedMLP(MegatronModule):
             del permuted_local_hidden_states
             _maybe_trim_cuda_cache_before_moe_unpadding()
 
+        _maybe_trim_cuda_cache_before_moe_fc2(bias_act_output)
         output, output_bias = apply_module(self.linear_fc2)(bias_act_output, tokens_per_expert)
         _tensor_audit(
             "moe_expert/after_fc2",
@@ -990,7 +1050,7 @@ class TEGroupedMLP(MegatronModule):
             output_bias = None
 
         # upad and concat the output
-        if self.config.fp8 or self.config.fp4:
+        if (self.config.fp8 or self.config.fp4) and not already_quant_padded:
             _tensor_audit(
                 "moe_expert/before_quant_unpadding",
                 output=output,
@@ -1003,6 +1063,13 @@ class TEGroupedMLP(MegatronModule):
                 "moe_expert/after_quant_unpadding",
                 output=output,
                 actual_tokens=actual_tokens_per_expert,
+            )
+        elif already_quant_padded:
+            _tensor_audit(
+                "moe_expert/skip_quant_unpadding_compact_deepep",
+                output=output,
+                actual_tokens=actual_tokens_per_expert,
+                padded_tokens=tokens_per_expert,
             )
 
         output_bias = None

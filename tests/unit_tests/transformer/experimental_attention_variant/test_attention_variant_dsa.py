@@ -23,6 +23,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     _hisa_selected_score_backward_cuda,
     _hisa_selected_score_backward_cuda_batched,
     _sparse_dsa_attention_chunk,
+    _dsa_next_owner_segment_range_end,
     _dsa_thd_tp_local_sequence_offsets,
     _streaming_qk_topk,
     chunked_dsa_forward,
@@ -75,6 +76,16 @@ def patch_hadamard_if_needed():
 
 
 class TestPackedTHDOffsets:
+    def test_owner_segment_range_limiter_splits_only_crossing_ranges(self):
+        assert _dsa_next_owner_segment_range_end(0, 16384, 8192) == 8192
+        assert _dsa_next_owner_segment_range_end(8192, 16384, 8192) == 16384
+        assert _dsa_next_owner_segment_range_end(1024, 4096, 8192) == 4096
+        assert _dsa_next_owner_segment_range_end(12288, 24576, 8192) == 16384
+
+    def test_owner_segment_range_limiter_rejects_empty_owner_segment(self):
+        with pytest.raises(ValueError, match="owner_segment_len"):
+            _dsa_next_owner_segment_range_end(0, 1, 0)
+
     def test_tp_local_offsets_rebase_global_packed_cu(self):
         class _TPGroup:
             def __init__(self, rank: int, size: int):
@@ -901,6 +912,223 @@ class TestSparseDSATritonAttention:
         ref_teacher = ref_teacher / ref_teacher.sum(dim=-1, keepdim=True).clamp_min(1e-20)
         torch.testing.assert_close(split_teacher_out, ref_teacher_out, rtol=0, atol=0)
         torch.testing.assert_close(split_teacher, ref_teacher, rtol=5e-3, atol=5e-3)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_split_qk_reentrant_deferred_query_grads_matches_eager(self, monkeypatch):
+        import megatron.core.transformer.experimental_attention_variant.dsa_triton as dsa_triton_mod
+
+        torch.manual_seed(20260519)
+        seqlen = 31
+        q_len = 13
+        num_heads = 2
+        qk_head_dim = 128
+        pos_dim = 64
+        value_head_dim = 64
+        topk = 11
+        softmax_scale = (qk_head_dim + pos_dim) ** -0.5
+
+        query_nope = torch.randn(
+            q_len, 1, num_heads, qk_head_dim, device="cuda", dtype=torch.float32
+        )
+        query_pe = torch.randn(q_len, 1, num_heads, pos_dim, device="cuda", dtype=torch.float32)
+        key_nope = torch.randn(
+            seqlen, 1, num_heads, qk_head_dim, device="cuda", dtype=torch.float32
+        )
+        key_pe = torch.randn(seqlen, 1, 1, pos_dim, device="cuda", dtype=torch.float32)
+        value = torch.randn(
+            seqlen, 1, num_heads, value_head_dim, device="cuda", dtype=torch.float32
+        )
+        index_scores = torch.randn(1, q_len, seqlen, device="cuda", dtype=torch.float32)
+        causal_mask = torch.triu(
+            torch.ones(q_len, seqlen, device="cuda", dtype=torch.bool), diagonal=1
+        )
+        topk_indices = (
+            index_scores.masked_fill(causal_mask.unsqueeze(0), float("-inf"))
+            .topk(topk, dim=-1, sorted=False)
+            .indices
+            .contiguous()
+        )
+        grad_output = torch.randn(
+            q_len, 1, num_heads * value_head_dim, device="cuda", dtype=torch.float32
+        )
+
+        monkeypatch.setenv("MEGATRON_DSA_TRITON", "1")
+        monkeypatch.setenv("MEGATRON_DSA_SPLIT_QK_REENTRANT_KV_BWD", "1")
+        monkeypatch.setenv("MEGATRON_DSA_SPLIT_QK_REENTRANT_KV_BWD_CHUNK", "17")
+        monkeypatch.setenv("MEGATRON_DSA_CUDA_SPLIT_QK_ROW_BWD", "1")
+        if not dsa_triton_mod._cuda_split_qk_row_backward_supported(
+            query_nope,
+            query_pe,
+            key_nope,
+            key_pe,
+            value,
+            topk_indices,
+            None,
+            None,
+        ):
+            pytest.skip("DSA split-QK row backward CUDA extension is unavailable")
+
+        def run(defer_query_grads: bool):
+            qn = query_nope.detach().clone().requires_grad_(True)
+            qp = query_pe.detach().clone().requires_grad_(True)
+            kn = key_nope.detach().clone().requires_grad_(True)
+            kp = key_pe.detach().clone().requires_grad_(True)
+            vv = value.detach().clone().requires_grad_(True)
+            monkeypatch.setenv(
+                "MEGATRON_DSA_SPLIT_QK_REENTRANT_DEFER_QUERY_GRADS",
+                "1" if defer_query_grads else "0",
+            )
+            out, teacher = sparse_dsa_attention_split_qk_with_teacher_triton(
+                qn,
+                qp,
+                kn,
+                kp,
+                vv,
+                topk_indices,
+                softmax_scale,
+            )
+            out_snapshot = out.detach().clone()
+            teacher_snapshot = teacher.detach().clone()
+            (out * grad_output).sum().backward()
+            return (
+                out_snapshot,
+                teacher_snapshot,
+                qn.grad.detach(),
+                qp.grad.detach(),
+                kn.grad.detach(),
+                kp.grad.detach(),
+                vv.grad.detach(),
+            )
+
+        eager = run(False)
+        deferred = run(True)
+
+        for deferred_tensor, eager_tensor in zip(deferred, eager):
+            torch.testing.assert_close(deferred_tensor, eager_tensor, rtol=2e-4, atol=2e-4)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_split_qk_reentrant_packed_kv_grad_matches_separate_refs(self, monkeypatch):
+        import megatron.core.transformer.experimental_attention_variant.dsa_triton as dsa_triton_mod
+
+        torch.manual_seed(20260519)
+        seqlen = 29
+        q_len = 12
+        num_heads = 2
+        qk_head_dim = 128
+        pos_dim = 64
+        value_head_dim = 64
+        topk = 9
+        softmax_scale = (qk_head_dim + pos_dim) ** -0.5
+
+        query_nope = torch.randn(
+            q_len, 1, num_heads, qk_head_dim, device="cuda", dtype=torch.float32
+        )
+        query_pe = torch.randn(q_len, 1, num_heads, pos_dim, device="cuda", dtype=torch.float32)
+        kv = torch.randn(
+            seqlen,
+            1,
+            num_heads,
+            qk_head_dim + value_head_dim,
+            device="cuda",
+            dtype=torch.float32,
+        )
+        key_pe = torch.randn(seqlen, 1, 1, pos_dim, device="cuda", dtype=torch.float32)
+        index_scores = torch.randn(1, q_len, seqlen, device="cuda", dtype=torch.float32)
+        causal_mask = torch.triu(
+            torch.ones(q_len, seqlen, device="cuda", dtype=torch.bool), diagonal=1
+        )
+        topk_indices = (
+            index_scores.masked_fill(causal_mask.unsqueeze(0), float("-inf"))
+            .topk(topk, dim=-1, sorted=False)
+            .indices
+            .contiguous()
+        )
+        grad_output = torch.randn(
+            q_len, 1, num_heads * value_head_dim, device="cuda", dtype=torch.float32
+        )
+
+        monkeypatch.setenv("MEGATRON_DSA_TRITON", "1")
+        monkeypatch.setenv("MEGATRON_DSA_SPLIT_QK_REENTRANT_KV_BWD", "1")
+        monkeypatch.setenv("MEGATRON_DSA_SPLIT_QK_REENTRANT_KV_BWD_CHUNK", "13")
+        monkeypatch.setenv("MEGATRON_DSA_SPLIT_QK_REENTRANT_DEFER_QUERY_GRADS", "1")
+        monkeypatch.setenv("MEGATRON_DSA_CUDA_SPLIT_QK_ROW_BWD", "1")
+        if not dsa_triton_mod._cuda_split_qk_row_backward_supported(
+            query_nope,
+            query_pe,
+            kv[..., :qk_head_dim],
+            key_pe,
+            kv[..., qk_head_dim:],
+            topk_indices,
+            None,
+            None,
+        ):
+            pytest.skip("DSA split-QK row backward CUDA extension is unavailable")
+
+        def run_separate_refs():
+            qn = query_nope.detach().clone().requires_grad_(True)
+            qp = query_pe.detach().clone().requires_grad_(True)
+            kn = kv[..., :qk_head_dim].detach().clone().requires_grad_(True)
+            vv = kv[..., qk_head_dim:].detach().clone().requires_grad_(True)
+            kp = key_pe.detach().clone().requires_grad_(True)
+            monkeypatch.setenv("MEGATRON_DSA_SPLIT_QK_REENTRANT_PACK_KV_GRAD", "0")
+            out, teacher = sparse_dsa_attention_split_qk_with_teacher_triton(
+                qn,
+                qp,
+                kn,
+                kp,
+                vv,
+                topk_indices,
+                softmax_scale,
+            )
+            out_snapshot = out.detach().clone()
+            teacher_snapshot = teacher.detach().clone()
+            (out * grad_output).sum().backward()
+            return (
+                out_snapshot,
+                teacher_snapshot,
+                qn.grad.detach(),
+                qp.grad.detach(),
+                kn.grad.detach(),
+                kp.grad.detach(),
+                vv.grad.detach(),
+            )
+
+        def run_packed_ref():
+            qn = query_nope.detach().clone().requires_grad_(True)
+            qp = query_pe.detach().clone().requires_grad_(True)
+            packed_kv = kv.detach().clone().requires_grad_(True)
+            kn = packed_kv[..., :qk_head_dim]
+            vv = packed_kv[..., qk_head_dim:]
+            kp = key_pe.detach().clone().requires_grad_(True)
+            monkeypatch.setenv("MEGATRON_DSA_SPLIT_QK_REENTRANT_PACK_KV_GRAD", "1")
+            out, teacher = sparse_dsa_attention_split_qk_with_teacher_triton(
+                qn,
+                qp,
+                kn,
+                kp,
+                vv,
+                topk_indices,
+                softmax_scale,
+                kv_nope_value_ref=packed_kv,
+            )
+            out_snapshot = out.detach().clone()
+            teacher_snapshot = teacher.detach().clone()
+            (out * grad_output).sum().backward()
+            return (
+                out_snapshot,
+                teacher_snapshot,
+                qn.grad.detach(),
+                qp.grad.detach(),
+                packed_kv.grad[..., :qk_head_dim].detach(),
+                kp.grad.detach(),
+                packed_kv.grad[..., qk_head_dim:].detach(),
+            )
+
+        separate = run_separate_refs()
+        packed = run_packed_ref()
+
+        for packed_tensor, separate_tensor in zip(packed, separate):
+            torch.testing.assert_close(packed_tensor, separate_tensor, rtol=2e-4, atol=2e-4)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_chunked_dsa_forward_uses_split_qk_without_materialized_key(self, monkeypatch):

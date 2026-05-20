@@ -97,6 +97,10 @@ _DSA_SP_PROJECT_BEFORE_GATHER_ENV = "MEGATRON_DSA_SP_PROJECT_BEFORE_GATHER"
 _DSA_INDEXER_ROPE_FUSION_ENV = "MEGATRON_DSA_INDEXER_ROPE_FUSION"
 _DSA_INDEXER_ROPE_INPLACE_ENV = "MEGATRON_DSA_INDEXER_ROPE_INPLACE"
 _DSA_INDEXER_TORCH_K_NORM_ENV = "MEGATRON_DSA_INDEXER_TORCH_K_NORM"
+_DSA_SP_Q_PROJ_TRIM_CACHE_ENV = "MEGATRON_DSA_SP_Q_PROJ_TRIM_CACHE"
+_DSA_SP_Q_PROJ_TRIM_SAFETY_MB_ENV = "MEGATRON_DSA_SP_Q_PROJ_TRIM_SAFETY_MB"
+_DSA_SP_Q_PROJ_TRIM_CACHED_MB_ENV = "MEGATRON_DSA_SP_Q_PROJ_TRIM_CACHED_MB"
+_DSA_SP_Q_PROJ_TRIM_SYNC_ENV = "MEGATRON_DSA_SP_Q_PROJ_TRIM_SYNC"
 _DSA_DEBUG_SYNC_ENV = "MEGATRON_DSA_DEBUG_SYNC"
 
 
@@ -122,6 +126,49 @@ def _dsa_debug_sync(label: str, tensor: Optional[torch.Tensor] = None) -> None:
         raise RuntimeError(
             f"DSA debug sync failed after {label}; device={device}, shape={shape}, dtype={dtype}"
         ) from exc
+
+
+def _dsa_next_owner_segment_range_end(q_start: int, q_end: int, owner_segment_len: int) -> int:
+    """Limit a query range so it does not cross a rank-major SP owner segment."""
+
+    if owner_segment_len <= 0:
+        raise ValueError(f"owner_segment_len must be positive, got {owner_segment_len}")
+    if q_end <= q_start:
+        return q_end
+    next_owner_boundary = ((q_start // owner_segment_len) + 1) * owner_segment_len
+    return min(q_end, next_owner_boundary)
+
+
+def _maybe_trim_cuda_cache_for_dsa_sp_q_projection(
+    device: torch.device, required_bytes: int, *, force: bool = False
+) -> None:
+    """Release allocator cache before compact SP owner-projected DSA Q allocation."""
+
+    if not torch.cuda.is_available():
+        return
+    raw = os.getenv(_DSA_SP_Q_PROJ_TRIM_CACHE_ENV, "1").strip().lower()
+    if raw in {"0", "false", "off", "no"}:
+        return
+    if device.type != "cuda":
+        return
+
+    with torch.cuda.device(device):
+        free_bytes, _ = torch.cuda.mem_get_info()
+        allocated = torch.cuda.memory_allocated(device)
+        reserved = torch.cuda.memory_reserved(device)
+    cached = max(0, reserved - allocated)
+
+    mib = 1024 * 1024
+    safety_mb = int(os.getenv(_DSA_SP_Q_PROJ_TRIM_SAFETY_MB_ENV, "1024"))
+    cached_threshold_mb = int(os.getenv(_DSA_SP_Q_PROJ_TRIM_CACHED_MB_ENV, "512"))
+    needed_bytes = max(0, required_bytes) + safety_mb * mib
+    if (force and cached > 0) or (
+        free_bytes < needed_bytes and cached > cached_threshold_mb * mib
+    ):
+        sync_raw = os.getenv(_DSA_SP_Q_PROJ_TRIM_SYNC_ENV, "1").strip().lower()
+        if sync_raw not in {"0", "false", "off", "no"}:
+            torch.cuda.synchronize(device)
+        torch.cuda.empty_cache()
 
 
 def _tensor_safe_for_custom_inplace(x: torch.Tensor) -> bool:
@@ -3085,8 +3132,10 @@ def chunked_dsa_forward(
         )
     split_query_pe = None
     split_key_pe = None
+    split_kv_nope_value_ref = None
     if dsa_split_qk is not None:
-        split_query_pe, split_key_pe = dsa_split_qk
+        split_query_pe, split_key_pe, *split_extra = dsa_split_qk
+        split_kv_nope_value_ref = split_extra[0] if split_extra else None
         if split_query_pe.size(0) != sq or split_query_pe.shape[:3] != query.shape[:3]:
             raise ValueError(
                 "DSA split query positional component must match query prefix shape, got "
@@ -3107,8 +3156,33 @@ def chunked_dsa_forward(
         return torch.cat([query_part, query_pe_part], dim=-1), torch.cat([key, key_pe], dim=-1)
 
     q_weights_provider = q if callable(q) else None
+    q_range_limiter = (
+        getattr(q_weights_provider, "_dsa_limit_range", None)
+        if q_weights_provider is not None
+        else None
+    )
+
+    def iter_query_ranges():
+        for base_q_start in range(0, sq, chunk_size):
+            base_q_end = min(base_q_start + chunk_size, sq)
+            if q_range_limiter is None:
+                yield base_q_start, base_q_end
+                continue
+            q_start = base_q_start
+            while q_start < base_q_end:
+                q_end = int(q_range_limiter(q_start, base_q_end))
+                if q_end <= q_start or q_end > base_q_end:
+                    raise ValueError(
+                        "DSA q_weights_provider range limiter returned an invalid range: "
+                        f"base=({base_q_start}, {base_q_end}) current_start={q_start} "
+                        f"limited_end={q_end}"
+                    )
+                yield q_start, q_end
+                q_start = q_end
+
     work_device = query.device
     outputs = []
+    output_buffer = None
     topk_buffer = None
     use_triton_attention = None
     use_streaming_indexer_topk = loss_coeff <= 0 and _env_flag_enabled(
@@ -3124,8 +3198,19 @@ def chunked_dsa_forward(
     attention_teacher_row_indices = []
     stream_triton_attention_chunks = _env_flag_enabled(_DSA_STREAM_TRITON_ATTENTION_CHUNKS_ENV, "0")
 
-    for q_start in range(0, sq, chunk_size):
-        q_end = min(q_start + chunk_size, sq)
+    def append_output_chunk(chunk_output: torch.Tensor, q_start: int, q_end: int):
+        nonlocal output_buffer
+        if output_buffer is None:
+            output_buffer = chunk_output.new_empty((sq, *chunk_output.shape[1:]))
+        expected_q = q_end - q_start
+        if chunk_output.size(0) != expected_q:
+            raise ValueError(
+                "DSA chunk output sequence dimension does not match chunk range: "
+                f"output_shape={tuple(chunk_output.shape)} q_range=({q_start}, {q_end})"
+            )
+        output_buffer[q_start:q_end].copy_(chunk_output)
+
+    for q_start, q_end in iter_query_ranges():
         if q_weights_provider is not None:
             q_chunk, weights_chunk = q_weights_provider(q_start, q_end)
         else:
@@ -3192,6 +3277,7 @@ def chunked_dsa_forward(
                             is_causal,
                             query_positions=query_positions_chunk,
                             key_positions=key_positions,
+                            kv_nope_value_ref=split_kv_nope_value_ref,
                         )
                     ) or (
                         query_pe_chunk is None
@@ -3499,6 +3585,7 @@ def chunked_dsa_forward(
                             q_start,
                             query_positions=query_positions_chunk,
                             key_positions=key_positions,
+                            kv_nope_value_ref=split_kv_nope_value_ref,
                         )
                     else:
                         (
@@ -3530,36 +3617,36 @@ def chunked_dsa_forward(
                     )
                     loss_sum = chunk_loss_sum if loss_sum is None else loss_sum + chunk_loss_sum
                     loss_count += hisa_selected_scores.size(0)
-                    outputs.append(chunk_output)
+                    append_output_chunk(chunk_output, q_start, q_end)
+                    del chunk_output
                 else:
                     if query_pe_chunk is not None and split_key_pe is not None:
-                        outputs.append(
-                            sparse_dsa_attention_split_qk_triton(
-                                query_chunk,
-                                query_pe_chunk,
-                                key,
-                                split_key_pe,
-                                value,
-                                topk_indices,
-                                softmax_scale,
-                                q_start,
-                                query_positions=query_positions_chunk,
-                                key_positions=key_positions,
-                            )
+                        chunk_output = sparse_dsa_attention_split_qk_triton(
+                            query_chunk,
+                            query_pe_chunk,
+                            key,
+                            split_key_pe,
+                            value,
+                            topk_indices,
+                            softmax_scale,
+                            q_start,
+                            query_positions=query_positions_chunk,
+                            key_positions=key_positions,
+                            kv_nope_value_ref=split_kv_nope_value_ref,
                         )
                     else:
-                        outputs.append(
-                            sparse_dsa_attention_triton(
-                                query_chunk,
-                                key,
-                                value,
-                                topk_indices,
-                                softmax_scale,
-                                q_start,
-                                query_positions=query_positions_chunk,
-                                key_positions=key_positions,
-                            )
+                        chunk_output = sparse_dsa_attention_triton(
+                            query_chunk,
+                            key,
+                            value,
+                            topk_indices,
+                            softmax_scale,
+                            q_start,
+                            query_positions=query_positions_chunk,
+                            key_positions=key_positions,
                         )
+                    append_output_chunk(chunk_output, q_start, q_end)
+                    del chunk_output
                 continue
             if topk_buffer is None:
                 topk_buffer = torch.empty(
@@ -3587,23 +3674,25 @@ def chunked_dsa_forward(
             fallback_query_chunk, fallback_key = materialize_attention_qk(
                 query_chunk, query_pe_chunk
             )
-            outputs.append(
-                _sparse_dsa_attention_chunk(
-                    fallback_query_chunk,
-                    fallback_key,
-                    value,
-                    topk_indices,
-                    softmax_scale,
-                    mask,
-                    q_start,
-                    is_causal,
-                    query_positions=query_positions_chunk,
-                    key_positions=key_positions,
-                )
+            chunk_output = _sparse_dsa_attention_chunk(
+                fallback_query_chunk,
+                fallback_key,
+                value,
+                topk_indices,
+                softmax_scale,
+                mask,
+                q_start,
+                is_causal,
+                query_positions=query_positions_chunk,
+                key_positions=key_positions,
             )
+            append_output_chunk(chunk_output, q_start, q_end)
+            del chunk_output
 
     if use_triton_attention and stream_triton_attention_chunks:
-        output = torch.cat(outputs, dim=0)
+        if output_buffer is None:
+            raise RuntimeError("DSA streamed attention produced no output chunks")
+        output = output_buffer
     elif use_triton_attention:
         # Keep top-k generation chunked to bound the indexer score tensor, then run
         # the selected-token attention as one autograd op so K/V gradients are
@@ -3621,6 +3710,7 @@ def chunked_dsa_forward(
                     0,
                     query_positions=query_positions,
                     key_positions=key_positions,
+                    kv_nope_value_ref=split_kv_nope_value_ref,
                 )
             else:
                 output, attention_teacher_probs = sparse_dsa_attention_with_teacher_triton(
@@ -3677,6 +3767,7 @@ def chunked_dsa_forward(
                     0,
                     query_positions=query_positions,
                     key_positions=key_positions,
+                    kv_nope_value_ref=split_kv_nope_value_ref,
                 )
             else:
                 output = sparse_dsa_attention_triton(
@@ -3690,7 +3781,10 @@ def chunked_dsa_forward(
                     key_positions=key_positions,
                 )
     else:
-        output = torch.cat(outputs, dim=0)
+        if output_buffer is not None:
+            output = output_buffer
+        else:
+            output = torch.cat(outputs, dim=0)
 
     indexer_loss = None
     if loss_sum is not None:
@@ -3815,9 +3909,10 @@ class DSAttention(MegatronModule):
                 query = query.squeeze(1)
                 key = key.squeeze(1)
                 value = value.squeeze(1)
-            split_query_pe = split_key_pe = None
+            split_query_pe = split_key_pe = split_kv_nope_value_ref = None
             if dsa_split_qk is not None:
-                split_query_pe, split_key_pe = dsa_split_qk
+                split_query_pe, split_key_pe, *split_extra = dsa_split_qk
+                split_kv_nope_value_ref = split_extra[0] if split_extra else None
                 if split_query_pe.dim() == 4:
                     if split_query_pe.size(1) != 1:
                         raise ValueError("DSAttention THD split query PE expects dummy batch")
@@ -3826,6 +3921,10 @@ class DSAttention(MegatronModule):
                     if split_key_pe.size(1) != 1:
                         raise ValueError("DSAttention THD split key PE expects dummy batch")
                     split_key_pe = split_key_pe.squeeze(1)
+                if split_kv_nope_value_ref is not None and split_kv_nope_value_ref.dim() == 4:
+                    if split_kv_nope_value_ref.size(1) != 1:
+                        raise ValueError("DSAttention THD split KV ref expects dummy batch")
+                    split_kv_nope_value_ref = split_kv_nope_value_ref.squeeze(1)
             if x.dim() == 2:
                 x = x.unsqueeze(1)
             if qr.dim() == 2:
@@ -3845,6 +3944,16 @@ class DSAttention(MegatronModule):
                     raise ValueError(
                         "DSAttention THD split-QK tensors must align with query/key, got "
                         f"query_pe={tuple(split_query_pe.shape)} key_pe={tuple(split_key_pe.shape)}"
+                    )
+                if split_kv_nope_value_ref is not None and (
+                    split_kv_nope_value_ref.dim() != 3
+                    or split_kv_nope_value_ref.shape[:2] != key.shape[:2]
+                    or split_kv_nope_value_ref.size(-1) != key.size(-1) + value.size(-1)
+                ):
+                    raise ValueError(
+                        "DSAttention THD split KV ref must align with key/value, got "
+                        f"kv_ref={tuple(split_kv_nope_value_ref.shape)} key={tuple(key.shape)} "
+                        f"value={tuple(value.shape)}"
                     )
             if x.dim() != 3 or qr.dim() != 3:
                 raise ValueError("DSAttention THD path expects x/qr as [tokens, batch, dim]")
@@ -3903,7 +4012,15 @@ class DSAttention(MegatronModule):
                     dsa_split_qk=(
                         None
                         if dsa_split_qk is None
-                        else (split_query_pe.unsqueeze(1), split_key_pe.unsqueeze(1))
+                        else (
+                            split_query_pe.unsqueeze(1),
+                            split_key_pe.unsqueeze(1),
+                            *(
+                                ()
+                                if split_kv_nope_value_ref is None
+                                else (split_kv_nope_value_ref.unsqueeze(1),)
+                            ),
+                        )
                     ),
                 )
 
@@ -3973,6 +4090,13 @@ class DSAttention(MegatronModule):
                             else (
                                 split_query_pe[q_start:q_end].unsqueeze(1),
                                 split_key_pe[kv_start:kv_end].unsqueeze(1),
+                                *(
+                                    ()
+                                    if split_kv_nope_value_ref is None
+                                    else (
+                                        split_kv_nope_value_ref[kv_start:kv_end].unsqueeze(1),
+                                    )
+                                ),
                             )
                         ),
                     )
@@ -4095,6 +4219,12 @@ class DSAttention(MegatronModule):
                     streambp_query_positions_for_provider = streambp_query_positions
                     local_seq_len = indexer_x.size(0)
                     tp_size = self.indexer.pg_collection.tp.size()
+                    owner_segment_len = (
+                        streambp_query_positions_for_provider.numel() // tp_size
+                        if tp_size > 1
+                        and streambp_query_positions_for_provider.numel() % tp_size == 0
+                        else None
+                    )
                     streambp_query_base = int(
                         (
                             streambp_query_positions_for_provider
@@ -4106,6 +4236,18 @@ class DSAttention(MegatronModule):
                     )
 
                     def q_weights_provider(q_start: int, q_end: int):
+                        q_len = q_end - q_start
+                        element_size = indexer_x.element_size()
+                        required_bytes = (
+                            q_len
+                            * indexer_x.size(1)
+                            * self.indexer.index_n_heads
+                            * (self.indexer.index_head_dim + 1)
+                            * element_size
+                        )
+                        _maybe_trim_cuda_cache_for_dsa_sp_q_projection(
+                            indexer_x.device, required_bytes
+                        )
                         return self.indexer._project_query_positions_sp_owner_broadcast_before_topk(
                             indexer_x,
                             indexer_qr,
@@ -4114,6 +4256,15 @@ class DSAttention(MegatronModule):
                             streambp_query_positions_for_provider[q_start:q_end],
                             query_base=streambp_query_base,
                         )
+
+                    if owner_segment_len is not None:
+
+                        def limit_streambp_sp_owner_range(q_start: int, q_end: int) -> int:
+                            return _dsa_next_owner_segment_range_end(
+                                q_start, q_end, owner_segment_len
+                            )
+
+                        q_weights_provider._dsa_limit_range = limit_streambp_sp_owner_range
 
             else:
                 (

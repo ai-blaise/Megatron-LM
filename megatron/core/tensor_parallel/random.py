@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
+import threading
 from collections.abc import Callable
 from typing import Any, Optional, TypeVar, Union
 
@@ -23,6 +25,79 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
 )
 from megatron.core.utils import is_te_min_version, safely_set_viewless_tensor_data
+
+_TE_REENTRANT_BACKWARD_ACTIVE_ENV = "MEGATRON_TE_REENTRANT_BACKWARD_ACTIVE"
+_TE_REENTRANT_BACKWARD_RETAIN_ENV = "MEGATRON_TE_REENTRANT_BACKWARD_RETAIN"
+_TE_REENTRANT_RETENTION_TLS = threading.local()
+
+
+class _TEReentrantCheckpointRetentionScope:
+    """Own CheckpointWithoutOutput recompute state for one outer StreamBP backward.
+
+    DSA can issue several nested backward calls into the same TE checkpointed
+    projection while StreamBP is replaying a layer. The TE checkpoint ctx must
+    survive all of those nested consumers, but it should be released once the
+    enclosing StreamBP backward call returns.
+    """
+
+    def __init__(self):
+        self._contexts = []
+        self._seen_context_ids = set()
+
+    def register(self, ctx):
+        ctx_id = id(ctx)
+        if ctx_id in self._seen_context_ids:
+            return
+        self._seen_context_ids.add(ctx_id)
+        self._contexts.append(ctx)
+
+    def clear(self):
+        for ctx in reversed(self._contexts):
+            ctx.outputs = None
+            ctx.inputs = None
+        self._contexts.clear()
+        self._seen_context_ids.clear()
+
+
+def _te_reentrant_retention_stack():
+    stack = getattr(_TE_REENTRANT_RETENTION_TLS, "stack", None)
+    if stack is None:
+        stack = []
+        _TE_REENTRANT_RETENTION_TLS.stack = stack
+    return stack
+
+
+def te_reentrant_checkpoint_retention_scope_active() -> bool:
+    """Return whether a StreamBP-owned reentrant checkpoint retention scope is active."""
+
+    return bool(getattr(_TE_REENTRANT_RETENTION_TLS, "stack", None))
+
+
+@contextlib.contextmanager
+def te_reentrant_checkpoint_retention_scope():
+    """Retain TE checkpoint state through one outer StreamBP replay backward.
+
+    Nested DSA backward calls register checkpoint contexts here. The contexts are
+    cleared when the outer StreamBP autograd call finishes, which is the correct
+    lifetime boundary for StreamBP + DSA + TE reentrant backward.
+    """
+
+    stack = _te_reentrant_retention_stack()
+    scope = _TEReentrantCheckpointRetentionScope()
+    stack.append(scope)
+    try:
+        yield scope
+    finally:
+        popped = stack.pop()
+        assert popped is scope
+        if stack:
+            parent = stack[-1]
+            for ctx in scope._contexts:
+                parent.register(ctx)
+            scope._contexts.clear()
+            scope._seen_context_ids.clear()
+        else:
+            scope.clear()
 
 # ---------------------------------------------------------------------------
 # C++ extension: zero-copy storage sharing for CheckpointWithoutOutput
@@ -744,10 +819,39 @@ class CheckpointWithoutOutputFunction(torch.autograd.Function):
         # This is to avoid double-reloading the inputs in CPU offloading scenario.
         inputs = ctx.inputs
         outputs = ctx.outputs
-        torch.autograd.backward(outputs, args)
-        ctx.outputs = None
-        ctx.inputs = None
+        reentrant_active = (
+            os.getenv(_TE_REENTRANT_BACKWARD_ACTIVE_ENV, "0").strip().lower()
+            not in {"0", "false", "off", "no"}
+        )
+        retention_scope = (
+            _te_reentrant_retention_stack()[-1]
+            if reentrant_active and te_reentrant_checkpoint_retention_scope_active()
+            else None
+        )
+        retain_reentrant = reentrant_active and (
+            retention_scope is not None
+            or (
+                os.getenv(_TE_REENTRANT_BACKWARD_RETAIN_ENV, "1").strip().lower()
+                not in {"0", "false", "off", "no"}
+            )
+        )
+        if outputs is None or inputs is None:
+            raise RuntimeError(
+                "CheckpointWithoutOutput backward was invoked after its recompute "
+                "state had been cleared. This usually means an output is being "
+                "consumed by multiple reentrant backward calls without the "
+                f"{_TE_REENTRANT_BACKWARD_ACTIVE_ENV}=1 guard."
+            )
+        torch.autograd.backward(outputs, args, retain_graph=retain_reentrant)
+        if retention_scope is not None:
+            retention_scope.register(ctx)
+        elif not retain_reentrant:
+            ctx.outputs = None
+            ctx.inputs = None
         grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else None for inp in inputs)
+        for inp in inputs:
+            if isinstance(inp, torch.Tensor):
+                inp.grad = None
         return (None, None) + grads
 
 

@@ -9,6 +9,10 @@ from typing import Optional, Protocol, Union
 import torch
 
 from megatron.core import parallel_state, tensor_parallel, utils
+from megatron.core.transformer.temp_activation_offload import (
+    maybe_temp_cpu_offload,
+    maybe_temp_cpu_reload,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
@@ -249,6 +253,10 @@ class MoELayer(BaseMoELayer):
         # Cudagraph tensor store for resuming the forward pass from the end of the cudagraph.
         self.cudagraph_tensor_store = MoECudaGraphTensorStore()
         self.fwd_execution_map = ["route", "expert_compute", "postprocess"]
+        self.offload_moe_shared = (
+            self.config.fine_grained_activation_offloading
+            and "moe_shared" in self.config.offload_modules
+        )
 
         # Optional delayed expert wgrad support for dispatch-backward overlap.
         self.setup_delayed_wgrad_for_dispatch_backward_overlap()
@@ -345,10 +353,49 @@ class MoELayer(BaseMoELayer):
         dispatched_input, tokens_per_expert, permuted_probs = (
             self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
         )
+        # The all-to-all/gather inputs can be multi-GB at 32k context. Once
+        # dispatch_postprocess has produced the expert-ordered tensor, keeping
+        # these Python references extends their lifetime through expert GEMMs.
+        hidden_states = None
+        probs = None
         expert_output, mlp_bias = self.experts(dispatched_input, tokens_per_expert, permuted_probs)
+        dispatched_input = None
+        permuted_probs = None
         assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
         output = self.token_dispatcher.combine_preprocess(expert_output)
+        expert_output = None
 
+        return output, mlp_bias
+
+    def dispatch_and_routed_experts_compute(
+        self, hidden_states: torch.Tensor, probs: torch.Tensor
+    ):
+        """Dispatch tokens and run routed experts with shorter tensor lifetimes.
+
+        Keeping dispatch and expert execution in one frame lets us drop the
+        pre/post all-to-all tensors before expert GEMMs allocate their padded
+        inputs, fc1 activations, and fc2 outputs. This is the same computation
+        as ``dispatch`` followed by ``routed_experts_compute``.
+        """
+
+        dispatched_input, dispatched_probs = self.dispatch(hidden_states, probs)
+        hidden_states = None
+        probs = None
+        if self.config.overlap_dispatch_backward_with_experts_wgrad:
+            dispatched_input = _RecordExpertDgradCompletion.apply(
+                self._delayed_wgrad_event, dispatched_input
+            )
+        expert_input, tokens_per_expert, permuted_probs = (
+            self.token_dispatcher.dispatch_postprocess(dispatched_input, dispatched_probs)
+        )
+        dispatched_input = None
+        dispatched_probs = None
+        expert_output, mlp_bias = self.experts(expert_input, tokens_per_expert, permuted_probs)
+        expert_input = None
+        permuted_probs = None
+        assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
+        output = self.token_dispatcher.combine_preprocess(expert_output)
+        expert_output = None
         return output, mlp_bias
 
     def combine(self, output: torch.Tensor):
@@ -369,6 +416,9 @@ class MoELayer(BaseMoELayer):
             output, _ = self.fc2_latent_proj(output)
 
         if shared_expert_output is not None:
+            shared_expert_output = maybe_temp_cpu_reload(
+                shared_expert_output, output.device, "moe_shared"
+            )
             output = output + shared_expert_output
         return output
 
@@ -415,8 +465,15 @@ class MoELayer(BaseMoELayer):
             try:
                 if "route" in self.fwd_execution_map:
                     shared_expert_output = self.shared_experts_compute(hidden_states)
+                    shared_expert_output = maybe_temp_cpu_offload(
+                        shared_expert_output,
+                        "moe_shared",
+                        enabled=self.offload_moe_shared,
+                        training=self.training,
+                    )
                     probs, routing_map = self.route(hidden_states, padding_mask)
                     hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
+                    routing_map = None
 
                     if intermediate_tensors is not None:
                         return hidden_states, probs, shared_expert_output
@@ -433,8 +490,9 @@ class MoELayer(BaseMoELayer):
                 if intermediate_tensors is not None:
                     hidden_states, probs = intermediate_tensors
 
-                dispatched_input, probs = self.dispatch(hidden_states, probs)
-                output, mlp_bias = self.routed_experts_compute(dispatched_input, probs)
+                output, mlp_bias = self.dispatch_and_routed_experts_compute(hidden_states, probs)
+                hidden_states = None
+                probs = None
                 assert (
                     mlp_bias is None
                 ), f"mlp_bias is not supported for {type(self.token_dispatcher)}"

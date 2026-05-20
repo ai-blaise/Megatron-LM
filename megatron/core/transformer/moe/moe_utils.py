@@ -83,6 +83,8 @@ def _maybe_trim_cuda_cache_before_moe_sort(input: torch.Tensor, probs: Optional[
         required_bytes += probs.numel() * probs.element_size()
     trim_threshold = max(free_threshold_mb * mib, required_bytes + safety_mb * mib)
     if free_bytes < trim_threshold and cached > cached_threshold_mb * mib:
+        if _env_flag("MEGATRON_MOE_SORT_TRIM_SYNC", default=True):
+            torch.cuda.synchronize(input.device)
         torch.cuda.empty_cache()
 
 

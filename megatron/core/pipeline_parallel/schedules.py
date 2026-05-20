@@ -1,6 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import contextlib
+import os
+import time
 from functools import partial
 from itertools import zip_longest
 from typing import Callable, Iterator, List, Optional, Union
@@ -43,6 +45,237 @@ from .hybrid_cp_schedule import hybrid_context_parallel_forward_backward
 
 # Types
 Shape = Union[List[int], torch.Size]
+
+_PIPELINE_PROGRESS_START_TIME = None
+_PIPELINE_PROGRESS_CONFIG = None
+
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default).lower() in {"1", "true", "yes", "on"}
+
+
+class _PipelineQueueOffloadedTensor:
+    """Host-resident pipeline queue tensor that preserves the original Tensor object.
+
+    Pipeline schedule queues keep stage input tensors alive from forward until
+    backward so the stage can retain/send input gradients.  For StreamBP runs,
+    those inputs are just replay boundaries; keeping their full CUDA storage
+    resident across the whole VPP warmup can dominate memory.  This wrapper
+    copies the tensor payload to host RAM and releases CUDA storage after
+    forward, then restores the same Tensor object before backward consumes it.
+    """
+
+    __slots__ = ("tensor", "cpu_tensor", "device", "released")
+
+    def __init__(self, tensor: torch.Tensor):
+        self.tensor = tensor
+        self.cpu_tensor = None
+        self.device = tensor.device
+        self.released = False
+
+    def offload(self) -> "_PipelineQueueOffloadedTensor":
+        if self.released or self.tensor is None or not self.tensor.is_cuda:
+            return self
+        min_mb = int(os.environ.get("MEGATRON_PIPELINE_QUEUE_OFFLOAD_MIN_MB", "1"))
+        tensor_bytes = self.tensor.numel() * self.tensor.element_size()
+        if tensor_bytes < min_mb * 1024 * 1024:
+            return self
+
+        pin_memory = _pipeline_queue_offload_pin_memory(self.tensor)
+        cpu_tensor = torch.empty(
+            tuple(self.tensor.shape),
+            dtype=self.tensor.dtype,
+            device="cpu",
+            pin_memory=pin_memory,
+        )
+        # Keep this copy synchronous before releasing storage. These tensors are
+        # exactly the long-lived memory pressure; correctness matters more than
+        # overlapping a D2H transfer with storage mutation.
+        cpu_tensor.copy_(self.tensor.detach(), non_blocking=False)
+        self.cpu_tensor = cpu_tensor
+        self.device = self.tensor.device
+        self.tensor.untyped_storage().resize_(0)
+        self.released = True
+        return self
+
+    def materialize(self) -> torch.Tensor:
+        if not self.released:
+            return self.tensor
+        restored = torch.empty(
+            tuple(self.cpu_tensor.shape),
+            dtype=self.cpu_tensor.dtype,
+            device=self.device,
+        )
+        restored.copy_(self.cpu_tensor, non_blocking=self.cpu_tensor.is_pinned())
+        self.tensor.data = restored
+        self.cpu_tensor = None
+        self.released = False
+        return self.tensor
+
+
+def _pipeline_queue_offload_enabled() -> bool:
+    return _env_flag("MEGATRON_PIPELINE_QUEUE_OFFLOAD", "0")
+
+
+def _pipeline_queue_offload_pin_memory(tensor: torch.Tensor) -> bool:
+    mode = os.environ.get("MEGATRON_PIPELINE_QUEUE_OFFLOAD_PIN_MEMORY", "auto").lower()
+    if mode in {"0", "false", "off", "no", "never"}:
+        return False
+    if mode in {"1", "true", "on", "yes", "always"}:
+        return True
+    if mode != "auto":
+        raise ValueError(
+            "MEGATRON_PIPELINE_QUEUE_OFFLOAD_PIN_MEMORY must be one of auto/always/never"
+        )
+    try:
+        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+            fine_grained_offloading_use_pinned_cpu_backup,
+        )
+
+        return fine_grained_offloading_use_pinned_cpu_backup(tensor.shape, tensor.dtype)
+    except Exception:
+        return False
+
+
+def _pipeline_queue_offload_value(value):
+    if not _pipeline_queue_offload_enabled():
+        return value
+    if value is None:
+        return None
+    if isinstance(value, _PipelineQueueOffloadedTensor):
+        return value.offload()
+    if isinstance(value, list):
+        return [_pipeline_queue_offload_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_pipeline_queue_offload_value(item) for item in value)
+    if torch.is_tensor(value):
+        return _PipelineQueueOffloadedTensor(value).offload()
+    return value
+
+
+def _pipeline_queue_materialize_value(value):
+    if isinstance(value, _PipelineQueueOffloadedTensor):
+        return value.materialize()
+    if isinstance(value, list):
+        return [_pipeline_queue_materialize_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_pipeline_queue_materialize_value(item) for item in value)
+    return value
+
+
+def _pipeline_progress_enabled() -> bool:
+    config = _pipeline_progress_config()
+    return config["enabled"]
+
+
+def _pipeline_progress_config():
+    global _PIPELINE_PROGRESS_CONFIG
+    if _PIPELINE_PROGRESS_CONFIG is not None:
+        return _PIPELINE_PROGRESS_CONFIG
+
+    enabled = _env_flag("MEGATRON_PIPELINE_PROGRESS_LOG", "0")
+    tp_rank = 0
+    if enabled:
+        try:
+            tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        except Exception:
+            tp_rank = 0
+    allowed_tp_ranks = os.environ.get("MEGATRON_PIPELINE_PROGRESS_TP_RANKS", "0")
+    if enabled and allowed_tp_ranks.lower() != "all":
+        enabled = str(tp_rank) in {rank.strip() for rank in allowed_tp_ranks.split(",")}
+    try:
+        interval = max(1, int(os.environ.get("MEGATRON_PIPELINE_PROGRESS_INTERVAL", "16")))
+    except ValueError:
+        interval = 16
+
+    _PIPELINE_PROGRESS_CONFIG = {"enabled": enabled, "interval": interval}
+    return _PIPELINE_PROGRESS_CONFIG
+
+
+def _pipeline_progress_interval() -> int:
+    return _pipeline_progress_config()["interval"]
+
+
+def _pipeline_progress_should_log(microbatch_id: int) -> bool:
+    config = _pipeline_progress_config()
+    if not config["enabled"]:
+        return False
+    return microbatch_id == 0 or (microbatch_id % config["interval"]) == 0
+
+
+def _pipeline_progress_log(event: str, state: str, **kwargs):
+    if not _pipeline_progress_config()["enabled"]:
+        return
+
+    global _PIPELINE_PROGRESS_START_TIME
+    now = time.monotonic()
+    if _PIPELINE_PROGRESS_START_TIME is None:
+        _PIPELINE_PROGRESS_START_TIME = now
+
+    try:
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+    except Exception:
+        rank = -1
+    try:
+        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+        pp_size = parallel_state.get_pipeline_model_parallel_world_size()
+    except Exception:
+        pp_rank = -1
+        pp_size = -1
+    try:
+        tp_rank = parallel_state.get_tensor_model_parallel_rank()
+    except Exception:
+        tp_rank = -1
+
+    if torch.cuda.is_available():
+        device = torch.cuda.current_device()
+        alloc_gb = torch.cuda.memory_allocated(device) / (1024**3)
+        reserved_gb = torch.cuda.memory_reserved(device) / (1024**3)
+    else:
+        alloc_gb = 0.0
+        reserved_gb = 0.0
+
+    detail = " ".join(f"{key}={value}" for key, value in kwargs.items())
+    print(
+        "[pipeline-progress] "
+        f"t={now - _PIPELINE_PROGRESS_START_TIME:.1f}s "
+        f"rank={rank} local_rank={os.environ.get('LOCAL_RANK', '?')} "
+        f"pp={pp_rank}/{pp_size} tp={tp_rank} event={event} state={state} "
+        f"mem={alloc_gb:.1f}G reserved={reserved_gb:.1f}G {detail}",
+        flush=True,
+    )
+
+
+def _pipeline_progress_queue_state(input_tensors, output_tensors, output_tensor_grads=None) -> str:
+    """Return queue depths for pipeline tensors, grouped by model chunk."""
+
+    def lens(values):
+        if values is None:
+            return "none"
+        if not values:
+            return "0"
+        if isinstance(values[0], list):
+            return "[" + ",".join(str(len(value)) for value in values) + "]"
+        return str(len(values))
+
+    parts = [
+        f"in={lens(input_tensors)}",
+        f"out={lens(output_tensors)}",
+    ]
+    if output_tensor_grads is not None:
+        parts.append(f"out_grad={lens(output_tensor_grads)}")
+    return " ".join(parts)
+
+
+def _pipeline_progress_offload_state() -> str:
+    """Return fine-grained offload state when explicitly requested."""
+
+    if not _env_flag("MEGATRON_PIPELINE_PROGRESS_OFFLOAD", "0"):
+        return ""
+    try:
+        return off_interface.debug_snapshot()
+    except Exception as exc:  # pragma: no cover - diagnostic only
+        return f"offload_state_error={type(exc).__name__}:{exc}"
 
 
 def get_forward_backward_func(
@@ -1413,6 +1646,21 @@ def forward_backward_pipelining_with_interleaving(
         """Helper method to run forward step with model split into chunks"""
         model_chunk_id = get_model_chunk_id(virtual_microbatch_id, forward=True)
         microbatch_id = get_microbatch_id_in_model_chunk(virtual_microbatch_id, forward=True)
+        log_progress = _pipeline_progress_should_log(virtual_microbatch_id)
+        progress_start = None
+        if log_progress:
+            progress_start = time.monotonic()
+            _pipeline_progress_log(
+                "fwd",
+                "start",
+                vmb=virtual_microbatch_id,
+                mb=microbatch_id,
+                vp=model_chunk_id,
+                queues=_pipeline_progress_queue_state(
+                    input_tensors, output_tensors, output_tensor_grads
+                ),
+                offload=_pipeline_progress_offload_state(),
+            )
 
         input_tensor = forward_step_helper_preprocess(
             virtual_microbatch_id, model_chunk_id, microbatch_id
@@ -1440,6 +1688,20 @@ def forward_backward_pipelining_with_interleaving(
         )
 
         forward_step_helper_postprocess(model_chunk_id, output_tensor, num_tokens)
+
+        if log_progress:
+            _pipeline_progress_log(
+                "fwd",
+                "end",
+                vmb=virtual_microbatch_id,
+                mb=microbatch_id,
+                vp=model_chunk_id,
+                dt=f"{time.monotonic() - progress_start:.2f}s",
+                queues=_pipeline_progress_queue_state(
+                    input_tensors, output_tensors, output_tensor_grads
+                ),
+                offload=_pipeline_progress_offload_state(),
+            )
 
         return output_tensor
 
@@ -1486,6 +1748,20 @@ def forward_backward_pipelining_with_interleaving(
         """Helper method to run backward step with model split into chunks"""
         nonlocal output_tensor_grads
         model_chunk_id = get_model_chunk_id(virtual_microbatch_id, forward=False)
+        log_progress = _pipeline_progress_should_log(virtual_microbatch_id)
+        progress_start = None
+        if log_progress:
+            progress_start = time.monotonic()
+            _pipeline_progress_log(
+                "bwd",
+                "start",
+                vmb=virtual_microbatch_id,
+                vp=model_chunk_id,
+                queues=_pipeline_progress_queue_state(
+                    input_tensors, output_tensors, output_tensor_grads
+                ),
+                offload=_pipeline_progress_offload_state(),
+            )
 
         input_tensor, output_tensor, output_tensor_grad = backward_step_helper_preprocess(
             virtual_microbatch_id, model_chunk_id
@@ -1496,6 +1772,19 @@ def forward_backward_pipelining_with_interleaving(
         )
 
         backward_step_helper_postprocess(virtual_microbatch_id)
+
+        if log_progress:
+            _pipeline_progress_log(
+                "bwd",
+                "end",
+                vmb=virtual_microbatch_id,
+                vp=model_chunk_id,
+                dt=f"{time.monotonic() - progress_start:.2f}s",
+                queues=_pipeline_progress_queue_state(
+                    input_tensors, output_tensors, output_tensor_grads
+                ),
+                offload=_pipeline_progress_offload_state(),
+            )
 
         return input_tensor_grad
 
@@ -1567,6 +1856,16 @@ def forward_backward_pipelining_with_interleaving(
         is_vp_last_stage, vp_size=config.virtual_pipeline_model_parallel_size
     )
     pp_group = p2p_communicator.pp_group
+    _pipeline_progress_log(
+        "schedule",
+        "start",
+        kind="interleaved",
+        microbatches=num_microbatches,
+        total_vmb=total_num_microbatches,
+        warmup=num_warmup_microbatches,
+        remaining=num_microbatches_remaining,
+        vp_chunks=num_model_chunks,
+    )
 
     # Run warmup forward passes.
     nvtx_range_push(suffix="warmup")
@@ -2686,6 +2985,14 @@ def forward_backward_pipelining_without_interleaving(
     model_type = get_model_type(model)
 
     rank = p2p_communicator.pp_group.rank()
+    _pipeline_progress_log(
+        "schedule",
+        "start",
+        kind="non_interleaved",
+        microbatches=num_microbatches,
+        warmup=num_warmup_microbatches,
+        remaining=num_microbatches_remaining,
+    )
     recv_tensor_shapes = get_tensor_shapes(
         seq_length=seq_length,
         micro_batch_size=micro_batch_size,
@@ -2723,6 +3030,19 @@ def forward_backward_pipelining_without_interleaving(
 
     # Run warmup forward passes.
     for i in range(num_warmup_microbatches):
+        log_progress = _pipeline_progress_should_log(i)
+        progress_start = None
+        if log_progress:
+            progress_start = time.monotonic()
+            _pipeline_progress_log(
+                "fwd",
+                "start",
+                phase="warmup",
+                mb=i,
+                queues=_pipeline_progress_queue_state(input_tensors, output_tensors),
+                offload=_pipeline_progress_offload_state(),
+            )
+
         # Decide to checkpoint all layers' activations of the current micro-batch
         if max_outstanding_backprops is not None:
             checkpoint_activations_microbatch = (
@@ -2753,6 +3073,17 @@ def forward_backward_pipelining_without_interleaving(
         p2p_communicator.send_forward(output_tensor, is_pp_last_stage(p2p_communicator.pp_group))
         total_num_tokens += num_tokens
 
+        if log_progress:
+            _pipeline_progress_log(
+                "fwd",
+                "end",
+                phase="warmup",
+                mb=i,
+                dt=f"{time.monotonic() - progress_start:.2f}s",
+                queues=_pipeline_progress_queue_state(input_tensors, output_tensors),
+                offload=_pipeline_progress_offload_state(),
+            )
+
         if not forward_only:
             input_tensors.append(input_tensor)
             output_tensors.append(output_tensor)
@@ -2769,15 +3100,28 @@ def forward_backward_pipelining_without_interleaving(
     # Run 1F1B in steady state.
     for i in range(num_microbatches_remaining):
         last_iteration = i == (num_microbatches_remaining - 1)
+        forward_microbatch_id = i + num_warmup_microbatches
 
         # Decide to checkpoint all layers' activations of the current micro-batch
         if max_outstanding_backprops is not None:
             checkpoint_activations_microbatch = (
-                (i + num_warmup_microbatches) % max_outstanding_backprops
+                forward_microbatch_id % max_outstanding_backprops
             ) >= config.num_microbatches_with_partial_activation_checkpoints
         else:
             checkpoint_activations_microbatch = None
 
+        log_forward_progress = _pipeline_progress_should_log(forward_microbatch_id)
+        forward_progress_start = None
+        if log_forward_progress:
+            forward_progress_start = time.monotonic()
+            _pipeline_progress_log(
+                "fwd",
+                "start",
+                phase="steady",
+                mb=forward_microbatch_id,
+                queues=_pipeline_progress_queue_state(input_tensors, output_tensors),
+                offload=_pipeline_progress_offload_state(),
+            )
         output_tensor, num_tokens = forward_step(
             forward_step_func,
             data_iterator,
@@ -2792,10 +3136,20 @@ def forward_backward_pipelining_without_interleaving(
             is_first_microbatch=check_first_val_step(
                 first_val_step, forward_only, (i == 0) and (num_warmup_microbatches == 0)
             ),
-            current_microbatch=i + num_warmup_microbatches,
+            current_microbatch=forward_microbatch_id,
             is_last_stage=is_pp_last_stage(p2p_communicator.pp_group),
         )
         total_num_tokens += num_tokens
+        if log_forward_progress:
+            _pipeline_progress_log(
+                "fwd",
+                "end",
+                phase="steady",
+                mb=forward_microbatch_id,
+                dt=f"{time.monotonic() - forward_progress_start:.2f}s",
+                queues=_pipeline_progress_queue_state(input_tensors, output_tensors),
+                offload=_pipeline_progress_offload_state(),
+            )
 
         if forward_only:
             p2p_communicator.send_forward(
@@ -2826,9 +3180,31 @@ def forward_backward_pipelining_without_interleaving(
                 if config.grad_sync_func is None or rank == 0:
                     enable_grad_sync()
 
+            log_backward_progress = _pipeline_progress_should_log(i)
+            backward_progress_start = None
+            if log_backward_progress:
+                backward_progress_start = time.monotonic()
+                _pipeline_progress_log(
+                    "bwd",
+                    "start",
+                    phase="steady",
+                    mb=i,
+                    queues=_pipeline_progress_queue_state(input_tensors, output_tensors),
+                    offload=_pipeline_progress_offload_state(),
+                )
             input_tensor_grad = backward_step(
                 input_tensor, output_tensor, output_tensor_grad, model_type, config
             )
+            if log_backward_progress:
+                _pipeline_progress_log(
+                    "bwd",
+                    "end",
+                    phase="steady",
+                    mb=i,
+                    dt=f"{time.monotonic() - backward_progress_start:.2f}s",
+                    queues=_pipeline_progress_queue_state(input_tensors, output_tensors),
+                    offload=_pipeline_progress_offload_state(),
+                )
 
             if last_iteration:
                 input_tensor = None
@@ -2862,9 +3238,31 @@ def forward_backward_pipelining_without_interleaving(
                 send_tensor_shapes, is_pp_last_stage(p2p_communicator.pp_group)
             )
 
+            log_progress = _pipeline_progress_should_log(i)
+            progress_start = None
+            if log_progress:
+                progress_start = time.monotonic()
+                _pipeline_progress_log(
+                    "bwd",
+                    "start",
+                    phase="cooldown",
+                    mb=i,
+                    queues=_pipeline_progress_queue_state(input_tensors, output_tensors),
+                    offload=_pipeline_progress_offload_state(),
+                )
             input_tensor_grad = backward_step(
                 input_tensor, output_tensor, output_tensor_grad, model_type, config
             )
+            if log_progress:
+                _pipeline_progress_log(
+                    "bwd",
+                    "end",
+                    phase="cooldown",
+                    mb=i,
+                    dt=f"{time.monotonic() - progress_start:.2f}s",
+                    queues=_pipeline_progress_queue_state(input_tensors, output_tensors),
+                    offload=_pipeline_progress_offload_state(),
+                )
 
             p2p_communicator.send_backward(
                 input_tensor_grad, is_pp_first_stage(p2p_communicator.pp_group)

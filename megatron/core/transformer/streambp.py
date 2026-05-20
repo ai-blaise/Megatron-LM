@@ -39,6 +39,108 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return value.lower() in ("1", "true", "yes", "on")
 
 
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+@dataclass
+class _StreamBPHostSavedTensor:
+    """Host-resident tensor saved by StreamBP for backward replay."""
+
+    device: torch.device
+    cpu_tensor: Tensor
+    copy_event: Optional[torch.cuda.Event]
+
+    @staticmethod
+    def from_tensor(tensor: Tensor) -> "_StreamBPHostSavedTensor":
+        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+            fine_grained_offloading_copy_to_cpu,
+        )
+
+        if not tensor.is_cuda:
+            return _StreamBPHostSavedTensor(tensor.device, tensor.detach().clone(), None)
+
+        pin_memory = _streambp_host_save_pin_memory(tensor)
+        cpu_tensor = torch.empty(
+            tensor.shape,
+            dtype=tensor.dtype,
+            device="cpu",
+            pin_memory=pin_memory,
+        )
+        fine_grained_offloading_copy_to_cpu(
+            cpu_tensor,
+            tensor.detach(),
+            non_blocking=pin_memory,
+        )
+        event = torch.cuda.Event() if pin_memory else None
+        if event is not None:
+            torch.cuda.current_stream(tensor.device).record_event(event)
+        return _StreamBPHostSavedTensor(tensor.device, cpu_tensor, event)
+
+    def load(self) -> Tensor:
+        if self.copy_event is not None:
+            torch.cuda.current_stream(self.device).wait_event(self.copy_event)
+        if self.device.type != "cuda":
+            return self.cpu_tensor
+        tensor = torch.empty(
+            self.cpu_tensor.shape,
+            dtype=self.cpu_tensor.dtype,
+            device=self.device,
+        )
+        tensor.copy_(self.cpu_tensor, non_blocking=self.cpu_tensor.is_pinned())
+        return tensor
+
+
+def _streambp_host_save_hidden_enabled() -> bool:
+    return _env_flag("MEGATRON_STREAMBP_HOST_SAVE_HIDDEN", default=True)
+
+
+def _streambp_host_save_pin_memory(tensor: Tensor) -> bool:
+    mode = os.getenv("MEGATRON_STREAMBP_HOST_SAVE_PIN_MEMORY", "auto").lower()
+    if mode in ("0", "false", "off", "no", "never"):
+        return False
+    if mode in ("1", "true", "on", "yes", "always"):
+        return True
+    if mode != "auto":
+        raise ValueError(
+            "MEGATRON_STREAMBP_HOST_SAVE_PIN_MEMORY must be one of auto/always/never"
+        )
+    from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+        fine_grained_offloading_use_pinned_cpu_backup,
+    )
+
+    return fine_grained_offloading_use_pinned_cpu_backup(tensor.shape, tensor.dtype)
+
+
+def _streambp_save_hidden_for_backward(ctx, hidden_states: Tensor) -> None:
+    if _streambp_host_save_hidden_enabled():
+        ctx._streambp_host_saved_hidden = _StreamBPHostSavedTensor.from_tensor(hidden_states)
+        ctx._streambp_saved_hidden_shape0 = int(hidden_states.size(0))
+        ctx._streambp_used_host_save_hidden = True
+        return
+
+    ctx._streambp_host_saved_hidden = None
+    ctx._streambp_used_host_save_hidden = False
+    ctx.save_for_backward(hidden_states)
+
+
+def _streambp_load_hidden_for_backward(ctx) -> Tensor:
+    host_saved = getattr(ctx, "_streambp_host_saved_hidden", None)
+    if host_saved is not None:
+        hidden_states = host_saved.load()
+        ctx._streambp_host_saved_hidden = None
+        return hidden_states
+
+    (hidden_states,) = ctx.saved_tensors
+    return hidden_states
+
+
 def _maybe_trim_cuda_cache_before_moe_replay(
     *, force: bool = False, synchronize: bool = False
 ) -> None:
@@ -60,6 +162,65 @@ def _maybe_trim_cuda_cache_before_moe_replay(
         if synchronize and _env_flag("MEGATRON_STREAMBP_MOE_REPLAY_TRIM_SYNC", default=True):
             torch.cuda.synchronize()
         torch.cuda.empty_cache()
+
+
+def _streambp_autograd_backward(outputs, grad_outputs) -> None:
+    """Run replay backward with StreamBP-owned TE reentrant retention."""
+
+    from megatron.core.tensor_parallel.random import te_reentrant_checkpoint_retention_scope
+
+    with te_reentrant_checkpoint_retention_scope():
+        torch.autograd.backward(outputs, grad_outputs)
+
+
+def _moe_attention_backward_chunks(
+    seq_len: int, chunks: Sequence[ChunkRange]
+) -> Sequence[ChunkRange]:
+    """Return backward-only attention replay chunks for hybrid MoE StreamBP."""
+
+    raw = os.getenv("MEGATRON_STREAMBP_MOE_ATTENTION_BACKWARD_CHUNK_SIZE")
+    if raw is None or raw == "":
+        return chunks
+    try:
+        chunk_size = int(raw)
+    except ValueError:
+        chunk_size = 0
+    if chunk_size <= 0:
+        return chunks
+    return iter_streambp_chunks(seq_len, chunk_size)
+
+
+def _streambp_autograd_backward_attention_outputs(
+    attention_outputs: list[tuple[int, int, Tensor]],
+    grad_start: int,
+    grad_output: Tensor,
+) -> None:
+    """Backprop through original attention replay outputs one graph at a time.
+
+    Hybrid MoE replay detaches the MLP input from the attention graph. Once the
+    MLP backward has produced d(post_attention), consuming the copied
+    post-attention buffer would keep every attention chunk's DSA/TE reentrant
+    state under one autograd engine invocation. Backward through the original
+    attention outputs preserves the same chain rule while releasing each chunk's
+    retained TE checkpoint state before the next chunk starts.
+    """
+
+    for output_index, (attention_start, attention_end, attention_output) in enumerate(
+        attention_outputs
+    ):
+        rel_start = attention_start - grad_start
+        rel_end = attention_end - grad_start
+        if rel_start < 0 or rel_end > grad_output.size(0):
+            raise RuntimeError(
+                "StreamBP attention gradient range mismatch: "
+                f"attention=[{attention_start}, {attention_end}), "
+                f"grad_start={grad_start}, grad_len={grad_output.size(0)}"
+            )
+        _maybe_trim_cuda_cache_before_moe_replay(force=True, synchronize=True)
+        _streambp_autograd_backward(attention_output, grad_output[rel_start:rel_end])
+        attention_outputs[output_index] = (attention_start, attention_end, None)  # type: ignore[list-item]
+        del attention_output
+    attention_outputs.clear()
 
 
 def _split_moe_mlp_attention_backward_enabled() -> bool:
@@ -106,6 +267,111 @@ def _suppress_fine_grained_offload_replay_context():
         fine_grained_offloading_suppress_offload(),
         _suppress_fine_grained_offload_forced_release_context(),
     ):
+        yield
+
+
+@dataclass
+class _ReplayOffloadedTensor:
+    device: torch.device
+    cpu_tensor: Tensor
+    event: Optional[torch.cuda.Event]
+    non_blocking: bool
+    stride: tuple[int, ...]
+
+
+@contextmanager
+def _streambp_replay_saved_tensor_offload_context(label: str = "replay"):
+    """Offload tensors saved by a single StreamBP replay graph.
+
+    The regular fine-grained pipeline offload manager is intentionally
+    suppressed inside StreamBP replay because the inner autograd graph does not
+    follow the outer pipeline queue ordering. This context provides a local
+    saved-tensor hook for one replay chunk: tensors saved during replay forward
+    are copied to CPU and reloaded when that same replay graph runs backward.
+    """
+
+    if not _env_flag("MEGATRON_STREAMBP_REPLAY_SAVED_TENSOR_OFFLOAD", default=False):
+        yield
+        return
+    if not torch.cuda.is_available():
+        yield
+        return
+
+    min_mb = _env_int("MEGATRON_STREAMBP_REPLAY_OFFLOAD_MIN_MB", 16)
+    free_threshold_mb = _env_int("MEGATRON_STREAMBP_REPLAY_OFFLOAD_FREE_MB", 0)
+    max_tensors = _env_int("MEGATRON_STREAMBP_REPLAY_OFFLOAD_MAX_TENSORS", 0)
+    min_bytes = max(0, min_mb) * 1024 * 1024
+    free_threshold_bytes = max(0, free_threshold_mb) * 1024 * 1024
+    packed_count = 0
+
+    try:
+        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+            fine_grained_offloading_copy_to_cpu,
+            fine_grained_offloading_use_pinned_cpu_backup,
+        )
+    except Exception:
+        yield
+        return
+
+    def pack(tensor: Tensor):
+        nonlocal packed_count
+        if not isinstance(tensor, torch.Tensor) or not tensor.is_cuda:
+            return tensor
+        # TE/NVFP4/FP8 tensor subclasses carry scaling metadata that is not
+        # preserved by a plain CPU tensor round-trip. Only offload ordinary
+        # CUDA tensors here; replay still keeps quantized wrappers intact.
+        if type(tensor) is not torch.Tensor:
+            return tensor
+        if tensor.numel() == 0 or tensor.numel() * tensor.element_size() < min_bytes:
+            return tensor
+        if max_tensors > 0 and packed_count >= max_tensors:
+            return tensor
+        if free_threshold_bytes > 0:
+            try:
+                free_bytes, _ = torch.cuda.mem_get_info(tensor.device)
+            except RuntimeError:
+                free_bytes = 0
+            if free_bytes > free_threshold_bytes:
+                return tensor
+
+        pin_memory = fine_grained_offloading_use_pinned_cpu_backup(tensor.shape, tensor.dtype)
+        cpu_tensor = torch.empty_strided(
+            tuple(tensor.shape),
+            tuple(tensor.stride()),
+            dtype=tensor.dtype,
+            device="cpu",
+            pin_memory=pin_memory,
+        )
+        non_blocking = bool(pin_memory)
+        fine_grained_offloading_copy_to_cpu(cpu_tensor, tensor, non_blocking=non_blocking)
+        event = None
+        if non_blocking:
+            event = torch.cuda.Event()
+            torch.cuda.current_stream(tensor.device).record_event(event)
+        packed_count += 1
+        return _ReplayOffloadedTensor(
+            device=tensor.device,
+            cpu_tensor=cpu_tensor,
+            event=event,
+            non_blocking=non_blocking,
+            stride=tuple(tensor.stride()),
+        )
+
+    def unpack(state):
+        if not isinstance(state, _ReplayOffloadedTensor):
+            return state
+        if state.event is not None:
+            state.event.synchronize()
+        tensor = torch.empty_strided(
+            tuple(state.cpu_tensor.shape),
+            state.stride,
+            dtype=state.cpu_tensor.dtype,
+            device=state.device,
+        )
+        tensor.copy_(state.cpu_tensor, non_blocking=state.non_blocking)
+        return tensor
+
+    with torch.autograd.graph.saved_tensors_hooks(pack, unpack):
         yield
 
 
@@ -547,6 +813,8 @@ def _copy_sequence_tensor_ranges(
     chunks: list[tuple[int, int, Tensor]],
     start: int,
     end: int,
+    *,
+    clear_chunks: bool = True,
 ) -> Tensor:
     """Concatenate sequence chunks without keeping every chunk plus a cat output live."""
     if not chunks:
@@ -558,7 +826,8 @@ def _copy_sequence_tensor_ranges(
                 "StreamBP single tensor chunk does not cover requested range "
                 f"[{start}, {end}); got [{chunk_start}, {chunk_end})"
             )
-        chunks.clear()
+        if clear_chunks:
+            chunks.clear()
         return tensor
 
     first_start, first_end, first = chunks[0]
@@ -585,7 +854,8 @@ def _copy_sequence_tensor_ranges(
         cursor = chunk_end
     if cursor != end:
         raise RuntimeError(f"StreamBP tensor chunks ended at {cursor}, expected {end}")
-    chunks.clear()
+    if clear_chunks:
+        chunks.clear()
     return result
 
 
@@ -937,6 +1207,82 @@ def _unique_trainable_parameters(
     return params
 
 
+def _unique_trainable_parameters_from_modules(
+    modules: Iterable[Optional[torch.nn.Module]],
+) -> list[torch.nn.Parameter]:
+    seen: set[int] = set()
+    params: list[torch.nn.Parameter] = []
+    for module in modules:
+        if module is None or not isinstance(module, torch.nn.Module):
+            continue
+        for param in module.parameters(recurse=True):
+            if param.requires_grad and id(param) not in seen:
+                seen.add(id(param))
+                params.append(param)
+    return params
+
+
+def _streambp_moe_hybrid_pending_marks(
+    layer: torch.nn.Module,
+    *,
+    seq_len: int,
+    chunks: Sequence[ChunkRange],
+    moe_mlp_chunks: int,
+    moe_mlp_backward_chunks: Optional[int],
+) -> list[torch.nn.Parameter]:
+    """Mark DDP readiness for split MoE replay without over-delaying params.
+
+    Regular StreamBP replays the whole layer once per sequence chunk, so every
+    parameter sees the same number of backward hooks.  The DeepSeek MoE hybrid
+    path is different: attention parameters are replayed per attention chunk,
+    while MoE/MLP parameters are replayed per MLP chunk.  Marking all layer
+    parameters with one count either starts communication too early for one
+    side or waits for hooks that will never arrive.  Keep the counts matched to
+    the replay subgraph that owns each parameter.
+    """
+
+    if not _split_moe_mlp_attention_backward_enabled():
+        mlp_backward_chunks = moe_mlp_backward_chunks or moe_mlp_chunks
+        return mark_streambp_pending_chunks(
+            _unique_trainable_parameters(layer),
+            len(iter_streambp_num_chunks(seq_len, mlp_backward_chunks)),
+        )
+
+    attention_params = _unique_trainable_parameters_from_modules(
+        (
+            getattr(layer, "input_layernorm", None),
+            getattr(layer, "input_gated_norm_down", None),
+            getattr(layer, "input_gated_norm_up", None),
+            getattr(layer, "self_attention", None),
+            getattr(layer, "pre_cross_attn_layernorm", None),
+            getattr(layer, "cross_attention", None),
+        )
+    )
+    mlp_params = _unique_trainable_parameters_from_modules(
+        (
+            getattr(layer, "pre_mlp_layernorm", None),
+            getattr(layer, "pre_mlp_gated_norm_down", None),
+            getattr(layer, "pre_mlp_gated_norm_up", None),
+            getattr(layer, "mlp", None),
+        )
+    )
+
+    attention_count = len(_moe_attention_backward_chunks(seq_len, chunks))
+    mlp_backward_chunks = moe_mlp_backward_chunks or moe_mlp_chunks
+    mlp_count = len(iter_streambp_num_chunks(seq_len, mlp_backward_chunks))
+
+    marked: list[torch.nn.Parameter] = []
+    marked.extend(mark_streambp_pending_chunks(attention_params, attention_count))
+    marked_ids = {id(param) for param in marked}
+    marked.extend(
+        mark_streambp_pending_chunks(
+            (param for param in mlp_params if id(param) not in marked_ids),
+            mlp_count,
+        )
+    )
+    return marked
+
+
 def moe_streambp_requires_full_replay(layer: torch.nn.Module) -> bool:
     """Return True for MoE modes that are not safe for chunked replay yet."""
     if not bool(getattr(layer, "is_moe_layer", False)):
@@ -1263,6 +1609,7 @@ def _moe_chunk_attention_full_mlp_backward(
 
     seq_len = hidden_states.size(0)
     chunk_size = chunks[0][1] - chunks[0][0] if chunks else seq_len
+    attention_backward_chunks = _moe_attention_backward_chunks(seq_len, chunks)
     layer_number = getattr(layer, "layer_number", "?")
     mlp_backward_chunks = moe_mlp_backward_chunks or moe_mlp_chunks
 
@@ -1273,200 +1620,227 @@ def _moe_chunk_attention_full_mlp_backward(
 
     with _maybe_context(context_factory):
         if mlp_backward_chunks == 1:
-            attention_outputs: list[tuple[int, int, Tensor]] = []
-            for chunk_range in chunks:
-                start, end = chunk_range
-                chunk_index = start // chunk_size
-                with _profile_streambp_chunk(
-                    f"streambp/backward_replay_moe_attention_chunk/{chunk_index}"
-                ):
+            with _streambp_replay_saved_tensor_offload_context(
+                f"moe_full_layer{layer_number}"
+            ):
+                attention_outputs: list[tuple[int, int, Tensor]] = []
+                for chunk_range in chunks:
+                    start, end = chunk_range
+                    chunk_index = start // chunk_size
+                    with _profile_streambp_chunk(
+                        f"streambp/backward_replay_moe_attention_chunk/{chunk_index}"
+                    ):
+                        _maybe_trim_cuda_cache_before_moe_replay()
+                        with _te_activation_recompute_context(recompute_phase=True):
+                            _debug_sync(
+                                f"layer{layer_number}:bwd_moe_attention_chunk{chunk_index}:before"
+                            )
+                            attention_output, context = layer._forward_attention(
+                                hidden_states=hidden_states,
+                                chunk_range=chunk_range,
+                                **call_kwargs,
+                            )
+                            _debug_sync(
+                                f"layer{layer_number}:bwd_moe_attention_chunk{chunk_index}:after"
+                            )
+                        if context is not None:
+                            raise ValueError(
+                                "StreamBP currently supports decoder-only MoE layers with context=None"
+                            )
+                        attention_outputs.append((start, end, attention_output))
+                post_attention = _copy_sequence_tensor_ranges(attention_outputs, 0, seq_len)
+                del attention_outputs
+                tensor_audit(
+                    "streambp/moe_backward/post_attention_full",
+                    post_attention=post_attention,
+                    layer=layer_number,
+                )
+                with _profile_streambp_chunk("streambp/backward_replay_moe_mlp_full"):
                     _maybe_trim_cuda_cache_before_moe_replay()
-                    with _te_activation_recompute_context(recompute_phase=True):
-                        _debug_sync(
-                            f"layer{layer_number}:bwd_moe_attention_chunk{chunk_index}:before"
+                    with (
+                        replay_streambp_moe_aux_stats(moe_aux_stats),
+                        _te_activation_recompute_context(recompute_phase=True),
+                    ):
+                        _debug_sync(f"layer{layer_number}:bwd_moe_mlp_full:before")
+                        output = layer._forward_mlp(
+                            post_attention,
+                            call_kwargs.get("inference_context", None),
+                            padding_mask=call_kwargs.get("padding_mask", None),
                         )
-                        attention_output, context = layer._forward_attention(
-                            hidden_states=hidden_states,
-                            chunk_range=chunk_range,
-                            **call_kwargs,
+                        tensor_audit(
+                            "streambp/moe_backward/mlp_output_full",
+                            output=output,
+                            grad_output=grad_output,
+                            layer=layer_number,
                         )
-                        _debug_sync(
-                            f"layer{layer_number}:bwd_moe_attention_chunk{chunk_index}:after"
-                        )
-                    if context is not None:
-                        raise ValueError(
-                            "StreamBP currently supports decoder-only MoE layers with context=None"
-                        )
-                    attention_outputs.append((start, end, attention_output))
-            post_attention = _copy_sequence_tensor_ranges(attention_outputs, 0, seq_len)
-            del attention_outputs
-            tensor_audit(
-                "streambp/moe_backward/post_attention_full",
-                post_attention=post_attention,
-                layer=layer_number,
-            )
-            with _profile_streambp_chunk("streambp/backward_replay_moe_mlp_full"):
-                _maybe_trim_cuda_cache_before_moe_replay()
-                with (
-                    replay_streambp_moe_aux_stats(moe_aux_stats),
-                    _te_activation_recompute_context(recompute_phase=True),
-                ):
-                    _debug_sync(f"layer{layer_number}:bwd_moe_mlp_full:before")
-                    output = layer._forward_mlp(
-                        post_attention,
-                        call_kwargs.get("inference_context", None),
-                        padding_mask=call_kwargs.get("padding_mask", None),
-                    )
-                    tensor_audit(
-                        "streambp/moe_backward/mlp_output_full",
-                        output=output,
-                        grad_output=grad_output,
-                        layer=layer_number,
-                    )
-                    _debug_sync(f"layer{layer_number}:bwd_moe_mlp_full:after")
-            _debug_sync(f"layer{layer_number}:bwd_moe_full_autograd:before")
-            torch.autograd.backward(output, grad_output)
-            _debug_sync(f"layer{layer_number}:bwd_moe_full_autograd:after")
+                        _debug_sync(f"layer{layer_number}:bwd_moe_mlp_full:after")
+                _debug_sync(f"layer{layer_number}:bwd_moe_full_autograd:before")
+                _streambp_autograd_backward(output, grad_output)
+                _debug_sync(f"layer{layer_number}:bwd_moe_full_autograd:after")
         else:
             padding_mask = call_kwargs.get("padding_mask", None)
             for mlp_chunk_index, (mlp_start, mlp_end) in enumerate(
                 iter_streambp_num_chunks(seq_len, mlp_backward_chunks)
             ):
-                attention_outputs: list[tuple[int, int, Tensor]] = []
-                for attention_start, attention_end in _intersect_streambp_chunk_ranges(
-                    chunks, mlp_start, mlp_end
+                with _streambp_replay_saved_tensor_offload_context(
+                    f"moe_mlp_chunk{mlp_chunk_index}_layer{layer_number}"
                 ):
-                    attention_chunk_index = attention_start // chunk_size
+                    attention_outputs: list[tuple[int, int, Tensor]] = []
+                    for attention_start, attention_end in _intersect_streambp_chunk_ranges(
+                        attention_backward_chunks, mlp_start, mlp_end
+                    ):
+                        attention_chunk_index = attention_start // chunk_size
+                        with _profile_streambp_chunk(
+                            "streambp/backward_replay_moe_attention_chunk/"
+                            f"{attention_chunk_index}"
+                        ):
+                            _maybe_trim_cuda_cache_before_moe_replay()
+                            with _te_activation_recompute_context(recompute_phase=True):
+                                _debug_sync(
+                                    f"layer{layer_number}:bwd_moe_mlp_chunk{mlp_chunk_index}:"
+                                    f"attention_chunk{attention_chunk_index}:before"
+                                )
+                                attention_output, context = layer._forward_attention(
+                                    hidden_states=hidden_states,
+                                    chunk_range=(attention_start, attention_end),
+                                    **call_kwargs,
+                                )
+                                _debug_sync(
+                                    f"layer{layer_number}:bwd_moe_mlp_chunk{mlp_chunk_index}:"
+                                    f"attention_chunk{attention_chunk_index}:after"
+                                )
+                            if context is not None:
+                                raise ValueError(
+                                    "StreamBP currently supports decoder-only MoE layers "
+                                    "with context=None"
+                                )
+                            attention_outputs.append(
+                                (attention_start, attention_end, attention_output)
+                            )
+                    post_attention = _copy_sequence_tensor_ranges(
+                        attention_outputs,
+                        mlp_start,
+                        mlp_end,
+                        clear_chunks=False,
+                    )
+                    if post_attention.size(0) != mlp_end - mlp_start:
+                        raise RuntimeError(
+                            "StreamBP MoE replay produced attention chunk length "
+                            f"{post_attention.size(0)} for MLP range "
+                            f"[{mlp_start}, {mlp_end})"
+                        )
+                    split_mlp_attention_backward = (
+                        _split_moe_mlp_attention_backward_enabled()
+                        and post_attention.requires_grad
+                    )
+                    mlp_input = (
+                        post_attention.detach().requires_grad_(True)
+                        if split_mlp_attention_backward
+                        else post_attention
+                    )
+                    tensor_audit(
+                        "streambp/moe_backward/post_attention_chunk",
+                        post_attention=post_attention,
+                        grad_chunk=grad_output[mlp_start:mlp_end],
+                        mlp_chunk=mlp_chunk_index,
+                            layer=layer_number,
+                        )
+                    if split_mlp_attention_backward:
+                        # The detached MLP input shares storage with post_attention.
+                        # Release the copied buffer's autograd graph immediately;
+                        # the attention graph is consumed below through the original
+                        # attention_outputs chunks.
+                        del post_attention
+                    else:
+                        attention_outputs.clear()
                     with _profile_streambp_chunk(
-                        "streambp/backward_replay_moe_attention_chunk/"
-                        f"{attention_chunk_index}"
+                        f"streambp/backward_replay_moe_mlp_chunk/{mlp_chunk_index}"
                     ):
                         _maybe_trim_cuda_cache_before_moe_replay()
-                        with _te_activation_recompute_context(recompute_phase=True):
-                            _debug_sync(
-                                f"layer{layer_number}:bwd_moe_mlp_chunk{mlp_chunk_index}:"
-                                f"attention_chunk{attention_chunk_index}:before"
-                            )
-                            attention_output, context = layer._forward_attention(
-                                hidden_states=hidden_states,
-                                chunk_range=(attention_start, attention_end),
-                                **call_kwargs,
-                            )
-                            _debug_sync(
-                                f"layer{layer_number}:bwd_moe_mlp_chunk{mlp_chunk_index}:"
-                                f"attention_chunk{attention_chunk_index}:after"
-                            )
-                        if context is not None:
-                            raise ValueError(
-                                "StreamBP currently supports decoder-only MoE layers "
-                                "with context=None"
-                            )
-                        attention_outputs.append((attention_start, attention_end, attention_output))
-                post_attention = _copy_sequence_tensor_ranges(attention_outputs, mlp_start, mlp_end)
-                del attention_outputs
-                if post_attention.size(0) != mlp_end - mlp_start:
-                    raise RuntimeError(
-                        "StreamBP MoE replay produced attention chunk length "
-                        f"{post_attention.size(0)} for MLP range "
-                        f"[{mlp_start}, {mlp_end})"
-                    )
-                split_mlp_attention_backward = (
-                    _split_moe_mlp_attention_backward_enabled()
-                    and post_attention.requires_grad
-                )
-                mlp_input = (
-                    post_attention.detach().requires_grad_(True)
-                    if split_mlp_attention_backward
-                    else post_attention
-                )
-                tensor_audit(
-                    "streambp/moe_backward/post_attention_chunk",
-                    post_attention=post_attention,
-                    grad_chunk=grad_output[mlp_start:mlp_end],
-                    mlp_chunk=mlp_chunk_index,
-                    layer=layer_number,
-                )
-                with _profile_streambp_chunk(
-                    f"streambp/backward_replay_moe_mlp_chunk/{mlp_chunk_index}"
-                ):
-                    _maybe_trim_cuda_cache_before_moe_replay()
-                    with (
-                        replay_streambp_moe_aux_stats(
-                            moe_aux_stats,
-                            chunk_index=forward_mlp_chunk_index_for_range(mlp_start),
-                        ),
-                        _te_activation_recompute_context(recompute_phase=True),
-                        _streambp_replay_save_quantized_te_inputs(layer),
-                    ):
-                        _debug_sync(
-                            f"layer{layer_number}:bwd_moe_mlp_chunk{mlp_chunk_index}:before"
-                        )
-                        chunk_output = layer._forward_mlp(
-                            mlp_input,
-                            call_kwargs.get("inference_context", None),
-                            padding_mask=_slice_padding_mask_for_sequence_chunk(
-                                padding_mask, mlp_start, mlp_end, seq_len
+                        with (
+                            replay_streambp_moe_aux_stats(
+                                moe_aux_stats,
+                                chunk_index=forward_mlp_chunk_index_for_range(mlp_start),
                             ),
-                        )
-                        tensor_audit(
-                            "streambp/moe_backward/mlp_output_chunk",
-                            output=chunk_output,
-                            grad_chunk=grad_output[mlp_start:mlp_end],
-                            mlp_chunk=mlp_chunk_index,
-                            layer=layer_number,
-                        )
-                        _debug_sync(
-                            f"layer{layer_number}:bwd_moe_mlp_chunk{mlp_chunk_index}:after"
-                        )
-                    if not torch.is_tensor(chunk_output):
-                        raise TypeError(
-                            "StreamBP split MoE MLP replay expects TransformerLayer._forward_mlp "
-                            f"to return a Tensor, got {type(chunk_output)}"
-                        )
-                    grad_chunk = grad_output[mlp_start:mlp_end]
-                    release_mlp_input_before_backward = _env_flag(
-                        "MEGATRON_STREAMBP_RELEASE_MLP_INPUT_BEFORE_BACKWARD", default=True
-                    )
-                    if release_mlp_input_before_backward and not split_mlp_attention_backward:
-                        del post_attention
-                    _debug_sync(
-                        f"layer{layer_number}:bwd_moe_mlp_chunk{mlp_chunk_index}:"
-                        "autograd_before"
-                    )
-                    _maybe_trim_cuda_cache_before_moe_replay(force=True, synchronize=True)
-                    torch.autograd.backward(chunk_output, grad_chunk)
-                    _debug_sync(
-                        f"layer{layer_number}:bwd_moe_mlp_chunk{mlp_chunk_index}:"
-                        "autograd_after"
-                    )
-                    del chunk_output, grad_chunk
-                    if split_mlp_attention_backward:
-                        attention_grad = mlp_input.grad
-                        tensor_audit(
-                            "streambp/moe_backward/mlp_input_grad",
-                            grad=attention_grad,
-                            mlp_chunk=mlp_chunk_index,
-                            layer=layer_number,
-                        )
-                        del mlp_input
-                        if attention_grad is None:
-                            raise RuntimeError(
-                                "StreamBP split MoE MLP replay did not produce an "
-                                "input gradient for the attention replay graph"
+                            _te_activation_recompute_context(recompute_phase=True),
+                            _streambp_replay_save_quantized_te_inputs(layer),
+                        ):
+                            _debug_sync(
+                                f"layer{layer_number}:bwd_moe_mlp_chunk{mlp_chunk_index}:before"
                             )
+                            chunk_output = layer._forward_mlp(
+                                mlp_input,
+                                call_kwargs.get("inference_context", None),
+                                padding_mask=_slice_padding_mask_for_sequence_chunk(
+                                    padding_mask, mlp_start, mlp_end, seq_len
+                                ),
+                            )
+                            tensor_audit(
+                                "streambp/moe_backward/mlp_output_chunk",
+                                output=chunk_output,
+                                grad_chunk=grad_output[mlp_start:mlp_end],
+                                mlp_chunk=mlp_chunk_index,
+                                layer=layer_number,
+                            )
+                            _debug_sync(
+                                f"layer{layer_number}:bwd_moe_mlp_chunk{mlp_chunk_index}:after"
+                            )
+                        if not torch.is_tensor(chunk_output):
+                            raise TypeError(
+                                "StreamBP split MoE MLP replay expects TransformerLayer._forward_mlp "
+                                f"to return a Tensor, got {type(chunk_output)}"
+                            )
+                        grad_chunk = grad_output[mlp_start:mlp_end]
+                        release_mlp_input_before_backward = _env_flag(
+                            "MEGATRON_STREAMBP_RELEASE_MLP_INPUT_BEFORE_BACKWARD", default=True
+                        )
+                        if release_mlp_input_before_backward and not split_mlp_attention_backward:
+                            del post_attention
                         _debug_sync(
                             f"layer{layer_number}:bwd_moe_mlp_chunk{mlp_chunk_index}:"
-                            "attention_autograd_before"
+                            "autograd_before"
                         )
                         _maybe_trim_cuda_cache_before_moe_replay(force=True, synchronize=True)
-                        torch.autograd.backward(post_attention, attention_grad)
+                        _streambp_autograd_backward(chunk_output, grad_chunk)
                         _debug_sync(
                             f"layer{layer_number}:bwd_moe_mlp_chunk{mlp_chunk_index}:"
-                            "attention_autograd_after"
+                            "autograd_after"
                         )
-                        del attention_grad, post_attention
-                    elif not release_mlp_input_before_backward:
-                        del post_attention
+                        del chunk_output, grad_chunk
+                        if split_mlp_attention_backward:
+                            attention_grad = mlp_input.grad
+                            tensor_audit(
+                                "streambp/moe_backward/mlp_input_grad",
+                                grad=attention_grad,
+                                mlp_chunk=mlp_chunk_index,
+                                layer=layer_number,
+                            )
+                            del mlp_input
+                            if attention_grad is None:
+                                raise RuntimeError(
+                                    "StreamBP split MoE MLP replay did not produce an "
+                                    "input gradient for the attention replay graph"
+                                )
+                            _debug_sync(
+                                f"layer{layer_number}:bwd_moe_mlp_chunk{mlp_chunk_index}:"
+                                "attention_autograd_before"
+                            )
+                            _maybe_trim_cuda_cache_before_moe_replay(
+                                force=True, synchronize=True
+                            )
+                            _streambp_autograd_backward_attention_outputs(
+                                attention_outputs,
+                                mlp_start,
+                                attention_grad,
+                            )
+                            _debug_sync(
+                                f"layer{layer_number}:bwd_moe_mlp_chunk{mlp_chunk_index}:"
+                                "attention_autograd_after"
+                            )
+                            attention_outputs.clear()
+                            del attention_grad
+                        elif not release_mlp_input_before_backward:
+                            del post_attention
 
 
 def _full_layer_activation_checkpoint(
@@ -1508,7 +1882,6 @@ class _StreamBPLayerCheckpoint(torch.autograd.Function):
         ctx.moe_mlp_backward_chunks = moe_mlp_backward_chunks
         ctx.context_factory = context_factory
         ctx.kwargs = kwargs
-        ctx.save_for_backward(hidden_states)
         chunks = iter_streambp_chunks(hidden_states.size(0), chunk_size)
         with torch.no_grad():
             if getattr(layer, "is_moe_layer", False):
@@ -1531,26 +1904,30 @@ class _StreamBPLayerCheckpoint(torch.autograd.Function):
                             moe_mlp_chunks=moe_mlp_chunks,
                         )
                 ctx.moe_aux_stats = moe_aux_stats
+                _streambp_save_hidden_for_backward(ctx, hidden_states)
                 return output
             ctx.moe_aux_stats = None
             if not chunk_forward:
-                return _reference_no_grad_forward(
+                output = _reference_no_grad_forward(
                     layer,
                     hidden_states,
                     kwargs,
                     context_factory=context_factory,
                 )
-            return _chunked_no_grad_forward(
-                layer,
-                hidden_states,
-                chunks,
-                kwargs,
-                context_factory=context_factory,
-            )
+            else:
+                output = _chunked_no_grad_forward(
+                    layer,
+                    hidden_states,
+                    chunks,
+                    kwargs,
+                    context_factory=context_factory,
+                )
+            _streambp_save_hidden_for_backward(ctx, hidden_states)
+            return output
 
     @staticmethod
     def backward(ctx, grad_output: Tensor):
-        (hidden_states,) = ctx.saved_tensors
+        hidden_states = _streambp_load_hidden_for_backward(ctx)
         chunks = iter_streambp_chunks(hidden_states.size(0), ctx.chunk_size)
 
         if (
@@ -1562,18 +1939,28 @@ class _StreamBPLayerCheckpoint(torch.autograd.Function):
             detached_hidden_states = hidden_states.detach().requires_grad_(
                 ctx.needs_input_grad[0]
             )
-            with _suppress_fine_grained_offload_replay_context(), torch.enable_grad():
-                _moe_chunk_attention_full_mlp_backward(
-                    ctx.layer,
-                    detached_hidden_states,
-                    grad_output,
-                    chunks,
-                    ctx.kwargs,
-                    context_factory=ctx.context_factory,
-                    moe_mlp_chunks=ctx.moe_mlp_chunks,
-                    moe_mlp_backward_chunks=ctx.moe_mlp_backward_chunks,
-                    moe_aux_stats=ctx.moe_aux_stats,
-                )
+            marked = _streambp_moe_hybrid_pending_marks(
+                ctx.layer,
+                seq_len=hidden_states.size(0),
+                chunks=chunks,
+                moe_mlp_chunks=ctx.moe_mlp_chunks,
+                moe_mlp_backward_chunks=ctx.moe_mlp_backward_chunks,
+            )
+            try:
+                with _suppress_fine_grained_offload_replay_context(), torch.enable_grad():
+                    _moe_chunk_attention_full_mlp_backward(
+                        ctx.layer,
+                        detached_hidden_states,
+                        grad_output,
+                        chunks,
+                        ctx.kwargs,
+                        context_factory=ctx.context_factory,
+                        moe_mlp_chunks=ctx.moe_mlp_chunks,
+                        moe_mlp_backward_chunks=ctx.moe_mlp_backward_chunks,
+                        moe_aux_stats=ctx.moe_aux_stats,
+                    )
+            finally:
+                clear_streambp_pending_chunks(marked)
             hidden_grad = detached_hidden_states.grad if ctx.needs_input_grad[0] else None
             return hidden_grad, None, None, None, None, None, None, None, None
 
@@ -1603,7 +1990,7 @@ class _StreamBPLayerCheckpoint(torch.autograd.Function):
                                 context_factory=ctx.context_factory,
                                 activation_recompute_phase=True,
                             )
-                        torch.autograd.backward(chunk_output, grad_output[start:end])
+                        _streambp_autograd_backward(chunk_output, grad_output[start:end])
             hidden_grad = detached_hidden_states.grad if ctx.needs_input_grad[0] else None
         finally:
             clear_streambp_pending_chunks(marked)
@@ -1633,19 +2020,20 @@ class _StreamBPFullLayerCheckpoint(torch.autograd.Function):
             if ctx.cuda_device_index is None:
                 ctx.cuda_device_index = torch.cuda.current_device()
             ctx.cuda_rng_state = torch.cuda.get_rng_state(ctx.cuda_device_index)
-        ctx.save_for_backward(hidden_states)
         with torch.no_grad():
-            return _call_layer(
+            output = _call_layer(
                 layer,
                 hidden_states,
                 kwargs,
                 context_factory=context_factory,
                 activation_recompute_phase=False,
             )
+        _streambp_save_hidden_for_backward(ctx, hidden_states)
+        return output
 
     @staticmethod
     def backward(ctx, grad_output: Tensor):
-        (hidden_states,) = ctx.saved_tensors
+        hidden_states = _streambp_load_hidden_for_backward(ctx)
         detached_hidden_states = hidden_states.detach().requires_grad_(ctx.needs_input_grad[0])
         devices = [ctx.cuda_device_index] if ctx.cuda_device_index is not None else []
         with torch.random.fork_rng(devices=devices, enabled=True):
@@ -1660,7 +2048,7 @@ class _StreamBPFullLayerCheckpoint(torch.autograd.Function):
                     context_factory=ctx.context_factory,
                     activation_recompute_phase=True,
                 )
-                torch.autograd.backward(output, grad_output)
+                _streambp_autograd_backward(output, grad_output)
         hidden_grad = detached_hidden_states.grad if ctx.needs_input_grad[0] else None
         return hidden_grad, None, None, None, None
 
@@ -2289,7 +2677,7 @@ class _StreamBPLMHeadLoss(torch.autograd.Function):
         params = _unique_trainable_parameters(ctx.output_layer, extra_tensors=(extra_weight,))
         marked = mark_streambp_pending_chunks(params, len(chunks))
 
-        hidden_grad = torch.zeros_like(hidden_states) if ctx.needs_input_grad[0] else None
+        hidden_grad = torch.empty_like(hidden_states) if ctx.needs_input_grad[0] else None
         tensor_audit(
             "streambp_lce/backward_start",
             hidden=hidden_states,
@@ -2346,7 +2734,7 @@ class _StreamBPLMHeadLoss(torch.autograd.Function):
                         chunk_start=start,
                         chunk_end=end,
                     )
-                    torch.autograd.backward(loss, grad_loss_chunk)
+                    _streambp_autograd_backward(loss, grad_loss_chunk)
                     if hidden_grad is not None:
                         hidden_grad[start:end] = hidden_chunk.grad
         finally:
@@ -2355,7 +2743,7 @@ class _StreamBPLMHeadLoss(torch.autograd.Function):
         return hidden_grad, None, None, None, None, None
 
 
-def streambp_lm_head_loss(
+def chunked_lm_head_loss(
     output_layer: torch.nn.Module,
     hidden_states: Tensor,
     labels: Tensor,
@@ -2364,7 +2752,12 @@ def streambp_lm_head_loss(
     chunk_size: Optional[int],
     **output_layer_kwargs: Any,
 ) -> Tensor:
-    """Compute GPT LM-head loss without materializing full-sequence logits."""
+    """Compute GPT LM-head loss without materializing full-sequence logits.
+
+    This helper is intentionally usable without layer StreamBP.  The fused
+    sequence-parallel LCE path below is a memory-safe LM-head schedule, not a
+    replay requirement.
+    """
     chunks = iter_streambp_chunks(hidden_states.size(0), chunk_size)
     sequence_parallel_output = _uses_sequence_parallel_output(output_layer, hidden_states, labels)
     fused_lce_available = _streambp_fused_lce_available(
@@ -2394,4 +2787,24 @@ def streambp_lm_head_loss(
         return loss_func(labels, logits)
     return _StreamBPLMHeadLoss.apply(
         hidden_states, labels, chunk_size, output_layer, loss_func, output_layer_kwargs
+    )
+
+
+def streambp_lm_head_loss(
+    output_layer: torch.nn.Module,
+    hidden_states: Tensor,
+    labels: Tensor,
+    *,
+    loss_func: Callable[[Tensor, Tensor], Tensor],
+    chunk_size: Optional[int],
+    **output_layer_kwargs: Any,
+) -> Tensor:
+    """Backward-compatible name for StreamBP callers."""
+    return chunked_lm_head_loss(
+        output_layer,
+        hidden_states,
+        labels,
+        loss_func=loss_func,
+        chunk_size=chunk_size,
+        **output_layer_kwargs,
     )

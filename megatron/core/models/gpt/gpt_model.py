@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import os
 from collections import OrderedDict
 from typing import Dict, Literal, Optional
 
@@ -39,6 +40,11 @@ from megatron.core.utils import (
     deprecate_inference_params,
     is_using_quantization_scales,
 )
+
+
+def _env_flag_enabled(name: str, default: str = "0") -> bool:
+    raw = os.getenv(name, default).strip().lower()
+    return raw in ("1", "true", "yes", "on")
 
 
 class GPTModel(LanguageModule):
@@ -692,16 +698,18 @@ class GPTModel(LanguageModule):
                 labels=labels,
                 **output_layer_kwargs,
             )
-        elif self.training and self.config.use_streambp:
-            from megatron.core.transformer.streambp import streambp_lm_head_loss
+        elif self.training and (
+            self.config.use_streambp or _env_flag_enabled("MEGATRON_CHUNKED_LM_HEAD_LOSS")
+        ):
+            from megatron.core.transformer.streambp import chunked_lm_head_loss
 
             output_layer_kwargs.pop("input_")
-            loss = streambp_lm_head_loss(
+            loss = chunked_lm_head_loss(
                 self.output_layer,
                 hidden_states,
                 labels,
                 loss_func=self.compute_language_model_loss,
-                chunk_size=self.config.streambp_logits_chunk_size,
+                chunk_size=getattr(self.config, "streambp_logits_chunk_size", None),
                 **output_layer_kwargs,
             )
         else:

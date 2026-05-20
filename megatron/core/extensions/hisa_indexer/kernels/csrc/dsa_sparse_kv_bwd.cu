@@ -494,6 +494,255 @@ __global__ void dsa_sparse_bwd_from_scores_row_kernel(
   }
 }
 
+template <int WARPS>
+__global__ void dsa_split_qk_bwd_row_kernel(
+    const void* __restrict__ query_nope,      // [Q, B, H, D]
+    const void* __restrict__ query_pe,        // [Q, B, H, P]
+    const void* __restrict__ key_nope,        // [S, B, H, D]
+    const void* __restrict__ key_pe,          // [S, B, KPH, P]
+    const void* __restrict__ value,           // [S, B, H, V]
+    const void* __restrict__ topk,            // [B, Q, K]
+    const int64_t* __restrict__ query_pos,    // [Q], optional when has_positions=1
+    const int64_t* __restrict__ key_pos,      // [S], optional when has_positions=1
+    const void* __restrict__ output,          // [Q, B, H, V]
+    const float* __restrict__ lse,            // [B * Q, H]
+    const void* __restrict__ grad_output,     // [Q, B, H, V]
+    void* __restrict__ grad_query_nope,       // [Q, B, H, D]
+    void* __restrict__ grad_query_pe,         // [Q, B, H, P]
+    void* __restrict__ grad_key_nope,         // [local_S, B, H, D]
+    void* __restrict__ grad_key_pe,           // [local_S, B, KPH, P]
+    void* __restrict__ grad_value,            // [local_S, B, H, V]
+    int Q,
+    int B,
+    int S,
+    int H,
+    int D,
+    int P,
+    int KPH,
+    int V,
+    int K,
+    int q_start,
+    int kv_start,
+    int kv_end,
+    int64_t query_nope_stride_s,
+    int64_t query_nope_stride_b,
+    int64_t query_nope_stride_h,
+    int64_t query_nope_stride_d,
+    int64_t key_nope_stride_s,
+    int64_t key_nope_stride_b,
+    int64_t key_nope_stride_h,
+    int64_t key_nope_stride_d,
+    int64_t value_stride_s,
+    int64_t value_stride_b,
+    int64_t value_stride_h,
+    int64_t value_stride_v,
+    int64_t grad_key_nope_stride_s,
+    int64_t grad_key_nope_stride_b,
+    int64_t grad_key_nope_stride_h,
+    int64_t grad_key_nope_stride_d,
+    int64_t grad_value_stride_s,
+    int64_t grad_value_stride_b,
+    int64_t grad_value_stride_h,
+    int64_t grad_value_stride_v,
+    float softmax_scale,
+    int scalar_dtype,
+    int topk_dtype,
+    int grad_dtype,
+    int has_positions,
+    int emit_query,
+    int emit_key_nope,
+    int emit_key_pe,
+    int emit_value) {
+  static_assert(WARPS > 0 && WARPS <= 16, "split-QK row scheduler supports 1..16 warps");
+  constexpr int kMaxDim = 256;
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  if (warp >= WARPS) {
+    return;
+  }
+
+  const int row = blockIdx.x;
+  const int head_batch = blockIdx.y;
+  const int head = head_batch % H;
+  const int batch = head_batch / H;
+  if (row >= Q || D > kMaxDim || P > kMaxDim || V > kMaxDim) {
+    return;
+  }
+
+  __shared__ float q_nope_s[kMaxDim];
+  __shared__ float q_pe_s[kMaxDim];
+  __shared__ float go_s[kMaxDim];
+  __shared__ float grad_q_nope_s[WARPS][kMaxDim];
+  __shared__ float grad_q_pe_s[WARPS][kMaxDim];
+  __shared__ float delta_s;
+  __shared__ int64_t q_abs_s;
+
+  const int pe_head = min(head, KPH - 1);
+  const int64_t q_base = ((static_cast<int64_t>(row) * B + batch) * H + head);
+  const int64_t q_nope_base =
+      static_cast<int64_t>(row) * query_nope_stride_s +
+      static_cast<int64_t>(batch) * query_nope_stride_b +
+      static_cast<int64_t>(head) * query_nope_stride_h;
+  for (int d = tid; d < D; d += WARPS * 32) {
+    q_nope_s[d] =
+        load_typed(query_nope, q_nope_base + d * query_nope_stride_d, scalar_dtype);
+  }
+  for (int d = tid; d < P; d += WARPS * 32) {
+    q_pe_s[d] = load_typed(query_pe, q_base * P + d, scalar_dtype);
+  }
+  for (int d = tid; d < V; d += WARPS * 32) {
+    go_s[d] = load_typed(grad_output, q_base * V + d, scalar_dtype);
+  }
+  for (int idx = tid; idx < WARPS * D; idx += WARPS * 32) {
+    reinterpret_cast<float*>(grad_q_nope_s)[idx] = 0.0f;
+  }
+  for (int idx = tid; idx < WARPS * P; idx += WARPS * 32) {
+    reinterpret_cast<float*>(grad_q_pe_s)[idx] = 0.0f;
+  }
+  if (tid == 0) {
+    q_abs_s = has_positions ? query_pos[row] : static_cast<int64_t>(q_start + row);
+  }
+  __syncthreads();
+
+  float delta = 0.0f;
+  if (warp == 0) {
+    for (int d = lane; d < V; d += 32) {
+      delta += load_typed(output, q_base * V + d, scalar_dtype) * go_s[d];
+    }
+    delta = warp_sum(delta);
+    if (lane == 0) {
+      delta_s = delta;
+    }
+  }
+  __syncthreads();
+  delta = delta_s;
+  const int64_t q_abs = q_abs_s;
+  const float row_lse = lse[(static_cast<int64_t>(batch) * Q + row) * H + head];
+
+  for (int slot = warp; slot < K; slot += WARPS) {
+    int32_t selected = -1;
+    if (lane == 0) {
+      selected = load_topk(
+          topk,
+          (static_cast<int64_t>(batch) * Q + row) * K + slot,
+          topk_dtype);
+    }
+    selected = __shfl_sync(0xffffffff, selected, 0);
+    const int safe_selected = selected > 0 ? selected : 0;
+    bool valid = selected >= 0 && selected < S;
+    if (valid) {
+      const int64_t selected_abs = has_positions ? key_pos[safe_selected] : selected;
+      valid = selected_abs <= q_abs;
+    }
+
+    const int64_t k_nope_base =
+        static_cast<int64_t>(safe_selected) * key_nope_stride_s +
+        static_cast<int64_t>(batch) * key_nope_stride_b +
+        static_cast<int64_t>(head) * key_nope_stride_h;
+    const int64_t k_pe_base =
+        ((static_cast<int64_t>(safe_selected) * B + batch) * KPH + pe_head);
+
+    float score_nope = 0.0f;
+    float score_pe = 0.0f;
+    if (valid) {
+      for (int d = lane; d < D; d += 32) {
+        score_nope += q_nope_s[d] *
+                      load_typed(key_nope, k_nope_base + d * key_nope_stride_d, scalar_dtype);
+      }
+      for (int d = lane; d < P; d += 32) {
+        score_pe += q_pe_s[d] * load_typed(key_pe, k_pe_base * P + d, scalar_dtype);
+      }
+    }
+    score_nope = warp_sum(score_nope);
+    score_pe = warp_sum(score_pe);
+    float score = (score_nope + score_pe) * softmax_scale;
+    score = __shfl_sync(0xffffffff, score, 0);
+
+    float dot_vg = 0.0f;
+    if (valid) {
+      const int64_t v_base =
+          static_cast<int64_t>(safe_selected) * value_stride_s +
+          static_cast<int64_t>(batch) * value_stride_b +
+          static_cast<int64_t>(head) * value_stride_h;
+      for (int d = lane; d < V; d += 32) {
+        dot_vg += load_typed(value, v_base + d * value_stride_v, scalar_dtype) * go_s[d];
+      }
+    }
+    dot_vg = warp_sum(dot_vg);
+    dot_vg = __shfl_sync(0xffffffff, dot_vg, 0);
+
+    const float prob = valid ? expf(score - row_lse) : 0.0f;
+    const float ds = prob * (dot_vg - delta) * softmax_scale;
+
+    if (valid && emit_query) {
+      for (int d = lane; d < D; d += 32) {
+        grad_q_nope_s[warp][d] +=
+            ds * load_typed(key_nope, k_nope_base + d * key_nope_stride_d, scalar_dtype);
+      }
+      for (int d = lane; d < P; d += 32) {
+        grad_q_pe_s[warp][d] += ds * load_typed(key_pe, k_pe_base * P + d, scalar_dtype);
+      }
+    }
+
+    const bool in_kv_range = valid && (kv_end <= 0 || (selected >= kv_start && selected < kv_end));
+    const int local_selected = selected - kv_start;
+    if (in_kv_range && emit_key_nope) {
+      const int64_t grad_k_base =
+          static_cast<int64_t>(local_selected) * grad_key_nope_stride_s +
+          static_cast<int64_t>(batch) * grad_key_nope_stride_b +
+          static_cast<int64_t>(head) * grad_key_nope_stride_h;
+      for (int d = lane; d < D; d += 32) {
+        atomic_add_typed(
+            grad_key_nope,
+            grad_k_base + static_cast<int64_t>(d) * grad_key_nope_stride_d,
+            ds * q_nope_s[d],
+            grad_dtype);
+      }
+    }
+    if (in_kv_range && emit_key_pe) {
+      const int64_t grad_kp_base =
+          ((static_cast<int64_t>(local_selected) * B + batch) * KPH + pe_head);
+      for (int d = lane; d < P; d += 32) {
+        atomic_add_typed(grad_key_pe, grad_kp_base * P + d, ds * q_pe_s[d], grad_dtype);
+      }
+    }
+    if (in_kv_range && emit_value) {
+      const int64_t grad_v_base =
+          static_cast<int64_t>(local_selected) * grad_value_stride_s +
+          static_cast<int64_t>(batch) * grad_value_stride_b +
+          static_cast<int64_t>(head) * grad_value_stride_h;
+      for (int d = lane; d < V; d += 32) {
+        atomic_add_typed(
+            grad_value,
+            grad_v_base + static_cast<int64_t>(d) * grad_value_stride_v,
+            prob * go_s[d],
+            grad_dtype);
+      }
+    }
+  }
+  __syncthreads();
+
+  if (emit_query) {
+    for (int d = tid; d < D; d += WARPS * 32) {
+      float acc = 0.0f;
+#pragma unroll
+      for (int w = 0; w < WARPS; ++w) {
+        acc += grad_q_nope_s[w][d];
+      }
+      store_typed(grad_query_nope, q_base * D + d, acc, grad_dtype);
+    }
+    for (int d = tid; d < P; d += WARPS * 32) {
+      float acc = 0.0f;
+#pragma unroll
+      for (int w = 0; w < WARPS; ++w) {
+        acc += grad_q_pe_s[w][d];
+      }
+      store_typed(grad_query_pe, q_base * P + d, acc, grad_dtype);
+    }
+  }
+}
+
 __global__ void dsa_sorted_delta_kernel(
     const void* __restrict__ output,      // [Q, B, H, V]
     const void* __restrict__ grad_output, // [Q, B, H, V]
@@ -966,6 +1215,172 @@ void launch_dsa_sparse_bwd_from_scores_row(
       topk_dtype,
       grad_dtype,
       stream);
+}
+
+template <int WARPS>
+void launch_split_qk_row(
+    const void* query_nope, const void* query_pe, const void* key_nope,
+    const void* key_pe, const void* value, const void* topk_indices,
+    const int64_t* query_positions, const int64_t* key_positions,
+    const void* output, const float* lse, const void* grad_output,
+    void* grad_query_nope, void* grad_query_pe, void* grad_key_nope,
+    void* grad_key_pe, void* grad_value, int q_len, int bsz, int sk,
+    int num_heads, int head_dim, int pos_dim, int key_pe_heads,
+    int value_dim, int topk_count, int q_start, int kv_start, int kv_end,
+    int64_t query_nope_stride_s, int64_t query_nope_stride_b,
+    int64_t query_nope_stride_h, int64_t query_nope_stride_d,
+    int64_t key_nope_stride_s, int64_t key_nope_stride_b,
+    int64_t key_nope_stride_h, int64_t key_nope_stride_d,
+    int64_t value_stride_s, int64_t value_stride_b, int64_t value_stride_h,
+    int64_t value_stride_v,
+    int64_t grad_key_nope_stride_s, int64_t grad_key_nope_stride_b,
+    int64_t grad_key_nope_stride_h, int64_t grad_key_nope_stride_d,
+    int64_t grad_value_stride_s, int64_t grad_value_stride_b,
+    int64_t grad_value_stride_h, int64_t grad_value_stride_v,
+    float softmax_scale, int scalar_dtype, int topk_dtype, int grad_dtype,
+    int has_positions, int emit_query, int emit_key_nope, int emit_key_pe,
+    int emit_value, cudaStream_t stream) {
+  const dim3 block(WARPS * 32);
+  const dim3 grid(q_len, bsz * num_heads);
+  dsa_split_qk_bwd_row_kernel<WARPS><<<grid, block, 0, stream>>>(
+      query_nope,
+      query_pe,
+      key_nope,
+      key_pe,
+      value,
+      topk_indices,
+      query_positions,
+      key_positions,
+      output,
+      lse,
+      grad_output,
+      grad_query_nope,
+      grad_query_pe,
+      grad_key_nope,
+      grad_key_pe,
+      grad_value,
+      q_len,
+      bsz,
+      sk,
+      num_heads,
+      head_dim,
+      pos_dim,
+      key_pe_heads,
+      value_dim,
+      topk_count,
+      q_start,
+      kv_start,
+      kv_end,
+      query_nope_stride_s,
+      query_nope_stride_b,
+      query_nope_stride_h,
+      query_nope_stride_d,
+      key_nope_stride_s,
+      key_nope_stride_b,
+      key_nope_stride_h,
+      key_nope_stride_d,
+      value_stride_s,
+      value_stride_b,
+      value_stride_h,
+      value_stride_v,
+      grad_key_nope_stride_s,
+      grad_key_nope_stride_b,
+      grad_key_nope_stride_h,
+      grad_key_nope_stride_d,
+      grad_value_stride_s,
+      grad_value_stride_b,
+      grad_value_stride_h,
+      grad_value_stride_v,
+      softmax_scale,
+      scalar_dtype,
+      topk_dtype,
+      grad_dtype,
+      has_positions,
+      emit_query,
+      emit_key_nope,
+      emit_key_pe,
+      emit_value);
+}
+
+void launch_dsa_split_qk_bwd_row(
+    const void* query_nope, const void* query_pe, const void* key_nope,
+    const void* key_pe, const void* value, const void* topk_indices,
+    const int64_t* query_positions, const int64_t* key_positions,
+    const void* output, const float* lse, const void* grad_output,
+    void* grad_query_nope, void* grad_query_pe, void* grad_key_nope,
+    void* grad_key_pe, void* grad_value, int q_len, int bsz, int sk,
+    int num_heads, int head_dim, int pos_dim, int key_pe_heads,
+    int value_dim, int topk_count, int q_start, int kv_start, int kv_end,
+    int64_t query_nope_stride_s, int64_t query_nope_stride_b,
+    int64_t query_nope_stride_h, int64_t query_nope_stride_d,
+    int64_t key_nope_stride_s, int64_t key_nope_stride_b,
+    int64_t key_nope_stride_h, int64_t key_nope_stride_d,
+    int64_t value_stride_s, int64_t value_stride_b, int64_t value_stride_h,
+    int64_t value_stride_v,
+    int64_t grad_key_nope_stride_s, int64_t grad_key_nope_stride_b,
+    int64_t grad_key_nope_stride_h, int64_t grad_key_nope_stride_d,
+    int64_t grad_value_stride_s, int64_t grad_value_stride_b,
+    int64_t grad_value_stride_h, int64_t grad_value_stride_v,
+    float softmax_scale, int scalar_dtype, int topk_dtype, int grad_dtype,
+    int has_positions, int emit_query, int emit_key_nope, int emit_key_pe,
+    int emit_value, int warps, cudaStream_t stream) {
+  if (warps == 16) {
+    launch_split_qk_row<16>(
+        query_nope, query_pe, key_nope, key_pe, value, topk_indices,
+        query_positions, key_positions, output, lse, grad_output,
+        grad_query_nope, grad_query_pe, grad_key_nope, grad_key_pe,
+        grad_value, q_len, bsz, sk, num_heads, head_dim, pos_dim,
+        key_pe_heads, value_dim, topk_count, q_start, kv_start, kv_end,
+        query_nope_stride_s, query_nope_stride_b,
+        query_nope_stride_h, query_nope_stride_d,
+        key_nope_stride_s, key_nope_stride_b,
+        key_nope_stride_h, key_nope_stride_d,
+        value_stride_s, value_stride_b, value_stride_h, value_stride_v,
+        grad_key_nope_stride_s, grad_key_nope_stride_b,
+        grad_key_nope_stride_h, grad_key_nope_stride_d,
+        grad_value_stride_s, grad_value_stride_b,
+        grad_value_stride_h, grad_value_stride_v,
+        softmax_scale, scalar_dtype, topk_dtype, grad_dtype, has_positions,
+        emit_query, emit_key_nope, emit_key_pe, emit_value, stream);
+    return;
+  }
+  if (warps == 4) {
+    launch_split_qk_row<4>(
+        query_nope, query_pe, key_nope, key_pe, value, topk_indices,
+        query_positions, key_positions, output, lse, grad_output,
+        grad_query_nope, grad_query_pe, grad_key_nope, grad_key_pe,
+        grad_value, q_len, bsz, sk, num_heads, head_dim, pos_dim,
+        key_pe_heads, value_dim, topk_count, q_start, kv_start, kv_end,
+        query_nope_stride_s, query_nope_stride_b,
+        query_nope_stride_h, query_nope_stride_d,
+        key_nope_stride_s, key_nope_stride_b,
+        key_nope_stride_h, key_nope_stride_d,
+        value_stride_s, value_stride_b, value_stride_h, value_stride_v,
+        grad_key_nope_stride_s, grad_key_nope_stride_b,
+        grad_key_nope_stride_h, grad_key_nope_stride_d,
+        grad_value_stride_s, grad_value_stride_b,
+        grad_value_stride_h, grad_value_stride_v,
+        softmax_scale, scalar_dtype, topk_dtype, grad_dtype, has_positions,
+        emit_query, emit_key_nope, emit_key_pe, emit_value, stream);
+    return;
+  }
+  launch_split_qk_row<8>(
+      query_nope, query_pe, key_nope, key_pe, value, topk_indices,
+      query_positions, key_positions, output, lse, grad_output,
+      grad_query_nope, grad_query_pe, grad_key_nope, grad_key_pe,
+      grad_value, q_len, bsz, sk, num_heads, head_dim, pos_dim,
+      key_pe_heads, value_dim, topk_count, q_start, kv_start, kv_end,
+      query_nope_stride_s, query_nope_stride_b,
+      query_nope_stride_h, query_nope_stride_d,
+      key_nope_stride_s, key_nope_stride_b,
+      key_nope_stride_h, key_nope_stride_d,
+      value_stride_s, value_stride_b, value_stride_h, value_stride_v,
+      grad_key_nope_stride_s, grad_key_nope_stride_b,
+      grad_key_nope_stride_h, grad_key_nope_stride_d,
+      grad_value_stride_s, grad_value_stride_b,
+      grad_value_stride_h, grad_value_stride_v,
+      softmax_scale, scalar_dtype, topk_dtype, grad_dtype, has_positions,
+      emit_query, emit_key_nope, emit_key_pe, emit_value, stream);
 }
 
 void launch_dsa_sparse_kv_bwd_sorted_from_scores(

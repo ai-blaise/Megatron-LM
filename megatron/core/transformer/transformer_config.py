@@ -1228,14 +1228,16 @@ class TransformerConfig(ModelParallelConfig):
     offload_modules: Optional[list[str]] = field(default_factory=list)
     """The submodules to offload its input.
     choices: "attn_norm", "qkv_linear", "core_attn", "attn_proj",
-             "mlp_norm", "expert_fc1", "moe_act".
+             "mlp_norm", "mlp_residual", "expert_fc1", "moe_act", "moe_shared".
     "attn_norm": offload the input of the normalization in the attention part.
     "qkv_linear": offload the input of the qkv linear part.
     "core_attn": offload the input of the core attention part.
     "attn_proj": offload the input of the attn linear projection part.
     "mlp_norm": offload the input of the normalization in the mlp part.
+    "mlp_residual": temporarily offload the MLP residual while MoE expert compute runs.
     "expert_fc1": offload the input of the expert fc1 part.
     "moe_act": offload the input of the moe act part.
+    "moe_shared": temporarily offload shared expert output while routed experts run.
     """
     min_offloaded_tensor_size: int = 1024 * 1024
     """The minimum size of the tensor to be offloaded."""
@@ -1796,7 +1798,9 @@ class TransformerConfig(ModelParallelConfig):
                 "moe_act",
                 "attn_norm",
                 "mlp_norm",
+                "mlp_residual",
                 "qkv_linear",
+                "moe_shared",
             }
             invalid_modules = set(self.offload_modules) - allowed_modules
             assert not invalid_modules, (
