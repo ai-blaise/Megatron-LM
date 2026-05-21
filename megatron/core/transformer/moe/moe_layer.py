@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import os
+import time
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from dataclasses import dataclass
+from fnmatch import fnmatch
 from typing import Optional, Protocol, Union
 
 import torch
@@ -41,6 +45,73 @@ try:
     HAVE_TE = True
 except ImportError:
     HAVE_TE = False
+
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).lower() in ("1", "true", "yes", "on")
+
+
+def _distributed_rank() -> int:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank()
+    return 0
+
+
+def _rank_selected(spec: str, rank: int) -> bool:
+    spec = (spec or "0").strip()
+    if spec.lower() in ("all", "*"):
+        return True
+    for item in spec.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "-" in item:
+            lo, hi = item.split("-", 1)
+            if lo.strip().isdigit() and hi.strip().isdigit() and int(lo) <= rank <= int(hi):
+                return True
+        elif item.isdigit() and int(item) == rank:
+            return True
+        elif fnmatch(str(rank), item):
+            return True
+    return False
+
+
+@contextmanager
+def _moe_stage_timer(layer_number: Optional[int], stage: str):
+    if not _env_flag("MEGATRON_MOE_STAGE_PROGRESS_LOG"):
+        yield
+        return
+    rank = _distributed_rank()
+    if not _rank_selected(os.getenv("MEGATRON_MOE_STAGE_PROGRESS_RANKS", "0"), rank):
+        yield
+        return
+
+    sync = _env_flag("MEGATRON_MOE_STAGE_PROGRESS_SYNC")
+    if sync and torch.cuda.is_available():
+        torch.cuda.synchronize()
+    start = time.perf_counter()
+    start_mem = torch.cuda.memory_allocated() / (1024**3) if torch.cuda.is_available() else 0.0
+    start_reserved = torch.cuda.memory_reserved() / (1024**3) if torch.cuda.is_available() else 0.0
+    print(
+        "[moe-stage] "
+        f"rank={rank} layer={layer_number} stage={stage} state=start "
+        f"mem={start_mem:.1f}G reserved={start_reserved:.1f}G",
+        flush=True,
+    )
+    try:
+        yield
+    finally:
+        if sync and torch.cuda.is_available():
+            torch.cuda.synchronize()
+        end = time.perf_counter()
+        end_mem = torch.cuda.memory_allocated() / (1024**3) if torch.cuda.is_available() else 0.0
+        end_reserved = torch.cuda.memory_reserved() / (1024**3) if torch.cuda.is_available() else 0.0
+        print(
+            "[moe-stage] "
+            f"rank={rank} layer={layer_number} stage={stage} state=end "
+            f"dt={end - start:.3f}s mem={end_mem:.1f}G reserved={end_reserved:.1f}G",
+            flush=True,
+        )
 
 
 class RouterInterface(Protocol):
@@ -378,23 +449,27 @@ class MoELayer(BaseMoELayer):
         as ``dispatch`` followed by ``routed_experts_compute``.
         """
 
-        dispatched_input, dispatched_probs = self.dispatch(hidden_states, probs)
+        with _moe_stage_timer(self.layer_number, "dispatch"):
+            dispatched_input, dispatched_probs = self.dispatch(hidden_states, probs)
         hidden_states = None
         probs = None
         if self.config.overlap_dispatch_backward_with_experts_wgrad:
             dispatched_input = _RecordExpertDgradCompletion.apply(
                 self._delayed_wgrad_event, dispatched_input
             )
-        expert_input, tokens_per_expert, permuted_probs = (
-            self.token_dispatcher.dispatch_postprocess(dispatched_input, dispatched_probs)
-        )
+        with _moe_stage_timer(self.layer_number, "dispatch_postprocess"):
+            expert_input, tokens_per_expert, permuted_probs = (
+                self.token_dispatcher.dispatch_postprocess(dispatched_input, dispatched_probs)
+            )
         dispatched_input = None
         dispatched_probs = None
-        expert_output, mlp_bias = self.experts(expert_input, tokens_per_expert, permuted_probs)
+        with _moe_stage_timer(self.layer_number, "experts"):
+            expert_output, mlp_bias = self.experts(expert_input, tokens_per_expert, permuted_probs)
         expert_input = None
         permuted_probs = None
         assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
-        output = self.token_dispatcher.combine_preprocess(expert_output)
+        with _moe_stage_timer(self.layer_number, "combine_preprocess"):
+            output = self.token_dispatcher.combine_preprocess(expert_output)
         expert_output = None
         return output, mlp_bias
 
@@ -404,14 +479,16 @@ class MoELayer(BaseMoELayer):
         This method uses the token dispatcher to combine the outputs from different
         experts (e.g., via an All-to-All communication).
         """
-        output = self.token_dispatcher.token_combine(output)
+        with _moe_stage_timer(self.layer_number, "token_combine"):
+            output = self.token_dispatcher.token_combine(output)
         return output
 
     def postprocess(self, output: torch.Tensor, shared_expert_output: Optional[torch.Tensor]):
         """Project the output back from latent dimension to hidden dimension after combine
         in latent dimension if needed. Combine expert output with shared_experts if needed."""
 
-        output = self.token_dispatcher.combine_postprocess(output)
+        with _moe_stage_timer(self.layer_number, "combine_postprocess"):
+            output = self.token_dispatcher.combine_postprocess(output)
         if self.config.moe_latent_size:
             output, _ = self.fc2_latent_proj(output)
 
@@ -464,15 +541,18 @@ class MoELayer(BaseMoELayer):
         def custom_forward(hidden_states, intermediate_tensors=None, padding_mask=None):
             try:
                 if "route" in self.fwd_execution_map:
-                    shared_expert_output = self.shared_experts_compute(hidden_states)
+                    with _moe_stage_timer(self.layer_number, "shared_experts"):
+                        shared_expert_output = self.shared_experts_compute(hidden_states)
                     shared_expert_output = maybe_temp_cpu_offload(
                         shared_expert_output,
                         "moe_shared",
                         enabled=self.offload_moe_shared,
                         training=self.training,
                     )
-                    probs, routing_map = self.route(hidden_states, padding_mask)
-                    hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
+                    with _moe_stage_timer(self.layer_number, "route"):
+                        probs, routing_map = self.route(hidden_states, padding_mask)
+                    with _moe_stage_timer(self.layer_number, "preprocess"):
+                        hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
                     routing_map = None
 
                     if intermediate_tensors is not None:
@@ -490,13 +570,17 @@ class MoELayer(BaseMoELayer):
                 if intermediate_tensors is not None:
                     hidden_states, probs = intermediate_tensors
 
-                output, mlp_bias = self.dispatch_and_routed_experts_compute(hidden_states, probs)
+                with _moe_stage_timer(self.layer_number, "dispatch_routed_experts"):
+                    output, mlp_bias = self.dispatch_and_routed_experts_compute(
+                        hidden_states, probs
+                    )
                 hidden_states = None
                 probs = None
                 assert (
                     mlp_bias is None
                 ), f"mlp_bias is not supported for {type(self.token_dispatcher)}"
-                output = self.combine(output)
+                with _moe_stage_timer(self.layer_number, "combine"):
+                    output = self.combine(output)
 
                 if intermediate_tensors is not None:
                     return output, mlp_bias
@@ -505,7 +589,8 @@ class MoELayer(BaseMoELayer):
                 if intermediate_tensors is not None:
                     output, shared_expert_output = intermediate_tensors
 
-                output = self.postprocess(output, shared_expert_output)
+                with _moe_stage_timer(self.layer_number, "postprocess"):
+                    output = self.postprocess(output, shared_expert_output)
 
                 if intermediate_tensors is not None:
                     return output

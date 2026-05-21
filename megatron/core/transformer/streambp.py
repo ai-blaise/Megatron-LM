@@ -158,7 +158,8 @@ def _maybe_trim_cuda_cache_before_moe_replay(
     mib = 1024 * 1024
     free_threshold_mb = int(os.getenv("MEGATRON_STREAMBP_MOE_REPLAY_TRIM_FREE_MB", "2048"))
     cached_threshold_mb = int(os.getenv("MEGATRON_STREAMBP_MOE_REPLAY_TRIM_CACHED_MB", "512"))
-    if force or (free_bytes < free_threshold_mb * mib and cached > cached_threshold_mb * mib):
+    force_trim = force and _env_flag("MEGATRON_STREAMBP_MOE_REPLAY_FORCE_TRIM", default=False)
+    if force_trim or (free_bytes < free_threshold_mb * mib and cached > cached_threshold_mb * mib):
         if synchronize and _env_flag("MEGATRON_STREAMBP_MOE_REPLAY_TRIM_SYNC", default=True):
             torch.cuda.synchronize()
         torch.cuda.empty_cache()
@@ -255,9 +256,19 @@ def _suppress_fine_grained_offload_forced_release_context():
 @contextmanager
 def _suppress_fine_grained_offload_replay_context():
     """Bypass fine-grained offload markers inside StreamBP replay graphs."""
+    temp_suppressed = {
+        item
+        for item in os.getenv(
+            "MEGATRON_STREAMBP_SUPPRESS_TEMP_OFFLOAD_MODULES", "moe_shared"
+        ).split()
+        if item
+    }
     try:
         from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
             fine_grained_offloading_suppress_offload,
+        )
+        from megatron.core.transformer.temp_activation_offload import (
+            suppress_temp_activation_offload,
         )
     except Exception:
         with _suppress_fine_grained_offload_forced_release_context():
@@ -266,6 +277,7 @@ def _suppress_fine_grained_offload_replay_context():
     with (
         fine_grained_offloading_suppress_offload(),
         _suppress_fine_grained_offload_forced_release_context(),
+        suppress_temp_activation_offload(temp_suppressed),
     ):
         yield
 

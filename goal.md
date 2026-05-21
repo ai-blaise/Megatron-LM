@@ -1,10 +1,43 @@
 # Corsaire-1 Kernel Port / AWS Handoff Progress
 
-Last updated: 2026-05-20 16:10 UTC
+Last updated: 2026-05-21 02:02 UTC
 
 ## Current Objective
 
 Prepare the 32xB200 AWS handoff while auditing `optimization-playground` kernels against the active Megatron training stack. Port only kernels or switches that are both correct and measurably useful on our active paths.
+
+## Current Live Finding
+
+The latest `corsaire-1-research-preview` run is intentionally running with broad fine-grained activation offload and temp activation offload disabled. This was done because the offloaded run was extremely slow in the forward path, and we needed to know whether CPU offload was the direct cause.
+
+Result so far:
+
+- offload disabled is wired into the tmux launcher;
+- actual Megatron args show `fine_grained_activation_offloading False` and `offload_modules []`;
+- early forward timings are effectively unchanged versus the offload-enabled run:
+  - PP0 `vmb=0/vp=0`: ~67s with offload, ~66.6s without;
+  - PP0 `vmb=4/vp=1`: ~171s with offload, ~170.5s without;
+  - PP1 `vmb=3/vp=0`: ~172s with offload, ~170.8s without;
+- current memory is not worse with offload disabled and is healthy during early forward.
+
+Conclusion: broad activation/temp offload should not remain part of the production launcher. It does not explain the current forward slowdown. The bottleneck appears tied to specific VPP/layer groups and their active MoE/DSA/HISA paths, not the offload machinery.
+
+Launcher state:
+
+- `examples/sft/launch_sft_deepseek_nvfp4_tmux.sh` now hard-disables `FINE_GRAINED_ACTIVATION_OFFLOADING` and `MEGATRON_TEMP_ACTIVATION_OFFLOAD` for training launches.
+- `examples/sft/run_sft_deepseek_nvfp4.sh` also hard-disables those paths, so stale caller env vars cannot silently re-enable offload when bypassing the tmux wrapper.
+- The underlying Megatron feature code is still present, but the production launcher no longer exposes default module lists or opt-in defaults for this run path.
+
+## Current Launcher Readiness
+
+The tmux launcher has been made safer for moving to a replacement second node:
+
+- `REMOTE_HOST`/`NODE1_HOST` is now required instead of defaulting to the old GCP node.
+- `MASTER_ADDR` auto-detects from the route to the remote host, but should still be set explicitly if the cluster has a preferred RDMA/control-plane address.
+- `SSH_KEY` is optional; set it only when a non-default key is needed. `SSH_OPTS` can carry extra SSH flags.
+- `GLOBAL_BATCH_SIZE` now defaults to `16`, matching the current survivable diagnostic shape, instead of silently reverting to `128`.
+- `DRY_RUN=1` bypasses existing tmux-session attach behavior and prints the resolved launch shape for verification.
+- Optional MoE stage progress logging is wired through as `MEGATRON_MOE_STAGE_PROGRESS_LOG`, `MEGATRON_MOE_STAGE_PROGRESS_RANKS`, and `MEGATRON_MOE_STAGE_PROGRESS_SYNC`.
 
 ## Active Training Shape To Preserve
 
