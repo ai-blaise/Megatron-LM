@@ -19,6 +19,7 @@ from typing import Optional
 
 import torch
 
+from megatron.core.fine_profile import fine_profile_range
 from megatron.core.quantization.indexcache.autograd import (
     get_indexcache_nvfp4_packed_tensors,
 )
@@ -29,8 +30,13 @@ _HISA_SELECTOR_BACKEND_ENV = "MEGATRON_HISA_SELECTOR_BACKEND"
 _HISA_CANDIDATE_SLOT_GROUP_ENV = "MEGATRON_HISA_CANDIDATE_SLOT_GROUP"
 _HISA_CANDIDATE_MAX_TEMP_MB_ENV = "MEGATRON_HISA_CANDIDATE_MAX_TEMP_MB"
 _HISA_CANDIDATE_FREE_MEM_RESERVE_MB_ENV = "MEGATRON_HISA_CANDIDATE_FREE_MEM_RESERVE_MB"
+_HISA_CANDIDATE_TRIM_CACHE_ENV = "MEGATRON_HISA_CANDIDATE_TRIM_CACHE"
 _HISA_COMPACT_CANDIDATE_TOPK_ENV = "MEGATRON_HISA_COMPACT_CANDIDATE_TOPK"
 _HISA_SELECTOR_ROW_CHUNK_ENV = "MEGATRON_HISA_SELECTOR_ROW_CHUNK"
+_HISA_MEGAKERNEL_PARALLEL_REFINE_ENV = "MEGATRON_HISA_MEGAKERNEL_PARALLEL_REFINE"
+_HISA_MEGAKERNEL_STREAMING_SCRATCH_ENV = "MEGATRON_HISA_MEGAKERNEL_STREAMING_SCRATCH"
+_HISA_MEGAKERNEL_SERIAL_MAX_CANDIDATES = 8192
+_HISA_MEGAKERNEL_PARALLEL_MAX_CANDIDATES = 8192
 _HISA_ASSUME_SORTED_POSITIONS_ENV = "MEGATRON_HISA_ASSUME_SORTED_POSITIONS"
 _HISA_BMM_FP32_ACCUM_TENSORCORES_ENV = "MEGATRON_HISA_BMM_FP32_ACCUM_TENSORCORES"
 _HISA_BMM_CUBLASDX_REFINE_ENV = "MEGATRON_HISA_BMM_CUBLASDX_REFINE"
@@ -101,6 +107,52 @@ def hisa_block_topk_counts(
     selected = torch.where(block_counts > 0, selected, torch.zeros_like(selected))
     max_selected = int(selected.max().item()) if selected.numel() else 0
     return selected.to(torch.int32), max(1, max_selected)
+
+
+def _forced_boundary_block_counts(
+    block_counts: torch.Tensor, forced_boundary_blocks: tuple[str, ...]
+) -> torch.Tensor:
+    """Return the per-row number of unique forced HISA boundary blocks."""
+
+    if not forced_boundary_blocks:
+        return torch.zeros_like(block_counts, dtype=torch.int32)
+    forced = set(forced_boundary_blocks)
+    unknown = forced.difference({"first", "last", "last_minus_one"})
+    if unknown:
+        raise ValueError(f"Unknown HISA forced boundary block {next(iter(unknown))!r}.")
+
+    counts = torch.zeros_like(block_counts, dtype=torch.int32)
+    if "first" in forced:
+        counts = counts + (block_counts >= 1).to(dtype=torch.int32)
+    if "last" in forced:
+        counts = counts + (block_counts >= 1).to(dtype=torch.int32)
+        if "first" in forced:
+            counts = counts - (block_counts == 1).to(dtype=torch.int32)
+    if "last_minus_one" in forced:
+        counts = counts + (block_counts >= 2).to(dtype=torch.int32)
+        if "first" in forced:
+            counts = counts - (block_counts == 2).to(dtype=torch.int32)
+    return counts.clamp_min(0)
+
+
+def _include_forced_boundary_budget(
+    block_topk_counts: Optional[torch.Tensor],
+    effective_block_topk: int,
+    row_block_counts: torch.Tensor,
+    forced_boundary_blocks: tuple[str, ...],
+) -> tuple[Optional[torch.Tensor], int]:
+    """Ensure the HISA block budget can actually contain forced boundary blocks."""
+
+    if not forced_boundary_blocks:
+        return block_topk_counts, effective_block_topk
+    forced_counts = _forced_boundary_block_counts(row_block_counts, forced_boundary_blocks)
+    if block_topk_counts is None:
+        effective = max(int(effective_block_topk), int(forced_counts.max().item()))
+        return None, effective
+    adjusted = torch.maximum(block_topk_counts.to(torch.int32), forced_counts)
+    adjusted = torch.minimum(adjusted, row_block_counts.to(torch.int32))
+    effective = max(int(effective_block_topk), int(adjusted.max().item()))
+    return adjusted, effective
 
 
 def _weighted_relu_dsa_score(
@@ -280,6 +332,12 @@ def _hisa_selector_backend() -> str:
         "tc": "bmm",
         "torch": "bmm",
         "cublas": "bmm",
+        "blackwell": "megakernel",
+        "sm100": "megakernel",
+        "cute": "megakernel",
+        "cublasdx_mega": "megakernel",
+        "mega": "megakernel",
+        "batched": "megakernel",
     }
     raw = aliases.get(raw, raw)
     if raw in ("packed", "nvfp4", "packed_nvfp4", "nvfp4_cuda"):
@@ -315,13 +373,21 @@ def _hisa_selector_backend() -> str:
         "packed_cublasdx_tiled",
         "packed_cublasdx_fp8",
         "deepgemm",
+        "megakernel",
     ):
         raise ValueError(
             f"{_HISA_SELECTOR_BACKEND_ENV} must be one of auto, cuda, bmm, packed_cuda, "
-            f"packed_cublasdx, packed_cublasdx_tiled, packed_cublasdx_fp8, deepgemm; "
+            f"packed_cublasdx, packed_cublasdx_tiled, packed_cublasdx_fp8, deepgemm, "
+            f"megakernel; "
             f"got {raw!r}"
         )
     return raw
+
+
+def indexcache_hisa_selector_backend_name() -> str:
+    """Return the normalized HISA selector backend name used by this process."""
+
+    return _hisa_selector_backend()
 
 
 def _hisa_candidate_slot_group() -> int:
@@ -332,10 +398,10 @@ def _hisa_candidate_slot_group() -> int:
     return value
 
 
-def _hisa_candidate_max_temp_bytes() -> int:
+def _hisa_candidate_max_temp_bytes() -> int | None:
     raw = os.getenv(_HISA_CANDIDATE_MAX_TEMP_MB_ENV, "32").strip().lower()
     if raw in ("0", "false", "off", "no", ""):
-        return 0
+        return None
     value_mb = int(raw)
     if value_mb < 0:
         raise ValueError(f"{_HISA_CANDIDATE_MAX_TEMP_MB_ENV} must be non-negative, got {value_mb}")
@@ -363,6 +429,9 @@ def _hisa_maybe_trim_cuda_cache(required_bytes: int, device: torch.device) -> No
     expected scratch plus the configured reserve will not fit.
     """
 
+    raw = os.getenv(_HISA_CANDIDATE_TRIM_CACHE_ENV, "0").strip().lower()
+    if raw in ("0", "false", "off", "no", ""):
+        return
     if required_bytes <= 0 or not torch.cuda.is_available() or device.type != "cuda":
         return
     try:
@@ -397,10 +466,17 @@ def _hisa_effective_candidate_slot_group(
     head_dim: int,
     k_dtype: torch.dtype,
 ) -> int:
-    """Cap HISA BMM candidate refinement scratch without changing selected scores."""
+    """Return the HISA BMM slot group after any explicit scratch cap.
+
+    ``MEGATRON_HISA_CANDIDATE_MAX_TEMP_MB=0`` disables the cap. The GCP A4
+    training profile uses that no-cap mode so candidate refinement is not
+    artificially serialized by memory-safety defaults from smaller runs.
+    """
 
     slot_group = max(1, int(requested_slot_group))
     max_temp_bytes = _hisa_candidate_max_temp_bytes()
+    if max_temp_bytes is None:
+        return slot_group
     if torch.cuda.is_available():
         try:
             free_bytes, _ = torch.cuda.mem_get_info()
@@ -443,6 +519,39 @@ def _next_power_of_two_int(value: int) -> int:
     return 1 << (value - 1).bit_length()
 
 
+def _hisa_cublasdx_refine_scratch_bytes(rows: int, candidate_capacity: int, topk_k: int) -> int:
+    # candidate_scores, candidate_indices, topk_indices, and selected_scores.
+    return int(rows) * (
+        int(candidate_capacity) * 8
+        + int(topk_k) * 8
+    )
+
+
+def _hisa_cublasdx_refine_live_row_chunk(
+    rows: int,
+    candidate_capacity: int,
+    topk_k: int,
+    device: torch.device,
+) -> int:
+    if rows <= 1 or not torch.cuda.is_available() or device.type != "cuda":
+        return max(1, int(rows))
+    try:
+        with torch.cuda.device(device):
+            free_bytes, _ = torch.cuda.mem_get_info()
+    except (RuntimeError, AssertionError):
+        return max(1, int(rows))
+    budget = max(0, int(free_bytes) - _hisa_candidate_free_mem_reserve_bytes())
+    required = _hisa_cublasdx_refine_scratch_bytes(rows, candidate_capacity, topk_k)
+    if required <= budget:
+        return int(rows)
+    bytes_per_row = _hisa_cublasdx_refine_scratch_bytes(1, candidate_capacity, topk_k)
+    if bytes_per_row <= 0:
+        return int(rows)
+    # Leave allocator and library workspaces breathing room; this split is only
+    # active under tight live-memory pressure.
+    return max(1, min(int(rows), int((budget * 3 // 4) // bytes_per_row)))
+
+
 def _hisa_bmm_fp32_accum_tensorcores_enabled() -> bool:
     raw = os.getenv(_HISA_BMM_FP32_ACCUM_TENSORCORES_ENV, "0").strip().lower()
     return raw not in ("0", "false", "off", "no")
@@ -451,6 +560,23 @@ def _hisa_bmm_fp32_accum_tensorcores_enabled() -> bool:
 def _hisa_bmm_cublasdx_refine_enabled() -> bool:
     raw = os.getenv(_HISA_BMM_CUBLASDX_REFINE_ENV, "0").strip().lower()
     return raw not in ("0", "false", "off", "no")
+
+
+def _hisa_megakernel_parallel_refine_enabled() -> bool:
+    raw = os.getenv(_HISA_MEGAKERNEL_PARALLEL_REFINE_ENV, "0").strip().lower()
+    return raw not in ("0", "false", "off", "no")
+
+
+def _hisa_megakernel_streaming_scratch(_topk_tokens: int) -> Optional[int]:
+    """Optional HISA candidate scratch cap for the streaming megakernel refine path."""
+
+    raw = os.getenv(_HISA_MEGAKERNEL_STREAMING_SCRATCH_ENV, "0").strip().lower()
+    if raw in ("", "0", "false", "off", "no"):
+        return None
+    raise RuntimeError(
+        f"{_HISA_MEGAKERNEL_STREAMING_SCRATCH_ENV} is disabled for the production "
+        "HISA selector path; the validated megakernel is hard-capped at 8192 candidates"
+    )
 
 
 def _hisa_bmm_fp32_accum(batch_a: torch.Tensor, batch_b: torch.Tensor) -> torch.Tensor:
@@ -547,6 +673,30 @@ def _hisa_dense_cublasdx_candidate_topk(
     prefix_i32 = prefix_lens.to(device=q_rows.device, dtype=torch.int32).contiguous()
     candidate_count = int(top_blocks_i32.shape[1]) * int(block_size)
     candidate_capacity = _next_power_of_two_int(max(int(topk_k), candidate_count))
+    live_row_chunk = _hisa_cublasdx_refine_live_row_chunk(
+        int(sq), int(candidate_capacity), int(topk_k), q_rows.device
+    )
+    if live_row_chunk < int(sq):
+        topk_indices = torch.empty((sq, int(topk_k)), device=q_rows.device, dtype=torch.int32)
+        selected_scores = torch.empty((sq, int(topk_k)), device=q_rows.device, dtype=torch.float32)
+        for row_start in range(0, int(sq), live_row_chunk):
+            row_end = min(row_start + live_row_chunk, int(sq))
+            chunk_result = _hisa_dense_cublasdx_candidate_topk(
+                q_rows[row_start:row_end],
+                weights_rows[row_start:row_end],
+                k_rows,
+                top_blocks[row_start:row_end],
+                prefix_lens[row_start:row_end],
+                topk_k,
+                block_size,
+            )
+            if chunk_result is None:
+                return None
+            chunk_indices, chunk_scores = chunk_result
+            topk_indices[row_start:row_end] = chunk_indices
+            selected_scores[row_start:row_end] = chunk_scores
+        return topk_indices, selected_scores
+
     candidate_scores = torch.empty(
         (sq, candidate_capacity), device=q_rows.device, dtype=torch.float32
     )
@@ -604,15 +754,16 @@ def _hisa_grouped_candidate_topk(
         return indices_out, scores_out
 
     sk = k_rows.shape[0]
-    cublasdx_result = _hisa_dense_cublasdx_candidate_topk(
-        q_rows,
-        weights_rows,
-        k_rows,
-        top_blocks,
-        prefix_lens,
-        topk_k,
-        block_size,
-    )
+    with fine_profile_range("hisa.candidate_refine.cublasdx_try"):
+        cublasdx_result = _hisa_dense_cublasdx_candidate_topk(
+            q_rows,
+            weights_rows,
+            k_rows,
+            top_blocks,
+            prefix_lens,
+            topk_k,
+            block_size,
+        )
     if cublasdx_result is not None:
         return cublasdx_result
 
@@ -651,10 +802,59 @@ def _hisa_grouped_candidate_topk(
             score_scratch_bytes + group_scratch_bytes,
             q_rows.device,
         )
-        all_scores = q_rows.new_full((sq, candidate_capacity), float("-inf"))
+        with fine_profile_range("hisa.candidate_refine.compact_alloc_scores"):
+            all_scores = q_rows.new_full((sq, candidate_capacity), float("-inf"))
         for slot_start in range(0, top_blocks.shape[1], slot_group):
             slot_end = min(slot_start + slot_group, top_blocks.shape[1])
-            block_ids = top_blocks[:, slot_start:slot_end].to(torch.int32)
+            with fine_profile_range(f"hisa.candidate_refine.compact_slot.{slot_start}_{slot_end}"):
+                block_ids = top_blocks[:, slot_start:slot_end].to(torch.int32)
+                valid_block = block_ids >= 0
+                cand_idx = block_ids.clamp_min(0).unsqueeze(-1) * block_size + offsets.view(
+                    1, 1, -1
+                )
+                valid = (
+                    valid_block.unsqueeze(-1)
+                    & (cand_idx < prefix_lens.view(-1, 1, 1))
+                    & (cand_idx < sk)
+                )
+                candidate_indices = cand_idx.reshape(sq, -1)
+                safe_idx = candidate_indices.clamp(0, max(sk - 1, 0)).to(torch.long).reshape(-1)
+                candidate_k = k_rows.index_select(0, safe_idx).view(sq, -1, head_dim)
+
+                cand_dot = _hisa_bmm_fp32_accum(q_rows, candidate_k.transpose(1, 2))
+                cand_dot.relu_()
+                cand_scores = torch.bmm(weights_rows.unsqueeze(1), cand_dot).squeeze(1)
+                valid_flat = valid.reshape(sq, -1)
+                cand_scores = cand_scores.masked_fill(~valid_flat, float("-inf"))
+
+                dst_start = slot_start * block_size
+                dst_end = dst_start + candidate_indices.shape[1]
+                all_scores[:, dst_start:dst_end] = cand_scores
+
+        with fine_profile_range("hisa.candidate_refine.compact_final_topk"):
+            running_scores, gather_pos = torch.topk(
+                all_scores, k=topk_k, dim=-1, sorted=False
+            )
+            slot_ids = torch.div(gather_pos, int(block_size), rounding_mode="floor")
+            offsets = (gather_pos - slot_ids * int(block_size)).to(torch.int32)
+            safe_slot_ids = slot_ids.clamp(0, max(int(top_blocks.shape[1]) - 1, 0))
+            selected_blocks = top_blocks.to(torch.int32).gather(1, safe_slot_ids)
+            running_indices = selected_blocks * int(block_size) + offsets
+            valid_final = (
+                torch.isfinite(running_scores)
+                & (gather_pos < candidate_width)
+                & (selected_blocks >= 0)
+                & (running_indices < prefix_lens.view(-1, 1))
+                & (running_indices < sk)
+            )
+        return running_indices.masked_fill(~valid_final, -1), running_scores
+
+    running_scores = q_rows.new_full((sq, topk_k), float("-inf"))
+    running_indices = torch.full((sq, topk_k), -1, device=q_rows.device, dtype=torch.int32)
+    for slot_start in range(0, top_blocks.shape[1], slot_group):
+        slot_end = min(slot_start + slot_group, top_blocks.shape[1])
+        with fine_profile_range(f"hisa.candidate_refine.streaming_slot.{slot_start}_{slot_end}"):
+            block_ids = top_blocks[:, slot_start : slot_start + slot_group].to(torch.int32)
             valid_block = block_ids >= 0
             cand_idx = block_ids.clamp_min(0).unsqueeze(-1) * block_size + offsets.view(
                 1, 1, -1
@@ -668,66 +868,22 @@ def _hisa_grouped_candidate_topk(
             safe_idx = candidate_indices.clamp(0, max(sk - 1, 0)).to(torch.long).reshape(-1)
             candidate_k = k_rows.index_select(0, safe_idx).view(sq, -1, head_dim)
 
+            # [Q, H, D] x [Q, D, G*B] -> [Q, H, G*B]. The default helper preserves
+            # exact FP32 selector semantics; the opt-in tensor-core mode keeps
+            # BF16/FP16 inputs and requests FP32 output accumulation from cuBLAS.
             cand_dot = _hisa_bmm_fp32_accum(q_rows, candidate_k.transpose(1, 2))
+            # Same memory discipline as the block selector: avoid materializing the
+            # [rows, heads, candidates] broadcast product before reducing heads.
             cand_dot.relu_()
             cand_scores = torch.bmm(weights_rows.unsqueeze(1), cand_dot).squeeze(1)
-            valid_flat = valid.reshape(sq, -1)
-            cand_scores = cand_scores.masked_fill(~valid_flat, float("-inf"))
+            cand_scores = cand_scores.masked_fill(~valid.reshape(sq, -1), float("-inf"))
 
-            dst_start = slot_start * block_size
-            dst_end = dst_start + candidate_indices.shape[1]
-            all_scores[:, dst_start:dst_end] = cand_scores
-
-        running_scores, gather_pos = torch.topk(
-            all_scores, k=topk_k, dim=-1, sorted=False
-        )
-        slot_ids = torch.div(gather_pos, int(block_size), rounding_mode="floor")
-        offsets = (gather_pos - slot_ids * int(block_size)).to(torch.int32)
-        safe_slot_ids = slot_ids.clamp(0, max(int(top_blocks.shape[1]) - 1, 0))
-        selected_blocks = top_blocks.to(torch.int32).gather(1, safe_slot_ids)
-        running_indices = selected_blocks * int(block_size) + offsets
-        valid_final = (
-            torch.isfinite(running_scores)
-            & (gather_pos < candidate_width)
-            & (selected_blocks >= 0)
-            & (running_indices < prefix_lens.view(-1, 1))
-            & (running_indices < sk)
-        )
-        return running_indices.masked_fill(~valid_final, -1), running_scores
-
-    running_scores = q_rows.new_full((sq, topk_k), float("-inf"))
-    running_indices = torch.full((sq, topk_k), -1, device=q_rows.device, dtype=torch.int32)
-    for slot_start in range(0, top_blocks.shape[1], slot_group):
-        block_ids = top_blocks[:, slot_start : slot_start + slot_group].to(torch.int32)
-        valid_block = block_ids >= 0
-        cand_idx = block_ids.clamp_min(0).unsqueeze(-1) * block_size + offsets.view(
-            1, 1, -1
-        )
-        valid = (
-            valid_block.unsqueeze(-1)
-            & (cand_idx < prefix_lens.view(-1, 1, 1))
-            & (cand_idx < sk)
-        )
-        candidate_indices = cand_idx.reshape(sq, -1)
-        safe_idx = candidate_indices.clamp(0, max(sk - 1, 0)).to(torch.long).reshape(-1)
-        candidate_k = k_rows.index_select(0, safe_idx).view(sq, -1, head_dim)
-
-        # [Q, H, D] x [Q, D, G*B] -> [Q, H, G*B]. The default helper preserves
-        # exact FP32 selector semantics; the opt-in tensor-core mode keeps
-        # BF16/FP16 inputs and requests FP32 output accumulation from cuBLAS.
-        cand_dot = _hisa_bmm_fp32_accum(q_rows, candidate_k.transpose(1, 2))
-        # Same memory discipline as the block selector: avoid materializing the
-        # [rows, heads, candidates] broadcast product before reducing heads.
-        cand_dot.relu_()
-        cand_scores = torch.bmm(weights_rows.unsqueeze(1), cand_dot).squeeze(1)
-        cand_scores = cand_scores.masked_fill(~valid.reshape(sq, -1), float("-inf"))
-
-        merged_scores = torch.cat((running_scores, cand_scores), dim=-1)
-        merged_indices = torch.cat((running_indices, candidate_indices), dim=-1)
-        running_scores, gather_pos = torch.topk(
-            merged_scores, k=topk_k, dim=-1, sorted=False
-        )
-        running_indices = merged_indices.gather(1, gather_pos)
+            merged_scores = torch.cat((running_scores, cand_scores), dim=-1)
+            merged_indices = torch.cat((running_indices, candidate_indices), dim=-1)
+            running_scores, gather_pos = torch.topk(
+                merged_scores, k=topk_k, dim=-1, sorted=False
+            )
+            running_indices = merged_indices.gather(1, gather_pos)
 
     valid_final = torch.isfinite(running_scores)
     return running_indices.masked_fill(~valid_final, -1), running_scores
@@ -765,30 +921,31 @@ def _indexcache_hisa_topk_bmm_for_batch(
         and q_rows.dtype in (torch.bfloat16, torch.float16)
     )
     if sq_total > row_chunk:
-        k_b_once = (
-            k_rows.contiguous()
-            if use_tc_inputs
-            else (k_b_precomputed if k_b_precomputed is not None else k_rows.float())
-        )
-        block_size = int(config.block_size)
-        sk = k_b_once.shape[0]
-        block_count = int(math.ceil(sk / block_size))
-        reps_once = (
-            block_reps_precomputed
-            if block_reps_precomputed is not None
-            else _mean_pool_all_blocks(k_b_once, block_size)
-        )
-        if block_prefix_precomputed is None:
-            pad_len = block_count * block_size - sk
-            if pad_len:
-                padded_k = torch.cat((k_b_once, k_b_once.new_zeros((pad_len, k_b_once.shape[-1]))), dim=0)
+        with fine_profile_range("hisa.bmm.precompute_reps_and_prefix"):
+            k_b_once = (
+                k_rows.contiguous()
+                if use_tc_inputs
+                else (k_b_precomputed if k_b_precomputed is not None else k_rows.float())
+            )
+            block_size = int(config.block_size)
+            sk = k_b_once.shape[0]
+            block_count = int(math.ceil(sk / block_size))
+            reps_once = (
+                block_reps_precomputed
+                if block_reps_precomputed is not None
+                else _mean_pool_all_blocks(k_b_once, block_size)
+            )
+            if block_prefix_precomputed is None:
+                pad_len = block_count * block_size - sk
+                if pad_len:
+                    padded_k = torch.cat((k_b_once, k_b_once.new_zeros((pad_len, k_b_once.shape[-1]))), dim=0)
+                else:
+                    padded_k = k_b_once
+                block_prefix_once = padded_k.reshape(block_count, block_size, k_b_once.shape[-1]).cumsum(dim=1)
+                if pad_len:
+                    del padded_k
             else:
-                padded_k = k_b_once
-            block_prefix_once = padded_k.reshape(block_count, block_size, k_b_once.shape[-1]).cumsum(dim=1)
-            if pad_len:
-                del padded_k
-        else:
-            block_prefix_once = block_prefix_precomputed
+                block_prefix_once = block_prefix_precomputed
         indices_out = torch.empty((sq_total, int(topk_k)), device=q_rows.device, dtype=torch.int32)
         scores_out = q_rows.new_empty((sq_total, int(topk_k)), dtype=torch.float32)
         for row_start in range(0, sq_total, row_chunk):
@@ -798,30 +955,32 @@ def _indexcache_hisa_topk_bmm_for_batch(
                 if block_topk_counts is not None
                 else None
             )
-            indices, scores = _indexcache_hisa_topk_bmm_for_batch(
-                q_rows[row_start:row_end],
-                weights_rows[row_start:row_end],
-                k_rows,
-                topk_k,
-                config=config,
-                prefix_lens=prefix_lens[row_start:row_end],
-                block_topk_counts=block_counts_chunk,
-                effective_block_topk=effective_block_topk,
-                k_b_precomputed=k_b_once,
-                block_reps_precomputed=reps_once,
-                block_prefix_precomputed=block_prefix_once,
-            )
+            with fine_profile_range(f"hisa.bmm.row_chunk.{row_start}_{row_end}"):
+                indices, scores = _indexcache_hisa_topk_bmm_for_batch(
+                    q_rows[row_start:row_end],
+                    weights_rows[row_start:row_end],
+                    k_rows,
+                    topk_k,
+                    config=config,
+                    prefix_lens=prefix_lens[row_start:row_end],
+                    block_topk_counts=block_counts_chunk,
+                    effective_block_topk=effective_block_topk,
+                    k_b_precomputed=k_b_once,
+                    block_reps_precomputed=reps_once,
+                    block_prefix_precomputed=block_prefix_once,
+                )
             indices_out[row_start:row_end] = indices
             scores_out[row_start:row_end] = scores
         return indices_out, scores_out
 
-    q_b = q_rows.contiguous() if use_tc_inputs else q_rows.float()
-    w_b = weights_rows.float()
-    k_b = (
-        k_rows.contiguous()
-        if use_tc_inputs and k_b_precomputed is None
-        else (k_b_precomputed if k_b_precomputed is not None else k_rows.float())
-    )
+    with fine_profile_range("hisa.bmm.cast_inputs"):
+        q_b = q_rows.contiguous() if use_tc_inputs else q_rows.float()
+        w_b = weights_rows.float()
+        k_b = (
+            k_rows.contiguous()
+            if use_tc_inputs and k_b_precomputed is None
+            else (k_b_precomputed if k_b_precomputed is not None else k_rows.float())
+        )
     sq, _, head_dim = q_b.shape
     sk = k_b.shape[0]
     block_size = int(config.block_size)
@@ -834,21 +993,23 @@ def _indexcache_hisa_topk_bmm_for_batch(
         row_block_counts = torch.div(
             prefix_lens + block_size - 1, block_size, rounding_mode="floor"
         ).to(torch.int32)
-        reps = (
-            block_reps_precomputed
-            if block_reps_precomputed is not None
-            else _mean_pool_all_blocks(k_b, block_size)
-        )
-        block_dot = _hisa_bmm_fp32_accum(
-            q_b.reshape(1, sq * q_b.shape[1], head_dim),
-            reps.t().unsqueeze(0),
-        ).reshape(sq, q_b.shape[1], block_count)
-        # Keep the block selector workspace flat. The previous transpose +
-        # broadcast multiply materialized [rows, blocks, heads], which is a
-        # large temporary at 32k context. ReLU is selector-local/no-grad, and
-        # the batched 1xH @ HxB reduction writes only [rows, blocks].
-        block_dot.relu_()
-        block_scores = torch.bmm(w_b.unsqueeze(1), block_dot).squeeze(1)
+        with fine_profile_range("hisa.bmm.block_reps"):
+            reps = (
+                block_reps_precomputed
+                if block_reps_precomputed is not None
+                else _mean_pool_all_blocks(k_b, block_size)
+            )
+        with fine_profile_range("hisa.bmm.block_scores"):
+            block_dot = _hisa_bmm_fp32_accum(
+                q_b.reshape(1, sq * q_b.shape[1], head_dim),
+                reps.t().unsqueeze(0),
+            ).reshape(sq, q_b.shape[1], block_count)
+            # Keep the block selector workspace flat. The previous transpose +
+            # broadcast multiply materialized [rows, blocks, heads], which is a
+            # large temporary at 32k context. ReLU is selector-local/no-grad, and
+            # the batched 1xH @ HxB reduction writes only [rows, blocks].
+            block_dot.relu_()
+            block_scores = torch.bmm(w_b.unsqueeze(1), block_dot).squeeze(1)
         block_scores = block_scores.masked_fill(
             arange_blocks.view(1, -1) >= row_block_counts.view(-1, 1),
             float("-inf"),
@@ -856,30 +1017,31 @@ def _indexcache_hisa_topk_bmm_for_batch(
 
         # Correct the per-row partial final block. A global block mean would
         # leak future tokens inside the current causal block.
-        last_blocks = (row_block_counts - 1).clamp_min(0)
-        starts = last_blocks * block_size
-        safe_prefix = prefix_lens.clamp(0, sk)
-        raw_counts = safe_prefix - starts
-        offsets = (raw_counts - 1).clamp_min(0)
-        if block_prefix_precomputed is not None:
-            block_prefix = block_prefix_precomputed
-        else:
-            pad_len = block_count * block_size - sk
-            if pad_len:
-                padded_k = torch.cat((k_b, k_b.new_zeros((pad_len, head_dim))), dim=0)
+        with fine_profile_range("hisa.bmm.partial_block_correction"):
+            last_blocks = (row_block_counts - 1).clamp_min(0)
+            starts = last_blocks * block_size
+            safe_prefix = prefix_lens.clamp(0, sk)
+            raw_counts = safe_prefix - starts
+            offsets = (raw_counts - 1).clamp_min(0)
+            if block_prefix_precomputed is not None:
+                block_prefix = block_prefix_precomputed
             else:
-                padded_k = k_b
-            # Prefix only within each HISA block. This avoids rebuilding a full
-            # sequence-length cumsum for every query chunk while preserving the
-            # exact causal partial-block correction.
-            block_prefix = padded_k.reshape(block_count, block_size, head_dim).cumsum(dim=1)
-        sums = block_prefix[last_blocks, offsets]
-        sums = torch.where(raw_counts.unsqueeze(-1) > 0, sums, torch.zeros_like(sums))
-        counts = raw_counts.clamp_min(1).to(k_b.dtype).unsqueeze(-1)
-        partial_reps = sums / counts
-        partial_dot = _hisa_bmm_fp32_accum(q_b, partial_reps.unsqueeze(-1)).squeeze(-1)
-        partial_scores = (torch.relu(partial_dot) * w_b).sum(dim=-1)
-        block_scores.scatter_(1, last_blocks.view(-1, 1), partial_scores.view(-1, 1))
+                pad_len = block_count * block_size - sk
+                if pad_len:
+                    padded_k = torch.cat((k_b, k_b.new_zeros((pad_len, head_dim))), dim=0)
+                else:
+                    padded_k = k_b
+                # Prefix only within each HISA block. This avoids rebuilding a full
+                # sequence-length cumsum for every query chunk while preserving the
+                # exact causal partial-block correction.
+                block_prefix = padded_k.reshape(block_count, block_size, head_dim).cumsum(dim=1)
+            sums = block_prefix[last_blocks, offsets]
+            sums = torch.where(raw_counts.unsqueeze(-1) > 0, sums, torch.zeros_like(sums))
+            counts = raw_counts.clamp_min(1).to(k_b.dtype).unsqueeze(-1)
+            partial_reps = sums / counts
+            partial_dot = _hisa_bmm_fp32_accum(q_b, partial_reps.unsqueeze(-1)).squeeze(-1)
+            partial_scores = (torch.relu(partial_dot) * w_b).sum(dim=-1)
+            block_scores.scatter_(1, last_blocks.view(-1, 1), partial_scores.view(-1, 1))
 
         valid_rows = row_block_counts > 0
         if "first" in config.forced_boundary_blocks:
@@ -899,28 +1061,30 @@ def _indexcache_hisa_topk_bmm_for_batch(
                 torch.full((int(has_prev.sum().item()), 1), float("inf"), device=q_b.device),
             )
 
-        block_keep = min(effective_block_topk, block_count)
-        top_block_values, top_blocks = torch.topk(
-            block_scores, k=block_keep, dim=-1, sorted=False
-        )
-        top_blocks = top_blocks.masked_fill(
-            torch.isnan(top_block_values) | (top_block_values == float("-inf")), -1
-        )
-        if block_topk_counts is not None and block_keep > 0:
-            slot_ids = torch.arange(block_keep, device=q_b.device).view(1, -1)
-            top_blocks = top_blocks.masked_fill(
-                slot_ids >= block_topk_counts.view(-1, 1), -1
+        with fine_profile_range("hisa.bmm.block_topk"):
+            block_keep = min(effective_block_topk, block_count)
+            top_block_values, top_blocks = torch.topk(
+                block_scores, k=block_keep, dim=-1, sorted=False
             )
+            top_blocks = top_blocks.masked_fill(
+                torch.isnan(top_block_values) | (top_block_values == float("-inf")), -1
+            )
+            if block_topk_counts is not None and block_keep > 0:
+                slot_ids = torch.arange(block_keep, device=q_b.device).view(1, -1)
+                top_blocks = top_blocks.masked_fill(
+                    slot_ids >= block_topk_counts.view(-1, 1), -1
+                )
 
-    return _hisa_grouped_candidate_topk(
-        q_b,
-        w_b,
-        k_b,
-        top_blocks,
-        prefix_lens,
-        topk_k,
-        block_size,
-    )
+    with fine_profile_range("hisa.bmm.candidate_refine"):
+        return _hisa_grouped_candidate_topk(
+            q_b,
+            w_b,
+            k_b,
+            top_blocks,
+            prefix_lens,
+            topk_k,
+            block_size,
+        )
 
 
 def _indexcache_hisa_topk_cuda_for_batch(
@@ -1059,6 +1223,12 @@ def indexcache_hisa_cuda_select_with_scores(
             dtype=torch.int32,
         )
         effective_block_topk = min(int(config.block_topk), block_count)
+    block_topk_counts, effective_block_topk = _include_forced_boundary_budget(
+        block_topk_counts,
+        effective_block_topk,
+        row_block_counts,
+        tuple(config.forced_boundary_blocks or ()),
+    )
 
     q_f = q_rows.contiguous().float()
     w_f = weights_rows.contiguous().float()
@@ -1154,6 +1324,12 @@ def indexcache_hisa_packed_nvfp4_select_with_scores(
             dtype=torch.int32,
         )
         effective_block_topk = min(int(config.block_topk), block_count)
+    block_topk_counts, effective_block_topk = _include_forced_boundary_budget(
+        block_topk_counts,
+        effective_block_topk,
+        row_block_counts,
+        tuple(config.forced_boundary_blocks or ()),
+    )
 
     q_f = q_rows.contiguous().float()
     w_f = weights_rows.contiguous().float()
@@ -1228,6 +1404,52 @@ def indexcache_hisa_packed_nvfp4_select_with_scores(
     return indices_i32, selected_scores
 
 
+def _deepgemm_hisa_build_block_prefix(k_rows: torch.Tensor, block_size: int) -> torch.Tensor:
+    block_count = int(math.ceil(k_rows.shape[0] / block_size))
+    pad_len = block_count * block_size - k_rows.shape[0]
+    if pad_len:
+        padded = torch.cat((k_rows, k_rows.new_zeros((pad_len, k_rows.shape[-1]))), dim=0)
+    else:
+        padded = k_rows
+    return padded.reshape(block_count, block_size, k_rows.shape[-1]).cumsum(dim=1)
+
+
+def _deepgemm_hisa_build_fused_cache(
+    packed: tuple[torch.Tensor, torch.Tensor, int, int],
+    *,
+    sk: int,
+    head_dim: int,
+) -> torch.Tensor:
+    packed_values, packed_scales, packed_row_offset, packed_row_stride = packed
+    k_values = packed_values[
+        packed_row_offset : packed_row_offset + sk * packed_row_stride : packed_row_stride
+    ].contiguous()
+    k_scales = packed_scales[
+        packed_row_offset : packed_row_offset + sk * packed_row_stride : packed_row_stride
+    ].contiguous()
+    page_size = 64
+    pages = int(math.ceil(sk / page_size))
+    fused_cache = torch.empty(
+        (pages, page_size, 1, head_dim // 2 + 4),
+        device=packed_values.device,
+        dtype=torch.uint8,
+    )
+    fused_page_flat = fused_cache.view(pages, page_size * (head_dim // 2 + 4))
+    padded_values = torch.zeros(
+        (pages * page_size, head_dim // 2), device=packed_values.device, dtype=torch.uint8
+    )
+    padded_scales = torch.zeros((pages * page_size,), device=packed_values.device, dtype=torch.int32)
+    padded_values[:sk] = k_values.view(sk, head_dim // 2).view(torch.uint8)
+    padded_scales[:sk] = k_scales.view(sk)
+    fused_page_flat[:, : page_size * (head_dim // 2)] = padded_values.view(
+        pages, page_size * (head_dim // 2)
+    )
+    fused_page_flat[:, page_size * (head_dim // 2) :] = padded_scales.view(
+        pages, page_size
+    ).view(torch.uint8)
+    return fused_cache
+
+
 def _indexcache_hisa_deepgemm_select_with_scores(
     q_rows: torch.Tensor,
     weights_rows: torch.Tensor,
@@ -1238,6 +1460,10 @@ def _indexcache_hisa_deepgemm_select_with_scores(
     prefix_lens: torch.Tensor,
     block_topk_counts: torch.Tensor,
     effective_block_topk: int,
+    k_b_precomputed: Optional[torch.Tensor] = None,
+    block_reps_precomputed: Optional[torch.Tensor] = None,
+    block_prefix_precomputed: Optional[torch.Tensor] = None,
+    fused_cache_precomputed: Optional[torch.Tensor] = None,
 ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
     """Select HISA candidates with DeepGEMM FP4 MQA scoring.
 
@@ -1263,30 +1489,6 @@ def _indexcache_hisa_deepgemm_select_with_scores(
     except (AssertionError, ImportError, RuntimeError, OSError):
         return None
 
-    sq_total = q_rows.shape[0]
-    row_chunk = _hisa_selector_row_chunk(sq_total)
-    if sq_total > row_chunk:
-        index_chunks = []
-        score_chunks = []
-        for row_start in range(0, sq_total, row_chunk):
-            row_end = min(row_start + row_chunk, sq_total)
-            result = _indexcache_hisa_deepgemm_select_with_scores(
-                q_rows[row_start:row_end],
-                weights_rows[row_start:row_end],
-                k_rows,
-                topk,
-                config=config,
-                prefix_lens=prefix_lens[row_start:row_end],
-                block_topk_counts=block_topk_counts[row_start:row_end],
-                effective_block_topk=effective_block_topk,
-            )
-            if result is None:
-                return None
-            indices, scores = result
-            index_chunks.append(indices)
-            score_chunks.append(scores)
-        return torch.cat(index_chunks, dim=0), torch.cat(score_chunks, dim=0)
-
     sq, heads, head_dim = q_rows.shape
     if heads != 64 or head_dim != 128:
         return None
@@ -1300,9 +1502,53 @@ def _indexcache_hisa_deepgemm_select_with_scores(
     if block_keep <= 0 or block_keep * block_size < topk_k:
         return None
 
+    sq_total = q_rows.shape[0]
+    row_chunk = _hisa_selector_row_chunk(sq_total)
+    if sq_total > row_chunk:
+        k_b_once = k_b_precomputed if k_b_precomputed is not None else k_rows.float()
+        reps_once = (
+            block_reps_precomputed
+            if block_reps_precomputed is not None
+            else _mean_pool_all_blocks(k_b_once, block_size)
+        )
+        block_prefix_once = (
+            block_prefix_precomputed
+            if block_prefix_precomputed is not None
+            else _deepgemm_hisa_build_block_prefix(k_b_once, block_size)
+        )
+        fused_cache_once = (
+            fused_cache_precomputed
+            if fused_cache_precomputed is not None
+            else _deepgemm_hisa_build_fused_cache(packed, sk=sk, head_dim=head_dim)
+        )
+        index_chunks = []
+        score_chunks = []
+        for row_start in range(0, sq_total, row_chunk):
+            row_end = min(row_start + row_chunk, sq_total)
+            result = _indexcache_hisa_deepgemm_select_with_scores(
+                q_rows[row_start:row_end],
+                weights_rows[row_start:row_end],
+                k_rows,
+                topk,
+                config=config,
+                prefix_lens=prefix_lens[row_start:row_end],
+                block_topk_counts=block_topk_counts[row_start:row_end],
+                effective_block_topk=effective_block_topk,
+                k_b_precomputed=k_b_once,
+                block_reps_precomputed=reps_once,
+                block_prefix_precomputed=block_prefix_once,
+                fused_cache_precomputed=fused_cache_once,
+            )
+            if result is None:
+                return None
+            indices, scores = result
+            index_chunks.append(indices)
+            score_chunks.append(scores)
+        return torch.cat(index_chunks, dim=0), torch.cat(score_chunks, dim=0)
+
     q_b = q_rows.float()
     w_b = weights_rows.float()
-    k_b = k_rows.float()
+    k_b = k_b_precomputed if k_b_precomputed is not None else k_rows.float()
     prefix_lens = prefix_lens.to(device=q_rows.device, dtype=torch.long).clamp(0, sk)
     row_block_counts = torch.div(
         prefix_lens + block_size - 1, block_size, rounding_mode="floor"
@@ -1315,7 +1561,11 @@ def _indexcache_hisa_deepgemm_select_with_scores(
 
     arange_blocks = torch.arange(block_count, device=q_rows.device, dtype=torch.int32)
     with torch.no_grad():
-        reps = _mean_pool_all_blocks(k_b, block_size)
+        reps = (
+            block_reps_precomputed
+            if block_reps_precomputed is not None
+            else _mean_pool_all_blocks(k_b, block_size)
+        )
         block_dot = _hisa_bmm_fp32_accum(
             q_b.reshape(1, sq * heads, head_dim),
             reps.t().unsqueeze(0),
@@ -1331,12 +1581,11 @@ def _indexcache_hisa_deepgemm_select_with_scores(
         starts = last_blocks * block_size
         raw_counts = prefix_lens.to(torch.int32) - starts
         offsets = (raw_counts - 1).clamp_min(0)
-        pad_len = block_count * block_size - sk
-        if pad_len:
-            padded_k = torch.cat((k_b, k_b.new_zeros((pad_len, head_dim))), dim=0)
-        else:
-            padded_k = k_b
-        block_prefix = padded_k.reshape(block_count, block_size, head_dim).cumsum(dim=1)
+        block_prefix = (
+            block_prefix_precomputed
+            if block_prefix_precomputed is not None
+            else _deepgemm_hisa_build_block_prefix(k_b, block_size)
+        )
         sums = block_prefix[last_blocks.long(), offsets.long()]
         sums = torch.where(raw_counts.unsqueeze(-1) > 0, sums, torch.zeros_like(sums))
         counts = raw_counts.clamp_min(1).to(k_b.dtype).unsqueeze(-1)
@@ -1369,10 +1618,6 @@ def _indexcache_hisa_deepgemm_select_with_scores(
         top_blocks = top_blocks.masked_fill(
             torch.isnan(top_block_values) | (top_block_values == float("-inf")), -1
         ).to(torch.int32)
-        slot_ids = torch.arange(block_keep, device=q_rows.device).view(1, -1)
-        top_blocks = top_blocks.masked_fill(
-            slot_ids >= block_topk_counts.view(-1, 1), -1
-        )
 
         # DeepGEMM has a contiguous candidate-length mask per row. Keep the
         # selected partial causal block as the final valid slot so that its
@@ -1385,7 +1630,7 @@ def _indexcache_hisa_deepgemm_select_with_scores(
                 if count <= 0:
                     continue
                 last_block = int(last_blocks[row].item())
-                match = (top_blocks[row, :count] == last_block).nonzero(as_tuple=False)
+                match = (top_blocks[row] == last_block).nonzero(as_tuple=False)
                 if match.numel() == 0:
                     return None
                 src = int(match[0, 0].item())
@@ -1394,32 +1639,16 @@ def _indexcache_hisa_deepgemm_select_with_scores(
                     tmp = top_blocks[row, dst].clone()
                     top_blocks[row, dst] = top_blocks[row, src]
                     top_blocks[row, src] = tmp
+        slot_ids = torch.arange(block_keep, device=q_rows.device).view(1, -1)
+        top_blocks = top_blocks.masked_fill(slot_ids >= valid_counts.view(-1, 1), -1)
 
-    packed_values, packed_scales, packed_row_offset, packed_row_stride = packed
-    k_values = packed_values[
-        packed_row_offset : packed_row_offset + sk * packed_row_stride : packed_row_stride
-    ].contiguous()
-    k_scales = packed_scales[
-        packed_row_offset : packed_row_offset + sk * packed_row_stride : packed_row_stride
-    ].contiguous()
     page_size = 64
     pages = int(math.ceil(sk / page_size))
-    fused_cache = torch.empty(
-        (pages, page_size, 1, head_dim // 2 + 4), device=q_rows.device, dtype=torch.uint8
+    fused_cache = (
+        fused_cache_precomputed
+        if fused_cache_precomputed is not None
+        else _deepgemm_hisa_build_fused_cache(packed, sk=sk, head_dim=head_dim)
     )
-    fused_page_flat = fused_cache.view(pages, page_size * (head_dim // 2 + 4))
-    padded_values = torch.zeros(
-        (pages * page_size, head_dim // 2), device=q_rows.device, dtype=torch.uint8
-    )
-    padded_scales = torch.zeros((pages * page_size,), device=q_rows.device, dtype=torch.int32)
-    padded_values[:sk] = k_values.view(sk, head_dim // 2).view(torch.uint8)
-    padded_scales[:sk] = k_scales.view(sk)
-    fused_page_flat[:, : page_size * (head_dim // 2)] = padded_values.view(
-        pages, page_size * (head_dim // 2)
-    )
-    fused_page_flat[:, page_size * (head_dim // 2) :] = padded_scales.view(
-        pages, page_size
-    ).view(torch.uint8)
 
     safe_blocks = top_blocks.clamp_min(0)
     page_table = torch.empty((sq, block_keep * 2), device=q_rows.device, dtype=torch.int32)
@@ -1470,6 +1699,239 @@ def _indexcache_hisa_deepgemm_select_with_scores(
     topk_indices = topk_indices.masked_fill(~valid, -1).to(torch.int32)
     selected_scores = selected_scores.masked_fill(~valid, float("-inf")).float()
     return topk_indices, selected_scores
+
+
+def indexcache_hisa_megakernel_batched_select_with_scores(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    k: torch.Tensor,
+    topk: int,
+    *,
+    config: IndexCacheHISAConfig,
+    prefix_lens: torch.Tensor,
+    block_reps_precomputed: Optional[torch.Tensor] = None,
+) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+    """Run the fused batched HISA selector extension.
+
+    This is the training fast path intended to replace the Python loop over
+    batch items plus the ATen BMM/topk/gather chain. It returns top-k indices as
+    ``[B, Q, K]`` and selected scores flattened as ``[B * Q, K]`` to match the
+    selected-score autograd contract in DSA.
+    """
+
+    if not (q.is_cuda and weights.is_cuda and k.is_cuda):
+        return None
+    if not (config.is_optimized and _is_blackwell_or_newer(q.device)):
+        return None
+    if q.dim() != 4 or weights.dim() != 3 or k.dim() != 3:
+        return None
+    q_len, bsz, heads, head_dim = q.shape
+    sk = k.shape[0]
+    if k.shape[1] != bsz or k.shape[2] != head_dim:
+        return None
+    if weights.shape != (q_len, bsz, heads):
+        return None
+    if heads != 64 or head_dim != 128:
+        return None
+    if q.dtype != k.dtype:
+        return None
+    if q.dtype not in (torch.float32, torch.bfloat16, torch.float16):
+        return None
+    if weights.dtype not in (torch.float32, torch.bfloat16, torch.float16):
+        return None
+    topk_k = min(int(topk), int(sk))
+    if topk_k <= 0:
+        return None
+
+    if not prefix_lens.is_cuda:
+        return None
+    if prefix_lens.dtype not in (torch.int32, torch.int64):
+        return None
+    if config.fallback_to_dense_if_short:
+        return None
+    if prefix_lens.numel() == q_len:
+        prefix_arg = prefix_lens.reshape(q_len)
+    elif prefix_lens.numel() == bsz * q_len:
+        prefix_arg = prefix_lens.reshape(bsz, q_len)
+    else:
+        return None
+    if prefix_arg.device != q.device:
+        return None
+
+    block_size = int(config.block_size)
+    block_count = int(math.ceil(sk / block_size))
+    if block_count <= 0:
+        return None
+    if config.compression_ratio > 0:
+        ratio_f = float(config.compression_ratio)
+        if abs(ratio_f - round(ratio_f)) < 1e-6:
+            ratio_i = int(round(ratio_f))
+            effective_block_topk = (block_count + ratio_i - 1) // ratio_i
+        else:
+            effective_block_topk = int(math.ceil(block_count / ratio_f))
+        effective_block_topk = max(1, min(int(effective_block_topk), block_count))
+    else:
+        effective_block_topk = min(int(config.block_topk), block_count)
+    forced = tuple(config.forced_boundary_blocks or ())
+    if forced:
+        forced_static = 0
+        if "first" in forced and block_count >= 1:
+            forced_static += 1
+        if "last" in forced and block_count >= 1:
+            forced_static += 1
+            if "first" in forced:
+                forced_static -= int(block_count == 1)
+        if "last_minus_one" in forced and block_count >= 2:
+            forced_static += 1
+            if "first" in forced:
+                forced_static -= int(block_count == 2)
+        effective_block_topk = max(int(effective_block_topk), int(forced_static))
+    use_parallel_refine = _hisa_megakernel_parallel_refine_enabled()
+    candidate_capacity_needed = _next_power_of_two_int(
+        max(int(topk_k), int(effective_block_topk) * block_size)
+    )
+    max_candidates = (
+        _HISA_MEGAKERNEL_PARALLEL_MAX_CANDIDATES
+        if use_parallel_refine
+        else _HISA_MEGAKERNEL_SERIAL_MAX_CANDIDATES
+    )
+    if candidate_capacity_needed > max_candidates:
+        raise RuntimeError(
+            "HISA megakernel candidate capacity exceeds the validated 8192-candidate "
+            f"path: capacity={candidate_capacity_needed} max={max_candidates} "
+            f"parallel_refine={int(use_parallel_refine)} block_keep={effective_block_topk} "
+            f"block_size={block_size} topk={topk_k}"
+        )
+
+    ext = _try_load_hisa_cuda_ext()
+    streaming_scratch = (
+        _hisa_megakernel_streaming_scratch(topk_k) if use_parallel_refine else None
+    )
+    streaming_refine = use_parallel_refine and (
+        candidate_capacity_needed > _HISA_MEGAKERNEL_SERIAL_MAX_CANDIDATES
+        or (
+            streaming_scratch is not None
+            and int(streaming_scratch) < int(candidate_capacity_needed)
+        )
+    )
+    if (
+        ext is None
+        or not hasattr(ext, "hisa_block_reps_batched_fwd")
+        or (
+            streaming_refine
+            and not hasattr(ext, "hisa_selector_megakernel_parallel_streaming_batched_fwd")
+        )
+        or (
+            use_parallel_refine
+            and not streaming_refine
+            and not hasattr(ext, "hisa_selector_megakernel_parallel_batched_fwd")
+        )
+        or (
+            not use_parallel_refine
+            and not hasattr(ext, "hisa_selector_megakernel_batched_fwd")
+        )
+    ):
+        return None
+
+    q_c = q.contiguous()
+    k_c = k.contiguous()
+    weights_c = weights.contiguous()
+    prefix_c = prefix_arg.contiguous()
+    if block_reps_precomputed is not None:
+        if block_reps_precomputed.shape != (bsz, block_count, head_dim):
+            return None
+        if block_reps_precomputed.device != k.device:
+            return None
+        if block_reps_precomputed.dtype != k.dtype:
+            return None
+        block_reps = block_reps_precomputed.contiguous()
+    else:
+        block_reps = torch.empty(
+            (bsz, block_count, head_dim), device=k.device, dtype=k.dtype
+        )
+        ext.hisa_block_reps_batched_fwd(k_c, block_reps, block_size)
+    topk_indices = torch.empty(
+        (bsz, q_len, topk_k), device=q.device, dtype=torch.int32
+    )
+    selected_scores = torch.empty(
+        (bsz, q_len, topk_k), device=q.device, dtype=torch.float32
+    )
+    if use_parallel_refine:
+        candidate_capacity = (
+            int(streaming_scratch or _HISA_MEGAKERNEL_SERIAL_MAX_CANDIDATES)
+            if streaming_refine
+            else candidate_capacity_needed
+        )
+        selected_blocks = torch.empty(
+            (bsz, q_len, int(effective_block_topk)), device=q.device, dtype=torch.int32
+        )
+        candidate_keys = torch.empty(
+            (bsz, q_len, candidate_capacity), device=q.device, dtype=torch.int64
+        )
+        if streaming_refine:
+            topk_ordinals = torch.empty(
+                (bsz, q_len, int(topk_k)), device=q.device, dtype=torch.int32
+            )
+            ext.hisa_selector_megakernel_parallel_streaming_batched_fwd(
+                q_c,
+                k_c,
+                block_reps,
+                weights_c,
+                prefix_c,
+                selected_blocks,
+                candidate_keys,
+                topk_indices,
+                selected_scores,
+                topk_ordinals,
+                block_size,
+                int(config.block_topk),
+                float(config.compression_ratio),
+                int(effective_block_topk),
+                int(topk_k),
+                int(candidate_capacity_needed),
+                "first" in forced,
+                "last" in forced,
+                "last_minus_one" in forced,
+            )
+        else:
+            ext.hisa_selector_megakernel_parallel_batched_fwd(
+                q_c,
+                k_c,
+                block_reps,
+                weights_c,
+                prefix_c,
+                selected_blocks,
+                candidate_keys,
+                topk_indices,
+                selected_scores,
+                block_size,
+                int(config.block_topk),
+                float(config.compression_ratio),
+                int(effective_block_topk),
+                int(topk_k),
+                "first" in forced,
+                "last" in forced,
+                "last_minus_one" in forced,
+            )
+    else:
+        ext.hisa_selector_megakernel_batched_fwd(
+            q_c,
+            k_c,
+            block_reps,
+            weights_c,
+            prefix_c,
+            topk_indices,
+            selected_scores,
+            block_size,
+            int(config.block_topk),
+            float(config.compression_ratio),
+            int(effective_block_topk),
+            int(topk_k),
+            "first" in forced,
+            "last" in forced,
+            "last_minus_one" in forced,
+        )
+    return topk_indices, selected_scores.reshape(bsz * q_len, topk_k)
 
 
 def indexcache_hisa_select_with_scores(
@@ -1523,8 +1985,28 @@ def indexcache_hisa_select_with_scores(
             dtype=torch.int32,
         )
         effective_block_topk = min(int(config.block_topk), block_count)
+    block_topk_counts, effective_block_topk = _include_forced_boundary_budget(
+        block_topk_counts,
+        effective_block_topk,
+        row_block_counts,
+        tuple(config.forced_boundary_blocks or ()),
+    )
 
     backend = _hisa_selector_backend()
+    if backend == "megakernel":
+        result = indexcache_hisa_megakernel_batched_select_with_scores(
+            q_rows.unsqueeze(1),
+            weights_rows.unsqueeze(1),
+            k_rows.unsqueeze(1),
+            topk_k,
+            config=config,
+            prefix_lens=prefix_lens,
+        )
+        if result is None:
+            return None
+        indices_bqk, scores_bq = result
+        return indices_bqk[0], scores_bq
+
     if backend in (
         "packed_cuda",
         "packed_cublasdx",
@@ -1583,6 +2065,193 @@ def indexcache_hisa_select_with_scores(
         config=config,
         prefix_lens=prefix_lens,
     )
+
+
+def describe_indexcache_hisa_select_with_scores(
+    q_rows: torch.Tensor,
+    weights_rows: torch.Tensor,
+    k_rows: torch.Tensor,
+    topk: int,
+    *,
+    config: IndexCacheHISAConfig,
+    prefix_lens: torch.Tensor,
+) -> str:
+    """Describe why the optimized HISA selected-score path is or is not eligible."""
+
+    backend = _hisa_selector_backend()
+    pieces = [f"backend={backend}"]
+    if not config.enabled:
+        return "; ".join((*pieces, "config.enabled=0"))
+    if not q_rows.is_cuda:
+        return "; ".join((*pieces, "q_rows is not CUDA"))
+    if not weights_rows.is_cuda:
+        return "; ".join((*pieces, "weights_rows is not CUDA"))
+    if not k_rows.is_cuda:
+        return "; ".join((*pieces, "k_rows is not CUDA"))
+    if not config.is_optimized:
+        return "; ".join((*pieces, f"execution_mode={config.execution_mode!r}"))
+    if not _is_blackwell_or_newer(q_rows.device):
+        return "; ".join((*pieces, "device is not Blackwell or newer"))
+
+    sq, heads, head_dim = q_rows.shape
+    sk = k_rows.shape[0]
+    topk_k = min(int(topk), sk)
+    if topk_k <= 0:
+        return "; ".join((*pieces, f"topk_k={topk_k} sk={sk}"))
+    prefix_lens = prefix_lens.to(device=q_rows.device, dtype=torch.long).clamp(0, sk)
+    if config.fallback_to_dense_if_short and int(prefix_lens.max().item()) <= topk_k:
+        return "; ".join(
+            (*pieces, "fallback_to_dense_if_short would choose dense short-context path")
+        )
+    block_size = int(config.block_size)
+    block_count = int(math.ceil(sk / block_size)) if block_size > 0 else 0
+    if block_count <= 0:
+        return "; ".join((*pieces, f"block_count={block_count} block_size={block_size} sk={sk}"))
+
+    row_block_counts = torch.div(
+        prefix_lens + block_size - 1, block_size, rounding_mode="floor"
+    ).to(torch.int32)
+    if config.compression_ratio > 0:
+        block_topk_counts, effective_block_topk = hisa_block_topk_counts(
+            row_block_counts,
+            block_size=block_size,
+            topk_tokens=topk_k,
+            compression_ratio=config.compression_ratio,
+        )
+    else:
+        block_topk_counts = torch.full(
+            (sq,),
+            min(int(config.block_topk), block_count),
+            device=q_rows.device,
+            dtype=torch.int32,
+        )
+        effective_block_topk = min(int(config.block_topk), block_count)
+    block_topk_counts, effective_block_topk = _include_forced_boundary_budget(
+        block_topk_counts,
+        effective_block_topk,
+        row_block_counts,
+        tuple(config.forced_boundary_blocks or ()),
+    )
+
+    if backend == "megakernel":
+        ext = _try_load_hisa_cuda_ext()
+        if ext is None:
+            return "; ".join((*pieces, "HISA CUDA extension unavailable"))
+        if not hasattr(ext, "hisa_block_reps_batched_fwd") or not hasattr(
+            ext, "hisa_selector_megakernel_batched_fwd"
+        ):
+            return "; ".join((*pieces, "HISA CUDA extension lacks megakernel entry points"))
+        if heads != 64 or head_dim != 128:
+            return "; ".join(
+                (*pieces, f"megakernel requires q shape [Q,64,128], got heads={heads} dim={head_dim}")
+            )
+        if q_rows.dtype != k_rows.dtype:
+            return "; ".join((*pieces, f"megakernel requires q/k dtype match: {q_rows.dtype} vs {k_rows.dtype}"))
+        if q_rows.dtype not in (torch.float32, torch.bfloat16, torch.float16):
+            return "; ".join((*pieces, f"megakernel unsupported q dtype {q_rows.dtype}"))
+        use_parallel_refine = _hisa_megakernel_parallel_refine_enabled()
+        candidate_capacity_needed = _next_power_of_two_int(
+            max(int(topk_k), int(effective_block_topk) * block_size)
+        )
+        max_candidates = (
+            _HISA_MEGAKERNEL_PARALLEL_MAX_CANDIDATES
+            if use_parallel_refine
+            else _HISA_MEGAKERNEL_SERIAL_MAX_CANDIDATES
+        )
+        if candidate_capacity_needed > max_candidates:
+            return "; ".join(
+                (
+                    *pieces,
+                    f"megakernel candidate capacity too large: capacity={candidate_capacity_needed} "
+                    f"max={max_candidates} parallel_refine={int(use_parallel_refine)} "
+                    f"block_keep={effective_block_topk} block_size={block_size} topk={topk_k}",
+                )
+            )
+        if (
+            use_parallel_refine
+            and candidate_capacity_needed > _HISA_MEGAKERNEL_SERIAL_MAX_CANDIDATES
+            and not hasattr(ext, "hisa_selector_megakernel_parallel_streaming_batched_fwd")
+        ):
+            return "; ".join(
+                (
+                    *pieces,
+                    "HISA CUDA extension lacks streaming parallel megakernel entry point "
+                    f"needed for capacity={candidate_capacity_needed}",
+                )
+            )
+        return "; ".join((*pieces, "eligible by static checks; megakernel returned None"))
+
+    if backend == "deepgemm":
+        if block_size != 128:
+            return "; ".join((*pieces, f"deepgemm requires block_size=128, got {block_size}"))
+        if get_indexcache_nvfp4_packed_tensors(k_rows) is None:
+            return "; ".join((*pieces, "missing NVFP4 IndexCache packed sidecar on k_rows"))
+        try:
+            import deep_gemm  # noqa: F401  # type: ignore
+            from deep_gemm.utils import per_token_cast_to_fp4  # noqa: F401  # type: ignore
+        except (AssertionError, ImportError, RuntimeError, OSError) as exc:
+            return "; ".join((*pieces, f"deep_gemm import failed: {type(exc).__name__}: {exc}"))
+        if heads != 64 or head_dim != 128:
+            return "; ".join(
+                (*pieces, f"deepgemm requires q shape [Q,64,128], got heads={heads} dim={head_dim}")
+            )
+        block_keep = min(int(effective_block_topk), block_count)
+        if block_keep <= 0 or block_keep * block_size < topk_k:
+            return "; ".join(
+                (
+                    *pieces,
+                    f"candidate capacity too small: block_keep={block_keep} "
+                    f"block_size={block_size} topk={topk_k}",
+                )
+            )
+        if bool((row_block_counts <= 0).any().item()):
+            return "; ".join((*pieces, "one or more rows have zero valid HISA blocks"))
+        partial_rows = (prefix_lens % block_size) != 0
+        if bool(partial_rows.any().item()) and "last" not in tuple(
+            config.forced_boundary_blocks or ()
+        ):
+            return "; ".join((*pieces, "partial causal rows require forced last block"))
+        return "; ".join(
+            (
+                *pieces,
+                "eligible by static checks; selector returned None during candidate planning",
+            )
+        )
+
+    if backend in ("packed_cuda", "packed_cublasdx", "packed_cublasdx_tiled", "packed_cublasdx_fp8"):
+        if get_indexcache_nvfp4_packed_tensors(k_rows) is None:
+            return "; ".join((*pieces, "missing NVFP4 IndexCache packed sidecar on k_rows"))
+        ext = _try_load_hisa_cuda_ext()
+        if ext is None:
+            return "; ".join((*pieces, "HISA CUDA extension unavailable"))
+        if backend == "packed_cuda":
+            ext_op = "hisa_selector_nvfp4_fwd"
+        elif backend == "packed_cublasdx":
+            ext_op = "hisa_selector_nvfp4_cublasdx_fwd"
+        elif backend == "packed_cublasdx_tiled":
+            ext_op = "hisa_selector_nvfp4_cublasdx_tiled_fwd"
+        else:
+            ext_op = "hisa_selector_nvfp4_cublasdx_fp8_fwd"
+        if not hasattr(ext, ext_op):
+            return "; ".join((*pieces, f"HISA CUDA extension lacks {ext_op}"))
+        if backend != "packed_cuda" and (heads != 64 or head_dim != 128):
+            return "; ".join(
+                (*pieces, f"{backend} requires q shape [Q,64,128], got heads={heads} dim={head_dim}")
+            )
+        return "; ".join((*pieces, "eligible by static checks; packed selector returned None"))
+
+    if backend == "cuda":
+        ext = _try_load_hisa_cuda_ext()
+        if ext is None:
+            return "; ".join((*pieces, "HISA CUDA extension unavailable"))
+        if not hasattr(ext, "hisa_selector_fwd"):
+            return "; ".join((*pieces, "HISA CUDA extension lacks hisa_selector_fwd"))
+        return "; ".join((*pieces, "eligible by static checks; CUDA selector returned None"))
+
+    if backend in ("auto", "bmm"):
+        return "; ".join((*pieces, "BMM HISA selected-score path should be available"))
+
+    return "; ".join((*pieces, "unknown backend state"))
 
 
 def indexcache_hisa_cuda_select_scores_teacher(
@@ -1651,6 +2320,12 @@ def indexcache_hisa_cuda_select_scores_teacher(
             dtype=torch.int32,
         )
         effective_block_topk = min(int(config.block_topk), block_count)
+    block_topk_counts, effective_block_topk = _include_forced_boundary_budget(
+        block_topk_counts,
+        effective_block_topk,
+        row_block_counts,
+        tuple(config.forced_boundary_blocks or ()),
+    )
 
     q_f = q_rows.contiguous().float()
     w_f = weights_rows.contiguous().float()
@@ -1761,6 +2436,12 @@ def indexcache_hisa_topk_with_scores(
         else:
             block_topk_counts = None
             effective_block_topk = min(config.block_topk, block_count)
+        block_topk_counts, effective_block_topk = _include_forced_boundary_budget(
+            block_topk_counts,
+            effective_block_topk,
+            row_block_counts,
+            tuple(config.forced_boundary_blocks or ()),
+        )
 
     for batch_idx in range(bsz):
         q_b = q[:, batch_idx].float()
@@ -1927,6 +2608,12 @@ def indexcache_hisa_topk(
             else:
                 block_topk_counts = None
                 effective_block_topk = min(config.block_topk, block_count)
+            block_topk_counts, effective_block_topk = _include_forced_boundary_budget(
+                block_topk_counts,
+                effective_block_topk,
+                row_block_counts,
+                tuple(config.forced_boundary_blocks or ()),
+            )
             top_blocks = _select_hisa_blocks(
                 block_scores,
                 row_block_counts,

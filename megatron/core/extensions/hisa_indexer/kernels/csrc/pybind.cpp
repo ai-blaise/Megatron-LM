@@ -86,6 +86,12 @@ void launch_hisa_selected_score_bwd(
     float* grad_k, float* grad_w, int Q, int H, int D, int L, int K,
     cudaStream_t stream);
 
+void launch_hisa_selected_score_bwd_batched(
+    const float* grad_selected_scores, const void* q, const void* k,
+    const void* weights, const void* topk_indices, float* grad_q,
+    float* grad_k, float* grad_w, int Q, int B, int H, int D, int L, int K,
+    int scalar_dtype, int weight_dtype, int topk_index_dtype, cudaStream_t stream);
+
 void launch_hisa_selector_teacher_fwd(
     const float* q, const float* k, const float* block_reps,
     const float* weights, const float* attn_query, const float* attn_key,
@@ -95,6 +101,39 @@ void launch_hisa_selector_teacher_fwd(
     int effective_block_topk, int topk_tokens, float softmax_scale,
     int force_first, int force_last, int force_last_minus_one,
     cudaStream_t stream);
+
+void launch_hisa_block_reps_batched_fwd(
+    const void* k, void* block_reps, int L, int B, int D,
+    int block_size, int MB, int scalar_dtype, cudaStream_t stream);
+
+void launch_hisa_selector_megakernel_batched_fwd(
+    const void* q, const void* k, const void* block_reps, const void* weights,
+    const void* prefix_lens, int32_t* topk_indices, float* selected_scores,
+    int Q, int B, int H, int D, int L, int MB, int block_size,
+    int block_topk, float compression_ratio, int effective_block_topk,
+    int topk_tokens, int prefix_lens_shared, int force_first, int force_last,
+    int force_last_minus_one, int scalar_dtype, int weight_dtype, int prefix_dtype,
+    cudaStream_t stream);
+
+void launch_hisa_selector_megakernel_parallel_batched_fwd(
+    const void* q, const void* k, const void* block_reps, const void* weights,
+    const void* prefix_lens, int32_t* selected_blocks, uint64_t* candidate_keys,
+    int32_t* topk_indices, float* selected_scores,
+    int Q, int B, int H, int D, int L, int MB, int block_size,
+    int block_topk, float compression_ratio, int effective_block_topk,
+    int topk_tokens, int candidate_capacity, int prefix_lens_shared,
+    int force_first, int force_last, int force_last_minus_one,
+    int scalar_dtype, int weight_dtype, int prefix_dtype, cudaStream_t stream);
+
+void launch_hisa_selector_megakernel_parallel_streaming_batched_fwd(
+    const void* q, const void* k, const void* block_reps, const void* weights,
+    const void* prefix_lens, int32_t* selected_blocks, uint64_t* candidate_keys,
+    int32_t* topk_indices, float* selected_scores, int32_t* topk_ordinals,
+    int Q, int B, int H, int D, int L, int MB, int block_size,
+    int block_topk, float compression_ratio, int effective_block_topk,
+    int topk_tokens, int candidate_scratch_capacity, int total_candidate_capacity,
+    int prefix_lens_shared, int force_first, int force_last, int force_last_minus_one,
+    int scalar_dtype, int weight_dtype, int prefix_dtype, cudaStream_t stream);
 
 void launch_dsa_sparse_kv_bwd(
     const void* query, const void* key, const void* value,
@@ -146,6 +185,56 @@ void launch_dsa_split_qk_bwd_row(
     int has_positions, int emit_query, int emit_key_nope, int emit_key_pe,
     int emit_value, int warps, cudaStream_t stream);
 
+void launch_dsa_split_qk_fwd_row(
+    const void* query_nope, const void* query_pe, const void* key_nope,
+    const void* key_pe, const void* value, const void* topk_indices,
+    const int64_t* query_positions, const int64_t* key_positions,
+    void* output, float* lse, float* teacher_probs,
+    float* teacher_score_scratch, int q_len, int bsz, int sk,
+    int num_heads, int head_dim, int pos_dim, int key_pe_heads,
+    int value_dim, int topk_count, int q_start,
+    int64_t query_nope_stride_s, int64_t query_nope_stride_b,
+    int64_t query_nope_stride_h, int64_t query_nope_stride_d,
+    int64_t key_nope_stride_s, int64_t key_nope_stride_b,
+    int64_t key_nope_stride_h, int64_t key_nope_stride_d,
+    int64_t value_stride_s, int64_t value_stride_b, int64_t value_stride_h,
+    int64_t value_stride_v, float softmax_scale, int scalar_dtype,
+    int topk_dtype, int has_positions, int emit_teacher,
+    int use_teacher_score_scratch, int warps, cudaStream_t stream);
+
+void launch_dsa_split_qk_fwd_cublasdx(
+    const void* query_nope, const void* query_pe, const void* key_nope,
+    const void* key_pe, const void* value, const void* topk_indices,
+    const int64_t* query_positions, const int64_t* key_positions,
+    void* output, float* lse, float* teacher_probs,
+    float* teacher_score_scratch, int q_len, int bsz, int sk,
+    int num_heads, int head_dim, int pos_dim, int key_pe_heads,
+    int value_dim, int topk_count, int q_start,
+    int64_t query_nope_stride_s, int64_t query_nope_stride_b,
+    int64_t query_nope_stride_h, int64_t query_nope_stride_d,
+    int64_t key_nope_stride_s, int64_t key_nope_stride_b,
+    int64_t key_nope_stride_h, int64_t key_nope_stride_d,
+    int64_t value_stride_s, int64_t value_stride_b, int64_t value_stride_h,
+    int64_t value_stride_v, float softmax_scale, int scalar_dtype,
+    int topk_dtype, int has_positions, int emit_teacher,
+    int use_teacher_score_scratch, cudaStream_t stream);
+
+void launch_dsa_split_qk_fwd_cublasdx_pe(
+    const void* query_nope, const void* query_pe, const void* key_nope,
+    const void* key_pe, const void* value, const void* topk_indices,
+    const int64_t* query_positions, const int64_t* key_positions,
+    void* output, float* lse, float* teacher_probs,
+    float* teacher_score_scratch, int q_len, int bsz, int sk,
+    int num_heads, int head_dim, int pos_dim, int key_pe_heads,
+    int value_dim, int topk_count, int q_start,
+    int64_t query_nope_stride_s, int64_t query_nope_stride_b,
+    int64_t query_nope_stride_h, int64_t query_nope_stride_d,
+    int64_t key_nope_stride_s, int64_t key_nope_stride_b,
+    int64_t key_nope_stride_h, int64_t key_nope_stride_d,
+    int64_t value_stride_s, int64_t value_stride_b, int64_t value_stride_h,
+    int64_t value_stride_v, float softmax_scale, int scalar_dtype,
+    int topk_dtype, int has_positions, cudaStream_t stream);
+
 void launch_dsa_sparse_kv_bwd_sorted_from_scores(
     const void* query, const void* value, const void* topk_indices,
     const float* selected_scores, const void* output, const float* lse,
@@ -178,6 +267,39 @@ void launch_dsa_indexer_rope_bwd(
     int64_t freq_stride_d, int grad_dtype, int freqs_dtype, float mscale,
     int interleaved, cudaStream_t stream);
 
+void launch_moe_deepep_compact_permute_fwd(
+    const void* hidden, const void* indices, const float* probs,
+    const int64_t* offsets, const int64_t* counts, int32_t* counters,
+    void* output, float* permuted_probs, int64_t* row_map,
+    int64_t* edge_map, int64_t num_edges, int topk, int num_experts,
+    int hidden_size, int hidden_dtype, int index_dtype,
+    cudaStream_t stream);
+
+void launch_moe_deepep_compact_permute_rows_fwd(
+    const void* hidden, const void* indices, const float* probs,
+    const int64_t* offsets, const int64_t* counts, int32_t* counters,
+    void* output, float* permuted_probs, int64_t* row_map,
+    int64_t* edge_map, int32_t* edge_to_row, int64_t num_rows, int topk,
+    int num_experts, int hidden_size, int hidden_dtype, int index_dtype,
+    cudaStream_t stream);
+
+void launch_moe_deepep_compact_unpermute_rows(
+    const void* permuted_hidden, const void* indices, const int32_t* edge_to_row,
+    void* output, int64_t num_rows, int topk, int num_experts, int hidden_size,
+    int hidden_dtype, int index_dtype, cudaStream_t stream);
+
+void launch_moe_deepep_compact_scatter_add(
+    const void* src, const int64_t* row_map, void* dst, int64_t num_rows,
+    int hidden_size, int dtype, cudaStream_t stream);
+
+void launch_moe_deepep_compact_gather(
+    const void* src, const int64_t* row_map, void* dst, int64_t num_rows,
+    int hidden_size, int dtype, cudaStream_t stream);
+
+void launch_moe_deepep_compact_scatter_probs(
+    const float* grad_permuted_probs, const int64_t* edge_map,
+    float* grad_probs, int64_t num_rows, cudaStream_t stream);
+
 }  // namespace hisa_indexer
 }  // namespace megatron
 
@@ -186,6 +308,10 @@ namespace {
 #define HISA_CHECK_CUDA(t) TORCH_CHECK((t).is_cuda(), #t " must be a CUDA tensor")
 #define HISA_CHECK_CONTIG(t) TORCH_CHECK((t).is_contiguous(), #t " must be contiguous")
 #define HISA_CHECK_DTYPE(t, dt) TORCH_CHECK((t).scalar_type() == (dt), #t " has wrong dtype")
+
+int dtype_code(torch::ScalarType dtype);
+int topk_dtype_code(torch::ScalarType dtype);
+void check_hisa_selector_scalar_dtype(torch::ScalarType dtype, const char* name);
 
 void hisa_score_bwd(
     torch::Tensor grad_cand_score, torch::Tensor grad_block_score,
@@ -976,6 +1102,105 @@ void hisa_selected_score_bwd(
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+void hisa_selected_score_bwd_batched(
+    torch::Tensor grad_selected_scores,
+    torch::Tensor q,
+    torch::Tensor k,
+    torch::Tensor weights,
+    torch::Tensor topk_indices,
+    torch::Tensor grad_q,
+    torch::Tensor grad_k,
+    torch::Tensor grad_w) {
+  HISA_CHECK_CUDA(grad_selected_scores);
+  HISA_CHECK_CUDA(q);
+  HISA_CHECK_CUDA(k);
+  HISA_CHECK_CUDA(weights);
+  HISA_CHECK_CUDA(topk_indices);
+  HISA_CHECK_CUDA(grad_q);
+  HISA_CHECK_CUDA(grad_k);
+  HISA_CHECK_CUDA(grad_w);
+
+  HISA_CHECK_CONTIG(grad_selected_scores);
+  HISA_CHECK_CONTIG(q);
+  HISA_CHECK_CONTIG(k);
+  HISA_CHECK_CONTIG(weights);
+  HISA_CHECK_CONTIG(topk_indices);
+  HISA_CHECK_CONTIG(grad_q);
+  HISA_CHECK_CONTIG(grad_k);
+  HISA_CHECK_CONTIG(grad_w);
+
+  HISA_CHECK_DTYPE(grad_selected_scores, torch::kFloat32);
+  check_hisa_selector_scalar_dtype(q.scalar_type(), "q");
+  TORCH_CHECK(k.scalar_type() == q.scalar_type(), "k dtype must match q dtype");
+  check_hisa_selector_scalar_dtype(weights.scalar_type(), "weights");
+  TORCH_CHECK(
+      topk_indices.scalar_type() == torch::kInt16 ||
+          topk_indices.scalar_type() == torch::kInt32,
+      "topk_indices must be int16 or int32 for batched HISA selected-score backward; got ",
+      topk_indices.scalar_type());
+  HISA_CHECK_DTYPE(grad_q, torch::kFloat32);
+  HISA_CHECK_DTYPE(grad_k, torch::kFloat32);
+  HISA_CHECK_DTYPE(grad_w, torch::kFloat32);
+
+  TORCH_CHECK(q.dim() == 4, "q must be [Q, B, H, D]");
+  TORCH_CHECK(k.dim() == 3, "k must be [L, B, D]");
+  TORCH_CHECK(weights.dim() == 3, "weights must be [Q, B, H]");
+  TORCH_CHECK(topk_indices.dim() == 3, "topk_indices must be [B, Q, K]");
+  TORCH_CHECK(
+      grad_selected_scores.dim() == 2 || grad_selected_scores.dim() == 3,
+      "grad_selected_scores must be [B * Q, K] or [B, Q, K]");
+
+  const int Q = q.size(0);
+  const int B = q.size(1);
+  const int H = q.size(2);
+  const int D = q.size(3);
+  const int L = k.size(0);
+  const int K = topk_indices.size(2);
+
+  TORCH_CHECK(D == 128, "batched HISA selected-score backward requires head_dim=128");
+  TORCH_CHECK(H == 64, "batched HISA selected-score backward requires 64 indexer heads");
+  TORCH_CHECK(k.size(1) == B && k.size(2) == D, "k shape must match q batch/head_dim");
+  TORCH_CHECK(weights.size(0) == Q && weights.size(1) == B && weights.size(2) == H,
+              "weights must be [Q, B, H]");
+  TORCH_CHECK(topk_indices.size(0) == B && topk_indices.size(1) == Q,
+              "topk_indices must be [B, Q, K]");
+  if (grad_selected_scores.dim() == 2) {
+    TORCH_CHECK(grad_selected_scores.size(0) == static_cast<int64_t>(B) * Q &&
+                    grad_selected_scores.size(1) == K,
+                "grad_selected_scores must be [B * Q, K]");
+  } else {
+    TORCH_CHECK(grad_selected_scores.size(0) == B &&
+                    grad_selected_scores.size(1) == Q &&
+                    grad_selected_scores.size(2) == K,
+                "grad_selected_scores must be [B, Q, K]");
+  }
+  TORCH_CHECK(grad_q.sizes() == q.sizes(), "grad_q shape must match q");
+  TORCH_CHECK(grad_k.sizes() == k.sizes(), "grad_k shape must match k");
+  TORCH_CHECK(grad_w.sizes() == weights.sizes(), "grad_w shape must match weights");
+
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  megatron::hisa_indexer::launch_hisa_selected_score_bwd_batched(
+      grad_selected_scores.data_ptr<float>(),
+      q.data_ptr(),
+      k.data_ptr(),
+      weights.data_ptr(),
+      topk_indices.data_ptr(),
+      grad_q.data_ptr<float>(),
+      grad_k.data_ptr<float>(),
+      grad_w.data_ptr<float>(),
+      Q,
+      B,
+      H,
+      D,
+      L,
+      K,
+      dtype_code(q.scalar_type()),
+      dtype_code(weights.scalar_type()),
+      topk_dtype_code(topk_indices.scalar_type()),
+      stream);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 void hisa_selector_teacher_fwd(
     torch::Tensor q,
     torch::Tensor k,
@@ -1101,6 +1326,465 @@ int dtype_code(torch::ScalarType dtype) {
     return 2;
   }
   TORCH_CHECK(false, "unsupported dtype for DSA sparse K/V backward: ", dtype);
+}
+
+int hisa_prefix_dtype_code(torch::ScalarType dtype) {
+  if (dtype == torch::kInt32) {
+    return 0;
+  }
+  if (dtype == torch::kInt64) {
+    return 1;
+  }
+  TORCH_CHECK(false, "prefix_lens must be int32 or int64; got ", dtype);
+}
+
+void check_hisa_selector_scalar_dtype(torch::ScalarType dtype, const char* name) {
+  TORCH_CHECK(
+      dtype == torch::kFloat32 || dtype == torch::kBFloat16 || dtype == torch::kFloat16,
+      name,
+      " must be float32, bfloat16, or float16; got ",
+      dtype);
+}
+
+void hisa_block_reps_batched_fwd(
+    torch::Tensor k,
+    torch::Tensor block_reps,
+    int64_t block_size) {
+  HISA_CHECK_CUDA(k);
+  HISA_CHECK_CUDA(block_reps);
+  HISA_CHECK_CONTIG(k);
+  HISA_CHECK_CONTIG(block_reps);
+  check_hisa_selector_scalar_dtype(k.scalar_type(), "k");
+  TORCH_CHECK(block_reps.scalar_type() == k.scalar_type(),
+              "block_reps dtype must match k dtype");
+  TORCH_CHECK(k.dim() == 3, "k must be [L, B, D]");
+  TORCH_CHECK(block_reps.dim() == 3, "block_reps must be [B, MB, D]");
+  const int L = static_cast<int>(k.size(0));
+  const int B = static_cast<int>(k.size(1));
+  const int D = static_cast<int>(k.size(2));
+  const int MB = static_cast<int>(block_reps.size(1));
+  TORCH_CHECK(block_reps.size(0) == B, "block_reps batch must match k");
+  TORCH_CHECK(block_reps.size(2) == D, "block_reps head_dim must match k");
+  TORCH_CHECK(block_size > 0, "block_size must be positive");
+  TORCH_CHECK(MB == (L + block_size - 1) / block_size,
+              "block_reps MB must equal ceil(L / block_size)");
+
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  megatron::hisa_indexer::launch_hisa_block_reps_batched_fwd(
+      k.data_ptr(),
+      block_reps.data_ptr(),
+      L,
+      B,
+      D,
+      static_cast<int>(block_size),
+      MB,
+      dtype_code(k.scalar_type()),
+      stream);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void hisa_selector_megakernel_batched_fwd(
+    torch::Tensor q,
+    torch::Tensor k,
+    torch::Tensor block_reps,
+    torch::Tensor weights,
+    torch::Tensor prefix_lens,
+    torch::Tensor topk_indices,
+    torch::Tensor selected_scores,
+    int64_t block_size,
+    int64_t block_topk,
+    double compression_ratio,
+    int64_t effective_block_topk,
+    int64_t topk_tokens,
+    bool force_first,
+    bool force_last,
+    bool force_last_minus_one) {
+  HISA_CHECK_CUDA(q);
+  HISA_CHECK_CUDA(k);
+  HISA_CHECK_CUDA(block_reps);
+  HISA_CHECK_CUDA(weights);
+  HISA_CHECK_CUDA(prefix_lens);
+  HISA_CHECK_CUDA(topk_indices);
+  HISA_CHECK_CUDA(selected_scores);
+
+  HISA_CHECK_CONTIG(q);
+  HISA_CHECK_CONTIG(k);
+  HISA_CHECK_CONTIG(block_reps);
+  HISA_CHECK_CONTIG(weights);
+  HISA_CHECK_CONTIG(prefix_lens);
+  HISA_CHECK_CONTIG(topk_indices);
+  HISA_CHECK_CONTIG(selected_scores);
+
+  check_hisa_selector_scalar_dtype(q.scalar_type(), "q");
+  TORCH_CHECK(k.scalar_type() == q.scalar_type(), "k dtype must match q dtype");
+  TORCH_CHECK(block_reps.scalar_type() == q.scalar_type(),
+              "block_reps dtype must match q dtype");
+  check_hisa_selector_scalar_dtype(weights.scalar_type(), "weights");
+  hisa_prefix_dtype_code(prefix_lens.scalar_type());
+  HISA_CHECK_DTYPE(topk_indices, torch::kInt32);
+  HISA_CHECK_DTYPE(selected_scores, torch::kFloat32);
+
+  TORCH_CHECK(q.dim() == 4, "q must be [Q, B, H, D]");
+  TORCH_CHECK(k.dim() == 3, "k must be [L, B, D]");
+  TORCH_CHECK(block_reps.dim() == 3, "block_reps must be [B, MB, D]");
+  TORCH_CHECK(weights.dim() == 3, "weights must be [Q, B, H]");
+  TORCH_CHECK(prefix_lens.dim() == 1 || prefix_lens.dim() == 2,
+              "prefix_lens must be [Q] or [B, Q]");
+  TORCH_CHECK(topk_indices.dim() == 3, "topk_indices must be [B, Q, K]");
+  TORCH_CHECK(selected_scores.dim() == 3, "selected_scores must be [B, Q, K]");
+
+  const int Q = static_cast<int>(q.size(0));
+  const int B = static_cast<int>(q.size(1));
+  const int H = static_cast<int>(q.size(2));
+  const int D = static_cast<int>(q.size(3));
+  const int L = static_cast<int>(k.size(0));
+  const int MB = static_cast<int>(block_reps.size(1));
+  const int K = static_cast<int>(topk_indices.size(2));
+
+  TORCH_CHECK(k.size(1) == B && k.size(2) == D, "k shape must match q batch/head_dim");
+  TORCH_CHECK(block_reps.size(0) == B && block_reps.size(2) == D,
+              "block_reps shape must match q batch/head_dim");
+  TORCH_CHECK(weights.size(0) == Q && weights.size(1) == B && weights.size(2) == H,
+              "weights must be [Q, B, H]");
+  const bool prefix_lens_shared = prefix_lens.dim() == 1;
+  if (prefix_lens_shared) {
+    TORCH_CHECK(prefix_lens.size(0) == Q, "shared prefix_lens must be [Q]");
+  } else {
+    TORCH_CHECK(prefix_lens.size(0) == B && prefix_lens.size(1) == Q,
+                "prefix_lens must be [B, Q]");
+  }
+  TORCH_CHECK(topk_indices.size(0) == B && topk_indices.size(1) == Q,
+              "topk_indices must be [B, Q, K]");
+  TORCH_CHECK(selected_scores.size(0) == B && selected_scores.size(1) == Q &&
+                  selected_scores.size(2) == K,
+              "selected_scores must match topk_indices shape");
+  TORCH_CHECK(topk_tokens == K, "topk_tokens must equal topk_indices.size(2)");
+  TORCH_CHECK(block_size > 0, "block_size must be positive");
+  TORCH_CHECK(block_topk > 0, "block_topk must be positive");
+  TORCH_CHECK(compression_ratio >= 0.0, "compression_ratio must be non-negative");
+  TORCH_CHECK(effective_block_topk > 0, "effective_block_topk must be positive");
+
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  megatron::hisa_indexer::launch_hisa_selector_megakernel_batched_fwd(
+      q.data_ptr(),
+      k.data_ptr(),
+      block_reps.data_ptr(),
+      weights.data_ptr(),
+      prefix_lens.data_ptr(),
+      topk_indices.data_ptr<int32_t>(),
+      selected_scores.data_ptr<float>(),
+      Q,
+      B,
+      H,
+      D,
+      L,
+      MB,
+      static_cast<int>(block_size),
+      static_cast<int>(block_topk),
+      static_cast<float>(compression_ratio),
+      static_cast<int>(effective_block_topk),
+      static_cast<int>(topk_tokens),
+      prefix_lens_shared ? 1 : 0,
+      force_first ? 1 : 0,
+      force_last ? 1 : 0,
+      force_last_minus_one ? 1 : 0,
+      dtype_code(q.scalar_type()),
+      dtype_code(weights.scalar_type()),
+      hisa_prefix_dtype_code(prefix_lens.scalar_type()),
+      stream);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void hisa_selector_megakernel_parallel_batched_fwd(
+    torch::Tensor q,
+    torch::Tensor k,
+    torch::Tensor block_reps,
+    torch::Tensor weights,
+    torch::Tensor prefix_lens,
+    torch::Tensor selected_blocks,
+    torch::Tensor candidate_keys,
+    torch::Tensor topk_indices,
+    torch::Tensor selected_scores,
+    int64_t block_size,
+    int64_t block_topk,
+    double compression_ratio,
+    int64_t effective_block_topk,
+    int64_t topk_tokens,
+    bool force_first,
+    bool force_last,
+    bool force_last_minus_one) {
+  HISA_CHECK_CUDA(q);
+  HISA_CHECK_CUDA(k);
+  HISA_CHECK_CUDA(block_reps);
+  HISA_CHECK_CUDA(weights);
+  HISA_CHECK_CUDA(prefix_lens);
+  HISA_CHECK_CUDA(selected_blocks);
+  HISA_CHECK_CUDA(candidate_keys);
+  HISA_CHECK_CUDA(topk_indices);
+  HISA_CHECK_CUDA(selected_scores);
+
+  HISA_CHECK_CONTIG(q);
+  HISA_CHECK_CONTIG(k);
+  HISA_CHECK_CONTIG(block_reps);
+  HISA_CHECK_CONTIG(weights);
+  HISA_CHECK_CONTIG(prefix_lens);
+  HISA_CHECK_CONTIG(selected_blocks);
+  HISA_CHECK_CONTIG(candidate_keys);
+  HISA_CHECK_CONTIG(topk_indices);
+  HISA_CHECK_CONTIG(selected_scores);
+
+  check_hisa_selector_scalar_dtype(q.scalar_type(), "q");
+  TORCH_CHECK(k.scalar_type() == q.scalar_type(), "k dtype must match q dtype");
+  TORCH_CHECK(block_reps.scalar_type() == q.scalar_type(),
+              "block_reps dtype must match q dtype");
+  check_hisa_selector_scalar_dtype(weights.scalar_type(), "weights");
+  hisa_prefix_dtype_code(prefix_lens.scalar_type());
+  HISA_CHECK_DTYPE(selected_blocks, torch::kInt32);
+  HISA_CHECK_DTYPE(candidate_keys, torch::kInt64);
+  HISA_CHECK_DTYPE(topk_indices, torch::kInt32);
+  HISA_CHECK_DTYPE(selected_scores, torch::kFloat32);
+
+  TORCH_CHECK(q.dim() == 4, "q must be [Q, B, H, D]");
+  TORCH_CHECK(k.dim() == 3, "k must be [L, B, D]");
+  TORCH_CHECK(block_reps.dim() == 3, "block_reps must be [B, MB, D]");
+  TORCH_CHECK(weights.dim() == 3, "weights must be [Q, B, H]");
+  TORCH_CHECK(prefix_lens.dim() == 1 || prefix_lens.dim() == 2,
+              "prefix_lens must be [Q] or [B, Q]");
+  TORCH_CHECK(selected_blocks.dim() == 3,
+              "selected_blocks must be [B, Q, effective_block_topk]");
+  TORCH_CHECK(candidate_keys.dim() == 3,
+              "candidate_keys must be [B, Q, candidate_capacity]");
+  TORCH_CHECK(topk_indices.dim() == 3, "topk_indices must be [B, Q, K]");
+  TORCH_CHECK(selected_scores.dim() == 3, "selected_scores must be [B, Q, K]");
+
+  const int Q = static_cast<int>(q.size(0));
+  const int B = static_cast<int>(q.size(1));
+  const int H = static_cast<int>(q.size(2));
+  const int D = static_cast<int>(q.size(3));
+  const int L = static_cast<int>(k.size(0));
+  const int MB = static_cast<int>(block_reps.size(1));
+  const int K = static_cast<int>(topk_indices.size(2));
+  const int candidate_capacity = static_cast<int>(candidate_keys.size(2));
+
+  TORCH_CHECK(k.size(1) == B && k.size(2) == D, "k shape must match q batch/head_dim");
+  TORCH_CHECK(block_reps.size(0) == B && block_reps.size(2) == D,
+              "block_reps shape must match q batch/head_dim");
+  TORCH_CHECK(weights.size(0) == Q && weights.size(1) == B && weights.size(2) == H,
+              "weights must be [Q, B, H]");
+  const bool prefix_lens_shared = prefix_lens.dim() == 1;
+  if (prefix_lens_shared) {
+    TORCH_CHECK(prefix_lens.size(0) == Q, "shared prefix_lens must be [Q]");
+  } else {
+    TORCH_CHECK(prefix_lens.size(0) == B && prefix_lens.size(1) == Q,
+                "prefix_lens must be [B, Q]");
+  }
+  TORCH_CHECK(selected_blocks.size(0) == B && selected_blocks.size(1) == Q &&
+                  selected_blocks.size(2) == effective_block_topk,
+              "selected_blocks must be [B, Q, effective_block_topk]");
+  TORCH_CHECK(candidate_keys.size(0) == B && candidate_keys.size(1) == Q,
+              "candidate_keys must be [B, Q, candidate_capacity]");
+  TORCH_CHECK(topk_indices.size(0) == B && topk_indices.size(1) == Q,
+              "topk_indices must be [B, Q, K]");
+  TORCH_CHECK(selected_scores.size(0) == B && selected_scores.size(1) == Q &&
+                  selected_scores.size(2) == K,
+              "selected_scores must match topk_indices shape");
+  TORCH_CHECK(topk_tokens == K, "topk_tokens must equal topk_indices.size(2)");
+  TORCH_CHECK(block_size > 0, "block_size must be positive");
+  TORCH_CHECK(block_topk > 0, "block_topk must be positive");
+  TORCH_CHECK(compression_ratio >= 0.0, "compression_ratio must be non-negative");
+  TORCH_CHECK(effective_block_topk > 0, "effective_block_topk must be positive");
+  TORCH_CHECK(candidate_capacity >= K, "candidate scratch must be at least topk_tokens");
+  TORCH_CHECK(candidate_capacity >= effective_block_topk * block_size,
+              "candidate scratch must contain all HISA selected-block tokens");
+  TORCH_CHECK((candidate_capacity & (candidate_capacity - 1)) == 0,
+              "candidate scratch width must be a power of two");
+
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  megatron::hisa_indexer::launch_hisa_selector_megakernel_parallel_batched_fwd(
+      q.data_ptr(),
+      k.data_ptr(),
+      block_reps.data_ptr(),
+      weights.data_ptr(),
+      prefix_lens.data_ptr(),
+      selected_blocks.data_ptr<int32_t>(),
+      reinterpret_cast<uint64_t*>(candidate_keys.data_ptr<int64_t>()),
+      topk_indices.data_ptr<int32_t>(),
+      selected_scores.data_ptr<float>(),
+      Q,
+      B,
+      H,
+      D,
+      L,
+      MB,
+      static_cast<int>(block_size),
+      static_cast<int>(block_topk),
+      static_cast<float>(compression_ratio),
+      static_cast<int>(effective_block_topk),
+      static_cast<int>(topk_tokens),
+      candidate_capacity,
+      prefix_lens_shared ? 1 : 0,
+      force_first ? 1 : 0,
+      force_last ? 1 : 0,
+      force_last_minus_one ? 1 : 0,
+      dtype_code(q.scalar_type()),
+      dtype_code(weights.scalar_type()),
+      hisa_prefix_dtype_code(prefix_lens.scalar_type()),
+      stream);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void hisa_selector_megakernel_parallel_streaming_batched_fwd(
+    torch::Tensor q,
+    torch::Tensor k,
+    torch::Tensor block_reps,
+    torch::Tensor weights,
+    torch::Tensor prefix_lens,
+    torch::Tensor selected_blocks,
+    torch::Tensor candidate_keys,
+    torch::Tensor topk_indices,
+    torch::Tensor selected_scores,
+    torch::Tensor topk_ordinals,
+    int64_t block_size,
+    int64_t block_topk,
+    double compression_ratio,
+    int64_t effective_block_topk,
+    int64_t topk_tokens,
+    int64_t total_candidate_capacity,
+    bool force_first,
+    bool force_last,
+    bool force_last_minus_one) {
+  HISA_CHECK_CUDA(q);
+  HISA_CHECK_CUDA(k);
+  HISA_CHECK_CUDA(block_reps);
+  HISA_CHECK_CUDA(weights);
+  HISA_CHECK_CUDA(prefix_lens);
+  HISA_CHECK_CUDA(selected_blocks);
+  HISA_CHECK_CUDA(candidate_keys);
+  HISA_CHECK_CUDA(topk_indices);
+  HISA_CHECK_CUDA(selected_scores);
+  HISA_CHECK_CUDA(topk_ordinals);
+
+  HISA_CHECK_CONTIG(q);
+  HISA_CHECK_CONTIG(k);
+  HISA_CHECK_CONTIG(block_reps);
+  HISA_CHECK_CONTIG(weights);
+  HISA_CHECK_CONTIG(prefix_lens);
+  HISA_CHECK_CONTIG(selected_blocks);
+  HISA_CHECK_CONTIG(candidate_keys);
+  HISA_CHECK_CONTIG(topk_indices);
+  HISA_CHECK_CONTIG(selected_scores);
+  HISA_CHECK_CONTIG(topk_ordinals);
+
+  check_hisa_selector_scalar_dtype(q.scalar_type(), "q");
+  TORCH_CHECK(k.scalar_type() == q.scalar_type(), "k dtype must match q dtype");
+  TORCH_CHECK(block_reps.scalar_type() == q.scalar_type(),
+              "block_reps dtype must match q dtype");
+  check_hisa_selector_scalar_dtype(weights.scalar_type(), "weights");
+  hisa_prefix_dtype_code(prefix_lens.scalar_type());
+  HISA_CHECK_DTYPE(selected_blocks, torch::kInt32);
+  HISA_CHECK_DTYPE(candidate_keys, torch::kInt64);
+  HISA_CHECK_DTYPE(topk_indices, torch::kInt32);
+  HISA_CHECK_DTYPE(selected_scores, torch::kFloat32);
+  HISA_CHECK_DTYPE(topk_ordinals, torch::kInt32);
+
+  TORCH_CHECK(q.dim() == 4, "q must be [Q, B, H, D]");
+  TORCH_CHECK(k.dim() == 3, "k must be [L, B, D]");
+  TORCH_CHECK(block_reps.dim() == 3, "block_reps must be [B, MB, D]");
+  TORCH_CHECK(weights.dim() == 3, "weights must be [Q, B, H]");
+  TORCH_CHECK(prefix_lens.dim() == 1 || prefix_lens.dim() == 2,
+              "prefix_lens must be [Q] or [B, Q]");
+  TORCH_CHECK(selected_blocks.dim() == 3,
+              "selected_blocks must be [B, Q, effective_block_topk]");
+  TORCH_CHECK(candidate_keys.dim() == 3,
+              "candidate_keys must be [B, Q, candidate_scratch_capacity]");
+  TORCH_CHECK(topk_indices.dim() == 3, "topk_indices must be [B, Q, K]");
+  TORCH_CHECK(selected_scores.dim() == 3, "selected_scores must be [B, Q, K]");
+  TORCH_CHECK(topk_ordinals.dim() == 3, "topk_ordinals must be [B, Q, K]");
+
+  const int Q = static_cast<int>(q.size(0));
+  const int B = static_cast<int>(q.size(1));
+  const int H = static_cast<int>(q.size(2));
+  const int D = static_cast<int>(q.size(3));
+  const int L = static_cast<int>(k.size(0));
+  const int MB = static_cast<int>(block_reps.size(1));
+  const int K = static_cast<int>(topk_indices.size(2));
+  const int candidate_scratch_capacity = static_cast<int>(candidate_keys.size(2));
+
+  TORCH_CHECK(k.size(1) == B && k.size(2) == D, "k shape must match q batch/head_dim");
+  TORCH_CHECK(block_reps.size(0) == B && block_reps.size(2) == D,
+              "block_reps shape must match q batch/head_dim");
+  TORCH_CHECK(weights.size(0) == Q && weights.size(1) == B && weights.size(2) == H,
+              "weights must be [Q, B, H]");
+  const bool prefix_lens_shared = prefix_lens.dim() == 1;
+  if (prefix_lens_shared) {
+    TORCH_CHECK(prefix_lens.size(0) == Q, "shared prefix_lens must be [Q]");
+  } else {
+    TORCH_CHECK(prefix_lens.size(0) == B && prefix_lens.size(1) == Q,
+                "prefix_lens must be [B, Q]");
+  }
+  TORCH_CHECK(selected_blocks.size(0) == B && selected_blocks.size(1) == Q &&
+                  selected_blocks.size(2) == effective_block_topk,
+              "selected_blocks must be [B, Q, effective_block_topk]");
+  TORCH_CHECK(candidate_keys.size(0) == B && candidate_keys.size(1) == Q,
+              "candidate_keys must be [B, Q, candidate_scratch_capacity]");
+  TORCH_CHECK(topk_indices.size(0) == B && topk_indices.size(1) == Q,
+              "topk_indices must be [B, Q, K]");
+  TORCH_CHECK(selected_scores.size(0) == B && selected_scores.size(1) == Q &&
+                  selected_scores.size(2) == K,
+              "selected_scores must match topk_indices shape");
+  TORCH_CHECK(topk_ordinals.sizes() == topk_indices.sizes(),
+              "topk_ordinals shape must match topk_indices");
+  TORCH_CHECK(topk_tokens == K, "topk_tokens must equal topk_indices.size(2)");
+  TORCH_CHECK(block_size > 0, "block_size must be positive");
+  TORCH_CHECK(block_topk > 0, "block_topk must be positive");
+  TORCH_CHECK(compression_ratio >= 0.0, "compression_ratio must be non-negative");
+  TORCH_CHECK(effective_block_topk > 0, "effective_block_topk must be positive");
+  TORCH_CHECK(candidate_scratch_capacity >= K, "candidate scratch must fit topk_tokens");
+  TORCH_CHECK(candidate_scratch_capacity <= 8192,
+              "streaming candidate scratch must not exceed 8192");
+  TORCH_CHECK((candidate_scratch_capacity & (candidate_scratch_capacity - 1)) == 0,
+              "candidate scratch width must be a power of two");
+  TORCH_CHECK(total_candidate_capacity >= effective_block_topk * block_size,
+              "total candidate capacity must contain all HISA selected-block tokens");
+  TORCH_CHECK(total_candidate_capacity >= candidate_scratch_capacity,
+              "total candidate capacity must be at least scratch capacity");
+  TORCH_CHECK((total_candidate_capacity & (total_candidate_capacity - 1)) == 0,
+              "total candidate capacity must be a power of two");
+
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  megatron::hisa_indexer::launch_hisa_selector_megakernel_parallel_streaming_batched_fwd(
+      q.data_ptr(),
+      k.data_ptr(),
+      block_reps.data_ptr(),
+      weights.data_ptr(),
+      prefix_lens.data_ptr(),
+      selected_blocks.data_ptr<int32_t>(),
+      reinterpret_cast<uint64_t*>(candidate_keys.data_ptr<int64_t>()),
+      topk_indices.data_ptr<int32_t>(),
+      selected_scores.data_ptr<float>(),
+      topk_ordinals.data_ptr<int32_t>(),
+      Q,
+      B,
+      H,
+      D,
+      L,
+      MB,
+      static_cast<int>(block_size),
+      static_cast<int>(block_topk),
+      static_cast<float>(compression_ratio),
+      static_cast<int>(effective_block_topk),
+      static_cast<int>(topk_tokens),
+      candidate_scratch_capacity,
+      static_cast<int>(total_candidate_capacity),
+      prefix_lens_shared ? 1 : 0,
+      force_first ? 1 : 0,
+      force_last ? 1 : 0,
+      force_last_minus_one ? 1 : 0,
+      dtype_code(q.scalar_type()),
+      dtype_code(weights.scalar_type()),
+      hisa_prefix_dtype_code(prefix_lens.scalar_type()),
+      stream);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 void check_dsa_indexer_rope_common(
@@ -1423,6 +2107,515 @@ int topk_dtype_code(torch::ScalarType dtype) {
     return 2;
   }
   TORCH_CHECK(false, "unsupported topk dtype for DSA sparse K/V backward: ", dtype);
+}
+
+void dsa_split_qk_fwd_row(
+    torch::Tensor query_nope,
+    torch::Tensor query_pe,
+    torch::Tensor key_nope,
+    torch::Tensor key_pe,
+    torch::Tensor value,
+    torch::Tensor topk_indices,
+    torch::Tensor query_positions,
+    torch::Tensor key_positions,
+    torch::Tensor output,
+    torch::Tensor lse,
+    torch::Tensor teacher_probs,
+    torch::Tensor teacher_score_scratch,
+    double softmax_scale,
+    int64_t q_start,
+    bool has_positions,
+    bool emit_teacher,
+    bool use_teacher_score_scratch,
+    int64_t warps) {
+  HISA_CHECK_CUDA(query_nope);
+  HISA_CHECK_CUDA(query_pe);
+  HISA_CHECK_CUDA(key_nope);
+  HISA_CHECK_CUDA(key_pe);
+  HISA_CHECK_CUDA(value);
+  HISA_CHECK_CUDA(topk_indices);
+  HISA_CHECK_CUDA(output);
+  HISA_CHECK_CUDA(lse);
+  if (has_positions) {
+    HISA_CHECK_CUDA(query_positions);
+    HISA_CHECK_CUDA(key_positions);
+    HISA_CHECK_DTYPE(query_positions, torch::kInt64);
+    HISA_CHECK_DTYPE(key_positions, torch::kInt64);
+    HISA_CHECK_CONTIG(query_positions);
+    HISA_CHECK_CONTIG(key_positions);
+  }
+  if (emit_teacher) {
+    HISA_CHECK_CUDA(teacher_probs);
+    HISA_CHECK_CONTIG(teacher_probs);
+    HISA_CHECK_DTYPE(teacher_probs, torch::kFloat32);
+  }
+  if (use_teacher_score_scratch) {
+    HISA_CHECK_CUDA(teacher_score_scratch);
+    HISA_CHECK_CONTIG(teacher_score_scratch);
+    HISA_CHECK_DTYPE(teacher_score_scratch, torch::kFloat32);
+  }
+
+  HISA_CHECK_CONTIG(query_pe);
+  HISA_CHECK_CONTIG(key_pe);
+  HISA_CHECK_CONTIG(topk_indices);
+  HISA_CHECK_CONTIG(output);
+  HISA_CHECK_CONTIG(lse);
+
+  TORCH_CHECK(query_nope.dim() == 4, "query_nope must be [Q, B, H, D]");
+  TORCH_CHECK(query_pe.dim() == 4, "query_pe must be [Q, B, H, P]");
+  TORCH_CHECK(key_nope.dim() == 4, "key_nope must be [S, B, H, D]");
+  TORCH_CHECK(key_pe.dim() == 4, "key_pe must be [S, B, KPH, P]");
+  TORCH_CHECK(value.dim() == 4, "value must be [S, B, H, V]");
+  TORCH_CHECK(topk_indices.dim() == 3, "topk_indices must be [B, Q, K]");
+  TORCH_CHECK(output.dim() == 4, "output must be [Q, B, H, V]");
+  TORCH_CHECK(lse.dim() == 2, "lse must be [B * Q, H]");
+
+  const int Q = query_nope.size(0);
+  const int B = query_nope.size(1);
+  const int H = query_nope.size(2);
+  const int D = query_nope.size(3);
+  const int S = key_nope.size(0);
+  const int KPH = key_pe.size(2);
+  const int P = query_pe.size(3);
+  const int V = value.size(3);
+  const int K = topk_indices.size(2);
+
+  TORCH_CHECK(query_pe.size(0) == Q && query_pe.size(1) == B &&
+                  query_pe.size(2) == H,
+              "query_pe shape must match query_nope sequence/batch/head");
+  TORCH_CHECK(key_nope.size(1) == B && key_nope.size(2) == H && key_nope.size(3) == D,
+              "key_nope shape must match query_nope batch/head/head_dim");
+  TORCH_CHECK(key_pe.size(0) == S && key_pe.size(1) == B && key_pe.size(3) == P,
+              "key_pe shape must match key sequence/batch/pos_dim");
+  TORCH_CHECK(KPH > 0 && KPH <= H, "key_pe heads must be in [1, H]");
+  TORCH_CHECK(value.size(0) == S && value.size(1) == B && value.size(2) == H,
+              "value shape must match key sequence/batch/head");
+  TORCH_CHECK(topk_indices.size(0) == B && topk_indices.size(1) == Q,
+              "topk_indices must be [B, Q, K]");
+  TORCH_CHECK(output.size(0) == Q && output.size(1) == B && output.size(2) == H &&
+                  output.size(3) == V,
+              "output shape must be [Q, B, H, V]");
+  TORCH_CHECK(lse.size(0) == B * Q && lse.size(1) == H,
+              "lse must be [B * Q, H]");
+  if (emit_teacher) {
+    TORCH_CHECK(teacher_probs.size(0) == B * Q && teacher_probs.size(1) == K,
+                "teacher_probs must be [B * Q, K]");
+  }
+  if (use_teacher_score_scratch) {
+    TORCH_CHECK(teacher_score_scratch.size(0) == B * Q &&
+                    teacher_score_scratch.size(1) == H &&
+                    teacher_score_scratch.size(2) == K,
+                "teacher_score_scratch must be [B * Q, H, K]");
+  }
+  TORCH_CHECK(query_nope.scalar_type() == query_pe.scalar_type() &&
+                  query_nope.scalar_type() == key_nope.scalar_type() &&
+                  query_nope.scalar_type() == key_pe.scalar_type() &&
+                  query_nope.scalar_type() == value.scalar_type() &&
+                  query_nope.scalar_type() == output.scalar_type(),
+              "query/key/value/output must share dtype");
+  TORCH_CHECK(query_nope.scalar_type() == torch::kFloat32 ||
+                  query_nope.scalar_type() == torch::kBFloat16 ||
+                  query_nope.scalar_type() == torch::kFloat16,
+              "split-QK DSA forward supports float32/bfloat16/float16");
+  TORCH_CHECK(topk_indices.scalar_type() == torch::kInt16 ||
+                  topk_indices.scalar_type() == torch::kInt32 ||
+                  topk_indices.scalar_type() == torch::kInt64,
+              "topk_indices must be int16, int32, or int64");
+  HISA_CHECK_DTYPE(lse, torch::kFloat32);
+  TORCH_CHECK(H > 0 && H <= 64,
+              "row-owned split-QK DSA forward supports up to 64 local heads");
+  TORCH_CHECK(D > 0 && D <= 256, "split-QK DSA forward supports head_dim in (0, 256]");
+  TORCH_CHECK(P > 0 && P <= 256, "split-QK DSA forward supports pos_dim in (0, 256]");
+  TORCH_CHECK(V > 0 && V <= 128, "split-QK DSA forward supports value_dim in (0, 128]");
+  TORCH_CHECK(K > 0 && K <= 4096, "split-QK DSA forward supports topk in (0, 4096]");
+  if (has_positions) {
+    TORCH_CHECK(query_positions.numel() == Q, "query_positions length must match Q");
+    TORCH_CHECK(key_positions.numel() == S, "key_positions length must match S");
+  }
+
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const int64_t effective_warps = warps <= 0 ? 8 : warps;
+  megatron::hisa_indexer::launch_dsa_split_qk_fwd_row(
+      query_nope.data_ptr(),
+      query_pe.data_ptr(),
+      key_nope.data_ptr(),
+      key_pe.data_ptr(),
+      value.data_ptr(),
+      topk_indices.data_ptr(),
+      has_positions ? query_positions.data_ptr<int64_t>() : nullptr,
+      has_positions ? key_positions.data_ptr<int64_t>() : nullptr,
+      output.data_ptr(),
+      lse.data_ptr<float>(),
+      emit_teacher ? teacher_probs.data_ptr<float>() : nullptr,
+      use_teacher_score_scratch ? teacher_score_scratch.data_ptr<float>() : nullptr,
+      Q,
+      B,
+      S,
+      H,
+      D,
+      P,
+      KPH,
+      V,
+      K,
+      static_cast<int>(q_start),
+      query_nope.stride(0),
+      query_nope.stride(1),
+      query_nope.stride(2),
+      query_nope.stride(3),
+      key_nope.stride(0),
+      key_nope.stride(1),
+      key_nope.stride(2),
+      key_nope.stride(3),
+      value.stride(0),
+      value.stride(1),
+      value.stride(2),
+      value.stride(3),
+      static_cast<float>(softmax_scale),
+      dtype_code(query_nope.scalar_type()),
+      topk_dtype_code(topk_indices.scalar_type()),
+      has_positions ? 1 : 0,
+      emit_teacher ? 1 : 0,
+      use_teacher_score_scratch ? 1 : 0,
+      static_cast<int>(effective_warps),
+      stream);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void dsa_split_qk_fwd_cublasdx(
+    torch::Tensor query_nope,
+    torch::Tensor query_pe,
+    torch::Tensor key_nope,
+    torch::Tensor key_pe,
+    torch::Tensor value,
+    torch::Tensor topk_indices,
+    torch::Tensor query_positions,
+    torch::Tensor key_positions,
+    torch::Tensor output,
+    torch::Tensor lse,
+    torch::Tensor teacher_probs,
+    torch::Tensor teacher_score_scratch,
+    double softmax_scale,
+    int64_t q_start,
+    bool has_positions,
+    bool emit_teacher,
+    bool use_teacher_score_scratch) {
+  HISA_CHECK_CUDA(query_nope);
+  HISA_CHECK_CUDA(query_pe);
+  HISA_CHECK_CUDA(key_nope);
+  HISA_CHECK_CUDA(key_pe);
+  HISA_CHECK_CUDA(value);
+  HISA_CHECK_CUDA(topk_indices);
+  HISA_CHECK_CUDA(output);
+  HISA_CHECK_CUDA(lse);
+  if (has_positions) {
+    HISA_CHECK_CUDA(query_positions);
+    HISA_CHECK_CUDA(key_positions);
+    HISA_CHECK_DTYPE(query_positions, torch::kInt64);
+    HISA_CHECK_DTYPE(key_positions, torch::kInt64);
+    HISA_CHECK_CONTIG(query_positions);
+    HISA_CHECK_CONTIG(key_positions);
+  }
+  if (emit_teacher) {
+    HISA_CHECK_CUDA(teacher_probs);
+    HISA_CHECK_CONTIG(teacher_probs);
+    HISA_CHECK_DTYPE(teacher_probs, torch::kFloat32);
+  }
+  if (use_teacher_score_scratch) {
+    HISA_CHECK_CUDA(teacher_score_scratch);
+    HISA_CHECK_CONTIG(teacher_score_scratch);
+    HISA_CHECK_DTYPE(teacher_score_scratch, torch::kFloat32);
+  }
+
+  HISA_CHECK_CONTIG(query_pe);
+  HISA_CHECK_CONTIG(key_pe);
+  HISA_CHECK_CONTIG(topk_indices);
+  HISA_CHECK_CONTIG(output);
+  HISA_CHECK_CONTIG(lse);
+
+  TORCH_CHECK(query_nope.dim() == 4, "query_nope must be [Q, B, H, D]");
+  TORCH_CHECK(query_pe.dim() == 4, "query_pe must be [Q, B, H, P]");
+  TORCH_CHECK(key_nope.dim() == 4, "key_nope must be [S, B, H, D]");
+  TORCH_CHECK(key_pe.dim() == 4, "key_pe must be [S, B, KPH, P]");
+  TORCH_CHECK(value.dim() == 4, "value must be [S, B, H, V]");
+  TORCH_CHECK(topk_indices.dim() == 3, "topk_indices must be [B, Q, K]");
+  TORCH_CHECK(output.dim() == 4, "output must be [Q, B, H, V]");
+  TORCH_CHECK(lse.dim() == 2, "lse must be [B * Q, H]");
+
+  const int Q = query_nope.size(0);
+  const int B = query_nope.size(1);
+  const int H = query_nope.size(2);
+  const int D = query_nope.size(3);
+  const int S = key_nope.size(0);
+  const int KPH = key_pe.size(2);
+  const int P = query_pe.size(3);
+  const int V = value.size(3);
+  const int K = topk_indices.size(2);
+
+  TORCH_CHECK(query_pe.size(0) == Q && query_pe.size(1) == B &&
+                  query_pe.size(2) == H,
+              "query_pe shape must match query_nope sequence/batch/head");
+  TORCH_CHECK(key_nope.size(1) == B && key_nope.size(2) == H && key_nope.size(3) == D,
+              "key_nope shape must match query_nope batch/head/head_dim");
+  TORCH_CHECK(key_pe.size(0) == S && key_pe.size(1) == B && key_pe.size(3) == P,
+              "key_pe shape must match key sequence/batch/pos_dim");
+  TORCH_CHECK(KPH > 0 && KPH <= H, "key_pe heads must be in [1, H]");
+  TORCH_CHECK(value.size(0) == S && value.size(1) == B && value.size(2) == H,
+              "value shape must match key sequence/batch/head");
+  TORCH_CHECK(topk_indices.size(0) == B && topk_indices.size(1) == Q,
+              "topk_indices must be [B, Q, K]");
+  TORCH_CHECK(output.size(0) == Q && output.size(1) == B && output.size(2) == H &&
+                  output.size(3) == V,
+              "output shape must be [Q, B, H, V]");
+  TORCH_CHECK(lse.size(0) == B * Q && lse.size(1) == H,
+              "lse must be [B * Q, H]");
+  if (emit_teacher) {
+    TORCH_CHECK(teacher_probs.size(0) == B * Q && teacher_probs.size(1) == K,
+                "teacher_probs must be [B * Q, K]");
+  }
+  if (use_teacher_score_scratch) {
+    TORCH_CHECK(teacher_score_scratch.size(0) == B * Q &&
+                    teacher_score_scratch.size(1) == H &&
+                    teacher_score_scratch.size(2) == K,
+                "teacher_score_scratch must be [B * Q, H, K]");
+  }
+  TORCH_CHECK(query_nope.scalar_type() == query_pe.scalar_type() &&
+                  query_nope.scalar_type() == key_nope.scalar_type() &&
+                  query_nope.scalar_type() == key_pe.scalar_type() &&
+                  query_nope.scalar_type() == value.scalar_type() &&
+                  query_nope.scalar_type() == output.scalar_type(),
+              "query/key/value/output must share dtype");
+  TORCH_CHECK(query_nope.scalar_type() == torch::kFloat32 ||
+                  query_nope.scalar_type() == torch::kBFloat16 ||
+                  query_nope.scalar_type() == torch::kFloat16,
+              "cuBLASDx split-QK DSA forward supports float32/bfloat16/float16");
+  TORCH_CHECK(topk_indices.scalar_type() == torch::kInt16 ||
+                  topk_indices.scalar_type() == torch::kInt32 ||
+                  topk_indices.scalar_type() == torch::kInt64,
+              "topk_indices must be int16, int32, or int64");
+  HISA_CHECK_DTYPE(lse, torch::kFloat32);
+  TORCH_CHECK(D == 128, "cuBLASDx split-QK DSA forward requires head_dim=128");
+  TORCH_CHECK(P == 64, "cuBLASDx split-QK DSA forward requires pos_dim=64");
+  TORCH_CHECK(V == 128, "cuBLASDx split-QK DSA forward requires value_dim=128");
+  TORCH_CHECK(H > 0 && H <= 64,
+              "cuBLASDx split-QK DSA forward supports up to 64 local heads");
+  TORCH_CHECK(K > 0 && K <= 4096,
+              "cuBLASDx split-QK DSA forward supports topk in (0, 4096]");
+  TORCH_CHECK(query_nope.stride(3) == 1, "query_nope last dimension must be contiguous");
+  TORCH_CHECK(key_nope.stride(3) == 1, "key_nope last dimension must be contiguous");
+  TORCH_CHECK(value.stride(3) == 1, "value last dimension must be contiguous");
+  if (has_positions) {
+    TORCH_CHECK(query_positions.numel() == Q, "query_positions length must match Q");
+    TORCH_CHECK(key_positions.numel() == S, "key_positions length must match S");
+  }
+
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  megatron::hisa_indexer::launch_dsa_split_qk_fwd_cublasdx(
+      query_nope.data_ptr(),
+      query_pe.data_ptr(),
+      key_nope.data_ptr(),
+      key_pe.data_ptr(),
+      value.data_ptr(),
+      topk_indices.data_ptr(),
+      has_positions ? query_positions.data_ptr<int64_t>() : nullptr,
+      has_positions ? key_positions.data_ptr<int64_t>() : nullptr,
+      output.data_ptr(),
+      lse.data_ptr<float>(),
+      emit_teacher ? teacher_probs.data_ptr<float>() : nullptr,
+      use_teacher_score_scratch ? teacher_score_scratch.data_ptr<float>() : nullptr,
+      Q,
+      B,
+      S,
+      H,
+      D,
+      P,
+      KPH,
+      V,
+      K,
+      static_cast<int>(q_start),
+      query_nope.stride(0),
+      query_nope.stride(1),
+      query_nope.stride(2),
+      query_nope.stride(3),
+      key_nope.stride(0),
+      key_nope.stride(1),
+      key_nope.stride(2),
+      key_nope.stride(3),
+      value.stride(0),
+      value.stride(1),
+      value.stride(2),
+      value.stride(3),
+      static_cast<float>(softmax_scale),
+      dtype_code(query_nope.scalar_type()),
+      topk_dtype_code(topk_indices.scalar_type()),
+      has_positions ? 1 : 0,
+      emit_teacher ? 1 : 0,
+      use_teacher_score_scratch ? 1 : 0,
+      stream);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void dsa_split_qk_fwd_cublasdx_pe(
+    torch::Tensor query_nope,
+    torch::Tensor query_pe,
+    torch::Tensor key_nope,
+    torch::Tensor key_pe,
+    torch::Tensor value,
+    torch::Tensor topk_indices,
+    torch::Tensor query_positions,
+    torch::Tensor key_positions,
+    torch::Tensor output,
+    torch::Tensor lse,
+    torch::Tensor teacher_probs,
+    torch::Tensor teacher_score_scratch,
+    double softmax_scale,
+    int64_t q_start,
+    bool has_positions) {
+  HISA_CHECK_CUDA(query_nope);
+  HISA_CHECK_CUDA(query_pe);
+  HISA_CHECK_CUDA(key_nope);
+  HISA_CHECK_CUDA(key_pe);
+  HISA_CHECK_CUDA(value);
+  HISA_CHECK_CUDA(topk_indices);
+  HISA_CHECK_CUDA(output);
+  HISA_CHECK_CUDA(lse);
+  HISA_CHECK_CUDA(teacher_probs);
+  HISA_CHECK_CUDA(teacher_score_scratch);
+  if (has_positions) {
+    HISA_CHECK_CUDA(query_positions);
+    HISA_CHECK_CUDA(key_positions);
+    HISA_CHECK_DTYPE(query_positions, torch::kInt64);
+    HISA_CHECK_DTYPE(key_positions, torch::kInt64);
+    HISA_CHECK_CONTIG(query_positions);
+    HISA_CHECK_CONTIG(key_positions);
+  }
+
+  HISA_CHECK_CONTIG(query_pe);
+  HISA_CHECK_CONTIG(key_pe);
+  HISA_CHECK_CONTIG(topk_indices);
+  HISA_CHECK_CONTIG(output);
+  HISA_CHECK_CONTIG(lse);
+  HISA_CHECK_CONTIG(teacher_probs);
+  HISA_CHECK_CONTIG(teacher_score_scratch);
+  HISA_CHECK_DTYPE(lse, torch::kFloat32);
+  HISA_CHECK_DTYPE(teacher_probs, torch::kFloat32);
+  HISA_CHECK_DTYPE(teacher_score_scratch, torch::kFloat32);
+
+  TORCH_CHECK(query_nope.dim() == 4, "query_nope must be [Q, B, H, D]");
+  TORCH_CHECK(query_pe.dim() == 4, "query_pe must be [Q, B, H, P]");
+  TORCH_CHECK(key_nope.dim() == 4, "key_nope must be [S, B, H, D]");
+  TORCH_CHECK(key_pe.dim() == 4, "key_pe must be [S, B, KPH, P]");
+  TORCH_CHECK(value.dim() == 4, "value must be [S, B, H, V]");
+  TORCH_CHECK(topk_indices.dim() == 3, "topk_indices must be [B, Q, K]");
+  TORCH_CHECK(output.dim() == 4, "output must be [Q, B, H, V]");
+  TORCH_CHECK(lse.dim() == 2, "lse must be [B * Q, H]");
+  TORCH_CHECK(teacher_probs.dim() == 2, "teacher_probs must be [B * Q, K]");
+  TORCH_CHECK(teacher_score_scratch.dim() == 3,
+              "teacher_score_scratch must be [B * Q, H, K]");
+
+  const int Q = query_nope.size(0);
+  const int B = query_nope.size(1);
+  const int H = query_nope.size(2);
+  const int D = query_nope.size(3);
+  const int S = key_nope.size(0);
+  const int KPH = key_pe.size(2);
+  const int P = query_pe.size(3);
+  const int V = value.size(3);
+  const int K = topk_indices.size(2);
+
+  TORCH_CHECK(query_pe.size(0) == Q && query_pe.size(1) == B &&
+                  query_pe.size(2) == H,
+              "query_pe shape must match query_nope sequence/batch/head");
+  TORCH_CHECK(key_nope.size(1) == B && key_nope.size(2) == H && key_nope.size(3) == D,
+              "key_nope shape must match query_nope batch/head/head_dim");
+  TORCH_CHECK(key_pe.size(0) == S && key_pe.size(1) == B && key_pe.size(3) == P,
+              "key_pe shape must match key sequence/batch/pos_dim");
+  TORCH_CHECK(value.size(0) == S && value.size(1) == B && value.size(2) == H,
+              "value shape must match key sequence/batch/head");
+  TORCH_CHECK(topk_indices.size(0) == B && topk_indices.size(1) == Q,
+              "topk_indices must be [B, Q, K]");
+  TORCH_CHECK(output.size(0) == Q && output.size(1) == B && output.size(2) == H &&
+                  output.size(3) == V,
+              "output shape must be [Q, B, H, V]");
+  TORCH_CHECK(lse.size(0) == B * Q && lse.size(1) == H,
+              "lse must be [B * Q, H]");
+  TORCH_CHECK(teacher_probs.size(0) == B * Q && teacher_probs.size(1) == K,
+              "teacher_probs must be [B * Q, K]");
+  TORCH_CHECK(teacher_score_scratch.size(0) == B * Q &&
+                  teacher_score_scratch.size(1) == H &&
+                  teacher_score_scratch.size(2) == K,
+              "teacher_score_scratch must be [B * Q, H, K]");
+  TORCH_CHECK(query_nope.scalar_type() == query_pe.scalar_type() &&
+                  query_nope.scalar_type() == key_nope.scalar_type() &&
+                  query_nope.scalar_type() == key_pe.scalar_type() &&
+                  query_nope.scalar_type() == value.scalar_type() &&
+                  query_nope.scalar_type() == output.scalar_type(),
+              "query/key/value/output must share dtype");
+  TORCH_CHECK(query_nope.scalar_type() == torch::kFloat32 ||
+                  query_nope.scalar_type() == torch::kBFloat16 ||
+                  query_nope.scalar_type() == torch::kFloat16,
+              "PE-shared cuBLASDx split-QK DSA forward supports float32/bfloat16/float16");
+  TORCH_CHECK(topk_indices.scalar_type() == torch::kInt16 ||
+                  topk_indices.scalar_type() == torch::kInt32 ||
+                  topk_indices.scalar_type() == torch::kInt64,
+              "topk_indices must be int16, int32, or int64");
+  TORCH_CHECK(D == 128, "PE-shared cuBLASDx split-QK DSA forward requires head_dim=128");
+  TORCH_CHECK(P == 64, "PE-shared cuBLASDx split-QK DSA forward requires pos_dim=64");
+  TORCH_CHECK(V == 128, "PE-shared cuBLASDx split-QK DSA forward requires value_dim=128");
+  TORCH_CHECK(KPH == 1, "PE-shared cuBLASDx split-QK DSA forward requires key_pe_heads=1");
+  TORCH_CHECK(H > 0 && H <= 64,
+              "PE-shared cuBLASDx split-QK DSA forward supports up to 64 local heads");
+  TORCH_CHECK(K > 0 && K <= 4096,
+              "PE-shared cuBLASDx split-QK DSA forward supports topk in (0, 4096]");
+  TORCH_CHECK(query_nope.stride(3) == 1, "query_nope last dimension must be contiguous");
+  TORCH_CHECK(key_nope.stride(3) == 1, "key_nope last dimension must be contiguous");
+  TORCH_CHECK(value.stride(3) == 1, "value last dimension must be contiguous");
+  if (has_positions) {
+    TORCH_CHECK(query_positions.numel() == Q, "query_positions length must match Q");
+    TORCH_CHECK(key_positions.numel() == S, "key_positions length must match S");
+  }
+
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  megatron::hisa_indexer::launch_dsa_split_qk_fwd_cublasdx_pe(
+      query_nope.data_ptr(),
+      query_pe.data_ptr(),
+      key_nope.data_ptr(),
+      key_pe.data_ptr(),
+      value.data_ptr(),
+      topk_indices.data_ptr(),
+      has_positions ? query_positions.data_ptr<int64_t>() : nullptr,
+      has_positions ? key_positions.data_ptr<int64_t>() : nullptr,
+      output.data_ptr(),
+      lse.data_ptr<float>(),
+      teacher_probs.data_ptr<float>(),
+      teacher_score_scratch.data_ptr<float>(),
+      Q,
+      B,
+      S,
+      H,
+      D,
+      P,
+      KPH,
+      V,
+      K,
+      static_cast<int>(q_start),
+      query_nope.stride(0),
+      query_nope.stride(1),
+      query_nope.stride(2),
+      query_nope.stride(3),
+      key_nope.stride(0),
+      key_nope.stride(1),
+      key_nope.stride(2),
+      key_nope.stride(3),
+      value.stride(0),
+      value.stride(1),
+      value.stride(2),
+      value.stride(3),
+      static_cast<float>(softmax_scale),
+      dtype_code(query_nope.scalar_type()),
+      topk_dtype_code(topk_indices.scalar_type()),
+      has_positions ? 1 : 0,
+      stream);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 void dsa_sparse_kv_bwd(
@@ -2124,6 +3317,332 @@ void dsa_sparse_kv_bwd_sorted_from_scores(
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+void moe_deepep_compact_permute_fwd(
+    torch::Tensor hidden,
+    torch::Tensor indices,
+    torch::Tensor probs,
+    torch::Tensor offsets,
+    torch::Tensor counts,
+    torch::Tensor output,
+    torch::Tensor permuted_probs,
+    torch::Tensor row_map,
+    torch::Tensor edge_map,
+    torch::Tensor counters) {
+  HISA_CHECK_CUDA(hidden);
+  HISA_CHECK_CUDA(indices);
+  HISA_CHECK_CUDA(probs);
+  HISA_CHECK_CUDA(offsets);
+  HISA_CHECK_CUDA(counts);
+  HISA_CHECK_CUDA(output);
+  HISA_CHECK_CUDA(permuted_probs);
+  HISA_CHECK_CUDA(row_map);
+  HISA_CHECK_CUDA(edge_map);
+  HISA_CHECK_CUDA(counters);
+
+  HISA_CHECK_CONTIG(hidden);
+  HISA_CHECK_CONTIG(indices);
+  HISA_CHECK_CONTIG(probs);
+  HISA_CHECK_CONTIG(offsets);
+  HISA_CHECK_CONTIG(counts);
+  HISA_CHECK_CONTIG(output);
+  HISA_CHECK_CONTIG(permuted_probs);
+  HISA_CHECK_CONTIG(row_map);
+  HISA_CHECK_CONTIG(edge_map);
+  HISA_CHECK_CONTIG(counters);
+
+  TORCH_CHECK(hidden.dim() == 2, "hidden must be [num_tokens, hidden_size]");
+  TORCH_CHECK(indices.dim() == 2, "indices must be [num_tokens, topk]");
+  TORCH_CHECK(probs.sizes() == indices.sizes(), "probs shape must match indices");
+  TORCH_CHECK(output.dim() == 2, "output must be [num_out_tokens, hidden_size]");
+  TORCH_CHECK(permuted_probs.dim() == 1, "permuted_probs must be [num_out_tokens]");
+  TORCH_CHECK(row_map.dim() == 1, "row_map must be [num_out_tokens]");
+  TORCH_CHECK(edge_map.dim() == 1, "edge_map must be [num_out_tokens]");
+  TORCH_CHECK(offsets.dim() == 1, "offsets must be [num_experts]");
+  TORCH_CHECK(counts.dim() == 1, "counts must be [num_experts]");
+  TORCH_CHECK(counters.dim() == 1, "counters must be [num_experts]");
+  TORCH_CHECK(hidden.scalar_type() == output.scalar_type(), "hidden/output dtype mismatch");
+  check_hisa_selector_scalar_dtype(hidden.scalar_type(), "hidden");
+  HISA_CHECK_DTYPE(probs, torch::kFloat32);
+  HISA_CHECK_DTYPE(permuted_probs, torch::kFloat32);
+  HISA_CHECK_DTYPE(offsets, torch::kInt64);
+  HISA_CHECK_DTYPE(counts, torch::kInt64);
+  HISA_CHECK_DTYPE(row_map, torch::kInt64);
+  HISA_CHECK_DTYPE(edge_map, torch::kInt64);
+  HISA_CHECK_DTYPE(counters, torch::kInt32);
+  TORCH_CHECK(
+      indices.scalar_type() == torch::kInt16 || indices.scalar_type() == torch::kInt32 ||
+          indices.scalar_type() == torch::kInt64,
+      "indices must be int16, int32, or int64");
+
+  const int64_t num_tokens = hidden.size(0);
+  const int hidden_size = static_cast<int>(hidden.size(1));
+  const int topk = static_cast<int>(indices.size(1));
+  const int num_experts = static_cast<int>(counts.size(0));
+  const int64_t num_out_tokens = output.size(0);
+  TORCH_CHECK(indices.size(0) == num_tokens, "indices token count must match hidden");
+  TORCH_CHECK(output.size(1) == hidden_size, "output hidden size must match hidden");
+  TORCH_CHECK(permuted_probs.size(0) == num_out_tokens, "permuted_probs row mismatch");
+  TORCH_CHECK(row_map.size(0) == num_out_tokens, "row_map row mismatch");
+  TORCH_CHECK(edge_map.size(0) == num_out_tokens, "edge_map row mismatch");
+  TORCH_CHECK(offsets.size(0) == num_experts, "offset/count size mismatch");
+  TORCH_CHECK(counters.size(0) == num_experts, "counter/count size mismatch");
+  TORCH_CHECK(topk > 0, "topk must be positive");
+
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  megatron::hisa_indexer::launch_moe_deepep_compact_permute_fwd(
+      hidden.data_ptr(),
+      indices.data_ptr(),
+      probs.data_ptr<float>(),
+      offsets.data_ptr<int64_t>(),
+      counts.data_ptr<int64_t>(),
+      counters.data_ptr<int32_t>(),
+      output.data_ptr(),
+      permuted_probs.data_ptr<float>(),
+      row_map.data_ptr<int64_t>(),
+      edge_map.data_ptr<int64_t>(),
+      num_tokens * static_cast<int64_t>(topk),
+      topk,
+      num_experts,
+      hidden_size,
+      dtype_code(hidden.scalar_type()),
+      topk_dtype_code(indices.scalar_type()),
+      stream);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void moe_deepep_compact_permute_rows_fwd(
+    torch::Tensor hidden,
+    torch::Tensor indices,
+    torch::Tensor probs,
+    torch::Tensor offsets,
+    torch::Tensor counts,
+    torch::Tensor output,
+    torch::Tensor permuted_probs,
+    torch::Tensor row_map,
+    torch::Tensor edge_map,
+    torch::Tensor edge_to_row,
+    torch::Tensor counters) {
+  HISA_CHECK_CUDA(hidden);
+  HISA_CHECK_CUDA(indices);
+  HISA_CHECK_CUDA(probs);
+  HISA_CHECK_CUDA(offsets);
+  HISA_CHECK_CUDA(counts);
+  HISA_CHECK_CUDA(output);
+  HISA_CHECK_CUDA(permuted_probs);
+  HISA_CHECK_CUDA(row_map);
+  HISA_CHECK_CUDA(edge_map);
+  HISA_CHECK_CUDA(edge_to_row);
+  HISA_CHECK_CUDA(counters);
+
+  HISA_CHECK_CONTIG(hidden);
+  HISA_CHECK_CONTIG(indices);
+  HISA_CHECK_CONTIG(probs);
+  HISA_CHECK_CONTIG(offsets);
+  HISA_CHECK_CONTIG(counts);
+  HISA_CHECK_CONTIG(output);
+  HISA_CHECK_CONTIG(permuted_probs);
+  HISA_CHECK_CONTIG(row_map);
+  HISA_CHECK_CONTIG(edge_map);
+  HISA_CHECK_CONTIG(edge_to_row);
+  HISA_CHECK_CONTIG(counters);
+
+  TORCH_CHECK(hidden.dim() == 2, "hidden must be [num_tokens, hidden_size]");
+  TORCH_CHECK(indices.dim() == 2, "indices must be [num_tokens, topk]");
+  TORCH_CHECK(probs.sizes() == indices.sizes(), "probs shape must match indices");
+  TORCH_CHECK(output.dim() == 2, "output must be [num_out_tokens, hidden_size]");
+  TORCH_CHECK(permuted_probs.dim() == 1, "permuted_probs must be [num_out_tokens]");
+  TORCH_CHECK(row_map.dim() == 1, "row_map must be [num_out_tokens]");
+  TORCH_CHECK(edge_map.dim() == 1, "edge_map must be [num_out_tokens]");
+  TORCH_CHECK(edge_to_row.dim() == 1, "edge_to_row must be [num_tokens * topk]");
+  TORCH_CHECK(offsets.dim() == 1, "offsets must be [num_experts]");
+  TORCH_CHECK(counts.dim() == 1, "counts must be [num_experts]");
+  TORCH_CHECK(counters.dim() == 1, "counters must be [num_experts]");
+  TORCH_CHECK(hidden.scalar_type() == output.scalar_type(), "hidden/output dtype mismatch");
+  check_hisa_selector_scalar_dtype(hidden.scalar_type(), "hidden");
+  HISA_CHECK_DTYPE(probs, torch::kFloat32);
+  HISA_CHECK_DTYPE(permuted_probs, torch::kFloat32);
+  HISA_CHECK_DTYPE(offsets, torch::kInt64);
+  HISA_CHECK_DTYPE(counts, torch::kInt64);
+  HISA_CHECK_DTYPE(row_map, torch::kInt64);
+  HISA_CHECK_DTYPE(edge_map, torch::kInt64);
+  HISA_CHECK_DTYPE(edge_to_row, torch::kInt32);
+  HISA_CHECK_DTYPE(counters, torch::kInt32);
+  TORCH_CHECK(
+      indices.scalar_type() == torch::kInt16 || indices.scalar_type() == torch::kInt32 ||
+          indices.scalar_type() == torch::kInt64,
+      "indices must be int16, int32, or int64");
+
+  const int64_t num_tokens = hidden.size(0);
+  const int hidden_size = static_cast<int>(hidden.size(1));
+  const int topk = static_cast<int>(indices.size(1));
+  const int num_experts = static_cast<int>(counts.size(0));
+  const int64_t num_out_tokens = output.size(0);
+  TORCH_CHECK(indices.size(0) == num_tokens, "indices token count must match hidden");
+  TORCH_CHECK(output.size(1) == hidden_size, "output hidden size must match hidden");
+  TORCH_CHECK(permuted_probs.size(0) == num_out_tokens, "permuted_probs row mismatch");
+  TORCH_CHECK(row_map.size(0) == num_out_tokens, "row_map row mismatch");
+  TORCH_CHECK(edge_map.size(0) == num_out_tokens, "edge_map row mismatch");
+  TORCH_CHECK(edge_to_row.size(0) == num_tokens * static_cast<int64_t>(topk), "edge_to_row row mismatch");
+  TORCH_CHECK(offsets.size(0) == num_experts, "offset/count size mismatch");
+  TORCH_CHECK(counters.size(0) == num_experts, "counter/count size mismatch");
+  TORCH_CHECK(topk > 0 && topk <= 64, "row compact permute supports 1 <= topk <= 64");
+
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  megatron::hisa_indexer::launch_moe_deepep_compact_permute_rows_fwd(
+      hidden.data_ptr(),
+      indices.data_ptr(),
+      probs.data_ptr<float>(),
+      offsets.data_ptr<int64_t>(),
+      counts.data_ptr<int64_t>(),
+      counters.data_ptr<int32_t>(),
+      output.data_ptr(),
+      permuted_probs.data_ptr<float>(),
+      row_map.data_ptr<int64_t>(),
+      edge_map.data_ptr<int64_t>(),
+      edge_to_row.data_ptr<int32_t>(),
+      num_tokens,
+      topk,
+      num_experts,
+      hidden_size,
+      dtype_code(hidden.scalar_type()),
+      topk_dtype_code(indices.scalar_type()),
+      stream);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void moe_deepep_compact_unpermute_rows(
+    torch::Tensor permuted_hidden,
+    torch::Tensor indices,
+    torch::Tensor edge_to_row,
+    torch::Tensor output,
+    int64_t num_experts) {
+  HISA_CHECK_CUDA(permuted_hidden);
+  HISA_CHECK_CUDA(indices);
+  HISA_CHECK_CUDA(edge_to_row);
+  HISA_CHECK_CUDA(output);
+  HISA_CHECK_CONTIG(permuted_hidden);
+  HISA_CHECK_CONTIG(indices);
+  HISA_CHECK_CONTIG(edge_to_row);
+  HISA_CHECK_CONTIG(output);
+  TORCH_CHECK(permuted_hidden.dim() == 2, "permuted_hidden must be [num_out_tokens, hidden_size]");
+  TORCH_CHECK(indices.dim() == 2, "indices must be [num_tokens, topk]");
+  TORCH_CHECK(edge_to_row.dim() == 1, "edge_to_row must be [num_tokens * topk]");
+  TORCH_CHECK(output.dim() == 2, "output must be [num_tokens, hidden_size]");
+  TORCH_CHECK(indices.size(0) == output.size(0), "indices/output token count mismatch");
+  TORCH_CHECK(output.size(1) == permuted_hidden.size(1), "hidden size mismatch");
+  TORCH_CHECK(
+      edge_to_row.size(0) == indices.size(0) * indices.size(1),
+      "edge_to_row must match flattened indices");
+  TORCH_CHECK(permuted_hidden.scalar_type() == output.scalar_type(), "input/output dtype mismatch");
+  check_hisa_selector_scalar_dtype(permuted_hidden.scalar_type(), "permuted_hidden");
+  HISA_CHECK_DTYPE(edge_to_row, torch::kInt32);
+  TORCH_CHECK(
+      indices.scalar_type() == torch::kInt16 || indices.scalar_type() == torch::kInt32 ||
+          indices.scalar_type() == torch::kInt64,
+      "indices must be int16, int32, or int64");
+  const int topk = static_cast<int>(indices.size(1));
+  TORCH_CHECK(topk > 0 && topk <= 64, "row compact unpermute supports 1 <= topk <= 64");
+
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  megatron::hisa_indexer::launch_moe_deepep_compact_unpermute_rows(
+      permuted_hidden.data_ptr(),
+      indices.data_ptr(),
+      edge_to_row.data_ptr<int32_t>(),
+      output.data_ptr(),
+      output.size(0),
+      topk,
+      static_cast<int>(num_experts),
+      static_cast<int>(output.size(1)),
+      dtype_code(permuted_hidden.scalar_type()),
+      topk_dtype_code(indices.scalar_type()),
+      stream);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void moe_deepep_compact_scatter_add(
+    torch::Tensor src, torch::Tensor row_map, torch::Tensor dst) {
+  HISA_CHECK_CUDA(src);
+  HISA_CHECK_CUDA(row_map);
+  HISA_CHECK_CUDA(dst);
+  HISA_CHECK_CONTIG(src);
+  HISA_CHECK_CONTIG(row_map);
+  HISA_CHECK_CONTIG(dst);
+  TORCH_CHECK(src.dim() == 2, "src must be [num_rows, hidden_size]");
+  TORCH_CHECK(dst.dim() == 2, "dst must be [num_tokens, hidden_size]");
+  TORCH_CHECK(row_map.dim() == 1, "row_map must be [num_rows]");
+  TORCH_CHECK(row_map.size(0) == src.size(0), "row_map row count must match src");
+  TORCH_CHECK(src.size(1) == dst.size(1), "src/dst hidden size mismatch");
+  TORCH_CHECK(src.scalar_type() == dst.scalar_type(), "src/dst dtype mismatch");
+  check_hisa_selector_scalar_dtype(src.scalar_type(), "src");
+  HISA_CHECK_DTYPE(row_map, torch::kInt64);
+
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  megatron::hisa_indexer::launch_moe_deepep_compact_scatter_add(
+      src.data_ptr(),
+      row_map.data_ptr<int64_t>(),
+      dst.data_ptr(),
+      src.size(0),
+      static_cast<int>(src.size(1)),
+      dtype_code(src.scalar_type()),
+      stream);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void moe_deepep_compact_gather(
+    torch::Tensor src, torch::Tensor row_map, torch::Tensor dst) {
+  HISA_CHECK_CUDA(src);
+  HISA_CHECK_CUDA(row_map);
+  HISA_CHECK_CUDA(dst);
+  HISA_CHECK_CONTIG(src);
+  HISA_CHECK_CONTIG(row_map);
+  HISA_CHECK_CONTIG(dst);
+  TORCH_CHECK(src.dim() == 2, "src must be [num_tokens, hidden_size]");
+  TORCH_CHECK(dst.dim() == 2, "dst must be [num_rows, hidden_size]");
+  TORCH_CHECK(row_map.dim() == 1, "row_map must be [num_rows]");
+  TORCH_CHECK(row_map.size(0) == dst.size(0), "row_map row count must match dst");
+  TORCH_CHECK(src.size(1) == dst.size(1), "src/dst hidden size mismatch");
+  TORCH_CHECK(src.scalar_type() == dst.scalar_type(), "src/dst dtype mismatch");
+  check_hisa_selector_scalar_dtype(src.scalar_type(), "src");
+  HISA_CHECK_DTYPE(row_map, torch::kInt64);
+
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  megatron::hisa_indexer::launch_moe_deepep_compact_gather(
+      src.data_ptr(),
+      row_map.data_ptr<int64_t>(),
+      dst.data_ptr(),
+      dst.size(0),
+      static_cast<int>(dst.size(1)),
+      dtype_code(src.scalar_type()),
+      stream);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void moe_deepep_compact_scatter_probs(
+    torch::Tensor grad_permuted_probs, torch::Tensor edge_map, torch::Tensor grad_probs) {
+  HISA_CHECK_CUDA(grad_permuted_probs);
+  HISA_CHECK_CUDA(edge_map);
+  HISA_CHECK_CUDA(grad_probs);
+  HISA_CHECK_CONTIG(grad_permuted_probs);
+  HISA_CHECK_CONTIG(edge_map);
+  HISA_CHECK_CONTIG(grad_probs);
+  TORCH_CHECK(grad_permuted_probs.dim() == 1, "grad_permuted_probs must be [num_rows]");
+  TORCH_CHECK(edge_map.dim() == 1, "edge_map must be [num_rows]");
+  TORCH_CHECK(grad_probs.dim() == 2, "grad_probs must be [num_tokens, topk]");
+  TORCH_CHECK(edge_map.size(0) == grad_permuted_probs.size(0), "edge_map row mismatch");
+  HISA_CHECK_DTYPE(grad_permuted_probs, torch::kFloat32);
+  HISA_CHECK_DTYPE(edge_map, torch::kInt64);
+  HISA_CHECK_DTYPE(grad_probs, torch::kFloat32);
+
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  megatron::hisa_indexer::launch_moe_deepep_compact_scatter_probs(
+      grad_permuted_probs.data_ptr<float>(),
+      edge_map.data_ptr<int64_t>(),
+      grad_probs.data_ptr<float>(),
+      grad_permuted_probs.size(0),
+      stream);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -2154,9 +3673,29 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       &hisa_selected_score_bwd,
       "HISA selected-score backward (CUDA)");
   m.def(
+      "hisa_selected_score_bwd_batched",
+      &hisa_selected_score_bwd_batched,
+      "Batched HISA selected-score backward [Q,B,64,128] (cuBLASDx/CUDA)");
+  m.def(
       "hisa_selector_teacher_fwd",
       &hisa_selector_teacher_fwd,
       "HISA selector + local teacher forward (CUDA)");
+  m.def(
+      "hisa_block_reps_batched_fwd",
+      &hisa_block_reps_batched_fwd,
+      "Batched HISA block representatives [L,B,D] -> [B,MB,D] (CUDA)");
+  m.def(
+      "hisa_selector_megakernel_batched_fwd",
+      &hisa_selector_megakernel_batched_fwd,
+      "Batched HISA selector megakernel [Q,B,64,128] -> [B,Q,K] (cuBLASDx/CUDA)");
+  m.def(
+      "hisa_selector_megakernel_parallel_batched_fwd",
+      &hisa_selector_megakernel_parallel_batched_fwd,
+      "Batched HISA selector with parallel candidate refinement [Q,B,64,128] -> [B,Q,K]");
+  m.def(
+      "hisa_selector_megakernel_parallel_streaming_batched_fwd",
+      &hisa_selector_megakernel_parallel_streaming_batched_fwd,
+      "Batched HISA selector with 8k-scratch streaming parallel candidate refinement [Q,B,64,128] -> [B,Q,K]");
   m.def(
       "dsa_sparse_kv_bwd",
       &dsa_sparse_kv_bwd,
@@ -2173,6 +3712,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "dsa_split_qk_bwd_row",
       &dsa_split_qk_bwd_row,
       "Split-QK sparse DSA row-owned backward (CUDA)");
+  m.def(
+      "dsa_split_qk_fwd_row",
+      &dsa_split_qk_fwd_row,
+      "Split-QK sparse DSA row-owned forward/teacher path (CUDA)");
+  m.def(
+      "dsa_split_qk_fwd_cublasdx",
+      &dsa_split_qk_fwd_cublasdx,
+      "Split-QK sparse DSA selected forward/teacher path (cuBLASDx/CuTe)");
+  m.def(
+      "dsa_split_qk_fwd_cublasdx_pe",
+      &dsa_split_qk_fwd_cublasdx_pe,
+      "Split-QK sparse DSA PE-shared selected forward/teacher path (cuBLASDx/CuTe)");
   m.def(
       "dsa_sparse_kv_bwd_sorted_from_scores",
       &dsa_sparse_kv_bwd_sorted_from_scores,
@@ -2197,4 +3748,28 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "dsa_indexer_rope_bwd",
       &dsa_indexer_rope_bwd,
       "DSA indexer RoPE full-head writer backward (CUDA)");
+  m.def(
+      "moe_deepep_compact_permute_fwd",
+      &moe_deepep_compact_permute_fwd,
+      "DeepEP compact-index local permute forward pack (CUDA)");
+  m.def(
+      "moe_deepep_compact_permute_rows_fwd",
+      &moe_deepep_compact_permute_rows_fwd,
+      "DeepEP compact-index row-segmented local permute forward pack (CUDA)");
+  m.def(
+      "moe_deepep_compact_unpermute_rows",
+      &moe_deepep_compact_unpermute_rows,
+      "DeepEP compact-index row-segmented local unpermute (CUDA)");
+  m.def(
+      "moe_deepep_compact_scatter_add",
+      &moe_deepep_compact_scatter_add,
+      "DeepEP compact-index row scatter-add (CUDA)");
+  m.def(
+      "moe_deepep_compact_gather",
+      &moe_deepep_compact_gather,
+      "DeepEP compact-index row gather (CUDA)");
+  m.def(
+      "moe_deepep_compact_scatter_probs",
+      &moe_deepep_compact_scatter_probs,
+      "DeepEP compact-index probability-gradient scatter (CUDA)");
 }

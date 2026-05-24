@@ -13,6 +13,7 @@ from typing import Optional, Protocol, Union
 import torch
 
 from megatron.core import parallel_state, tensor_parallel, utils
+from megatron.core.fine_profile import fine_profile_range
 from megatron.core.transformer.temp_activation_offload import (
     maybe_temp_cpu_offload,
     maybe_temp_cpu_reload,
@@ -78,12 +79,15 @@ def _rank_selected(spec: str, rank: int) -> bool:
 
 @contextmanager
 def _moe_stage_timer(layer_number: Optional[int], stage: str):
+    range_name = f"moe.layer{layer_number if layer_number is not None else 'unknown'}.{stage}"
     if not _env_flag("MEGATRON_MOE_STAGE_PROGRESS_LOG"):
-        yield
+        with fine_profile_range(range_name):
+            yield
         return
     rank = _distributed_rank()
     if not _rank_selected(os.getenv("MEGATRON_MOE_STAGE_PROGRESS_RANKS", "0"), rank):
-        yield
+        with fine_profile_range(range_name):
+            yield
         return
 
     sync = _env_flag("MEGATRON_MOE_STAGE_PROGRESS_SYNC")
@@ -99,7 +103,8 @@ def _moe_stage_timer(layer_number: Optional[int], stage: str):
         flush=True,
     )
     try:
-        yield
+        with fine_profile_range(range_name):
+            yield
     finally:
         if sync and torch.cuda.is_available():
             torch.cuda.synchronize()
@@ -301,6 +306,8 @@ class MoELayer(BaseMoELayer):
             raise ValueError(
                 f"Unsupported token dispatcher type: {config.moe_token_dispatcher_type}"
             )
+        if hasattr(self.token_dispatcher, "_comm_manager"):
+            setattr(self.token_dispatcher._comm_manager, "layer_number", self.layer_number)
 
         # Initialize experts
         self.experts = build_module(

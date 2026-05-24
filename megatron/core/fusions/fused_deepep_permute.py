@@ -50,6 +50,61 @@ def _stable_compact_map_enabled() -> bool:
     return value.strip().lower() not in ("0", "false", "off", "no")
 
 
+def _compact_backend() -> str:
+    return os.getenv("MEGATRON_DEEPEP_COMPACT_BACKEND", "triton").strip().lower()
+
+
+def _cuda_backend_requested() -> bool:
+    return _compact_backend() in {"cuda", "cpp", "megakernel", "rowcuda", "cuda_rows"}
+
+
+def _cuda_edge_backend_requested() -> bool:
+    return _compact_backend() in {"edgecuda", "cuda_edge"}
+
+
+def _cuda_row_backend_requested() -> bool:
+    return _compact_backend() in {"cuda", "cpp", "megakernel", "rowcuda", "cuda_rows"}
+
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    value = os.getenv(name, default).strip().lower()
+    return value not in {"0", "false", "off", "no"}
+
+
+def _cuda_backward_requested() -> bool:
+    return _env_flag("MEGATRON_DEEPEP_COMPACT_CUDA_BACKWARD", "0")
+
+
+def _cuda_unpermute_requested() -> bool:
+    return _env_flag("MEGATRON_DEEPEP_COMPACT_CUDA_UNPERMUTE", "0")
+
+
+def _get_cuda_ext():
+    from megatron.core.extensions.hisa_indexer.kernels.build import get_ext
+
+    return get_ext()
+
+
+def _cpu_counts_offsets(tokens_per_expert: torch.Tensor, align_size: int):
+    counts_cpu = tokens_per_expert.detach().to(device="cpu", dtype=torch.int64).contiguous()
+    if align_size and align_size > 1:
+        padded_counts_cpu = torch.div(
+            counts_cpu + align_size - 1, align_size, rounding_mode="floor"
+        )
+        padded_counts_cpu = padded_counts_cpu * align_size
+    else:
+        padded_counts_cpu = counts_cpu
+    offsets_cpu = torch.empty_like(padded_counts_cpu)
+    if padded_counts_cpu.numel():
+        cumulative_cpu = torch.cumsum(padded_counts_cpu, dim=0)
+        offsets_cpu[0] = 0
+        offsets_cpu[1:] = cumulative_cpu[:-1]
+        num_out_tokens = int(cumulative_cpu[-1])
+    else:
+        num_out_tokens = 0
+    return counts_cpu, padded_counts_cpu.contiguous(), offsets_cpu.contiguous(), num_out_tokens
+
+
 @triton_jit
 def _build_deepep_permute_maps_kernel(
     indices,
@@ -160,6 +215,75 @@ def _scatter_probs_kernel(
 class _DeepEPIndicesPermute(torch.autograd.Function):
     @staticmethod
     def forward(ctx, hidden, indices, probs, tokens_per_expert, align_size: int):
+        if _cuda_backend_requested() or _cuda_edge_backend_requested():
+            if not hidden.is_cuda:
+                raise RuntimeError("CUDA DeepEP compact permute requires CUDA tensors")
+            if align_size and align_size > 1:
+                raise RuntimeError(
+                    "CUDA DeepEP compact permute currently requires align_size=1; "
+                    "disable MEGATRON_DEEPEP_COMPACT_BACKEND=cuda for padded routing"
+                )
+            if hidden.dim() != 2 or indices.dim() != 2 or probs.shape != indices.shape:
+                raise ValueError("Expected hidden [N,H] and matching indices/probs [N,K]")
+            if not indices.is_contiguous():
+                indices = indices.contiguous()
+            if not probs.is_contiguous():
+                probs = probs.contiguous()
+            if probs.dtype != torch.float32:
+                raise RuntimeError("CUDA DeepEP compact permute expects fp32 probabilities")
+
+            _, padded_counts_cpu, offsets_cpu, num_out_tokens = _cpu_counts_offsets(
+                tokens_per_expert, align_size
+            )
+            hidden_size = hidden.shape[1]
+            output = torch.empty(
+                (num_out_tokens, hidden_size), device=hidden.device, dtype=hidden.dtype
+            )
+            permuted_probs = torch.empty((num_out_tokens,), device=hidden.device, dtype=probs.dtype)
+            row_map = torch.empty((num_out_tokens,), device=hidden.device, dtype=torch.int64)
+            edge_map = torch.empty((num_out_tokens,), device=hidden.device, dtype=torch.int64)
+            counts = padded_counts_cpu.to(device=hidden.device, non_blocking=True)
+            offsets = offsets_cpu.to(device=hidden.device, non_blocking=True)
+            counters = torch.zeros((counts.numel(),), device=hidden.device, dtype=torch.int32)
+
+            if _cuda_row_backend_requested():
+                edge_to_row = torch.empty(
+                    (indices.numel(),), device=hidden.device, dtype=torch.int32
+                )
+                _get_cuda_ext().moe_deepep_compact_permute_rows_fwd(
+                    hidden,
+                    indices,
+                    probs,
+                    offsets,
+                    counts,
+                    output,
+                    permuted_probs,
+                    row_map,
+                    edge_map,
+                    edge_to_row,
+                    counters,
+                )
+            else:
+                edge_to_row = torch.empty((0,), device=hidden.device, dtype=torch.int32)
+                _get_cuda_ext().moe_deepep_compact_permute_fwd(
+                    hidden,
+                    indices,
+                    probs,
+                    offsets,
+                    counts,
+                    output,
+                    permuted_probs,
+                    row_map,
+                    edge_map,
+                    counters,
+                )
+            ctx.save_for_backward(row_map, edge_map)
+            ctx.hidden_shape = hidden.shape
+            ctx.probs_shape = probs.shape
+            ctx.hidden_size = hidden_size
+            ctx.cuda_compact = _cuda_backward_requested()
+            return output, permuted_probs, row_map, edge_to_row, counts
+
         if not HAVE_TRITON or not hidden.is_cuda:
             raise RuntimeError("DeepEP compact-index permute requires Triton CUDA support")
         if hidden.dim() != 2 or indices.dim() != 2 or probs.shape != indices.shape:
@@ -260,13 +384,36 @@ class _DeepEPIndicesPermute(torch.autograd.Function):
         ctx.hidden_shape = hidden.shape
         ctx.probs_shape = probs.shape
         ctx.hidden_size = hidden_size
-        return output, permuted_probs, row_map, padded_counts
+        ctx.cuda_compact = False
+        edge_to_row = torch.empty((0,), device=hidden.device, dtype=torch.int32)
+        return output, permuted_probs, row_map, edge_to_row, padded_counts
 
     @staticmethod
-    def backward(ctx, grad_output, grad_permuted_probs, grad_row_map, grad_padded_counts):
+    def backward(
+        ctx, grad_output, grad_permuted_probs, grad_row_map, grad_edge_to_row, grad_padded_counts
+    ):
         row_map, edge_map = ctx.saved_tensors
         num_tokens, hidden_size = ctx.hidden_shape
         num_rows = row_map.numel()
+
+        if getattr(ctx, "cuda_compact", False):
+            ext = _get_cuda_ext()
+            grad_output = grad_output.contiguous()
+            grad_hidden = torch.zeros(
+                (num_tokens, hidden_size), device=grad_output.device, dtype=grad_output.dtype
+            )
+            ext.moe_deepep_compact_scatter_add(grad_output, row_map, grad_hidden)
+            grad_probs = None
+            if grad_permuted_probs is not None:
+                grad_probs = torch.zeros(
+                    ctx.probs_shape,
+                    device=grad_permuted_probs.device,
+                    dtype=grad_permuted_probs.dtype,
+                )
+                ext.moe_deepep_compact_scatter_probs(
+                    grad_permuted_probs.contiguous(), edge_map, grad_probs
+                )
+            return grad_hidden, None, grad_probs, None, None
 
         grad_hidden = torch.zeros(
             (num_tokens, hidden_size), device=grad_output.device, dtype=grad_output.dtype
@@ -317,7 +464,55 @@ class _DeepEPIndicesPermute(torch.autograd.Function):
 
 class _DeepEPIndicesUnpermute(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, permuted_hidden, row_map, restore_shape):
+    def forward(ctx, permuted_hidden, row_map, restore_shape, indices, edge_to_row, num_experts: int):
+        if (
+            _cuda_unpermute_requested()
+            and _cuda_row_backend_requested()
+            and indices is not None
+            and edge_to_row is not None
+            and edge_to_row.numel() > 0
+        ):
+            if not permuted_hidden.is_cuda:
+                raise RuntimeError("CUDA DeepEP compact unpermute requires CUDA tensors")
+            if not indices.is_contiguous():
+                indices = indices.contiguous()
+            restore_tokens = int(restore_shape[0])
+            hidden_size = int(restore_shape[1])
+            output = torch.empty(
+                (restore_tokens, hidden_size),
+                device=permuted_hidden.device,
+                dtype=permuted_hidden.dtype,
+            )
+            _get_cuda_ext().moe_deepep_compact_unpermute_rows(
+                permuted_hidden.contiguous(),
+                indices,
+                edge_to_row,
+                output,
+                int(num_experts),
+            )
+            ctx.save_for_backward(row_map)
+            ctx.hidden_size = hidden_size
+            ctx.cuda_compact = True
+            return output
+
+        if (_cuda_backend_requested() or _cuda_edge_backend_requested()) and _cuda_unpermute_requested():
+            if not permuted_hidden.is_cuda:
+                raise RuntimeError("CUDA DeepEP compact unpermute requires CUDA tensors")
+            restore_tokens = int(restore_shape[0])
+            hidden_size = int(restore_shape[1])
+            output = torch.zeros(
+                (restore_tokens, hidden_size),
+                device=permuted_hidden.device,
+                dtype=permuted_hidden.dtype,
+            )
+            _get_cuda_ext().moe_deepep_compact_scatter_add(
+                permuted_hidden.contiguous(), row_map, output
+            )
+            ctx.save_for_backward(row_map)
+            ctx.hidden_size = hidden_size
+            ctx.cuda_compact = True
+            return output
+
         if not HAVE_TRITON or not permuted_hidden.is_cuda:
             raise RuntimeError("DeepEP compact-index unpermute requires Triton CUDA support")
         restore_tokens = int(restore_shape[0])
@@ -349,6 +544,7 @@ class _DeepEPIndicesUnpermute(torch.autograd.Function):
             )
         ctx.save_for_backward(row_map)
         ctx.hidden_size = hidden_size
+        ctx.cuda_compact = False
         return output
 
     @staticmethod
@@ -359,6 +555,12 @@ class _DeepEPIndicesUnpermute(torch.autograd.Function):
         grad_permuted = torch.empty(
             (num_rows, hidden_size), device=grad_output.device, dtype=grad_output.dtype
         )
+        if getattr(ctx, "cuda_compact", False):
+            _get_cuda_ext().moe_deepep_compact_gather(
+                grad_output.contiguous(), row_map, grad_permuted
+            )
+            return grad_permuted, None, None, None, None, None
+
         block_m = 4
         block_h = min(256, _next_power_of_2(hidden_size))
         row_chunk = _row_chunk_size()
@@ -378,7 +580,7 @@ class _DeepEPIndicesUnpermute(torch.autograd.Function):
                 BLOCK_H=block_h,
                 num_warps=8,
             )
-        return grad_permuted, None, None
+        return grad_permuted, None, None, None, None, None
 
 
 def deepep_indices_permute(
@@ -387,15 +589,22 @@ def deepep_indices_permute(
     probs: torch.Tensor,
     tokens_per_expert: torch.Tensor,
     align_size: int,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Permute DeepEP compact local expert indices directly into per-expert order."""
 
     return _DeepEPIndicesPermute.apply(hidden, indices, probs, tokens_per_expert, align_size)
 
 
 def deepep_indices_unpermute(
-    permuted_hidden: torch.Tensor, row_map: torch.Tensor, restore_shape: torch.Size
+    permuted_hidden: torch.Tensor,
+    row_map: torch.Tensor,
+    restore_shape: torch.Size,
+    indices: torch.Tensor | None = None,
+    edge_to_row: torch.Tensor | None = None,
+    num_experts: int = 0,
 ) -> torch.Tensor:
     """Restore compact-index permuted expert outputs to DeepEP combine order."""
 
-    return _DeepEPIndicesUnpermute.apply(permuted_hidden, row_map, restore_shape)
+    return _DeepEPIndicesUnpermute.apply(
+        permuted_hidden, row_map, restore_shape, indices, edge_to_row, num_experts
+    )

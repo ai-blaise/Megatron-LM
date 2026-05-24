@@ -8,7 +8,9 @@ Forward fast paths, in priority order:
    Two-pass tensor-core implementation (mma.sync.aligned.m16n8k16 +
    cp.async double-buffer). Handles the small/medium ``num_tokens`` regime
    that the previous Triton path served, but ~1.05-1.49× faster than
-   ``torch.mm`` at production rank R=16, D=7168.
+   ``torch.mm`` at production rank R=16, D=7168. In training it also writes
+   the fp32 ``z = normed @ w_down.T`` workspace consumed by backward, avoiding
+   the previous post-forward ``torch.mm`` recompute.
 2. **torch.mm fallback** — used when ``num_tokens`` is large (cuBLAS dominates
    the launch-overhead-amortised regime; see ``_torch_mm_min_tokens``) or when
    the CuTe launcher returns ``cudaErrorInvalidValue`` (R=64 N≥16, R≤48 with
@@ -17,10 +19,8 @@ Forward fast paths, in priority order:
    ``MEGATRON_GATED_NORM_USE_TRITON=1``; also drives the backward pass.
 
 The public surface — ``apply_gated_norm`` and ``GatedNormFunction`` — is
-unchanged. Backward continues to run through the Triton implementation; when
-backward is needed, the CuTe forward additionally recomputes the pre-silu
-``z = normed @ w_down.T`` workspace via ``torch.mm`` so the saved tensor
-matches what the Triton backward expects.
+unchanged. Backward continues to run through the Triton implementation, using
+the CuTe-emitted ``z`` workspace when the CuTe path is active.
 """
 
 from __future__ import annotations
@@ -226,6 +226,7 @@ def _gated_norm_cute_forward(
     flat_normed: torch.Tensor,
     w_down: torch.Tensor,
     w_up: torch.Tensor,
+    z: torch.Tensor,
     output: torch.Tensor,
     hidden_size: int,
     rank: int,
@@ -248,6 +249,7 @@ def _gated_norm_cute_forward(
         flat_normed,
         w_down,
         w_up,
+        z,
         output_flat,
         num_tokens,
         hidden_size,
@@ -257,9 +259,8 @@ def _gated_norm_cute_forward(
         return True
     if err in (_CUDA_ERROR_INVALID_VALUE, _CUDA_ERROR_MEMORY_ALLOCATION):
         # InvalidValue is the documented shape fallback. MemoryAllocation is
-        # also non-fatal here: PP2 32k SFT can have only tiny scratch headroom,
-        # while the torch.mm path does not need the CuTe cudaMallocAsync
-        # workspace.
+        # also non-fatal here: use the torch.mm fallback instead of aborting
+        # the run if the CuTe path cannot launch.
         return False
     raise RuntimeError(
         f"GatedNorm CuTe kernel failed with cudaError={err} (rank={rank}, "
@@ -452,12 +453,8 @@ def _gated_norm_forward(
 
     if not use_triton_debug:
         if _gated_norm_cute_forward(
-            flat_normed, w_down, w_up, output, hidden_size, rank
+            flat_normed, w_down, w_up, z, output, hidden_size, rank
         ):
-            # CuTe doesn't externalize z. Recompute it via torch.mm only when
-            # backward is actually needed. Inference skips this entirely.
-            if needs_backward:
-                z = torch.mm(flat_normed, w_down.t()).float()
             return output.reshape(input_shape), flat_normed, w_down, w_up, z
         # CuTe declined (cudaErrorInvalidValue / unavailable) → torch.mm.
         z = _gated_norm_torch_mm_forward(flat_normed, w_down, w_up, output, hidden_size)

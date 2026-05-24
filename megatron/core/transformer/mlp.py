@@ -122,6 +122,7 @@ def _split_nvfp4_swiglu_dim0(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.
             "fp4_dtype": getattr(tensor, "_fp4_dtype"),
             "quantizer": quantizer,
             "requires_grad": tensor.requires_grad,
+            "with_gemm_swizzled_scales": getattr(tensor, "_with_gemm_swizzled_scales", False),
         }
         outputs.append(tensor_cls(**kwargs))
 

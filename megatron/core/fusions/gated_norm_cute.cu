@@ -708,6 +708,7 @@ __global__ void zero_workspace_kernel(float* z_workspace, int n_elems) {
 inline cudaError_t launch_gated_norm_cute(const __nv_bfloat16* normed,
                                           const __nv_bfloat16* w_down,
                                           const __nv_bfloat16* w_up,
+                                          float* z_workspace,
                                           __nv_bfloat16* output,
                                           int num_tokens,
                                           int hidden_size,
@@ -726,7 +727,10 @@ inline cudaError_t launch_gated_norm_cute(const __nv_bfloat16* normed,
     while (p < v) p <<= 1;
     return p;
   };
-  const int max_rank = next_po2(rank);
+  // Use the real rank as the row stride so the same workspace can be saved for
+  // the Triton backward path. The tensor-core kernels already guard columns by
+  // rank; the power-of-two/padded values are only needed for smem layouts.
+  const int max_rank = rank;
   const int rank_up_8 = ((rank + 7) / 8) * 8;
   const int rank_up_16 = ((rank + 15) / 16) * 16;
   const int sms = 148;
@@ -755,11 +759,6 @@ inline cudaError_t launch_gated_norm_cute(const __nv_bfloat16* normed,
   chunk_per_split = ((chunk_per_split + BK_P1 - 1) / BK_P1) * BK_P1;
   split_k = (hidden_size + chunk_per_split - 1) / chunk_per_split;
 
-  float* z_workspace = nullptr;
-  size_t ws_bytes = (size_t)num_tokens * max_rank * sizeof(float);
-  cudaError_t err = cudaMallocAsync(&z_workspace, ws_bytes, stream);
-  if (err != cudaSuccess) return err;
-
   if (split_k > 1) {
     int n_elems = num_tokens * max_rank;
     int blocks = (n_elems + 255) / 256;
@@ -775,7 +774,6 @@ inline cudaError_t launch_gated_norm_cute(const __nv_bfloat16* normed,
       cudaError_t e = cudaFuncSetAttribute(                                   \
           fn, cudaFuncAttributeMaxDynamicSharedMemorySize, p1_smem);          \
       if (e != cudaSuccess) {                                                 \
-        cudaFreeAsync(z_workspace, stream);                                   \
         return e;                                                             \
       }                                                                       \
     }                                                                         \
@@ -795,7 +793,6 @@ inline cudaError_t launch_gated_norm_cute(const __nv_bfloat16* normed,
       case 56: LAUNCH_P1(16, 56, 1); break;
       case 64: LAUNCH_P1(16, 64, 1); break;
       default:
-        cudaFreeAsync(z_workspace, stream);
         return cudaErrorInvalidValue;
     }
   } else if (p1_BM == 64) {
@@ -809,7 +806,6 @@ inline cudaError_t launch_gated_norm_cute(const __nv_bfloat16* normed,
       case 56: LAUNCH_P1(64, 56, 4); break;
       case 64: LAUNCH_P1(64, 64, 4); break;
       default:
-        cudaFreeAsync(z_workspace, stream);
         return cudaErrorInvalidValue;
     }
   } else {
@@ -823,7 +819,6 @@ inline cudaError_t launch_gated_norm_cute(const __nv_bfloat16* normed,
       case 56: LAUNCH_P1(128, 56, 8); break;
       case 64: LAUNCH_P1(128, 64, 8); break;
       default:
-        cudaFreeAsync(z_workspace, stream);
         return cudaErrorInvalidValue;
     }
   }
@@ -843,7 +838,6 @@ inline cudaError_t launch_gated_norm_cute(const __nv_bfloat16* normed,
                  p2_BM * (BN_P2 + kSmemPad)) *
                 (int)sizeof(__nv_bfloat16);
   if (p2_smem > kMaxSmemBytes) {
-    cudaFreeAsync(z_workspace, stream);
     return cudaErrorInvalidValue;
   }
 
@@ -858,7 +852,6 @@ inline cudaError_t launch_gated_norm_cute(const __nv_bfloat16* normed,
       cudaError_t e = cudaFuncSetAttribute(                                   \
           fn, cudaFuncAttributeMaxDynamicSharedMemorySize, p2_smem);          \
       if (e != cudaSuccess) {                                                 \
-        cudaFreeAsync(z_workspace, stream);                                   \
         return e;                                                             \
       }                                                                       \
     }                                                                         \
@@ -888,7 +881,6 @@ inline cudaError_t launch_gated_norm_cute(const __nv_bfloat16* normed,
       cudaError_t e = cudaFuncSetAttribute(                                   \
           fn, cudaFuncAttributeMaxDynamicSharedMemorySize, p2_nnw_smem);      \
       if (e != cudaSuccess) {                                                 \
-        cudaFreeAsync(z_workspace, stream);                                   \
         return e;                                                             \
       }                                                                       \
     }                                                                         \
@@ -912,7 +904,6 @@ inline cudaError_t launch_gated_norm_cute(const __nv_bfloat16* normed,
         case 48: LAUNCH_P2(16, 3, 1); break;
         case 64: LAUNCH_P2(16, 4, 1); break;
         default:
-          cudaFreeAsync(z_workspace, stream);
           return cudaErrorInvalidValue;
       }
     }
@@ -923,7 +914,6 @@ inline cudaError_t launch_gated_norm_cute(const __nv_bfloat16* normed,
       case 48: LAUNCH_P2(64, 3, 4); break;
       case 64: LAUNCH_P2(64, 4, 4); break;
       default:
-        cudaFreeAsync(z_workspace, stream);
         return cudaErrorInvalidValue;
     }
   } else {
@@ -933,7 +923,6 @@ inline cudaError_t launch_gated_norm_cute(const __nv_bfloat16* normed,
       case 48: LAUNCH_P2(128, 3, 8); break;
       case 64: LAUNCH_P2(128, 4, 8); break;
       default:
-        cudaFreeAsync(z_workspace, stream);
         return cudaErrorInvalidValue;
     }
   }
@@ -941,7 +930,6 @@ inline cudaError_t launch_gated_norm_cute(const __nv_bfloat16* normed,
 #undef LAUNCH_P2_NNW
 
   cudaError_t last = cudaGetLastError();
-  cudaFreeAsync(z_workspace, stream);
   return last;
 }
 
@@ -953,6 +941,7 @@ inline cudaError_t launch_gated_norm_cute(const __nv_bfloat16* normed,
 extern "C" int megatron_gated_norm_cute_forward(const void* normed,
                                                 const void* w_down,
                                                 const void* w_up,
+                                                void* z_workspace,
                                                 void* output,
                                                 int num_tokens,
                                                 int hidden_size,
@@ -962,6 +951,7 @@ extern "C" int megatron_gated_norm_cute_forward(const void* normed,
       reinterpret_cast<const __nv_bfloat16*>(normed),
       reinterpret_cast<const __nv_bfloat16*>(w_down),
       reinterpret_cast<const __nv_bfloat16*>(w_up),
+      reinterpret_cast<float*>(z_workspace),
       reinterpret_cast<__nv_bfloat16*>(output),
       num_tokens,
       hidden_size,

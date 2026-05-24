@@ -49,7 +49,11 @@ _DSA_CUDA_KV_BWD_TILE_K_ENV = "MEGATRON_DSA_CUDA_KV_BWD_TILE_K"
 _DSA_CUDA_BWD_FROM_SCORES_ENV = "MEGATRON_DSA_CUDA_BWD_FROM_SCORES"
 _DSA_CUDA_ROW_BWD_FROM_SCORES_ENV = "MEGATRON_DSA_CUDA_ROW_BWD_FROM_SCORES"
 _DSA_CUDA_SORTED_KV_BWD_ENV = "MEGATRON_DSA_CUDA_SORTED_KV_BWD"
+_DSA_CUDA_SPLIT_QK_PE_CUBLASDX_FWD_ENV = "MEGATRON_DSA_CUDA_SPLIT_QK_PE_CUBLASDX_FWD"
+_DSA_CUDA_SPLIT_QK_CUBLASDX_FWD_ENV = "MEGATRON_DSA_CUDA_SPLIT_QK_CUBLASDX_FWD"
+_DSA_CUDA_SPLIT_QK_ROW_FWD_ENV = "MEGATRON_DSA_CUDA_SPLIT_QK_ROW_FWD"
 _DSA_CUDA_SPLIT_QK_ROW_BWD_ENV = "MEGATRON_DSA_CUDA_SPLIT_QK_ROW_BWD"
+_DSA_CUDA_SPLIT_QK_ROW_QUERY_BWD_ENV = "MEGATRON_DSA_CUDA_SPLIT_QK_ROW_QUERY_BWD"
 _DSA_CUDA_SPLIT_QK_ROW_BWD_WARPS_ENV = "MEGATRON_DSA_CUDA_SPLIT_QK_ROW_BWD_WARPS"
 _HISA_TARGET_TRITON_ENV = "MEGATRON_HISA_TARGET_TRITON"
 _HISA_TARGET_BLOCK_K_ENV = "MEGATRON_HISA_TARGET_BLOCK_K"
@@ -67,6 +71,7 @@ _DSA_SPLIT_QK_REENTRANT_DEFER_QUERY_GRADS_ENV = (
     "MEGATRON_DSA_SPLIT_QK_REENTRANT_DEFER_QUERY_GRADS"
 )
 _DSA_SPLIT_QK_REENTRANT_PACK_KV_GRAD_ENV = "MEGATRON_DSA_SPLIT_QK_REENTRANT_PACK_KV_GRAD"
+_DSA_SPLIT_QK_REENTRANT_RETAIN_GRAPH_ENV = "MEGATRON_DSA_SPLIT_QK_REENTRANT_RETAIN_GRAPH"
 _TE_REENTRANT_BACKWARD_ACTIVE_ENV = "MEGATRON_TE_REENTRANT_BACKWARD_ACTIVE"
 _TE_REENTRANT_BACKWARD_RETAIN_ENV = "MEGATRON_TE_REENTRANT_BACKWARD_RETAIN"
 
@@ -214,6 +219,11 @@ def _split_qk_reentrant_pack_kv_grad_enabled() -> bool:
     return raw not in {"0", "false", "off", "no"}
 
 
+def _split_qk_reentrant_retain_graph_enabled() -> bool:
+    raw = os.getenv(_DSA_SPLIT_QK_REENTRANT_RETAIN_GRAPH_ENV, "0").strip().lower()
+    return raw not in {"0", "false", "off", "no"}
+
+
 def _key_block_kv_backward_enabled() -> bool:
     raw = os.getenv(_DSA_TRITON_KEY_BLOCK_KV_BWD_ENV, "0").strip().lower()
     return raw not in {"0", "false", "off", "no"}
@@ -249,8 +259,28 @@ def _cuda_sorted_kv_backward_requested() -> bool:
     return raw not in {"0", "false", "off", "no"}
 
 
+def _cuda_split_qk_row_forward_requested() -> bool:
+    raw = os.getenv(_DSA_CUDA_SPLIT_QK_ROW_FWD_ENV, "0").strip().lower()
+    return raw not in {"0", "false", "off", "no"}
+
+
+def _cuda_split_qk_cublasdx_forward_requested() -> bool:
+    raw = os.getenv(_DSA_CUDA_SPLIT_QK_CUBLASDX_FWD_ENV, "0").strip().lower()
+    return raw not in {"0", "false", "off", "no"}
+
+
+def _cuda_split_qk_pe_cublasdx_forward_requested() -> bool:
+    raw = os.getenv(_DSA_CUDA_SPLIT_QK_PE_CUBLASDX_FWD_ENV, "0").strip().lower()
+    return raw not in {"0", "false", "off", "no"}
+
+
 def _cuda_split_qk_row_backward_requested() -> bool:
     raw = os.getenv(_DSA_CUDA_SPLIT_QK_ROW_BWD_ENV, "0").strip().lower()
+    return raw not in {"0", "false", "off", "no"}
+
+
+def _cuda_split_qk_row_query_backward_requested() -> bool:
+    raw = os.getenv(_DSA_CUDA_SPLIT_QK_ROW_QUERY_BWD_ENV, "1").strip().lower()
     return raw not in {"0", "false", "off", "no"}
 
 
@@ -444,6 +474,182 @@ def _cuda_split_qk_row_backward_supported(
         return False
     ext = _try_load_dsa_cuda_ext()
     return ext is not None and hasattr(ext, "dsa_split_qk_bwd_row")
+
+
+def _cuda_split_qk_row_forward_supported(
+    query_nope: torch.Tensor,
+    query_pe: torch.Tensor,
+    key_nope: torch.Tensor,
+    key_pe: torch.Tensor,
+    value: torch.Tensor,
+    topk_indices: torch.Tensor,
+    query_positions: torch.Tensor | None,
+    key_positions: torch.Tensor | None,
+) -> bool:
+    if not _cuda_split_qk_row_forward_requested():
+        return False
+    if not (
+        query_nope.is_cuda
+        and query_pe.is_cuda
+        and key_nope.is_cuda
+        and key_pe.is_cuda
+        and value.is_cuda
+        and topk_indices.is_cuda
+    ):
+        return False
+    if query_positions is not None or key_positions is not None:
+        if query_positions is None or key_positions is None:
+            return False
+        if not (query_positions.is_cuda and key_positions.is_cuda):
+            return False
+        if query_positions.dtype != torch.long or key_positions.dtype != torch.long:
+            return False
+    if query_nope.dtype not in (torch.float32, torch.bfloat16, torch.float16):
+        return False
+    if not (
+        query_pe.dtype == query_nope.dtype
+        and key_nope.dtype == query_nope.dtype
+        and key_pe.dtype == query_nope.dtype
+        and value.dtype == query_nope.dtype
+    ):
+        return False
+    if topk_indices.dtype not in (torch.int16, torch.int32, torch.int64):
+        return False
+    if query_nope.dim() != 4 or query_pe.dim() != 4 or key_nope.dim() != 4:
+        return False
+    if key_pe.dim() != 4 or value.dim() != 4 or topk_indices.dim() != 3:
+        return False
+    local_heads = query_nope.size(2)
+    if local_heads <= 0 or local_heads > 64:
+        return False
+    if query_nope.size(-1) <= 0 or query_nope.size(-1) > 256:
+        return False
+    if query_pe.size(-1) <= 0 or query_pe.size(-1) > 256:
+        return False
+    if value.size(-1) <= 0 or value.size(-1) > 128:
+        return False
+    if topk_indices.size(-1) <= 0 or topk_indices.size(-1) > 4096:
+        return False
+    ext = _try_load_dsa_cuda_ext()
+    return ext is not None and hasattr(ext, "dsa_split_qk_fwd_row")
+
+
+def _cuda_split_qk_cublasdx_forward_supported(
+    query_nope: torch.Tensor,
+    query_pe: torch.Tensor,
+    key_nope: torch.Tensor,
+    key_pe: torch.Tensor,
+    value: torch.Tensor,
+    topk_indices: torch.Tensor,
+    query_positions: torch.Tensor | None,
+    key_positions: torch.Tensor | None,
+) -> bool:
+    if not _cuda_split_qk_cublasdx_forward_requested():
+        return False
+    if not (
+        query_nope.is_cuda
+        and query_pe.is_cuda
+        and key_nope.is_cuda
+        and key_pe.is_cuda
+        and value.is_cuda
+        and topk_indices.is_cuda
+    ):
+        return False
+    if query_positions is not None or key_positions is not None:
+        if query_positions is None or key_positions is None:
+            return False
+        if not (query_positions.is_cuda and key_positions.is_cuda):
+            return False
+        if query_positions.dtype != torch.long or key_positions.dtype != torch.long:
+            return False
+    if query_nope.dtype not in (torch.float32, torch.bfloat16, torch.float16):
+        return False
+    if not (
+        query_pe.dtype == query_nope.dtype
+        and key_nope.dtype == query_nope.dtype
+        and key_pe.dtype == query_nope.dtype
+        and value.dtype == query_nope.dtype
+    ):
+        return False
+    if topk_indices.dtype not in (torch.int16, torch.int32, torch.int64):
+        return False
+    if query_nope.dim() != 4 or query_pe.dim() != 4 or key_nope.dim() != 4:
+        return False
+    if key_pe.dim() != 4 or value.dim() != 4 or topk_indices.dim() != 3:
+        return False
+    if query_nope.size(-1) != 128 or query_pe.size(-1) != 64 or value.size(-1) != 128:
+        return False
+    if key_nope.size(-1) != 128 or key_pe.size(-1) != 64:
+        return False
+    local_heads = query_nope.size(2)
+    if local_heads <= 0 or local_heads > 64:
+        return False
+    if topk_indices.size(-1) <= 0 or topk_indices.size(-1) > 4096:
+        return False
+    if query_nope.stride(-1) != 1 or key_nope.stride(-1) != 1 or value.stride(-1) != 1:
+        return False
+    ext = _try_load_dsa_cuda_ext()
+    return ext is not None and hasattr(ext, "dsa_split_qk_fwd_cublasdx")
+
+
+def _cuda_split_qk_pe_cublasdx_forward_supported(
+    query_nope: torch.Tensor,
+    query_pe: torch.Tensor,
+    key_nope: torch.Tensor,
+    key_pe: torch.Tensor,
+    value: torch.Tensor,
+    topk_indices: torch.Tensor,
+    query_positions: torch.Tensor | None,
+    key_positions: torch.Tensor | None,
+) -> bool:
+    if not _cuda_split_qk_pe_cublasdx_forward_requested():
+        return False
+    if not (
+        query_nope.is_cuda
+        and query_pe.is_cuda
+        and key_nope.is_cuda
+        and key_pe.is_cuda
+        and value.is_cuda
+        and topk_indices.is_cuda
+    ):
+        return False
+    if query_positions is not None or key_positions is not None:
+        if query_positions is None or key_positions is None:
+            return False
+        if not (query_positions.is_cuda and key_positions.is_cuda):
+            return False
+        if query_positions.dtype != torch.long or key_positions.dtype != torch.long:
+            return False
+    if query_nope.dtype not in (torch.float32, torch.bfloat16, torch.float16):
+        return False
+    if not (
+        query_pe.dtype == query_nope.dtype
+        and key_nope.dtype == query_nope.dtype
+        and key_pe.dtype == query_nope.dtype
+        and value.dtype == query_nope.dtype
+    ):
+        return False
+    if topk_indices.dtype not in (torch.int16, torch.int32, torch.int64):
+        return False
+    if query_nope.dim() != 4 or query_pe.dim() != 4 or key_nope.dim() != 4:
+        return False
+    if key_pe.dim() != 4 or value.dim() != 4 or topk_indices.dim() != 3:
+        return False
+    if query_nope.size(-1) != 128 or query_pe.size(-1) != 64 or value.size(-1) != 128:
+        return False
+    if key_nope.size(-1) != 128 or key_pe.size(-1) != 64:
+        return False
+    if key_pe.size(2) != 1:
+        return False
+    local_heads = query_nope.size(2)
+    if local_heads <= 0 or local_heads > 64:
+        return False
+    if topk_indices.size(-1) <= 0 or topk_indices.size(-1) > 4096:
+        return False
+    if query_nope.stride(-1) != 1 or key_nope.stride(-1) != 1 or value.stride(-1) != 1:
+        return False
+    ext = _try_load_dsa_cuda_ext()
+    return ext is not None and hasattr(ext, "dsa_split_qk_fwd_cublasdx_pe")
 
 
 def _dsa_sparse_kv_backward_cuda(
@@ -647,6 +853,403 @@ def _dsa_split_qk_backward_row_cuda(
         bool(emit_key_pe),
         bool(emit_value),
         int(_cuda_split_qk_row_backward_warps()),
+    )
+
+
+def _dsa_split_qk_forward_row_cuda(
+    query_nope: torch.Tensor,
+    query_pe: torch.Tensor,
+    key_nope: torch.Tensor,
+    key_pe: torch.Tensor,
+    value: torch.Tensor,
+    topk_indices: torch.Tensor,
+    query_positions: torch.Tensor | None,
+    key_positions: torch.Tensor | None,
+    output: torch.Tensor,
+    lse: torch.Tensor,
+    teacher_probs: torch.Tensor,
+    teacher_score_scratch: torch.Tensor,
+    softmax_scale: float,
+    q_start: int,
+    emit_teacher: bool,
+    use_teacher_score_scratch: bool,
+) -> None:
+    ext = _try_load_dsa_cuda_ext()
+    if ext is None or not hasattr(ext, "dsa_split_qk_fwd_row"):
+        raise RuntimeError("DSA split-QK row forward CUDA extension is unavailable")
+    has_positions = query_positions is not None or key_positions is not None
+    if has_positions:
+        if query_positions is None or key_positions is None:
+            raise ValueError("query_positions and key_positions must both be provided")
+        query_positions = query_positions.contiguous()
+        key_positions = key_positions.contiguous()
+    else:
+        query_positions = torch.empty(0, device=topk_indices.device, dtype=torch.long)
+        key_positions = query_positions
+    ext.dsa_split_qk_fwd_row(
+        query_nope,
+        query_pe,
+        key_nope,
+        key_pe,
+        value,
+        topk_indices,
+        query_positions,
+        key_positions,
+        output,
+        lse,
+        teacher_probs,
+        teacher_score_scratch,
+        float(softmax_scale),
+        int(q_start),
+        bool(has_positions),
+        bool(emit_teacher),
+        bool(use_teacher_score_scratch),
+        int(_cuda_split_qk_row_backward_warps()),
+    )
+
+
+def _hisa_block_reps_batched_cuda(k: torch.Tensor, block_size: int) -> torch.Tensor:
+    ext = _try_load_dsa_cuda_ext()
+    if ext is None or not hasattr(ext, "hisa_block_reps_batched_fwd"):
+        raise RuntimeError("HISA block representative CUDA extension is unavailable")
+    if k.dim() != 3:
+        raise ValueError(f"k must be [S, B, D], got {tuple(k.shape)}")
+    if int(block_size) <= 0:
+        raise ValueError(f"block_size must be positive, got {block_size}")
+    sk, bsz, dim = k.shape
+    block_count = (int(sk) + int(block_size) - 1) // int(block_size)
+    k_c = k.contiguous()
+    block_reps = torch.empty((bsz, block_count, dim), device=k.device, dtype=k.dtype)
+    ext.hisa_block_reps_batched_fwd(k_c, block_reps, int(block_size))
+    return block_reps
+
+
+def _hisa_dsa_split_qk_fused_forward_cuda(
+    q_indexer: torch.Tensor,
+    weights: torch.Tensor,
+    k_indexer: torch.Tensor,
+    block_reps: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    query_nope: torch.Tensor,
+    query_pe: torch.Tensor,
+    key_nope: torch.Tensor,
+    key_pe: torch.Tensor,
+    value: torch.Tensor,
+    query_positions: torch.Tensor | None,
+    key_positions: torch.Tensor | None,
+    softmax_scale: float,
+    q_start: int,
+    block_size: int,
+    block_topk: int,
+    compression_ratio: float,
+    effective_block_topk: int,
+    topk_count: int,
+    force_first: bool,
+    force_last: bool,
+    force_last_minus_one: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ext = _try_load_dsa_cuda_ext()
+    if ext is None or not hasattr(ext, "hisa_dsa_split_qk_fused_fwd"):
+        raise RuntimeError("fused HISA/DSA forward CUDA extension is unavailable")
+
+    if query_pe is None or key_pe is None:
+        raise RuntimeError("fused HISA/DSA forward requires split-QK MLA positional tensors")
+    if q_indexer.dim() != 4 or k_indexer.dim() != 3:
+        raise ValueError("q_indexer must be [Q,B,64,128] and k_indexer must be [S,B,128]")
+    q_len, bsz, _, _ = q_indexer.shape
+    sk = k_indexer.shape[0]
+    topk_k = min(int(topk_count), int(sk))
+    if topk_k <= 0:
+        raise ValueError(f"topk_count must be positive, got {topk_count}")
+
+    q_c = q_indexer.contiguous()
+    weights_c = weights.contiguous()
+    k_c = k_indexer.contiguous()
+    block_reps_c = block_reps.contiguous()
+    prefix_c = prefix_lens.contiguous()
+    query_nope_c = query_nope if query_nope.stride(-1) == 1 else query_nope.contiguous()
+    query_pe_c = query_pe.contiguous()
+    key_nope_c = key_nope if key_nope.stride(-1) == 1 else key_nope.contiguous()
+    key_pe_c = key_pe.contiguous()
+    value_c = value if value.stride(-1) == 1 else value.contiguous()
+
+    has_positions = query_positions is not None or key_positions is not None
+    if has_positions:
+        if query_positions is None or key_positions is None:
+            raise ValueError("query_positions and key_positions must both be provided")
+        query_positions_c = query_positions.contiguous()
+        key_positions_c = key_positions.contiguous()
+    else:
+        query_positions_c = torch.empty(0, device=q_indexer.device, dtype=torch.long)
+        key_positions_c = query_positions_c
+
+    _, _, num_heads, value_dim = value_c.shape
+    if query_nope_c.shape[-1] != 128 or query_pe_c.shape[-1] != 64 or value_dim != 128:
+        raise RuntimeError(
+            "persistent HISA/DSA tiled attention requires noPE=128, PE=64, V=128"
+        )
+    topk_dtype = torch.int16 if int(sk) <= 32768 else torch.int32
+    topk_indices = torch.empty((bsz, q_len, topk_k), device=q_indexer.device, dtype=topk_dtype)
+    selected_scores = torch.empty(
+        (bsz, q_len, topk_k), device=q_indexer.device, dtype=torch.float32
+    )
+    output = torch.empty(
+        (q_len, bsz, num_heads, value_dim), device=query_nope.device, dtype=query_nope.dtype
+    )
+    lse = torch.empty((bsz * q_len, num_heads), device=query_nope.device, dtype=torch.float32)
+    teacher_probs = torch.empty((bsz * q_len, topk_k), device=query_nope.device, dtype=torch.float32)
+
+    ext.hisa_dsa_split_qk_fused_fwd(
+        q_c,
+        weights_c,
+        k_c,
+        block_reps_c,
+        prefix_c,
+        query_nope_c,
+        query_pe_c,
+        key_nope_c,
+        key_pe_c,
+        value_c,
+        topk_indices,
+        selected_scores,
+        output,
+        lse,
+        teacher_probs,
+        query_positions_c,
+        key_positions_c,
+        float(softmax_scale),
+        int(q_start),
+        int(block_size),
+        int(block_topk),
+        float(compression_ratio),
+        int(effective_block_topk),
+        bool(has_positions),
+        bool(force_first),
+        bool(force_last),
+        bool(force_last_minus_one),
+    )
+    return output, topk_indices, selected_scores.reshape(bsz * q_len, topk_k), teacher_probs, lse
+
+
+def _hisa_dsa_split_qk_persistent_forward_cuda(
+    q_indexer: torch.Tensor,
+    weights: torch.Tensor,
+    k_indexer: torch.Tensor,
+    block_reps: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    query_nope: torch.Tensor,
+    query_pe: torch.Tensor,
+    key_nope: torch.Tensor,
+    key_pe: torch.Tensor,
+    value: torch.Tensor,
+    query_positions: torch.Tensor | None,
+    key_positions: torch.Tensor | None,
+    softmax_scale: float,
+    q_start: int,
+    block_size: int,
+    block_topk: int,
+    compression_ratio: float,
+    effective_block_topk: int,
+    topk_count: int,
+    force_first: bool,
+    force_last: bool,
+    force_last_minus_one: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ext = _try_load_dsa_cuda_ext()
+    if ext is None or not hasattr(ext, "hisa_dsa_split_qk_persistent_fwd"):
+        raise RuntimeError("persistent HISA/DSA forward CUDA extension is unavailable")
+
+    if query_pe is None or key_pe is None:
+        raise RuntimeError("persistent HISA/DSA forward requires split-QK MLA positional tensors")
+    if q_indexer.dim() != 4 or k_indexer.dim() != 3:
+        raise ValueError("q_indexer must be [Q,B,64,128] and k_indexer must be [S,B,128]")
+    q_len, bsz, _, _ = q_indexer.shape
+    sk = k_indexer.shape[0]
+    topk_k = min(int(topk_count), int(sk))
+    if topk_k <= 0:
+        raise ValueError(f"topk_count must be positive, got {topk_count}")
+    candidate_capacity = int(effective_block_topk) * int(block_size)
+    if candidate_capacity < topk_k:
+        raise ValueError(
+            f"persistent HISA/DSA candidate_capacity={candidate_capacity} < topk={topk_k}"
+        )
+
+    q_c = q_indexer.contiguous()
+    weights_c = weights.contiguous()
+    k_c = k_indexer.contiguous()
+    block_reps_c = block_reps.contiguous()
+    prefix_c = prefix_lens.contiguous()
+    query_nope_c = query_nope if query_nope.stride(-1) == 1 else query_nope.contiguous()
+    query_pe_c = query_pe.contiguous()
+    key_nope_c = key_nope if key_nope.stride(-1) == 1 else key_nope.contiguous()
+    key_pe_c = key_pe.contiguous()
+    value_c = value if value.stride(-1) == 1 else value.contiguous()
+
+    has_positions = query_positions is not None or key_positions is not None
+    if has_positions:
+        if query_positions is None or key_positions is None:
+            raise ValueError("query_positions and key_positions must both be provided")
+        query_positions_c = query_positions.contiguous()
+        key_positions_c = key_positions.contiguous()
+    else:
+        query_positions_c = torch.empty(0, device=q_indexer.device, dtype=torch.long)
+        key_positions_c = query_positions_c
+
+    _, _, num_heads, value_dim = value_c.shape
+    topk_dtype = torch.int16 if int(sk) <= 32768 else torch.int32
+    topk_indices = torch.empty((bsz, q_len, topk_k), device=q_indexer.device, dtype=topk_dtype)
+    selected_scores = torch.empty(
+        (bsz, q_len, topk_k), device=q_indexer.device, dtype=torch.float32
+    )
+    output = torch.empty(
+        (q_len, bsz, num_heads, value_dim), device=query_nope.device, dtype=query_nope.dtype
+    )
+    lse = torch.empty((bsz * q_len, num_heads), device=query_nope.device, dtype=torch.float32)
+    teacher_probs = torch.empty((bsz * q_len, topk_k), device=query_nope.device, dtype=torch.float32)
+    selected_blocks = torch.empty(
+        (bsz, q_len, int(effective_block_topk)), device=q_indexer.device, dtype=torch.int32
+    )
+    candidate_keys = torch.empty(
+        (bsz, q_len, int(candidate_capacity)), device=q_indexer.device, dtype=torch.int64
+    )
+    attention_scores = torch.empty(
+        (bsz * q_len, num_heads, topk_k), device=q_indexer.device, dtype=torch.float32
+    )
+    output_accum = torch.empty(
+        (bsz * q_len, num_heads, value_dim), device=q_indexer.device, dtype=torch.float32
+    )
+
+    ext.hisa_dsa_split_qk_persistent_fwd(
+        q_c,
+        weights_c,
+        k_c,
+        block_reps_c,
+        prefix_c,
+        query_nope_c,
+        query_pe_c,
+        key_nope_c,
+        key_pe_c,
+        value_c,
+        topk_indices,
+        selected_scores,
+        output,
+        lse,
+        teacher_probs,
+        selected_blocks,
+        candidate_keys,
+        attention_scores,
+        output_accum,
+        query_positions_c,
+        key_positions_c,
+        float(softmax_scale),
+        int(q_start),
+        int(block_size),
+        int(block_topk),
+        float(compression_ratio),
+        int(effective_block_topk),
+        bool(has_positions),
+        bool(force_first),
+        bool(force_last),
+        bool(force_last_minus_one),
+    )
+    return output, topk_indices, selected_scores.reshape(bsz * q_len, topk_k), teacher_probs, lse
+
+
+def _dsa_split_qk_forward_cublasdx_cuda(
+    query_nope: torch.Tensor,
+    query_pe: torch.Tensor,
+    key_nope: torch.Tensor,
+    key_pe: torch.Tensor,
+    value: torch.Tensor,
+    topk_indices: torch.Tensor,
+    query_positions: torch.Tensor | None,
+    key_positions: torch.Tensor | None,
+    output: torch.Tensor,
+    lse: torch.Tensor,
+    teacher_probs: torch.Tensor,
+    teacher_score_scratch: torch.Tensor,
+    softmax_scale: float,
+    q_start: int,
+    emit_teacher: bool,
+    use_teacher_score_scratch: bool,
+) -> None:
+    ext = _try_load_dsa_cuda_ext()
+    if ext is None or not hasattr(ext, "dsa_split_qk_fwd_cublasdx"):
+        raise RuntimeError("DSA split-QK cuBLASDx forward extension is unavailable")
+    has_positions = query_positions is not None or key_positions is not None
+    if has_positions:
+        if query_positions is None or key_positions is None:
+            raise ValueError("query_positions and key_positions must both be provided")
+        query_positions = query_positions.contiguous()
+        key_positions = key_positions.contiguous()
+    else:
+        query_positions = torch.empty(0, device=topk_indices.device, dtype=torch.long)
+        key_positions = query_positions
+    ext.dsa_split_qk_fwd_cublasdx(
+        query_nope,
+        query_pe,
+        key_nope,
+        key_pe,
+        value,
+        topk_indices,
+        query_positions,
+        key_positions,
+        output,
+        lse,
+        teacher_probs,
+        teacher_score_scratch,
+        float(softmax_scale),
+        int(q_start),
+        bool(has_positions),
+        bool(emit_teacher),
+        bool(use_teacher_score_scratch),
+    )
+
+
+def _dsa_split_qk_forward_pe_cublasdx_cuda(
+    query_nope: torch.Tensor,
+    query_pe: torch.Tensor,
+    key_nope: torch.Tensor,
+    key_pe: torch.Tensor,
+    value: torch.Tensor,
+    topk_indices: torch.Tensor,
+    query_positions: torch.Tensor | None,
+    key_positions: torch.Tensor | None,
+    output: torch.Tensor,
+    lse: torch.Tensor,
+    teacher_probs: torch.Tensor,
+    teacher_score_scratch: torch.Tensor,
+    softmax_scale: float,
+    q_start: int,
+) -> None:
+    ext = _try_load_dsa_cuda_ext()
+    if ext is None or not hasattr(ext, "dsa_split_qk_fwd_cublasdx_pe"):
+        raise RuntimeError("DSA split-QK PE-shared cuBLASDx forward extension is unavailable")
+    has_positions = query_positions is not None or key_positions is not None
+    if has_positions:
+        if query_positions is None or key_positions is None:
+            raise ValueError("query_positions and key_positions must both be provided")
+        query_positions = query_positions.contiguous()
+        key_positions = key_positions.contiguous()
+    else:
+        query_positions = torch.empty(0, device=topk_indices.device, dtype=torch.long)
+        key_positions = query_positions
+    ext.dsa_split_qk_fwd_cublasdx_pe(
+        query_nope,
+        query_pe,
+        key_nope,
+        key_pe,
+        value,
+        topk_indices,
+        query_positions,
+        key_positions,
+        output,
+        lse,
+        teacher_probs,
+        teacher_score_scratch,
+        float(softmax_scale),
+        int(q_start),
+        bool(has_positions),
     )
 
 
@@ -1333,16 +1936,25 @@ def _hisa_kl_grad_kernel(
         mask=valid_k,
         other=0.0,
     ).to(tl.float32)
-    valid = valid_k & (scores > -3.0e38)
+    scores_finite = (scores == scores) & (scores > -3.0e38) & (scores < 3.0e38)
+    teacher_finite = (teacher == teacher) & (teacher >= 0.0) & (teacher < 3.0e38)
+    valid = valid_k & scores_finite
     scores = tl.where(valid, scores, -float("inf"))
+    teacher = tl.where(valid & teacher_finite, teacher, 0.0)
+    has_valid = tl.sum(tl.where(valid, 1, 0), axis=0) > 0
 
     row_max = tl.max(scores, axis=0)
-    exp_scores = tl.exp(scores - row_max)
+    row_max = tl.where(has_valid, row_max, 0.0)
+    exp_scores = tl.exp(tl.where(valid, scores - row_max, -float("inf")))
     exp_scores = tl.where(valid, exp_scores, 0.0)
     denom = tl.sum(exp_scores, axis=0)
+    denom = tl.maximum(denom, 1.0e-20)
     index_probs = exp_scores / denom
-    index_probs = tl.where(valid, index_probs, 0.0)
-    teacher = tl.where(valid, teacher, 0.0)
+    index_probs = tl.where(valid & has_valid, index_probs, 0.0)
+    teacher = tl.where(valid & has_valid, teacher, 0.0)
+    teacher_sum = tl.sum(teacher, axis=0)
+    has_teacher = teacher_sum > 0.0
+    teacher = tl.where(has_teacher, teacher / tl.maximum(teacher_sum, 1.0e-20), 0.0)
 
     prob_ratio = index_probs / (index_probs + 1.0e-10)
     teacher_prob_ratio = teacher * prob_ratio
@@ -2107,6 +2719,12 @@ def _sparse_dsa_split_qk_forward_kernel(
         mask=q_valid[:, None] & (qd_offsets[None, :] < head_dim),
         other=0.0,
     ).to(tl.float32)
+    query_nope_finite = (
+        (query_nope == query_nope)
+        & (query_nope > -3.0e38)
+        & (query_nope < 3.0e38)
+    )
+    query_nope = tl.where(query_nope_finite, query_nope, 0.0)
     query_pe = tl.load(
         query_pe_ptr
         + ((q_offsets[:, None] * bsz + batch_idx) * num_heads + head_idx) * pos_dim
@@ -2114,6 +2732,12 @@ def _sparse_dsa_split_qk_forward_kernel(
         mask=q_valid[:, None] & (pd_offsets[None, :] < pos_dim),
         other=0.0,
     ).to(tl.float32)
+    query_pe_finite = (
+        (query_pe == query_pe)
+        & (query_pe > -3.0e38)
+        & (query_pe < 3.0e38)
+    )
+    query_pe = tl.where(query_pe_finite, query_pe, 0.0)
 
     m_i = tl.full((BLOCK_Q,), -float("inf"), tl.float32)
     l_i = tl.full((BLOCK_Q,), 0.0, tl.float32)
@@ -2135,6 +2759,7 @@ def _sparse_dsa_split_qk_forward_kernel(
         ).to(tl.int32)
         selected_valid = selected >= 0
         safe_selected = tl.maximum(selected, 0)
+        safe_selected_i64 = safe_selected.to(tl.int64)
         if HAS_POSITIONS:
             selected_abs = tl.load(
                 key_pos_ptr + safe_selected,
@@ -2157,7 +2782,7 @@ def _sparse_dsa_split_qk_forward_kernel(
 
         key_nope = tl.load(
             key_nope_ptr
-            + safe_selected[:, :, None] * key_nope_stride_s
+            + safe_selected_i64[:, :, None] * key_nope_stride_s
             + batch_idx * key_nope_stride_b
             + head_idx * key_nope_stride_h
             + qd_offsets[None, None, :] * key_nope_stride_d,
@@ -2166,7 +2791,7 @@ def _sparse_dsa_split_qk_forward_kernel(
         ).to(tl.float32)
         key_pe = tl.load(
             key_pe_ptr
-            + ((safe_selected[:, :, None] * bsz + batch_idx) * key_pe_heads + key_pe_head_idx)
+            + ((safe_selected_i64[:, :, None] * bsz + batch_idx) * key_pe_heads + key_pe_head_idx)
             * pos_dim
             + pd_offsets[None, None, :],
             mask=valid[:, :, None] & (pd_offsets[None, None, :] < pos_dim),
@@ -2198,7 +2823,7 @@ def _sparse_dsa_split_qk_forward_kernel(
 
         value = tl.load(
             value_ptr
-            + safe_selected[:, :, None] * v_stride_s
+            + safe_selected_i64[:, :, None] * v_stride_s
             + batch_idx * v_stride_b
             + head_idx * v_stride_h
             + vd_offsets[None, None, :] * v_stride_d,
@@ -2235,6 +2860,7 @@ def _sparse_dsa_split_qk_forward_kernel(
                 ).to(tl.int32)
                 selected_valid = selected >= 0
                 safe_selected = tl.maximum(selected, 0)
+                safe_selected_i64 = safe_selected.to(tl.int64)
                 if HAS_POSITIONS:
                     selected_abs = tl.load(
                         key_pos_ptr + safe_selected,
@@ -2256,7 +2882,7 @@ def _sparse_dsa_split_qk_forward_kernel(
                     )
                 key_nope = tl.load(
                     key_nope_ptr
-                    + safe_selected[:, :, None] * key_nope_stride_s
+                    + safe_selected_i64[:, :, None] * key_nope_stride_s
                     + batch_idx * key_nope_stride_b
                     + head_idx * key_nope_stride_h
                     + qd_offsets[None, None, :] * key_nope_stride_d,
@@ -2265,7 +2891,10 @@ def _sparse_dsa_split_qk_forward_kernel(
                 ).to(tl.float32)
                 key_pe = tl.load(
                     key_pe_ptr
-                    + ((safe_selected[:, :, None] * bsz + batch_idx) * key_pe_heads + key_pe_head_idx)
+                    + (
+                        (safe_selected_i64[:, :, None] * bsz + batch_idx) * key_pe_heads
+                        + key_pe_head_idx
+                    )
                     * pos_dim
                     + pd_offsets[None, None, :],
                     mask=valid[:, :, None] & (pd_offsets[None, None, :] < pos_dim),
@@ -2388,6 +3017,12 @@ def _sparse_dsa_split_qk_backward_kernel(
         mask=q_valid[:, None] & (vd_offsets[None, :] < value_dim),
         other=0.0,
     ).to(tl.float32)
+    grad_output_finite = (
+        (grad_output == grad_output)
+        & (grad_output > -3.0e38)
+        & (grad_output < 3.0e38)
+    )
+    grad_output = tl.where(grad_output_finite, grad_output, 0.0)
     output = tl.load(
         output_ptr
         + ((q_offsets[:, None] * bsz + batch_idx) * num_heads + head_idx) * value_dim
@@ -2395,12 +3030,22 @@ def _sparse_dsa_split_qk_backward_kernel(
         mask=q_valid[:, None] & (vd_offsets[None, :] < value_dim),
         other=0.0,
     ).to(tl.float32)
+    output_finite = (
+        (output == output)
+        & (output > -3.0e38)
+        & (output < 3.0e38)
+    )
+    output = tl.where(output_finite, output, 0.0)
     row_lse = tl.load(
         lse_ptr + (batch_idx * q_len + q_offsets) * num_heads + head_idx,
         mask=q_valid,
         other=0.0,
     ).to(tl.float32)
+    row_lse_valid = q_valid & (row_lse == row_lse) & (row_lse > -3.0e38) & (row_lse < 3.0e38)
+    row_lse_safe = tl.where(row_lse_valid, row_lse, 0.0)
     delta = tl.sum(grad_output * output, axis=1)
+    delta_valid = (delta == delta) & (delta > -3.0e38) & (delta < 3.0e38)
+    delta = tl.where(row_lse_valid & delta_valid, delta, 0.0)
 
     grad_query_nope = tl.zeros((BLOCK_Q, BLOCK_QD), tl.float32)
     grad_query_pe = tl.zeros((BLOCK_Q, BLOCK_PD), tl.float32)
@@ -2421,6 +3066,7 @@ def _sparse_dsa_split_qk_backward_kernel(
         ).to(tl.int32)
         selected_valid = selected >= 0
         safe_selected = tl.maximum(selected, 0)
+        safe_selected_i64 = safe_selected.to(tl.int64)
         if HAS_POSITIONS:
             selected_abs = tl.load(
                 key_pos_ptr + safe_selected,
@@ -2443,21 +3089,33 @@ def _sparse_dsa_split_qk_backward_kernel(
 
         key_nope = tl.load(
             key_nope_ptr
-            + safe_selected[:, :, None] * key_nope_stride_s
+            + safe_selected_i64[:, :, None] * key_nope_stride_s
             + batch_idx * key_nope_stride_b
             + head_idx * key_nope_stride_h
             + qd_offsets[None, None, :] * key_nope_stride_d,
             mask=valid[:, :, None] & (qd_offsets[None, None, :] < head_dim),
             other=0.0,
         ).to(tl.float32)
+        key_nope_finite = (
+            (key_nope == key_nope)
+            & (key_nope > -3.0e38)
+            & (key_nope < 3.0e38)
+        )
+        key_nope = tl.where(key_nope_finite, key_nope, 0.0)
         key_pe = tl.load(
             key_pe_ptr
-            + ((safe_selected[:, :, None] * bsz + batch_idx) * key_pe_heads + key_pe_head_idx)
+            + ((safe_selected_i64[:, :, None] * bsz + batch_idx) * key_pe_heads + key_pe_head_idx)
             * pos_dim
             + pd_offsets[None, None, :],
             mask=valid[:, :, None] & (pd_offsets[None, None, :] < pos_dim),
             other=0.0,
         ).to(tl.float32)
+        key_pe_finite = (
+            (key_pe == key_pe)
+            & (key_pe > -3.0e38)
+            & (key_pe < 3.0e38)
+        )
+        key_pe = tl.where(key_pe_finite, key_pe, 0.0)
         if USE_SCORE_SCRATCH:
             scores = tl.load(
                 teacher_score_ptr
@@ -2467,29 +3125,42 @@ def _sparse_dsa_split_qk_backward_kernel(
                 mask=q_valid[:, None] & valid_topk[None, :],
                 other=-float("inf"),
             ).to(tl.float32)
-            valid = valid & (scores > -3.0e38)
+            scores_finite = (scores == scores) & (scores > -3.0e38) & (scores < 3.0e38)
+            valid = valid & scores_finite
         else:
             scores = (
                 tl.sum(key_nope * query_nope[:, None, :], axis=2)
                 + tl.sum(key_pe * query_pe[:, None, :], axis=2)
             ) * softmax_scale
+            scores_finite = (scores == scores) & (scores > -3.0e38) & (scores < 3.0e38)
+            valid = valid & scores_finite
+        valid = valid & row_lse_valid[:, None]
         scores = tl.where(valid, scores, -float("inf"))
-        probs = tl.exp(scores - row_lse[:, None])
-        probs = tl.where(valid, probs, 0.0)
+        probs = tl.exp(scores - row_lse_safe[:, None])
+        probs_finite = (probs == probs) & (probs >= 0.0) & (probs < 3.0e38)
+        probs = tl.where(valid & probs_finite, probs, 0.0)
 
         value = tl.load(
             value_ptr
-            + safe_selected[:, :, None] * v_stride_s
+            + safe_selected_i64[:, :, None] * v_stride_s
             + batch_idx * v_stride_b
             + head_idx * v_stride_h
             + vd_offsets[None, None, :] * v_stride_d,
             mask=valid[:, :, None] & (vd_offsets[None, None, :] < value_dim),
             other=0.0,
         ).to(tl.float32)
+        value_finite = (
+            (value == value)
+            & (value > -3.0e38)
+            & (value < 3.0e38)
+        )
+        value = tl.where(value_finite, value, 0.0)
 
         dp = tl.sum(value * grad_output[:, None, :], axis=2)
+        dp_valid = (dp == dp) & (dp > -3.0e38) & (dp < 3.0e38)
         ds = probs * (dp - delta[:, None]) * softmax_scale
-        ds = tl.where(valid, ds, 0.0)
+        ds_valid = (ds == ds) & (ds > -3.0e38) & (ds < 3.0e38)
+        ds = tl.where(valid & dp_valid & ds_valid, ds, 0.0)
         if EMIT_QUERY_GRADS:
             grad_query_nope += tl.sum(ds[:, :, None] * key_nope, axis=1)
             grad_query_pe += tl.sum(ds[:, :, None] * key_pe, axis=1)
@@ -2500,11 +3171,12 @@ def _sparse_dsa_split_qk_backward_kernel(
             if KV_END > 0:
                 kv_valid = kv_valid & (safe_selected >= KV_START) & (safe_selected < KV_END)
                 grad_selected = safe_selected - KV_START
+            grad_selected_i64 = grad_selected.to(tl.int64)
 
             if EMIT_KEY_NOPE_GRAD:
                 tl.atomic_add(
                     grad_key_nope_ptr
-                    + ((grad_selected[:, :, None] * bsz + batch_idx) * num_heads + head_idx)
+                    + ((grad_selected_i64[:, :, None] * bsz + batch_idx) * num_heads + head_idx)
                     * head_dim
                     + qd_offsets[None, None, :],
                     ds[:, :, None] * query_nope[:, None, :],
@@ -2515,7 +3187,7 @@ def _sparse_dsa_split_qk_backward_kernel(
                 tl.atomic_add(
                     grad_key_pe_ptr
                     + (
-                        (grad_selected[:, :, None] * bsz + batch_idx)
+                        (grad_selected_i64[:, :, None] * bsz + batch_idx)
                         * key_pe_heads
                         + key_pe_head_idx
                     )
@@ -2528,7 +3200,7 @@ def _sparse_dsa_split_qk_backward_kernel(
             if EMIT_VALUE_GRAD:
                 tl.atomic_add(
                     grad_value_ptr
-                    + ((grad_selected[:, :, None] * bsz + batch_idx) * num_heads + head_idx)
+                    + ((grad_selected_i64[:, :, None] * bsz + batch_idx) * num_heads + head_idx)
                     * value_dim
                     + vd_offsets[None, None, :] * v_stride_d,
                     probs[:, :, None] * grad_output[:, None, :],
@@ -3429,12 +4101,51 @@ class SparseDSASplitQKAttentionTriton(torch.autograd.Function):
             query_positions = topk_flat
             key_positions = topk_flat
 
+        use_cuda_pe_cublasdx_forward = (
+            bool(emit_teacher and _teacher_score_scratch_enabled())
+            and _cuda_split_qk_pe_cublasdx_forward_supported(
+                query_nope_flat,
+                query_pe_flat,
+                key_nope_flat,
+                key_pe_flat,
+                value_flat,
+                topk_flat,
+                query_positions if has_positions else None,
+                key_positions if has_positions else None,
+            )
+        )
+        use_cuda_cublasdx_forward = (not use_cuda_pe_cublasdx_forward) and _cuda_split_qk_cublasdx_forward_supported(
+            query_nope_flat,
+            query_pe_flat,
+            key_nope_flat,
+            key_pe_flat,
+            value_flat,
+            topk_flat,
+            query_positions if has_positions else None,
+            key_positions if has_positions else None,
+        )
+        use_cuda_row_forward = (not use_cuda_cublasdx_forward) and _cuda_split_qk_row_forward_supported(
+            query_nope_flat,
+            query_pe_flat,
+            key_nope_flat,
+            key_pe_flat,
+            value_flat,
+            topk_flat,
+            query_positions if has_positions else None,
+            key_positions if has_positions else None,
+        )
         output = torch.empty(
             (q_len, bsz, num_heads, value_dim), device=query_nope.device, dtype=query_nope.dtype
         )
         lse = torch.empty((bsz * q_len, num_heads), device=query_nope.device, dtype=torch.float32)
         teacher_probs = (
-            torch.zeros((bsz * q_len, topk_count), device=query_nope.device, dtype=torch.float32)
+            (
+                torch.empty((bsz * q_len, topk_count), device=query_nope.device, dtype=torch.float32)
+                if use_cuda_pe_cublasdx_forward or use_cuda_cublasdx_forward or use_cuda_row_forward
+                else torch.zeros(
+                    (bsz * q_len, topk_count), device=query_nope.device, dtype=torch.float32
+                )
+            )
             if emit_teacher
             else output
         )
@@ -3472,53 +4183,109 @@ class SparseDSASplitQKAttentionTriton(torch.autograd.Function):
         block_vd = triton.next_power_of_2(value_dim)
         grid = (triton.cdiv(q_len, block_q), num_heads * bsz)
 
-        _sparse_dsa_split_qk_forward_kernel[grid](
-            query_nope_flat,
-            query_pe_flat,
-            key_nope_flat,
-            key_pe_flat,
-            value_flat,
-            topk_flat,
-            query_positions,
-            key_positions,
-            output,
-            lse,
-            teacher_probs,
-            teacher_score_scratch,
-            float(softmax_scale),
-            q_len,
-            bsz,
-            num_heads,
-            head_dim,
-            pos_dim,
-            value_dim,
-            key_pe_heads,
-            query_nope_flat.stride(0),
-            query_nope_flat.stride(1),
-            query_nope_flat.stride(2),
-            query_nope_flat.stride(3),
-            key_nope_flat.stride(0),
-            key_nope_flat.stride(1),
-            key_nope_flat.stride(2),
-            key_nope_flat.stride(3),
-            value_flat.stride(0),
-            value_flat.stride(1),
-            value_flat.stride(2),
-            value_flat.stride(3),
-            topk_count,
-            int(q_start),
-            BLOCK_Q=block_q,
-            BLOCK_K=block_k,
-            BLOCK_QD=block_qd,
-            BLOCK_PD=block_pd,
-            BLOCK_VD=block_vd,
-            HAS_POSITIONS=has_positions,
-            EMIT_TEACHER=bool(emit_teacher),
-            USE_TEACHER_SCORE_SCRATCH=bool(
-                emit_teacher and _teacher_score_scratch_enabled()
-            ),
-            num_warps=4,
-        )
+        if use_cuda_pe_cublasdx_forward:
+            _dsa_split_qk_forward_pe_cublasdx_cuda(
+                query_nope_flat,
+                query_pe_flat,
+                key_nope_flat,
+                key_pe_flat,
+                value_flat,
+                topk_flat,
+                query_positions if has_positions else None,
+                key_positions if has_positions else None,
+                output,
+                lse,
+                teacher_probs,
+                teacher_score_scratch,
+                float(softmax_scale),
+                int(q_start),
+            )
+        elif use_cuda_cublasdx_forward:
+            _dsa_split_qk_forward_cublasdx_cuda(
+                query_nope_flat,
+                query_pe_flat,
+                key_nope_flat,
+                key_pe_flat,
+                value_flat,
+                topk_flat,
+                query_positions if has_positions else None,
+                key_positions if has_positions else None,
+                output,
+                lse,
+                teacher_probs,
+                teacher_score_scratch,
+                float(softmax_scale),
+                int(q_start),
+                bool(emit_teacher),
+                bool(emit_teacher and _teacher_score_scratch_enabled()),
+            )
+        elif use_cuda_row_forward:
+            _dsa_split_qk_forward_row_cuda(
+                query_nope_flat,
+                query_pe_flat,
+                key_nope_flat,
+                key_pe_flat,
+                value_flat,
+                topk_flat,
+                query_positions if has_positions else None,
+                key_positions if has_positions else None,
+                output,
+                lse,
+                teacher_probs,
+                teacher_score_scratch,
+                float(softmax_scale),
+                int(q_start),
+                bool(emit_teacher),
+                bool(emit_teacher and _teacher_score_scratch_enabled()),
+            )
+        else:
+            _sparse_dsa_split_qk_forward_kernel[grid](
+                query_nope_flat,
+                query_pe_flat,
+                key_nope_flat,
+                key_pe_flat,
+                value_flat,
+                topk_flat,
+                query_positions,
+                key_positions,
+                output,
+                lse,
+                teacher_probs,
+                teacher_score_scratch,
+                float(softmax_scale),
+                q_len,
+                bsz,
+                num_heads,
+                head_dim,
+                pos_dim,
+                value_dim,
+                key_pe_heads,
+                query_nope_flat.stride(0),
+                query_nope_flat.stride(1),
+                query_nope_flat.stride(2),
+                query_nope_flat.stride(3),
+                key_nope_flat.stride(0),
+                key_nope_flat.stride(1),
+                key_nope_flat.stride(2),
+                key_nope_flat.stride(3),
+                value_flat.stride(0),
+                value_flat.stride(1),
+                value_flat.stride(2),
+                value_flat.stride(3),
+                topk_count,
+                int(q_start),
+                BLOCK_Q=block_q,
+                BLOCK_K=block_k,
+                BLOCK_QD=block_qd,
+                BLOCK_PD=block_pd,
+                BLOCK_VD=block_vd,
+                HAS_POSITIONS=has_positions,
+                EMIT_TEACHER=bool(emit_teacher),
+                USE_TEACHER_SCORE_SCRATCH=bool(
+                    emit_teacher and _teacher_score_scratch_enabled()
+                ),
+                num_warps=4,
+            )
 
         ctx.save_for_backward(
             query_nope_flat,
@@ -3625,11 +4392,16 @@ class SparseDSASplitQKAttentionTriton(torch.autograd.Function):
                 key_positions if ctx.has_positions else None,
             )
         )
+        need_query_grads = ctx.needs_input_grad[0] or ctx.needs_input_grad[1]
         defer_query_grads = (
-            use_reentrant_kv_backward and _split_qk_reentrant_defer_query_grads_enabled()
+            need_query_grads
+            and use_reentrant_kv_backward
+            and _split_qk_reentrant_defer_query_grads_enabled()
         )
         query_grad_required_bytes = (
             (query_nope.numel() + query_pe.numel()) * _dtype_element_size(query_grad_dtype)
+            if need_query_grads
+            else 0
         )
         _maybe_trim_cuda_cache_for_dsa_backward(
             (0 if defer_query_grads else query_grad_required_bytes)
@@ -3638,10 +4410,14 @@ class SparseDSASplitQKAttentionTriton(torch.autograd.Function):
         )
         unused_grad = torch.empty(0, device=query_nope.device, dtype=query_grad_dtype)
         grad_query_nope = (
-            unused_grad if defer_query_grads else torch.empty_like(query_nope, dtype=query_grad_dtype)
+            unused_grad
+            if defer_query_grads or not need_query_grads
+            else torch.empty_like(query_nope, dtype=query_grad_dtype)
         )
         grad_query_pe = (
-            unused_grad if defer_query_grads else torch.empty_like(query_pe, dtype=query_grad_dtype)
+            unused_grad
+            if defer_query_grads or not need_query_grads
+            else torch.empty_like(query_pe, dtype=query_grad_dtype)
         )
         grid = (triton.cdiv(q_len, ctx.backward_block_q), num_heads * bsz)
 
@@ -3682,7 +4458,15 @@ class SparseDSASplitQKAttentionTriton(torch.autograd.Function):
                 and not ctx.backward_score_scratch
             )
             chunk_size = _split_qk_reentrant_kv_backward_chunk(sk)
-            query_grads_done = False
+            allow_cuda_row_query_backward = (
+                cuda_split_qk_row_backward
+                and not ctx.backward_score_scratch
+                and not defer_query_grads
+                and need_query_grads
+                and chunk_size >= sk
+                and _cuda_split_qk_row_query_backward_requested()
+            )
+            query_grads_done = not need_query_grads
             for kv_start in range(0, sk, chunk_size):
                 kv_end = min(sk, kv_start + chunk_size)
                 local_s = kv_end - kv_start
@@ -3741,6 +4525,10 @@ class SparseDSASplitQKAttentionTriton(torch.autograd.Function):
                     tensor_audit(
                         "dsa_triton/split_qk_backward_reentrant_packed_kv_alloc",
                         grad_kv=grad_kv_chunk,
+                        grad_query_nope=(
+                            grad_query_nope if allow_cuda_row_query_backward else None
+                        ),
+                        grad_query_pe=grad_query_pe if allow_cuda_row_query_backward else None,
                         grad_key_pe=grad_key_pe_chunk if emit_key_pe else None,
                         kv_start=kv_start,
                         kv_end=kv_end,
@@ -3749,6 +4537,9 @@ class SparseDSASplitQKAttentionTriton(torch.autograd.Function):
                         heads=num_heads,
                         topk_count=ctx.topk_count,
                         kv_grad_dtype=str(kv_grad_dtype),
+                    )
+                    emit_query_this_chunk = (
+                        (not query_grads_done) and allow_cuda_row_query_backward
                     )
                     _dsa_split_qk_backward_row_cuda(
                         query_nope,
@@ -3762,8 +4553,8 @@ class SparseDSASplitQKAttentionTriton(torch.autograd.Function):
                         output,
                         lse,
                         grad_output,
-                        unused_grad,
-                        unused_grad,
+                        grad_query_nope if emit_query_this_chunk else unused_grad,
+                        grad_query_pe if emit_query_this_chunk else unused_grad,
                         grad_key_nope_chunk,
                         grad_key_pe_chunk,
                         grad_value_chunk,
@@ -3771,11 +4562,13 @@ class SparseDSASplitQKAttentionTriton(torch.autograd.Function):
                         ctx.q_start,
                         kv_start,
                         kv_end,
-                        emit_query=False,
+                        emit_query=emit_query_this_chunk,
                         emit_key_nope=emit_key_nope,
                         emit_key_pe=emit_key_pe,
                         emit_value=emit_value,
                     )
+                    if emit_query_this_chunk:
+                        query_grads_done = True
                     grad_kv_for_ref = (
                         grad_kv_chunk
                         if grad_kv_chunk.dtype == kv_nope_value_ref.dtype
@@ -3802,7 +4595,9 @@ class SparseDSASplitQKAttentionTriton(torch.autograd.Function):
                             )
                     if reentrant_tensors:
                         retain_reentrant_graph = (
-                            _te_reentrant_checkpoint_retention_scope_active() or kv_end < sk
+                            _split_qk_reentrant_retain_graph_enabled()
+                            or _te_reentrant_checkpoint_retention_scope_active()
+                            or kv_end < sk
                         )
                         with torch.enable_grad(), _te_reentrant_backward_guard(
                             retain_graph=retain_reentrant_graph
@@ -3848,14 +4643,10 @@ class SparseDSASplitQKAttentionTriton(torch.autograd.Function):
                         kv_grad_dtype=str(kv_grad_dtype),
                         value_grad_dtype=str(value_grad_dtype),
                     )
-                    # The CUDA row kernel is used for K/V chunks only. Its
-                    # split positional query-gradient emission is not yet
-                    # numerically equivalent, so query grads are produced by
-                    # the existing Triton query-only pass below.
                     emit_query_this_chunk = (
                         (not query_grads_done)
                         and not defer_query_grads
-                        and not cuda_split_qk_row_backward
+                        and (allow_cuda_row_query_backward or not cuda_split_qk_row_backward)
                     )
                     if cuda_split_qk_row_backward and not ctx.backward_score_scratch:
                         _dsa_split_qk_backward_row_cuda(
@@ -3998,12 +4789,10 @@ class SparseDSASplitQKAttentionTriton(torch.autograd.Function):
                         topk_count=ctx.topk_count,
                         kv_grad_dtype=str(kv_grad_dtype),
                     )
-                    # Keep CUDA row backward on the K/V side only; query grads
-                    # are emitted by the Triton query-only pass below.
                     emit_query_this_chunk = (
                         (not query_grads_done)
                         and not defer_query_grads
-                        and not cuda_split_qk_row_backward
+                        and (allow_cuda_row_query_backward or not cuda_split_qk_row_backward)
                     )
                     if cuda_split_qk_row_backward and not ctx.backward_score_scratch:
                         _dsa_split_qk_backward_row_cuda(
@@ -4115,11 +4904,14 @@ class SparseDSASplitQKAttentionTriton(torch.autograd.Function):
 
                 if reentrant_tensors:
                     # Locally, DSA only needs retention while later K/V chunks
-                    # remain. Under StreamBP, the enclosing replay backward can
-                    # have additional reentrant consumers after this local loop,
-                    # so StreamBP owns the wider retention boundary.
+                    # remain. Some no-StreamBP profiles still have later
+                    # consumers of the upstream TE graph, so the launcher can
+                    # request a wider retention boundary without disabling this
+                    # split-Q/K fast path.
                     retain_reentrant_graph = (
-                        _te_reentrant_checkpoint_retention_scope_active() or kv_end < sk
+                        _split_qk_reentrant_retain_graph_enabled()
+                        or _te_reentrant_checkpoint_retention_scope_active()
+                        or kv_end < sk
                     )
                     with torch.enable_grad(), _te_reentrant_backward_guard(
                         retain_graph=retain_reentrant_graph
@@ -4147,7 +4939,7 @@ class SparseDSASplitQKAttentionTriton(torch.autograd.Function):
                         del grad_key_pe_chunk
                     del reentrant_tensors, reentrant_grads
 
-            if not query_grads_done:
+            if need_query_grads and not query_grads_done:
                 _maybe_trim_cuda_cache_for_dsa_backward(query_grad_required_bytes)
                 grad_query_nope = torch.empty_like(query_nope, dtype=query_grad_dtype)
                 grad_query_pe = torch.empty_like(query_pe, dtype=query_grad_dtype)
@@ -4218,8 +5010,8 @@ class SparseDSASplitQKAttentionTriton(torch.autograd.Function):
                 )
 
             return (
-                grad_query_nope.to(query_nope.dtype),
-                grad_query_pe.to(query_pe.dtype),
+                grad_query_nope.to(query_nope.dtype) if ctx.needs_input_grad[0] else None,
+                grad_query_pe.to(query_pe.dtype) if ctx.needs_input_grad[1] else None,
                 None,
                 None,
                 None,

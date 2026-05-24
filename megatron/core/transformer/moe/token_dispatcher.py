@@ -15,6 +15,7 @@ from megatron.core.fusions.fused_deepep_permute import (
 )
 from megatron.core.fusions.fused_indices_converter import fused_indices_to_multihot
 from megatron.core.fusions.fused_pad_routing_map import fused_pad_routing_map
+from megatron.core.fine_profile import fine_profile_range
 from megatron.core.jit import jit_fuser
 from megatron.core.tensor_parallel import (
     all_to_all,
@@ -24,7 +25,9 @@ from megatron.core.tensor_parallel import (
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.fused_a2a import (
     fused_combine,
+    fused_combine_expert_major,
     fused_dispatch,
+    fused_dispatch_expert_major,
     hybrid_ep_combine,
     hybrid_ep_dispatch,
     set_deepep_num_sms,
@@ -61,6 +64,166 @@ logger = logging.getLogger(__name__)
 def _deepep_compact_local_permute_enabled() -> bool:
     value = os.getenv("MEGATRON_DEEPEP_COMPACT_LOCAL_PERMUTE", "1")
     return value.strip().lower() not in ("0", "false", "off", "no")
+
+
+def _deepep_expert_major_combine_enabled() -> bool:
+    value = os.getenv("MEGATRON_DEEPEP_EXPERT_MAJOR_COMBINE", "0")
+    return value.strip().lower() not in ("0", "false", "off", "no")
+
+
+def _deepep_expert_major_dispatch_enabled() -> bool:
+    value = os.getenv("MEGATRON_DEEPEP_EXPERT_MAJOR_DISPATCH", "0")
+    return value.strip().lower() not in ("0", "false", "off", "no")
+
+
+def _env_flag_enabled(name: str, default: str = "0") -> bool:
+    value = os.getenv(name, default)
+    return value.strip().lower() not in ("0", "false", "off", "no", "")
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name, str(default)).strip()
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _dist_rank(group=None) -> int:
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return -1
+    try:
+        return torch.distributed.get_rank(group=group)
+    except Exception:
+        return torch.distributed.get_rank()
+
+
+def _dist_world(group=None) -> int:
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return 1
+    try:
+        return torch.distributed.get_world_size(group=group)
+    except Exception:
+        return torch.distributed.get_world_size()
+
+
+def _format_cuda_memory_for_log() -> str:
+    if not torch.cuda.is_available():
+        return "mem=unavailable"
+    gib = 1024.0**3
+    try:
+        free, total = torch.cuda.mem_get_info()
+    except RuntimeError:
+        free, total = 0, 0
+    return (
+        f"mem_alloc_gib={torch.cuda.memory_allocated() / gib:.2f} "
+        f"mem_reserved_gib={torch.cuda.memory_reserved() / gib:.2f} "
+        f"mem_free_gib={free / gib:.2f} mem_total_gib={total / gib:.2f}"
+    )
+
+
+def _log_deepep_dispatch_stats(
+    event: str,
+    token_indices: Optional[torch.Tensor],
+    token_probs: Optional[torch.Tensor],
+    num_experts: int,
+    num_local_experts: int,
+    group,
+    hidden_states: Optional[torch.Tensor] = None,
+    tokens_per_expert: Optional[torch.Tensor] = None,
+    layer_number: Optional[int] = None,
+) -> None:
+    if not _env_flag_enabled("MEGATRON_MOE_DISPATCH_STATS_LOG", "0"):
+        return
+    rank = _dist_rank()
+    stride = max(1, _env_int("MEGATRON_MOE_DISPATCH_STATS_RANK_STRIDE", 8))
+    if rank >= 0 and rank % stride != 0:
+        return
+
+    group_rank = _dist_rank(group)
+    group_world = _dist_world(group)
+    parts = [
+        f"[moe_dispatch_stats] event={event}",
+        f"rank={rank}",
+        f"group_rank={group_rank}",
+        f"group_world={group_world}",
+        f"num_experts={num_experts}",
+        f"num_local_experts={num_local_experts}",
+    ]
+    if layer_number is not None:
+        parts.append(f"layer={layer_number}")
+    if hidden_states is not None:
+        parts.append(f"hidden_shape={tuple(hidden_states.shape)}")
+        parts.append(f"hidden_dtype={hidden_states.dtype}")
+    if token_indices is not None:
+        parts.append(f"token_indices_shape={tuple(token_indices.shape)}")
+        try:
+            valid = token_indices[token_indices >= 0]
+            valid_count = int(valid.numel())
+            parts.append(f"valid_edges={valid_count}")
+            if valid_count > 0:
+                counts = torch.bincount(valid.to(torch.long), minlength=num_experts)
+                nonzero = int((counts > 0).sum().item())
+                parts.append(f"expert_edges_min={int(counts.min().item())}")
+                parts.append(f"expert_edges_max={int(counts.max().item())}")
+                parts.append(f"expert_edges_nonzero={nonzero}")
+                if tokens_per_expert is not None:
+                    tpe = tokens_per_expert.to(torch.long)
+                    parts.append(f"tokens_per_expert_min={int(tpe.min().item())}")
+                    parts.append(f"tokens_per_expert_max={int(tpe.max().item())}")
+                    parts.append(f"tokens_per_expert_sum={int(tpe.sum().item())}")
+                    mean = tpe.float().mean().clamp_min(1.0)
+                    parts.append(
+                        f"tokens_per_expert_max_over_mean={float((tpe.max().float() / mean).item()):.6f}"
+                    )
+                    topk = max(0, _env_int("MEGATRON_MOE_DISPATCH_STATS_TOPK_EXPERTS", 4))
+                    if topk > 0 and tpe.numel() > 0:
+                        values, indices = torch.topk(tpe, k=min(topk, tpe.numel()))
+                        pairs = [
+                            f"{int(idx)}:{int(val)}"
+                            for idx, val in zip(indices.detach().cpu(), values.detach().cpu())
+                        ]
+                        parts.append(f"tokens_per_expert_top={','.join(pairs)}")
+        except RuntimeError as exc:
+            parts.append(f"count_error={type(exc).__name__}:{exc}")
+    if token_probs is not None:
+        parts.append(f"token_probs_dtype={token_probs.dtype}")
+        try:
+            if token_probs.numel() == 0:
+                parts.append("probs_empty=1")
+            else:
+                finite = torch.isfinite(token_probs)
+                parts.append(f"probs_finite={int(finite.all().item())}")
+                parts.append(f"probs_min={float(token_probs.min().item()):.6g}")
+                parts.append(f"probs_max={float(token_probs.max().item()):.6g}")
+        except RuntimeError as exc:
+            parts.append(f"prob_error={type(exc).__name__}:{exc}")
+    parts.append(_format_cuda_memory_for_log())
+    print(" ".join(parts), flush=True)
+
+
+def _deepep_num_sms(default: int) -> int:
+    value = os.getenv("MEGATRON_DEEPEP_NUM_SMS", "").strip()
+    if not value:
+        parsed = int(default)
+    else:
+        parsed = int(value)
+    if parsed <= 0 or parsed % 2 != 0:
+        raise ValueError(f"MEGATRON_DEEPEP_NUM_SMS must be a positive even integer, got {parsed}")
+    return parsed
+
+
+def _validate_deepep_combine_sms(num_sms: int) -> None:
+    value = os.getenv("MEGATRON_DEEPEP_COMBINE_NUM_SMS", "").strip()
+    if not value:
+        return
+    combine_sms = int(value)
+    if combine_sms != num_sms:
+        raise RuntimeError(
+            "MEGATRON_DEEPEP_COMBINE_NUM_SMS must match MEGATRON_DEEPEP_NUM_SMS. "
+            f"Got combine={combine_sms}, deepep={num_sms}. DeepEP combine reuses "
+            "the dispatch handle channel layout."
+        )
 
 
 def _moe_combine_reduce_scatter_dtype(hidden_states: torch.Tensor, probs: torch.Tensor) -> torch.dtype:
@@ -1238,26 +1401,48 @@ class _DeepepManager(_DispatchManager):
         # Compact local permute state. This is only valid between DeepEP dispatch
         # postprocess and combine preprocess for the current MoE layer call.
         self.compact_row_map = None
+        self.compact_edge_to_row = None
         self.compact_local_permute = _deepep_compact_local_permute_enabled()
+        self.expert_major_dispatch = _deepep_expert_major_dispatch_enabled()
+        self.expert_major_dispatched = False
+        self.expert_major_combine = _deepep_expert_major_combine_enabled()
+        self.layer_number = None
+        if self.expert_major_dispatch and not self.compact_local_permute:
+            raise RuntimeError(
+                "MEGATRON_DEEPEP_EXPERT_MAJOR_DISPATCH=1 requires "
+                "MEGATRON_DEEPEP_COMPACT_LOCAL_PERMUTE=1"
+            )
+        if self.expert_major_combine and not self.compact_local_permute:
+            raise RuntimeError(
+                "MEGATRON_DEEPEP_EXPERT_MAJOR_COMBINE=1 requires "
+                "MEGATRON_DEEPEP_COMPACT_LOCAL_PERMUTE=1"
+            )
 
         if fused_dispatch is None:
             raise ImportError(
                 "DeepEP is not installed. Please install DeepEP package from "
                 "https://github.com/deepseek-ai/deepep."
             )
-        set_deepep_num_sms(config.moe_deepep_num_sms)
+        deepep_num_sms = _deepep_num_sms(config.moe_deepep_num_sms)
+        _validate_deepep_combine_sms(deepep_num_sms)
+        set_deepep_num_sms(deepep_num_sms)
 
     def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
-        num_tokens = routing_map.shape[0]
+        with fine_profile_range("moe.deepep.setup_metadata"):
+            num_tokens = routing_map.shape[0]
 
-        routing_map = routing_map.reshape(num_tokens, self.num_experts)
-        probs = probs.reshape(num_tokens, self.num_experts)
-        # Convert the format of routing map from multihot to indices.
-        self.token_probs, self.token_indices = torch.topk(probs, self.router_topk, dim=-1)
-        # Mask the indices of dropped tokens with -1
-        if self.capacity_factor is not None:
-            mask = self.token_probs == 0
-            self.token_indices = self.token_indices.masked_fill(mask, -1)
+            routing_map = routing_map.reshape(num_tokens, self.num_experts)
+            probs = probs.reshape(num_tokens, self.num_experts)
+            # Convert the format of routing map from multihot to indices.
+            with fine_profile_range("moe.deepep.setup_metadata.topk"):
+                self.token_probs, self.token_indices = torch.topk(
+                    probs, self.router_topk, dim=-1
+                )
+            # Mask the indices of dropped tokens with -1
+            if self.capacity_factor is not None:
+                with fine_profile_range("moe.deepep.setup_metadata.capacity_mask"):
+                    mask = self.token_probs == 0
+                    self.token_indices = self.token_indices.masked_fill(mask, -1)
 
     def dispatch(
         self,
@@ -1265,30 +1450,105 @@ class _DeepepManager(_DispatchManager):
         async_finish: bool = False,
         allocate_on_comm_stream: bool = False,
     ) -> torch.Tensor:
-        # DeepEP only supports float32 probs
-        if self.token_probs.dtype != torch.float32:
-            if self.token_probs.dtype in [torch.bfloat16, torch.float16]:
-                logger.warning(
-                    "DeepEP only supports float32 probs, please set --moe-router-dtype=fp32"
-                )
-            self.token_probs = self.token_probs.float()  # downcast or upcast
-        hidden_states, dispatched_indices, dispatched_probs, num_tokens_per_expert, handle = (
-            fused_dispatch(
-                hidden_states,
+        with fine_profile_range("moe.deepep.dispatch"):
+            _log_deepep_dispatch_stats(
+                "pre_dispatch",
                 self.token_indices,
                 self.token_probs,
                 self.num_experts,
+                self.num_local_experts,
                 self.group,
-                async_finish=async_finish,
-                allocate_on_comm_stream=allocate_on_comm_stream,
+                hidden_states=hidden_states,
+                layer_number=self.layer_number,
             )
-        )
-        self.handle = handle
-        self.tokens_per_expert = num_tokens_per_expert
-        self.dispatched_indices = dispatched_indices
-        self.dispatched_probs = dispatched_probs
+            if self.expert_major_dispatch:
+                if fused_dispatch_expert_major is None:
+                    raise RuntimeError("DeepEP strict expert-major dispatch requested but unavailable")
+                if self.config.moe_router_padding_for_quantization:
+                    raise RuntimeError(
+                        "DeepEP strict expert-major dispatch does not support "
+                        "moe_router_padding_for_quantization"
+                    )
+                if self.token_probs.dtype != torch.float32:
+                    if self.token_probs.dtype in [torch.bfloat16, torch.float16]:
+                        logger.warning(
+                            "DeepEP only supports float32 probs, please set --moe-router-dtype=fp32"
+                        )
+                    with fine_profile_range("moe.deepep.dispatch.cast_probs_fp32"):
+                        self.token_probs = self.token_probs.float()
+                with fine_profile_range("moe.deepep.dispatch.expert_major_fused_dispatch"):
+                    (
+                        hidden_states,
+                        self.dispatched_indices,
+                        self.dispatched_probs,
+                        self.compact_row_map,
+                        self.compact_edge_to_row,
+                        self.tokens_per_expert,
+                        self.handle,
+                    ) = fused_dispatch_expert_major(
+                        hidden_states,
+                        self.token_indices,
+                        self.token_probs,
+                        self.num_experts,
+                        self.num_local_experts,
+                        self.group,
+                        async_finish=async_finish,
+                        allocate_on_comm_stream=allocate_on_comm_stream,
+                    )
+                self.hidden_shape_before_permute = torch.Size(
+                    (self.dispatched_indices.shape[0], hidden_states.shape[1])
+                )
+                self.expert_major_dispatched = True
+                _log_deepep_dispatch_stats(
+                    "post_expert_major_dispatch",
+                    self.dispatched_indices,
+                    self.dispatched_probs,
+                    self.num_experts,
+                    self.num_local_experts,
+                    self.group,
+                    hidden_states=hidden_states,
+                    tokens_per_expert=self.tokens_per_expert,
+                    layer_number=self.layer_number,
+                )
+                return hidden_states
 
-        return hidden_states
+            # DeepEP only supports float32 probs
+            if self.token_probs.dtype != torch.float32:
+                if self.token_probs.dtype in [torch.bfloat16, torch.float16]:
+                    logger.warning(
+                        "DeepEP only supports float32 probs, please set --moe-router-dtype=fp32"
+                    )
+                with fine_profile_range("moe.deepep.dispatch.cast_probs_fp32"):
+                    self.token_probs = self.token_probs.float()  # downcast or upcast
+            with fine_profile_range("moe.deepep.dispatch.fused_dispatch"):
+                hidden_states, dispatched_indices, dispatched_probs, num_tokens_per_expert, handle = (
+                    fused_dispatch(
+                        hidden_states,
+                        self.token_indices,
+                        self.token_probs,
+                        self.num_experts,
+                        self.group,
+                        async_finish=async_finish,
+                        allocate_on_comm_stream=allocate_on_comm_stream,
+                    )
+                )
+            self.handle = handle
+            self.tokens_per_expert = num_tokens_per_expert
+            self.dispatched_indices = dispatched_indices
+            self.dispatched_probs = dispatched_probs
+            _log_deepep_dispatch_stats(
+                "post_dispatch",
+                self.dispatched_indices,
+                self.dispatched_probs,
+                self.num_experts,
+                self.num_local_experts,
+                self.group,
+                hidden_states=hidden_states,
+                tokens_per_expert=self.tokens_per_expert,
+                layer_number=self.layer_number,
+            )
+
+            return hidden_states
 
     def _indices_to_multihot(self, indices, probs):
         """
@@ -1302,23 +1562,24 @@ class _DeepepManager(_DispatchManager):
             A tuple of (routing_map, probs), where routing_map is the multihot vector
             and probs is the multihot probabilities.
         """
-        batch_size = indices.shape[0]
-        multihot_routing_map = torch.zeros(
-            (batch_size, self.num_local_experts), dtype=torch.long, device=indices.device
-        )
+        with fine_profile_range("moe.deepep.local.indices_to_multihot"):
+            batch_size = indices.shape[0]
+            multihot_routing_map = torch.zeros(
+                (batch_size, self.num_local_experts), dtype=torch.long, device=indices.device
+            )
 
-        multihot_probs = torch.zeros(
-            (batch_size, self.num_local_experts), dtype=torch.float, device=indices.device
-        )
+            multihot_probs = torch.zeros(
+                (batch_size, self.num_local_experts), dtype=torch.float, device=indices.device
+            )
 
-        mask = indices != -1
-        valid_indices = indices[mask]
-        row_indices = torch.arange(batch_size, device=indices.device).repeat_interleave(
-            mask.sum(dim=1)
-        )
-        multihot_routing_map[row_indices, valid_indices] = 1
-        multihot_probs[row_indices, valid_indices] = probs[mask]
-        return multihot_routing_map.bool(), multihot_probs
+            mask = indices != -1
+            valid_indices = indices[mask]
+            row_indices = torch.arange(batch_size, device=indices.device).repeat_interleave(
+                mask.sum(dim=1)
+            )
+            multihot_routing_map[row_indices, valid_indices] = 1
+            multihot_probs[row_indices, valid_indices] = probs[mask]
+            return multihot_routing_map.bool(), multihot_probs
 
     def get_number_of_tokens_per_expert(self) -> torch.Tensor:
         """
@@ -1332,16 +1593,51 @@ class _DeepepManager(_DispatchManager):
         async_finish: bool = False,
         allocate_on_comm_stream: bool = False,
     ) -> torch.Tensor:
-        hidden_states, _ = fused_combine(
-            hidden_states,
-            self.group,
-            self.handle,
-            async_finish=async_finish,
-            allocate_on_comm_stream=allocate_on_comm_stream,
-        )
-        # Release the handle after combine operation
-        self.handle = None
-        return hidden_states
+        with fine_profile_range("moe.deepep.combine"):
+            if self.expert_major_combine:
+                if fused_combine_expert_major is None:
+                    raise RuntimeError("DeepEP strict expert-major combine requested but unavailable")
+                if self.compact_row_map is None or self.compact_edge_to_row is None:
+                    raise RuntimeError(
+                        "DeepEP strict expert-major combine requested without compact row maps"
+                    )
+                if self.dispatched_indices is None:
+                    raise RuntimeError(
+                        "DeepEP strict expert-major combine requested without dispatched indices"
+                    )
+                if self.handle is None:
+                    raise RuntimeError(
+                        "DeepEP strict expert-major combine requested without DeepEP handle"
+                    )
+                with fine_profile_range("moe.deepep.combine.expert_major_fused_combine"):
+                    hidden_states, _ = fused_combine_expert_major(
+                        hidden_states,
+                        self.group,
+                        self.handle,
+                        self.dispatched_indices,
+                        self.compact_edge_to_row,
+                        self.compact_row_map,
+                        self.num_local_experts,
+                        async_finish=async_finish,
+                        allocate_on_comm_stream=allocate_on_comm_stream,
+                    )
+                self.handle = None
+                self.compact_row_map = None
+                self.compact_edge_to_row = None
+                self.expert_major_dispatched = False
+                return hidden_states
+
+            with fine_profile_range("moe.deepep.combine.fused_combine"):
+                hidden_states, _ = fused_combine(
+                    hidden_states,
+                    self.group,
+                    self.handle,
+                    async_finish=async_finish,
+                    allocate_on_comm_stream=allocate_on_comm_stream,
+                )
+            # Release the handle after combine operation
+            self.handle = None
+            return hidden_states
 
     def _pad_routing_map(
         self, routing_map: torch.Tensor, tokens_per_expert: torch.Tensor
@@ -1375,6 +1671,13 @@ class _DeepepManager(_DispatchManager):
         return routing_map, tokens_per_expert
 
     def get_permuted_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.expert_major_dispatched:
+            if self.compact_row_map is None or self.compact_edge_to_row is None:
+                raise RuntimeError(
+                    "DeepEP strict expert-major dispatch did not produce compact maps"
+                )
+            return hidden_states, self.dispatched_probs
+
         if self.compact_local_permute:
             self.hidden_shape_before_permute = hidden_states.shape
             align_size = (
@@ -1382,18 +1685,20 @@ class _DeepepManager(_DispatchManager):
                 if self.config.moe_router_padding_for_quantization
                 else 1
             )
-            (
-                hidden_states,
-                permuted_probs,
-                self.compact_row_map,
-                padded_tokens_per_expert,
-            ) = deepep_indices_permute(
-                hidden_states,
-                self.dispatched_indices,
-                self.dispatched_probs,
-                self.tokens_per_expert,
-                align_size,
-            )
+            with fine_profile_range("moe.deepep.local.compact_indices_permute"):
+                (
+                    hidden_states,
+                    permuted_probs,
+                    self.compact_row_map,
+                    self.compact_edge_to_row,
+                    padded_tokens_per_expert,
+                ) = deepep_indices_permute(
+                    hidden_states,
+                    self.dispatched_indices,
+                    self.dispatched_probs,
+                    self.tokens_per_expert,
+                    align_size,
+                )
             padded_tokens_per_expert._moe_quant_padding_applied = (
                 self.config.moe_router_padding_for_quantization and align_size > 1
             )
@@ -1404,55 +1709,74 @@ class _DeepepManager(_DispatchManager):
             return hidden_states, permuted_probs
 
         if is_experimental_enabled() and self.permute_fusion:
-            self.dispatched_routing_map, self.dispatched_probs = fused_indices_to_multihot(
-                self.dispatched_indices, self.dispatched_probs, self.num_local_experts
-            )
+            with fine_profile_range("moe.deepep.local.fused_indices_to_multihot"):
+                self.dispatched_routing_map, self.dispatched_probs = fused_indices_to_multihot(
+                    self.dispatched_indices, self.dispatched_probs, self.num_local_experts
+                )
         else:
             self.dispatched_routing_map, self.dispatched_probs = self._indices_to_multihot(
                 self.dispatched_indices, self.dispatched_probs
             )
         if self.config.moe_router_padding_for_quantization:
-            self.dispatched_routing_map, self.tokens_per_expert = self._pad_routing_map(
-                self.dispatched_routing_map, self.tokens_per_expert
-            )
+            with fine_profile_range("moe.deepep.local.pad_routing_map"):
+                self.dispatched_routing_map, self.tokens_per_expert = self._pad_routing_map(
+                    self.dispatched_routing_map, self.tokens_per_expert
+                )
 
         self.hidden_shape_before_permute = hidden_states.shape
         assert self.dispatched_probs.dtype == torch.float32, "DeepEP only supports float32 probs"
-        (
-            hidden_states,
-            permuted_probs,
-            self.reversed_mapping_for_combine,
-            self.pad_offsets,
-            self.tokens_per_expert,
-        ) = permute(
-            hidden_states,
-            self.dispatched_routing_map,
-            probs=self.dispatched_probs,
-            num_out_tokens=self.tokens_per_expert.sum().item(),
-            fused=self.permute_fusion,
-            tokens_per_expert=self.tokens_per_expert,
-            align_size=get_align_size_for_quantization(self.config),
-        )
+        with fine_profile_range("moe.deepep.local.permute"):
+            (
+                hidden_states,
+                permuted_probs,
+                self.reversed_mapping_for_combine,
+                self.pad_offsets,
+                self.tokens_per_expert,
+            ) = permute(
+                hidden_states,
+                self.dispatched_routing_map,
+                probs=self.dispatched_probs,
+                num_out_tokens=self.tokens_per_expert.sum().item(),
+                fused=self.permute_fusion,
+                tokens_per_expert=self.tokens_per_expert,
+                align_size=get_align_size_for_quantization(self.config),
+            )
         if self.router_dtype == "fp64":
             permuted_probs = permuted_probs.to(torch.float64)
         return hidden_states, permuted_probs
 
     def get_restored_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self.compact_row_map is not None:
-            hidden_states = deepep_indices_unpermute(
-                hidden_states, self.compact_row_map, self.hidden_shape_before_permute
-            )
-            self.compact_row_map = None
+        if self.expert_major_combine:
+            if self.compact_row_map is None or self.compact_edge_to_row is None:
+                raise RuntimeError(
+                    "DeepEP strict expert-major combine requested but compact maps are missing"
+                )
             return hidden_states
 
-        hidden_states = unpermute(
-            hidden_states,
-            self.reversed_mapping_for_combine,
-            restore_shape=self.hidden_shape_before_permute,
-            routing_map=self.dispatched_routing_map,
-            fused=self.permute_fusion,
-            pad_offsets=self.pad_offsets,
-        )
+        if self.compact_row_map is not None:
+            with fine_profile_range("moe.deepep.local.compact_indices_unpermute"):
+                hidden_states = deepep_indices_unpermute(
+                    hidden_states,
+                    self.compact_row_map,
+                    self.hidden_shape_before_permute,
+                    self.dispatched_indices,
+                    self.compact_edge_to_row,
+                    self.num_local_experts,
+                )
+            self.compact_row_map = None
+            self.compact_edge_to_row = None
+            self.expert_major_dispatched = False
+            return hidden_states
+
+        with fine_profile_range("moe.deepep.local.unpermute"):
+            hidden_states = unpermute(
+                hidden_states,
+                self.reversed_mapping_for_combine,
+                restore_shape=self.hidden_shape_before_permute,
+                routing_map=self.dispatched_routing_map,
+                fused=self.permute_fusion,
+                pad_offsets=self.pad_offsets,
+            )
         return hidden_states
 
 
@@ -1524,20 +1848,23 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         routing_map is replicated across TP group since each TP ranks in a TP group should
         receive the same tokens.
         """
-        num_local_tokens = routing_map.shape[0]
-        world_size = self.tp_size * self.ep_size
-        # Organize routing map and probs to [num_local_tokens, world_size, num_local_experts]
-        routing_map = (
-            routing_map.reshape(num_local_tokens, self.ep_size, 1, self.num_local_experts)
-            .expand(-1, -1, self.tp_size, -1)
-            .reshape(num_local_tokens, world_size, self.num_local_experts)
-        ).contiguous()
-        probs = (
-            probs.reshape(num_local_tokens, self.ep_size, 1, self.num_local_experts)
-            .expand(-1, -1, self.tp_size, -1)
-            .reshape(num_local_tokens, world_size, self.num_local_experts)
-        ).contiguous()
-        return routing_map, probs
+        with fine_profile_range("moe.flex.initialize_metadata"):
+            num_local_tokens = routing_map.shape[0]
+            world_size = self.tp_size * self.ep_size
+            # Organize routing map and probs to [num_local_tokens, world_size, num_local_experts]
+            with fine_profile_range("moe.flex.initialize_metadata.expand_routing_map"):
+                routing_map = (
+                    routing_map.reshape(num_local_tokens, self.ep_size, 1, self.num_local_experts)
+                    .expand(-1, -1, self.tp_size, -1)
+                    .reshape(num_local_tokens, world_size, self.num_local_experts)
+                ).contiguous()
+            with fine_profile_range("moe.flex.initialize_metadata.expand_probs"):
+                probs = (
+                    probs.reshape(num_local_tokens, self.ep_size, 1, self.num_local_experts)
+                    .expand(-1, -1, self.tp_size, -1)
+                    .reshape(num_local_tokens, world_size, self.num_local_experts)
+                ).contiguous()
+            return routing_map, probs
 
     @jit_fuser
     def dispatch_preprocess(
@@ -1563,7 +1890,8 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         # Initialize metadata
         routing_map, probs = self._initialize_metadata(routing_map, probs)
 
-        self._comm_manager.setup_metadata(routing_map, probs)
+        with fine_profile_range("moe.flex.dispatch_preprocess.setup_metadata"):
+            self._comm_manager.setup_metadata(routing_map, probs)
         return hidden_states, self._comm_manager.token_probs
 
     def token_dispatch(
@@ -1590,10 +1918,11 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         Returns:
             A tuple of dispatched tokens and probabilities.
         """
-        return (
-            self._comm_manager.dispatch(hidden_states, async_finish, allocate_on_comm_stream),
-            self._comm_manager.dispatched_probs,
-        )
+        with fine_profile_range("moe.flex.token_dispatch.manager_dispatch"):
+            return (
+                self._comm_manager.dispatch(hidden_states, async_finish, allocate_on_comm_stream),
+                self._comm_manager.dispatched_probs,
+            )
 
     def dispatch_postprocess(self, hidden_states: torch.Tensor, probs: torch.Tensor):
         """Converts dispatched tokens to a per-expert format for expert processing.
@@ -1608,10 +1937,12 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         Returns:
             A tuple of permuted tokens, token counts per expert, and permuted probabilities.
         """
-        global_input_tokens, permuted_probs = (
-            self._comm_manager.get_permuted_hidden_states_by_experts(hidden_states)
-        )
-        tokens_per_expert = self._comm_manager.get_number_of_tokens_per_expert()
+        with fine_profile_range("moe.flex.dispatch_postprocess.local_permute"):
+            global_input_tokens, permuted_probs = (
+                self._comm_manager.get_permuted_hidden_states_by_experts(hidden_states)
+            )
+        with fine_profile_range("moe.flex.dispatch_postprocess.get_counts"):
+            tokens_per_expert = self._comm_manager.get_number_of_tokens_per_expert()
         return global_input_tokens, tokens_per_expert, permuted_probs
 
     def combine_preprocess(self, hidden_states: torch.Tensor):
@@ -1620,7 +1951,8 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         This method restores the hidden states to their original ordering before expert processing
         by using the communication manager's restoration function.
         """
-        hidden_states = self._comm_manager.get_restored_hidden_states_by_experts(hidden_states)
+        with fine_profile_range("moe.flex.combine_preprocess.local_unpermute"):
+            hidden_states = self._comm_manager.get_restored_hidden_states_by_experts(hidden_states)
         return hidden_states
 
     def token_combine(
@@ -1641,7 +1973,8 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         Returns:
             Combined tokens after fused un-permutation and communication.
         """
-        return self._comm_manager.combine(hidden_states, async_finish, allocate_on_comm_stream)
+        with fine_profile_range("moe.flex.token_combine.manager_combine"):
+            return self._comm_manager.combine(hidden_states, async_finish, allocate_on_comm_stream)
 
     def combine_postprocess(self, hidden_states: torch.Tensor):
         """

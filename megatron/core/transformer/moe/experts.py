@@ -29,6 +29,7 @@ from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.fusions.fused_bias_geglu import quick_gelu, weighted_bias_quick_geglu_impl
 from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
+from megatron.core.fine_profile import fine_profile_range
 from megatron.core.jit import jit_fuser
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
@@ -875,57 +876,62 @@ class TEGroupedMLP(MegatronModule):
         )
         actual_tokens_attr = getattr(tokens_per_expert, "_moe_actual_tokens_per_expert", None)
         tokens_per_expert: list[int] = tokens_per_expert.tolist()
-        if self.config.fp8 or self.config.fp4:
-            if already_quant_padded:
-                actual_tokens_per_expert = (
-                    actual_tokens_attr.tolist()
-                    if isinstance(actual_tokens_attr, torch.Tensor)
-                    else tokens_per_expert
+        with fine_profile_range("moe.expert.quant_padding"):
+            if self.config.fp8 or self.config.fp4:
+                if already_quant_padded:
+                    actual_tokens_per_expert = (
+                        actual_tokens_attr.tolist()
+                        if isinstance(actual_tokens_attr, torch.Tensor)
+                        else tokens_per_expert
+                    )
+                    if permuted_probs.dim() == 1:
+                        permuted_probs = permuted_probs.unsqueeze(-1)
+                else:
+                    actual_tokens_per_expert = tokens_per_expert
+                    _maybe_trim_cuda_cache_before_moe_unpadding()
+                    permuted_local_hidden_states, tokens_per_expert = self.quantization_padding(
+                        permuted_local_hidden_states, tokens_per_expert
+                    )
+                    permuted_probs, _ = self.quantization_padding(
+                        permuted_probs.unsqueeze(-1), actual_tokens_per_expert
+                    )
+                _tensor_audit(
+                    "moe_expert/after_quant_padding",
+                    hidden=permuted_local_hidden_states,
+                    probs=permuted_probs,
+                    actual_tokens=actual_tokens_per_expert,
+                    padded_tokens=tokens_per_expert,
                 )
-                if permuted_probs.dim() == 1:
-                    permuted_probs = permuted_probs.unsqueeze(-1)
             else:
-                actual_tokens_per_expert = tokens_per_expert
-                _maybe_trim_cuda_cache_before_moe_unpadding()
-                permuted_local_hidden_states, tokens_per_expert = self.quantization_padding(
-                    permuted_local_hidden_states, tokens_per_expert
-                )
-                permuted_probs, _ = self.quantization_padding(
-                    permuted_probs.unsqueeze(-1), actual_tokens_per_expert
-                )
-            _tensor_audit(
-                "moe_expert/after_quant_padding",
-                hidden=permuted_local_hidden_states,
-                probs=permuted_probs,
-                actual_tokens=actual_tokens_per_expert,
-                padded_tokens=tokens_per_expert,
-            )
-        else:
-            permuted_probs = permuted_probs.unsqueeze(-1)
+                permuted_probs = permuted_probs.unsqueeze(-1)
 
-        if self.config.moe_apply_probs_on_input:
-            assert (
-                self.config.moe_router_topk == 1
-            ), "`moe_apply_probs_on_input` only works with `moe_router_topk`=1."
-            original_dtype = permuted_local_hidden_states.dtype
-            permuted_local_hidden_states = permuted_probs * permuted_local_hidden_states
-            permuted_local_hidden_states = permuted_local_hidden_states.to(original_dtype)
-            # Probs already applied, so reset to 1.
-            permuted_probs = torch.ones_like(permuted_probs)
+        with fine_profile_range("moe.expert.apply_probs_on_input"):
+            if self.config.moe_apply_probs_on_input:
+                assert (
+                    self.config.moe_router_topk == 1
+                ), "`moe_apply_probs_on_input` only works with `moe_router_topk`=1."
+                original_dtype = permuted_local_hidden_states.dtype
+                permuted_local_hidden_states = permuted_probs * permuted_local_hidden_states
+                permuted_local_hidden_states = permuted_local_hidden_states.to(original_dtype)
+                # Probs already applied, so reset to 1.
+                permuted_probs = torch.ones_like(permuted_probs)
 
-        with off_interface(
-            self.offload_expert_fc1, permuted_local_hidden_states, "expert_fc1"
-        ) as permuted_local_hidden_states:
-            _maybe_trim_cuda_cache_before_moe_fc1(permuted_local_hidden_states)
-            _tensor_audit(
-                "moe_expert/before_fc1",
-                hidden=permuted_local_hidden_states,
-                probs=permuted_probs,
-                tokens=tokens_per_expert,
-            )
-            fc1_output, bias_parallel = apply_module(self.linear_fc1)(
-                permuted_local_hidden_states, tokens_per_expert
-            )
+        with fine_profile_range("moe.expert.fc1"):
+            with off_interface(
+                self.offload_expert_fc1, permuted_local_hidden_states, "expert_fc1"
+            ) as permuted_local_hidden_states:
+                with fine_profile_range("moe.expert.fc1_trim_cache"):
+                    _maybe_trim_cuda_cache_before_moe_fc1(permuted_local_hidden_states)
+                _tensor_audit(
+                    "moe_expert/before_fc1",
+                    hidden=permuted_local_hidden_states,
+                    probs=permuted_probs,
+                    tokens=tokens_per_expert,
+                )
+                with fine_profile_range("moe.expert.grouped_fc1"):
+                    fc1_output, bias_parallel = apply_module(self.linear_fc1)(
+                        permuted_local_hidden_states, tokens_per_expert
+                    )
         _tensor_audit(
             "moe_expert/after_fc1",
             fc1_output=fc1_output,
@@ -940,72 +946,76 @@ class TEGroupedMLP(MegatronModule):
             )
 
         def bias_act_func(intermediate_parallel, bias_parallel, permuted_probs):
-            if self.config.use_te_activation_func:
-                if bias_parallel is not None:
-                    intermediate_parallel = intermediate_parallel + bias_parallel
-                intermediate_parallel = self.activation_func(intermediate_parallel)
-                if permuted_probs is not None:
+            with fine_profile_range("moe.expert.activation_func"):
+                if self.config.use_te_activation_func:
+                    if bias_parallel is not None:
+                        intermediate_parallel = intermediate_parallel + bias_parallel
+                    intermediate_parallel = self.activation_func(intermediate_parallel)
+                    if permuted_probs is not None:
+                        original_dtype = intermediate_parallel.dtype
+                        intermediate_parallel = intermediate_parallel * permuted_probs
+                        intermediate_parallel = intermediate_parallel.to(original_dtype)
+                elif self.config.bias_activation_fusion:
+                    if self.activation_func == F.silu and self.config.gated_linear_unit:
+                        # dtype is handled inside the fused kernel
+                        intermediate_parallel = weighted_bias_swiglu_impl(
+                            intermediate_parallel,
+                            bias_parallel,
+                            permuted_probs,
+                            self.config.activation_func_fp8_input_store,
+                        )
+                    elif self.activation_func == quick_gelu and self.config.gated_linear_unit:
+                        intermediate_parallel = weighted_bias_quick_geglu_impl(
+                            intermediate_parallel,
+                            bias_parallel,
+                            permuted_probs,
+                            self.config.activation_func_fp8_input_store,
+                            self.config.glu_linear_offset,
+                            self.config.activation_func_clamp_value,
+                        )
+                    else:
+                        raise ValueError(
+                            "Only support fusion of swiglu and quick_gelu in TEGroupedMLP."
+                        )
+                elif (
+                    self.activation_func == squared_relu
+                    and self.config.use_fused_weighted_squared_relu
+                ):
+                    assert bias_parallel is None
+                    intermediate_parallel = weighted_squared_relu_impl(
+                        intermediate_parallel, permuted_probs
+                    )
+                else:
+                    if self.config.gated_linear_unit:
+
+                        def glu(x):
+                            x_glu, x_linear = torch.chunk(x, 2, dim=-1)
+                            if (val := self.config.activation_func_clamp_value) is not None:
+                                x_glu = x_glu.clamp(min=None, max=val)
+                                x_linear = x_linear.clamp(min=-val, max=val)
+                            return self.config.activation_func(x_glu) * (
+                                x_linear + self.config.glu_linear_offset
+                            )
+
+                        intermediate_parallel = glu(intermediate_parallel)
+                    else:
+                        intermediate_parallel = self.activation_func(intermediate_parallel)
                     original_dtype = intermediate_parallel.dtype
                     intermediate_parallel = intermediate_parallel * permuted_probs
                     intermediate_parallel = intermediate_parallel.to(original_dtype)
-            elif self.config.bias_activation_fusion:
-                if self.activation_func == F.silu and self.config.gated_linear_unit:
-                    # dtype is handled inside the fused kernel
-                    intermediate_parallel = weighted_bias_swiglu_impl(
-                        intermediate_parallel,
-                        bias_parallel,
-                        permuted_probs,
-                        self.config.activation_func_fp8_input_store,
-                    )
-                elif self.activation_func == quick_gelu and self.config.gated_linear_unit:
-                    intermediate_parallel = weighted_bias_quick_geglu_impl(
-                        intermediate_parallel,
-                        bias_parallel,
-                        permuted_probs,
-                        self.config.activation_func_fp8_input_store,
-                        self.config.glu_linear_offset,
-                        self.config.activation_func_clamp_value,
-                    )
-                else:
-                    raise ValueError(
-                        "Only support fusion of swiglu and quick_gelu in TEGroupedMLP."
-                    )
-            elif (
-                self.activation_func == squared_relu and self.config.use_fused_weighted_squared_relu
-            ):
-                assert bias_parallel is None
-                intermediate_parallel = weighted_squared_relu_impl(
-                    intermediate_parallel, permuted_probs
-                )
-            else:
-                if self.config.gated_linear_unit:
-
-                    def glu(x):
-                        x_glu, x_linear = torch.chunk(x, 2, dim=-1)
-                        if (val := self.config.activation_func_clamp_value) is not None:
-                            x_glu = x_glu.clamp(min=None, max=val)
-                            x_linear = x_linear.clamp(min=-val, max=val)
-                        return self.config.activation_func(x_glu) * (
-                            x_linear + self.config.glu_linear_offset
-                        )
-
-                    intermediate_parallel = glu(intermediate_parallel)
-                else:
-                    intermediate_parallel = self.activation_func(intermediate_parallel)
-                original_dtype = intermediate_parallel.dtype
-                intermediate_parallel = intermediate_parallel * permuted_probs
-                intermediate_parallel = intermediate_parallel.to(original_dtype)
-            return intermediate_parallel
+                return intermediate_parallel
 
         if self.activation_recompute:
             self.activation_checkpoint = tensor_parallel.CheckpointWithoutOutput()
             with off_interface(self.offload_moe_act, fc1_output, "moe_act") as fc1_output:
-                bias_act_output = self.activation_checkpoint.checkpoint(
-                    bias_act_func, fc1_output, bias_parallel, permuted_probs
-                )
+                with fine_profile_range("moe.expert.activation_checkpoint"):
+                    bias_act_output = self.activation_checkpoint.checkpoint(
+                        bias_act_func, fc1_output, bias_parallel, permuted_probs
+                    )
         else:
             with off_interface(self.offload_moe_act, fc1_output, "moe_act") as fc1_output:
-                bias_act_output = bias_act_func(fc1_output, bias_parallel, permuted_probs)
+                with fine_profile_range("moe.expert.activation"):
+                    bias_act_output = bias_act_func(fc1_output, bias_parallel, permuted_probs)
         _tensor_audit(
             "moe_expert/after_activation",
             fc1_output=fc1_output,
@@ -1021,9 +1031,28 @@ class TEGroupedMLP(MegatronModule):
             del bias_parallel
             del permuted_local_hidden_states
             _maybe_trim_cuda_cache_before_moe_unpadding()
+        elif (
+            not self.offload_moe_act
+            and _env_flag("MEGATRON_MOE_EXPERT_RELEASE_PRE_FC2_REFS", default=True)
+        ):
+            # These locals are not read after activation. Autograd keeps any saved
+            # tensors it needs through the producer Function contexts; dropping the
+            # Python refs here avoids carrying duplicate live references into TE's
+            # grouped fc2 input quantization and output allocation.
+            del fc1_output
+            del bias_parallel
+            del permuted_local_hidden_states
 
-        _maybe_trim_cuda_cache_before_moe_fc2(bias_act_output)
-        output, output_bias = apply_module(self.linear_fc2)(bias_act_output, tokens_per_expert)
+        _tensor_audit(
+            "moe_expert/before_fc2",
+            bias_act_output=bias_act_output,
+            probs=permuted_probs,
+            tokens=tokens_per_expert,
+        )
+        with fine_profile_range("moe.expert.fc2_trim_cache"):
+            _maybe_trim_cuda_cache_before_moe_fc2(bias_act_output)
+        with fine_profile_range("moe.expert.grouped_fc2"):
+            output, output_bias = apply_module(self.linear_fc2)(bias_act_output, tokens_per_expert)
         _tensor_audit(
             "moe_expert/after_fc2",
             output=output,
@@ -1040,7 +1069,8 @@ class TEGroupedMLP(MegatronModule):
             output = off_interface.group_commit(
                 output, name="moe_act", forced_released_tensors=[fc1_output]
             )
-        output = self._apply_bias(output, output_bias, tokens_per_expert, permuted_probs)
+        with fine_profile_range("moe.expert.apply_output_bias"):
+            output = self._apply_bias(output, output_bias, tokens_per_expert, permuted_probs)
         if not grad_enabled:
             # StreamBP no-grad replay does not need these large intermediates once
             # fc2 has produced the expert output. Free them before TE unpadding
@@ -1057,8 +1087,9 @@ class TEGroupedMLP(MegatronModule):
                 actual_tokens=actual_tokens_per_expert,
                 padded_tokens=tokens_per_expert,
             )
-            _maybe_trim_cuda_cache_before_moe_unpadding()
-            output = self.quantization_unpadding(output, actual_tokens_per_expert)
+            with fine_profile_range("moe.expert.quant_unpadding"):
+                _maybe_trim_cuda_cache_before_moe_unpadding()
+                output = self.quantization_unpadding(output, actual_tokens_per_expert)
             _tensor_audit(
                 "moe_expert/after_quant_unpadding",
                 output=output,

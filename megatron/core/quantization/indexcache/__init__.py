@@ -35,10 +35,13 @@ from megatron.core.quantization.indexcache.autograd import (
 )
 from megatron.core.quantization.indexcache.hisa import (
     IndexCacheHISAConfig,
+    describe_indexcache_hisa_select_with_scores,
     hisa_block_topk_counts,
     indexcache_hisa_cuda_select_scores_teacher,
     indexcache_hisa_cuda_select_with_scores,
+    indexcache_hisa_megakernel_batched_select_with_scores,
     indexcache_hisa_select_with_scores,
+    indexcache_hisa_selector_backend_name,
     indexcache_hisa_topk,
     indexcache_hisa_topk_with_scores,
 )
@@ -57,11 +60,14 @@ __all__ = [
     "IndexCacheKVFn",
     "apply_indexcache_kv",
     "build_indexcache_config",
+    "describe_indexcache_hisa_select_with_scores",
     "get_indexcache_nvfp4_packed_tensors",
     "hisa_block_topk_counts",
     "indexcache_hisa_cuda_select_scores_teacher",
     "indexcache_hisa_cuda_select_with_scores",
+    "indexcache_hisa_megakernel_batched_select_with_scores",
     "indexcache_hisa_select_with_scores",
+    "indexcache_hisa_selector_backend_name",
     "indexcache_hisa_topk",
     "indexcache_hisa_topk_with_scores",
     "resolve_indexcache_quantization",

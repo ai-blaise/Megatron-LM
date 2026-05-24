@@ -10,6 +10,7 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core import parallel_state
+from megatron.core.fine_profile import fine_profile_range
 from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
     YarnRotaryEmbedding,
@@ -24,6 +25,11 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.experimental_attention_variant.dsa_triton import (
+    _bf16_grad_atomics_enabled,
+    _dsa_split_qk_backward_row_cuda,
+    _hisa_block_reps_batched_cuda,
+    _hisa_dsa_split_qk_fused_forward_cuda,
+    _hisa_dsa_split_qk_persistent_forward_cuda,
     dsa_indexer_scores_triton,
     hisa_kl_loss_and_grad_triton,
     hisa_attention_target_probs_triton,
@@ -41,8 +47,10 @@ from megatron.core.transformer.experimental_attention_variant.dsa_triton import 
 from megatron.core.quantization.indexcache import (
     INDEXCACHE_QUANT_NVFP4,
     IndexCacheHISAConfig,
-    indexcache_hisa_cuda_select_scores_teacher,
+    describe_indexcache_hisa_select_with_scores,
+    indexcache_hisa_megakernel_batched_select_with_scores,
     indexcache_hisa_select_with_scores,
+    indexcache_hisa_selector_backend_name,
     indexcache_hisa_topk,
     indexcache_hisa_topk_with_scores,
 )
@@ -90,23 +98,251 @@ _DSA_STREAM_TRITON_ATTENTION_CHUNKS_ENV = "MEGATRON_DSA_STREAM_TRITON_ATTENTION_
 _DSA_VALIDATE_TOPK_INDICES_ENV = "MEGATRON_DSA_VALIDATE_TOPK_INDICES"
 _HISA_TARGET_ROW_CHUNK_ENV = "MEGATRON_HISA_TARGET_ROW_CHUNK"
 _HISA_FUSED_INDEXER_LOSS_ENV = "MEGATRON_HISA_FUSED_INDEXER_LOSS"
+_HISA_DSA_FUSED_FORWARD_ENV = "MEGATRON_HISA_DSA_FUSED_FORWARD"
+_HISA_DSA_PERSISTENT_FORWARD_ENV = "MEGATRON_HISA_DSA_PERSISTENT_FORWARD"
 _HISA_ASSUME_SORTED_POSITIONS_ENV = "MEGATRON_HISA_ASSUME_SORTED_POSITIONS"
 _HISA_FALLBACK_DENSE_IF_SHORT_ENV = "MEGATRON_HISA_FALLBACK_DENSE_IF_SHORT"
+_HISA_SELECTED_SCORE_BWD_BATCHED_CUDA_ENV = "MEGATRON_HISA_SELECTED_SCORE_BWD_BATCHED_CUDA"
+_HISA_INDEXER_LOSS_DEBUG_ENV = "MEGATRON_HISA_INDEXER_LOSS_DEBUG"
+_HISA_INDEXER_LOSS_DEBUG_RANKS_ENV = "MEGATRON_HISA_INDEXER_LOSS_DEBUG_RANKS"
+_HISA_INDEXER_LOSS_DEBUG_EVENTS_ENV = "MEGATRON_HISA_INDEXER_LOSS_DEBUG_EVENTS"
+_HISA_INDEXER_LOSS_DEBUG_MAX_LINES_ENV = "MEGATRON_HISA_INDEXER_LOSS_DEBUG_MAX_LINES"
+_HISA_INDEXER_LOSS_DEBUG_EXACT_NUMEL_ENV = "MEGATRON_HISA_INDEXER_LOSS_DEBUG_EXACT_NUMEL"
 _DSA_CHUNK_INDEXER_PROJ_ENV = "MEGATRON_DSA_CHUNK_INDEXER_PROJ"
 _DSA_SP_PROJECT_BEFORE_GATHER_ENV = "MEGATRON_DSA_SP_PROJECT_BEFORE_GATHER"
 _DSA_INDEXER_ROPE_FUSION_ENV = "MEGATRON_DSA_INDEXER_ROPE_FUSION"
 _DSA_INDEXER_ROPE_INPLACE_ENV = "MEGATRON_DSA_INDEXER_ROPE_INPLACE"
 _DSA_INDEXER_TORCH_K_NORM_ENV = "MEGATRON_DSA_INDEXER_TORCH_K_NORM"
+_DSA_INDEXER_AUX_LOSS_AUTOSCALE_ENV = "MEGATRON_DSA_INDEXER_AUX_LOSS_AUTOSCALE"
+_DSA_CP_GATHER_SPLIT_KV_REF_ENV = "MEGATRON_DSA_CP_GATHER_SPLIT_KV_REF"
+_DSA_CP_SORTED_ZIGZAG_GATHER_ENV = "MEGATRON_DSA_CP_SORTED_ZIGZAG_GATHER"
 _DSA_SP_Q_PROJ_TRIM_CACHE_ENV = "MEGATRON_DSA_SP_Q_PROJ_TRIM_CACHE"
 _DSA_SP_Q_PROJ_TRIM_SAFETY_MB_ENV = "MEGATRON_DSA_SP_Q_PROJ_TRIM_SAFETY_MB"
 _DSA_SP_Q_PROJ_TRIM_CACHED_MB_ENV = "MEGATRON_DSA_SP_Q_PROJ_TRIM_CACHED_MB"
 _DSA_SP_Q_PROJ_TRIM_SYNC_ENV = "MEGATRON_DSA_SP_Q_PROJ_TRIM_SYNC"
 _DSA_DEBUG_SYNC_ENV = "MEGATRON_DSA_DEBUG_SYNC"
+_DSA_RUNTIME_AUDIT_ENV = "MEGATRON_DSA_RUNTIME_AUDIT"
+_DSA_RUNTIME_AUDIT_RANKS_ENV = "MEGATRON_DSA_RUNTIME_AUDIT_RANKS"
+_DSA_INDEXER_K_GRAD_DEBUG_ENV = "MEGATRON_DSA_INDEXER_K_GRAD_DEBUG"
+_DSA_INDEXER_K_GRAD_DEBUG_RANKS_ENV = "MEGATRON_DSA_INDEXER_K_GRAD_DEBUG_RANKS"
+_DSA_INDEXER_K_GRAD_DEBUG_LAYERS_ENV = "MEGATRON_DSA_INDEXER_K_GRAD_DEBUG_LAYERS"
+_DSA_INDEXER_K_GRAD_DEBUG_MAX_LINES_ENV = "MEGATRON_DSA_INDEXER_K_GRAD_DEBUG_MAX_LINES"
+_HISA_RUNTIME_LOGGED: set[tuple[int, str, str]] = set()
+_DSA_RUNTIME_LOGGED: set[tuple[int, str, str]] = set()
+_HISA_INDEXER_LOSS_DEBUG_LINES = 0
+_HISA_INDEXER_LOSS_DEBUG_CALLS = 0
+_DSA_INDEXER_K_GRAD_DEBUG_LINES = 0
 
 
 def _env_flag_enabled(name: str, default: str = "1") -> bool:
     raw = os.getenv(name, default).strip().lower()
     return raw not in {"0", "false", "off", "no"}
+
+
+def _dsa_indexer_aux_loss_autoscale_enabled() -> bool:
+    return _env_flag_enabled(_DSA_INDEXER_AUX_LOSS_AUTOSCALE_ENV, "0")
+
+
+def _dsa_distributed_rank() -> int:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return int(torch.distributed.get_rank())
+    return 0
+
+
+def _dsa_runtime_audit_enabled(rank: int) -> bool:
+    if not _env_flag_enabled(_DSA_RUNTIME_AUDIT_ENV, "0"):
+        return False
+    raw_ranks = os.getenv(_DSA_RUNTIME_AUDIT_RANKS_ENV, "0").strip().lower()
+    if raw_ranks in {"*", "all"}:
+        return True
+    for item in raw_ranks.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if item.isdigit() and int(item) == rank:
+            return True
+    return False
+
+
+def _rank_in_csv_env(rank: int, env_name: str, default: str = "0") -> bool:
+    raw_ranks = os.getenv(env_name, default).strip().lower()
+    if raw_ranks in {"*", "all"}:
+        return True
+    for item in raw_ranks.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if item.isdigit() and int(item) == rank:
+            return True
+    return False
+
+
+def _int_in_csv_env(value: int, env_name: str, default: str = "*") -> bool:
+    raw_values = os.getenv(env_name, default).strip().lower()
+    if raw_values in {"*", "all"}:
+        return True
+    for item in raw_values.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "-" in item:
+            start, end = item.split("-", 1)
+            if start.strip().isdigit() and end.strip().isdigit() and int(start) <= value <= int(end):
+                return True
+        elif item.isdigit() and int(item) == value:
+            return True
+    return False
+
+
+def _hisa_indexer_loss_debug_enabled(rank: int) -> bool:
+    return _env_flag_enabled(_HISA_INDEXER_LOSS_DEBUG_ENV, "0") and _rank_in_csv_env(
+        rank, _HISA_INDEXER_LOSS_DEBUG_RANKS_ENV, "0,7,88,95"
+    )
+
+
+def _hisa_indexer_loss_debug_stats(label: str, tensor: Optional[torch.Tensor]) -> str:
+    if tensor is None:
+        return f"{label}=None"
+    with torch.no_grad():
+        t = tensor.detach()
+        if t.numel() == 0:
+            return f"{label}: shape={tuple(t.shape)} dtype={t.dtype} numel=0"
+        if not t.is_floating_point():
+            t_i64 = t.to(torch.int64)
+            return (
+                f"{label}: shape={tuple(t.shape)} dtype={t.dtype} numel={t.numel()} "
+                f"min={int(t_i64.min().item())} max={int(t_i64.max().item())}"
+            )
+        t_f = t.float()
+        finite = torch.isfinite(t_f)
+        finite_count = int(finite.sum().item())
+        nonfinite_count = int(t_f.numel() - finite_count)
+        nan_count = int(torch.isnan(t_f).sum().item())
+        inf_count = int(torch.isinf(t_f).sum().item())
+        exact_numel = int(os.getenv(_HISA_INDEXER_LOSS_DEBUG_EXACT_NUMEL_ENV, str(16 * 1024 * 1024)))
+        if t_f.numel() > exact_numel:
+            absmax_raw = float(t_f.abs().max().item())
+            return (
+                f"{label}: shape={tuple(t.shape)} dtype={t.dtype} numel={t.numel()} "
+                f"finite={finite_count} nonfinite={nonfinite_count} nan={nan_count} inf={inf_count} "
+                f"absmax_raw={absmax_raw:.6e} stats=skipped_large"
+            )
+        if finite_count:
+            finite_vals = t_f[finite]
+            min_val = float(finite_vals.min().item())
+            max_val = float(finite_vals.max().item())
+            absmax = float(finite_vals.abs().max().item())
+            mean_val = float(finite_vals.mean().item())
+        else:
+            min_val = max_val = absmax = mean_val = float("nan")
+        return (
+            f"{label}: shape={tuple(t.shape)} dtype={t.dtype} numel={t.numel()} "
+            f"finite={finite_count} nonfinite={nonfinite_count} nan={nan_count} inf={inf_count} "
+            f"min={min_val:.6e} max={max_val:.6e} absmax={absmax:.6e} mean={mean_val:.6e}"
+        )
+
+
+def _log_hisa_indexer_loss_debug(event: str, call_id: int, **tensors) -> None:
+    global _HISA_INDEXER_LOSS_DEBUG_LINES
+    rank = _dsa_distributed_rank()
+    if not _hisa_indexer_loss_debug_enabled(rank):
+        return
+    raw_events = os.getenv(_HISA_INDEXER_LOSS_DEBUG_EVENTS_ENV, "*").strip().lower()
+    if raw_events not in {"*", "all"}:
+        allowed = [item.strip() for item in raw_events.split(",") if item.strip()]
+        if allowed and not any(item in event.lower() for item in allowed):
+            return
+    max_lines = int(os.getenv(_HISA_INDEXER_LOSS_DEBUG_MAX_LINES_ENV, "256"))
+    force = False
+    for tensor in tensors.values():
+        if tensor is None or not isinstance(tensor, torch.Tensor) or not tensor.is_floating_point():
+            continue
+        with torch.no_grad():
+            force = force or bool((~torch.isfinite(tensor.detach().float())).any().item())
+        if force:
+            break
+    if _HISA_INDEXER_LOSS_DEBUG_LINES >= max_lines and not force:
+        return
+    _HISA_INDEXER_LOSS_DEBUG_LINES += 1
+    parts = [
+        f"[hisa_indexer_loss_debug] rank={rank}",
+        f"call={call_id}",
+        f"event={event}",
+    ]
+    for label, tensor in tensors.items():
+        parts.append(_hisa_indexer_loss_debug_stats(label, tensor))
+    print(" | ".join(parts), flush=True)
+
+
+def _dsa_register_indexer_k_grad_debug(
+    label: str,
+    layer_number: Optional[int],
+    tensor: torch.Tensor,
+) -> None:
+    if not _env_flag_enabled(_DSA_INDEXER_K_GRAD_DEBUG_ENV, "0"):
+        return
+    if not isinstance(tensor, torch.Tensor) or not tensor.requires_grad:
+        return
+    rank = _dsa_distributed_rank()
+    if not _rank_in_csv_env(rank, _DSA_INDEXER_K_GRAD_DEBUG_RANKS_ENV, "0"):
+        return
+    layer = int(layer_number or -1)
+    if not _int_in_csv_env(layer, _DSA_INDEXER_K_GRAD_DEBUG_LAYERS_ENV, "*"):
+        return
+
+    def _hook(grad: torch.Tensor) -> torch.Tensor:
+        global _DSA_INDEXER_K_GRAD_DEBUG_LINES
+        max_lines = int(os.getenv(_DSA_INDEXER_K_GRAD_DEBUG_MAX_LINES_ENV, "128"))
+        force = False
+        if isinstance(grad, torch.Tensor) and grad.is_floating_point():
+            with torch.no_grad():
+                force = bool((~torch.isfinite(grad.detach().float())).any().item())
+        if _DSA_INDEXER_K_GRAD_DEBUG_LINES >= max_lines and not force:
+            return grad
+        _DSA_INDEXER_K_GRAD_DEBUG_LINES += 1
+        try:
+            from megatron.core import numeric_debug as _numeric_debug
+
+            iteration = _numeric_debug.context_iteration(-1)
+        except Exception:
+            iteration = -1
+        print(
+            " | ".join(
+                [
+                    f"[dsa_indexer_k_grad_debug] rank={rank}",
+                    f"iter={iteration}",
+                    f"layer={layer}",
+                    f"label={label}",
+                    _hisa_indexer_loss_debug_stats("grad", grad),
+                ]
+            ),
+            flush=True,
+        )
+        return grad
+
+    tensor.register_hook(_hook)
+
+
+def _log_hisa_runtime_once(label: str, message: str, mode: str = "default") -> None:
+    rank = _dsa_distributed_rank()
+    if not _dsa_runtime_audit_enabled(rank):
+        return
+    key = (rank, label, mode)
+    if key in _HISA_RUNTIME_LOGGED:
+        return
+    _HISA_RUNTIME_LOGGED.add(key)
+    print(f"[hisa_runtime][rank{rank}] layer={label} mode={mode} {message}", flush=True)
+
+
+def _log_dsa_runtime_once(label: str, message: str, mode: str = "default") -> None:
+    rank = _dsa_distributed_rank()
+    if not _dsa_runtime_audit_enabled(rank):
+        return
+    key = (rank, label, mode)
+    if key in _DSA_RUNTIME_LOGGED:
+        return
+    _DSA_RUNTIME_LOGGED.add(key)
+    print(f"[dsa_runtime][rank{rank}] layer={label} mode={mode} {message}", flush=True)
 
 
 def _dsa_debug_sync(label: str, tensor: Optional[torch.Tensor] = None) -> None:
@@ -364,24 +600,45 @@ def _hisa_target_row_chunk(q_len: int) -> int:
 
 
 def _dsa_topk_buffer_dtype(sk: int) -> torch.dtype:
-    if _env_flag_enabled(_DSA_COMPACT_TOPK_INDICES_ENV, "0") and sk <= 32768:
+    if _dsa_topk_indices_can_use_int16(sk):
         return torch.int16
     return torch.int32
+
+
+def _dsa_topk_indices_can_use_int16(sk: int) -> bool:
+    # Valid selected-token ids are [-1, sk - 1]. 32k context therefore fits in
+    # signed int16 because the largest real id is 32767.
+    return (
+        _env_flag_enabled(_DSA_COMPACT_TOPK_INDICES_ENV, "0")
+        and sk <= torch.iinfo(torch.int16).max + 1
+    )
 
 
 def _maybe_narrow_dsa_topk_indices(topk_indices: torch.Tensor, sk: int) -> torch.Tensor:
     """Keep selected-token buffers off int64 in CUDA hot paths.
 
     PyTorch `topk` emits `long` indices, but the DSA Triton/CUDA kernels and
-    current sequence lengths only need 32-bit selected-token IDs. Narrowing here
+    current sequence lengths only need compact selected-token IDs. Narrowing here
     also covers dense/streaming fallback selectors before they feed the shared
-    loss and attention code. Do not narrow if a future caller actually exceeds
-    int32 addressable key positions.
+    loss and attention code. Do not narrow below int32 if a future caller exceeds
+    the signed int16 id range.
     """
 
+    if _dsa_topk_indices_can_use_int16(sk) and topk_indices.dtype != torch.int16:
+        return topk_indices.contiguous().to(torch.int16)
     if topk_indices.dtype == torch.long and sk <= torch.iinfo(torch.int32).max:
-        return topk_indices.to(torch.int32)
+        return topk_indices.contiguous().to(torch.int32)
     return topk_indices
+
+
+def _maybe_compact_hisa_saved_topk_indices(topk_indices: torch.Tensor, sk: int) -> torch.Tensor:
+    """Store HISA selected-score backward indices in the smallest supported dtype."""
+
+    if _dsa_topk_indices_can_use_int16(sk):
+        return topk_indices.contiguous().to(torch.int16)
+    if topk_indices.dtype != torch.int32:
+        return topk_indices.contiguous().to(torch.int32)
+    return topk_indices.contiguous()
 
 
 def _maybe_sort_dsa_topk_indices(topk_indices: torch.Tensor) -> torch.Tensor:
@@ -534,6 +791,84 @@ def _dsa_cp_gathered_position_ids(
         ],
         dim=0,
     )
+
+
+class _DSACPSortedZigzagGather(torch.autograd.Function):
+    """Gather CP zigzag-local tensors directly into absolute-position order."""
+
+    @staticmethod
+    def forward(ctx, input_: torch.Tensor, cp_group: torch.distributed.ProcessGroup):
+        cp_size = _dsa_process_group_size(cp_group)
+        cp_rank = _dsa_process_group_rank(cp_group)
+        if cp_size <= 1:
+            ctx.cp_group = None
+            return input_
+        local_seq_len = input_.size(0)
+        if local_seq_len % 2 != 0:
+            raise ValueError(
+                "DSA CP sorted gather expects an even local sequence length, got "
+                f"{local_seq_len}"
+            )
+
+        chunk_len = local_seq_len // 2
+        output_shape = (local_seq_len * cp_size, *input_.shape[1:])
+        output = torch.empty(output_shape, dtype=input_.dtype, device=input_.device)
+
+        first_views = [
+            output[rank * chunk_len : (rank + 1) * chunk_len] for rank in range(cp_size)
+        ]
+        torch.distributed.all_gather(
+            first_views,
+            input_[:chunk_len].contiguous(),
+            group=cp_group,
+        )
+
+        second_views = []
+        for rank in range(cp_size):
+            seq_chunk = 2 * cp_size - rank - 1
+            second_views.append(output[seq_chunk * chunk_len : (seq_chunk + 1) * chunk_len])
+        torch.distributed.all_gather(
+            second_views,
+            input_[chunk_len:].contiguous(),
+            group=cp_group,
+        )
+
+        ctx.cp_group = cp_group
+        ctx.cp_rank = cp_rank
+        ctx.cp_size = cp_size
+        ctx.chunk_len = chunk_len
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        cp_group = ctx.cp_group
+        if cp_group is None:
+            return grad_output, None
+
+        chunk_len = ctx.chunk_len
+        cp_rank = ctx.cp_rank
+        cp_size = ctx.cp_size
+        local_grad = grad_output.new_empty((chunk_len * 2, *grad_output.shape[1:]))
+        local_grad[:chunk_len].copy_(
+            grad_output[cp_rank * chunk_len : (cp_rank + 1) * chunk_len]
+        )
+        seq_chunk = 2 * cp_size - cp_rank - 1
+        local_grad[chunk_len:].copy_(
+            grad_output[seq_chunk * chunk_len : (seq_chunk + 1) * chunk_len]
+        )
+        torch.distributed.all_reduce(local_grad, group=cp_group)
+        return local_grad, None
+
+
+def _dsa_cp_sorted_zigzag_gather(
+    input_: torch.Tensor,
+    cp_group: Optional[torch.distributed.ProcessGroup],
+) -> torch.Tensor:
+    if _dsa_process_group_size(cp_group) <= 1:
+        return input_
+    if not _env_flag_enabled(_DSA_CP_SORTED_ZIGZAG_GATHER_ENV, "0"):
+        return gather_from_sequence_parallel_region(input_, group=cp_group)
+    return _DSACPSortedZigzagGather.apply(input_, cp_group)
 
 
 def _dsa_thd_local_sequence_offsets(
@@ -1693,6 +2028,8 @@ class DSAIndexer(MegatronModule):
         seqlen, bsz, _ = x.size()
         k, _ = self.linear_wk(x)
         _dsa_debug_sync("indexer key linear_wk", k)
+        debug_layer_number = getattr(self, "layer_number", None)
+        _dsa_register_indexer_k_grad_debug("linear_wk_output", debug_layer_number, k)
         if self.config.fp4 and (
             not torch.is_grad_enabled() or _env_flag_enabled(_DSA_INDEXER_TORCH_K_NORM_ENV, "1")
         ):
@@ -1723,6 +2060,7 @@ class DSAIndexer(MegatronModule):
             _dsa_debug_sync("indexer key torch rope", k)
         k = rotate_activation(k)
         _dsa_debug_sync("indexer key hadamard", k)
+        _dsa_register_indexer_k_grad_debug("post_norm_rope_hadamard", debug_layer_number, k)
         if pad_len:
             k = k[:orig_seqlen]
 
@@ -1731,6 +2069,7 @@ class DSAIndexer(MegatronModule):
 
             k = apply_indexcache_kv(k, self.indexcache_config)
             _dsa_debug_sync("indexer key indexcache", k)
+            _dsa_register_indexer_k_grad_debug("post_indexcache", debug_layer_number, k)
         return k
 
     def _apply_indexcache_to_key(self, k: torch.Tensor) -> torch.Tensor:
@@ -1747,6 +2086,7 @@ class DSAIndexer(MegatronModule):
         mscale: float,
         orig_seqlen: int,
         pad_len: int,
+        apply_indexcache: bool = True,
     ) -> torch.Tensor:
         """Project the local SP hidden shard before gathering compact DSA index keys."""
         local_rank = self.pg_collection.tp.rank()
@@ -1763,7 +2103,12 @@ class DSAIndexer(MegatronModule):
             apply_indexcache=False,
         )
         k = gather_from_sequence_parallel_region(k_local, group=self.pg_collection.tp)
-        return self._apply_indexcache_to_key(k)
+        debug_layer_number = getattr(self, "layer_number", None)
+        _dsa_register_indexer_k_grad_debug("post_sp_gather", debug_layer_number, k)
+        if apply_indexcache:
+            k = self._apply_indexcache_to_key(k)
+            _dsa_register_indexer_k_grad_debug("post_sp_gather_indexcache", debug_layer_number, k)
+        return k
 
     def _project_query_chunk_sp_owner_broadcast_before_topk(
         self,
@@ -1985,6 +2330,7 @@ class DSAIndexer(MegatronModule):
         qr: torch.Tensor,
         packed_seq_params: Optional[PackedSeqParams] = None,
         query_indices: Optional[torch.Tensor] = None,
+        apply_indexcache: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """All computations before topk."""
         x, qr, rotary_pos_emb, mscale, orig_seqlen, pad_len = self._prepare_inputs_before_topk(
@@ -2019,7 +2365,14 @@ class DSAIndexer(MegatronModule):
         q, weights = self._project_query_before_topk(
             query_x, query_qr, query_rotary_pos_emb, mscale
         )
-        k = self._project_key_before_topk(x, rotary_pos_emb, mscale, orig_seqlen, pad_len)
+        k = self._project_key_before_topk(
+            x,
+            rotary_pos_emb,
+            mscale,
+            orig_seqlen,
+            pad_len,
+            apply_indexcache=apply_indexcache,
+        )
         if pad_len and query_indices is None:
             q = q[:orig_seqlen]
         if pad_len and query_indices is None:
@@ -2681,6 +3034,60 @@ def _hisa_fused_indexer_loss_enabled() -> bool:
     return _env_flag_enabled(_HISA_FUSED_INDEXER_LOSS_ENV, "1")
 
 
+def _hisa_dsa_fused_forward_enabled() -> bool:
+    if _env_flag_enabled(_HISA_DSA_FUSED_FORWARD_ENV, "0"):
+        raise RuntimeError(
+            f"{_HISA_DSA_FUSED_FORWARD_ENV}=1 requested, but the experimental full "
+            "HISA+DSA selected-attention fused forward path is disabled for production. "
+            "Whole-path benchmarks were slower than the HISA selector megakernel plus "
+            "the existing selected-attention path."
+        )
+    return False
+
+
+def _hisa_dsa_persistent_forward_enabled() -> bool:
+    if _env_flag_enabled(_HISA_DSA_PERSISTENT_FORWARD_ENV, "0"):
+        raise RuntimeError(
+            f"{_HISA_DSA_PERSISTENT_FORWARD_ENV}=1 requested, but this experimental "
+            "persistent HISA/DSA forward path was removed from the production extension "
+            "build after whole-path benchmarks showed it was slower than the existing "
+            "HISA selector plus selected-attention path."
+        )
+    return False
+
+
+def _hisa_fused_effective_block_topk(sk: int, config: IndexCacheHISAConfig) -> int:
+    block_size = int(config.block_size)
+    block_count = int(math.ceil(int(sk) / block_size))
+    if block_count <= 0:
+        return 0
+    if float(config.compression_ratio) > 0:
+        ratio_f = float(config.compression_ratio)
+        if abs(ratio_f - round(ratio_f)) < 1e-6:
+            ratio_i = int(round(ratio_f))
+            effective = (block_count + ratio_i - 1) // ratio_i
+        else:
+            effective = int(math.ceil(block_count / ratio_f))
+        effective = max(1, min(int(effective), block_count))
+    else:
+        effective = min(int(config.block_topk), block_count)
+    forced = tuple(config.forced_boundary_blocks or ())
+    if forced:
+        forced_static = 0
+        if "first" in forced and block_count >= 1:
+            forced_static += 1
+        if "last" in forced and block_count >= 1:
+            forced_static += 1
+            if "first" in forced:
+                forced_static -= int(block_count == 1)
+        if "last_minus_one" in forced and block_count >= 2:
+            forced_static += 1
+            if "first" in forced:
+                forced_static -= int(block_count == 2)
+        effective = max(int(effective), int(forced_static))
+    return max(1, min(int(effective), block_count))
+
+
 def _hisa_selected_score_backward_cuda(
     grad_scores: torch.Tensor,
     q_rows: torch.Tensor,
@@ -2692,24 +3099,26 @@ def _hisa_selected_score_backward_cuda(
     if ext is None or not hasattr(ext, "hisa_selected_score_bwd"):
         raise RuntimeError("HISA selected-score backward CUDA extension is unavailable")
 
-    q_f = q_rows.contiguous().float()
-    weights_f = weights_rows.contiguous().float()
-    k_f = k_rows.contiguous().float()
-    topk_i32 = topk_indices_i32.contiguous().to(torch.int32)
-    grad_f = grad_scores.contiguous().float()
-    grad_q = torch.zeros_like(q_f)
-    grad_k = torch.zeros_like(k_f)
-    grad_w = torch.zeros_like(weights_f)
-    ext.hisa_selected_score_bwd(
-        grad_f,
-        q_f,
-        k_f,
-        weights_f,
-        topk_i32,
-        grad_q,
-        grad_k,
-        grad_w,
-    )
+    with fine_profile_range("hisa.selected_score_bwd.single.prepare"):
+        q_f = q_rows.contiguous().float()
+        weights_f = weights_rows.contiguous().float()
+        k_f = k_rows.contiguous().float()
+        topk_i32 = topk_indices_i32.contiguous().to(torch.int32)
+        grad_f = grad_scores.contiguous().float()
+        grad_q = torch.zeros_like(q_f)
+        grad_k = torch.zeros_like(k_f)
+        grad_w = torch.zeros_like(weights_f)
+    with fine_profile_range("hisa.selected_score_bwd.single.cuda"):
+        ext.hisa_selected_score_bwd(
+            grad_f,
+            q_f,
+            k_f,
+            weights_f,
+            topk_i32,
+            grad_q,
+            grad_k,
+            grad_w,
+        )
     return grad_q, grad_w, grad_k
 
 
@@ -2731,15 +3140,51 @@ def _hisa_selected_score_backward_cuda_batched(
     q_len, bsz, num_heads, head_dim = q.shape
     sk = k.shape[0]
     topk_k = topk_indices_i32.shape[-1]
-    q_flat = q.permute(1, 0, 2, 3).reshape(bsz * q_len, num_heads, head_dim)
-    weights_flat = weights.permute(1, 0, 2).reshape(bsz * q_len, num_heads)
-    k_concat = k.permute(1, 0, 2).reshape(bsz * sk, k.shape[-1])
-    topk_batched = topk_indices_i32.contiguous().to(torch.int32)
-    batch_offsets = (
-        torch.arange(bsz, device=topk_batched.device, dtype=torch.int32).view(bsz, 1, 1)
-        * int(sk)
-    )
-    topk_global = torch.where(topk_batched >= 0, topk_batched + batch_offsets, topk_batched)
+    ext = _try_load_hisa_cuda_ext()
+    use_batched_cuda = _env_flag_enabled(_HISA_SELECTED_SCORE_BWD_BATCHED_CUDA_ENV, "1")
+    if (
+        use_batched_cuda
+        and
+        ext is not None
+        and hasattr(ext, "hisa_selected_score_bwd_batched")
+        and num_heads == 64
+        and head_dim == 128
+        and q.dtype == k.dtype
+        and q.dtype in (torch.float32, torch.bfloat16, torch.float16)
+        and weights.dtype in (torch.float32, torch.bfloat16, torch.float16)
+    ):
+        with fine_profile_range("hisa.selected_score_bwd.batched.prepare"):
+            q_c = q.contiguous()
+            weights_c = weights.contiguous()
+            k_c = k.contiguous()
+            topk_i32 = topk_indices_i32.contiguous().to(torch.int32)
+            grad_f = grad_scores.reshape(bsz * q_len, topk_k).contiguous().float()
+            grad_q = torch.zeros(q.shape, device=q.device, dtype=torch.float32)
+            grad_k = torch.zeros(k.shape, device=k.device, dtype=torch.float32)
+            grad_w = torch.zeros(weights.shape, device=weights.device, dtype=torch.float32)
+        with fine_profile_range("hisa.selected_score_bwd.batched.cuda"):
+            ext.hisa_selected_score_bwd_batched(
+                grad_f,
+                q_c,
+                k_c,
+                weights_c,
+                topk_i32,
+                grad_q,
+                grad_k,
+                grad_w,
+            )
+        return grad_q, grad_w, grad_k
+
+    with fine_profile_range("hisa.selected_score_bwd.batched.fallback_prepare"):
+        q_flat = q.permute(1, 0, 2, 3).reshape(bsz * q_len, num_heads, head_dim)
+        weights_flat = weights.permute(1, 0, 2).reshape(bsz * q_len, num_heads)
+        k_concat = k.permute(1, 0, 2).reshape(bsz * sk, k.shape[-1])
+        topk_batched = topk_indices_i32.contiguous().to(torch.int32)
+        batch_offsets = (
+            torch.arange(bsz, device=topk_batched.device, dtype=torch.int32).view(bsz, 1, 1)
+            * int(sk)
+        )
+        topk_global = torch.where(topk_batched >= 0, topk_batched + batch_offsets, topk_batched)
     grad_q_flat, grad_w_flat, grad_k_concat = _hisa_selected_score_backward_cuda(
         grad_scores.reshape(bsz * q_len, topk_k),
         q_flat,
@@ -2747,9 +3192,10 @@ def _hisa_selected_score_backward_cuda_batched(
         k_concat,
         topk_global.reshape(bsz * q_len, topk_k),
     )
-    grad_q = grad_q_flat.reshape(bsz, q_len, num_heads, head_dim).permute(1, 0, 2, 3)
-    grad_weights = grad_w_flat.reshape(bsz, q_len, num_heads).permute(1, 0, 2)
-    grad_k = grad_k_concat.reshape(bsz, sk, k.shape[-1]).permute(1, 0, 2)
+    with fine_profile_range("hisa.selected_score_bwd.batched.fallback_finalize"):
+        grad_q = grad_q_flat.reshape(bsz, q_len, num_heads, head_dim).permute(1, 0, 2, 3)
+        grad_weights = grad_w_flat.reshape(bsz, q_len, num_heads).permute(1, 0, 2)
+        grad_k = grad_k_concat.reshape(bsz, sk, k.shape[-1]).permute(1, 0, 2)
     return grad_q.contiguous(), grad_weights.contiguous(), grad_k.contiguous()
 
 
@@ -2771,6 +3217,15 @@ class _HISASelectWithScores(torch.autograd.Function):
         topk: int,
         config: IndexCacheHISAConfig,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        global _HISA_INDEXER_LOSS_DEBUG_CALLS
+        _HISA_INDEXER_LOSS_DEBUG_CALLS += 1
+        debug_call_id = _HISA_INDEXER_LOSS_DEBUG_CALLS
+        if q_rows.size(-1) != 128 or k_rows.size(-1) != 128:
+            raise RuntimeError(
+                "HISA selected-score autograd path cannot handle this chunk: "
+                f"selected-score backward requires head_dim=128, got q_dim={q_rows.size(-1)} "
+                f"k_dim={k_rows.size(-1)}"
+            )
         result = indexcache_hisa_select_with_scores(
             q_rows,
             weights_rows,
@@ -2780,13 +3235,35 @@ class _HISASelectWithScores(torch.autograd.Function):
             prefix_lens=prefix_lens,
         )
         if result is None:
-            raise RuntimeError("HISA selected-score autograd path cannot handle this chunk")
+            reason = describe_indexcache_hisa_select_with_scores(
+                q_rows,
+                weights_rows,
+                k_rows,
+                int(topk),
+                config=config,
+                prefix_lens=prefix_lens,
+            )
+            raise RuntimeError(
+                "HISA selected-score autograd path cannot handle this chunk: " + reason
+            )
         topk_i32, selected_scores = result
-        topk_i32 = topk_i32.contiguous().to(torch.int32)
+        topk_compact = _maybe_compact_hisa_saved_topk_indices(topk_i32, k_rows.shape[0])
         selected_scores = selected_scores.contiguous().float()
-        ctx.mark_non_differentiable(topk_i32)
-        ctx.save_for_backward(q_rows, weights_rows, k_rows, topk_i32)
-        return topk_i32, selected_scores
+        ctx.mark_non_differentiable(topk_compact)
+        _log_hisa_indexer_loss_debug(
+            "select_scores.single.forward",
+            debug_call_id,
+            selected_scores=selected_scores,
+            topk=topk_i32,
+        )
+        ctx.save_for_backward(
+            q_rows,
+            weights_rows,
+            k_rows,
+            topk_compact,
+        )
+        ctx.debug_call_id = debug_call_id
+        return topk_compact, selected_scores
 
     @staticmethod
     def backward(ctx, grad_topk: torch.Tensor | None, grad_selected_scores: torch.Tensor | None):
@@ -2800,6 +3277,11 @@ class _HISASelectWithScores(torch.autograd.Function):
                 None,
                 None,
             )
+        _log_hisa_indexer_loss_debug(
+            "select_scores.single.backward_input",
+            ctx.debug_call_id,
+            grad_selected_scores=grad_selected_scores,
+        )
         grad_q, grad_w, grad_k = _hisa_selected_score_backward_cuda(
             grad_selected_scores,
             q_rows,
@@ -2807,10 +3289,27 @@ class _HISASelectWithScores(torch.autograd.Function):
             k_rows,
             topk_i32,
         )
+        _log_hisa_indexer_loss_debug(
+            "select_scores.single.backward_output",
+            ctx.debug_call_id,
+            grad_q=grad_q,
+            grad_w=grad_w,
+            grad_k=grad_k,
+        )
+        grad_q = grad_q.to(q_rows.dtype)
+        grad_w = grad_w.to(weights_rows.dtype)
+        grad_k = grad_k.to(k_rows.dtype)
+        _log_hisa_indexer_loss_debug(
+            "select_scores.single.backward_return",
+            ctx.debug_call_id,
+            grad_q=grad_q,
+            grad_w=grad_w,
+            grad_k=grad_k,
+        )
         return (
-            grad_q.to(q_rows.dtype),
-            grad_w.to(weights_rows.dtype),
-            grad_k.to(k_rows.dtype),
+            grad_q,
+            grad_w,
+            grad_k,
             None,
             None,
             None,
@@ -2827,10 +3326,65 @@ class _HISASelectWithScoresBatched(torch.autograd.Function):
         weights: torch.Tensor,
         k: torch.Tensor,
         prefix_lens: torch.Tensor,
+        block_reps: Optional[torch.Tensor],
         topk: int,
         config: IndexCacheHISAConfig,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        global _HISA_INDEXER_LOSS_DEBUG_CALLS
+        _HISA_INDEXER_LOSS_DEBUG_CALLS += 1
+        debug_call_id = _HISA_INDEXER_LOSS_DEBUG_CALLS
+        if q.size(-1) != 128 or k.size(-1) != 128:
+            raise RuntimeError(
+                "HISA selected-score autograd path cannot handle this chunk: "
+                f"selected-score backward requires head_dim=128, got q_dim={q.size(-1)} "
+                f"k_dim={k.size(-1)}"
+            )
         q_len, bsz, _, _ = q.shape
+        if indexcache_hisa_selector_backend_name() == "megakernel":
+            result = indexcache_hisa_megakernel_batched_select_with_scores(
+                q,
+                weights,
+                k,
+                int(topk),
+                config=config,
+                prefix_lens=prefix_lens,
+                block_reps_precomputed=block_reps,
+            )
+            if result is None:
+                reason = describe_indexcache_hisa_select_with_scores(
+                    q[:, 0],
+                    weights[:, 0],
+                    k[:, 0],
+                    int(topk),
+                    config=config,
+                    prefix_lens=(
+                        prefix_lens
+                        if prefix_lens.numel() == q_len
+                        else prefix_lens[:q_len]
+                    ),
+                )
+                raise RuntimeError(
+                    "HISA selected-score autograd path cannot handle this chunk: " + reason
+                )
+            topk_i32, selected_scores = result
+            topk_compact = _maybe_compact_hisa_saved_topk_indices(topk_i32, k.shape[0])
+            ctx.mark_non_differentiable(topk_compact)
+            ctx.save_for_backward(
+                q,
+                weights,
+                k,
+                topk_compact,
+            )
+            selected_scores = selected_scores.contiguous().float()
+            _log_hisa_indexer_loss_debug(
+                "select_scores.batched.forward",
+                debug_call_id,
+                selected_scores=selected_scores,
+                topk=topk_i32,
+            )
+            ctx.debug_call_id = debug_call_id
+            return topk_compact, selected_scores
+
         topk_batches = []
         selected_score_batches = []
         for batch_idx in range(bsz):
@@ -2847,7 +3401,17 @@ class _HISASelectWithScoresBatched(torch.autograd.Function):
                 prefix_lens=prefix_b,
             )
             if result is None:
-                raise RuntimeError("HISA selected-score autograd path cannot handle this chunk")
+                reason = describe_indexcache_hisa_select_with_scores(
+                    q[:, batch_idx],
+                    weights[:, batch_idx],
+                    k[:, batch_idx],
+                    int(topk),
+                    config=config,
+                    prefix_lens=prefix_b,
+                )
+                raise RuntimeError(
+                    "HISA selected-score autograd path cannot handle this chunk: " + reason
+                )
             topk_i32, selected_scores = result
             topk_batches.append(topk_i32.contiguous().to(torch.int32))
             selected_score_batches.append(selected_scores.contiguous().float())
@@ -2856,9 +3420,22 @@ class _HISASelectWithScoresBatched(torch.autograd.Function):
         selected_scores = torch.stack(selected_score_batches, dim=0).reshape(
             bsz * q_len, int(topk)
         )
-        ctx.mark_non_differentiable(topk_i32)
-        ctx.save_for_backward(q, weights, k, topk_i32)
-        return topk_i32, selected_scores
+        topk_compact = _maybe_compact_hisa_saved_topk_indices(topk_i32, k.shape[0])
+        ctx.mark_non_differentiable(topk_compact)
+        ctx.save_for_backward(
+            q,
+            weights,
+            k,
+            topk_compact,
+        )
+        _log_hisa_indexer_loss_debug(
+            "select_scores.batched.forward",
+            debug_call_id,
+            selected_scores=selected_scores,
+            topk=topk_i32,
+        )
+        ctx.debug_call_id = debug_call_id
+        return topk_compact, selected_scores
 
     @staticmethod
     def backward(ctx, grad_topk: torch.Tensor | None, grad_selected_scores: torch.Tensor | None):
@@ -2872,6 +3449,11 @@ class _HISASelectWithScoresBatched(torch.autograd.Function):
                 None,
                 None,
             )
+        _log_hisa_indexer_loss_debug(
+            "select_scores.batched.backward_input",
+            ctx.debug_call_id,
+            grad_selected_scores=grad_selected_scores,
+        )
         grad_q, grad_w, grad_k = _hisa_selected_score_backward_cuda_batched(
             grad_selected_scores,
             q,
@@ -2879,10 +3461,285 @@ class _HISASelectWithScoresBatched(torch.autograd.Function):
             k,
             topk_i32,
         )
+        _log_hisa_indexer_loss_debug(
+            "select_scores.batched.backward_output",
+            ctx.debug_call_id,
+            grad_q=grad_q,
+            grad_w=grad_w,
+            grad_k=grad_k,
+        )
+        grad_q = grad_q.to(q.dtype)
+        grad_w = grad_w.to(weights.dtype)
+        grad_k = grad_k.to(k.dtype)
+        _log_hisa_indexer_loss_debug(
+            "select_scores.batched.backward_return",
+            ctx.debug_call_id,
+            grad_q=grad_q,
+            grad_w=grad_w,
+            grad_k=grad_k,
+        )
         return (
-            grad_q.to(q.dtype),
-            grad_w.to(weights.dtype),
-            grad_k.to(k.dtype),
+            grad_q,
+            grad_w,
+            grad_k,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
+class _HISADSASplitQKFusedForward(torch.autograd.Function):
+    """Single-launch local HISA selector + split-QK selected attention forward."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        q_indexer: torch.Tensor,
+        weights: torch.Tensor,
+        k_indexer: torch.Tensor,
+        block_reps: torch.Tensor,
+        prefix_lens: torch.Tensor,
+        query_nope: torch.Tensor,
+        query_pe: torch.Tensor,
+        key_nope: torch.Tensor,
+        key_pe: torch.Tensor,
+        value: torch.Tensor,
+        query_positions: torch.Tensor,
+        key_positions: torch.Tensor,
+        softmax_scale: float,
+        q_start: int,
+        block_size: int,
+        block_topk: int,
+        compression_ratio: float,
+        effective_block_topk: int,
+        topk_count: int,
+        has_positions: bool,
+        force_first: bool,
+        force_last: bool,
+        force_last_minus_one: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        global _HISA_INDEXER_LOSS_DEBUG_CALLS
+        _HISA_INDEXER_LOSS_DEBUG_CALLS += 1
+        debug_call_id = _HISA_INDEXER_LOSS_DEBUG_CALLS
+        q_pos_arg = query_positions if has_positions else None
+        k_pos_arg = key_positions if has_positions else None
+        fused_forward_impl = (
+            _hisa_dsa_split_qk_persistent_forward_cuda
+            if _hisa_dsa_persistent_forward_enabled()
+            else _hisa_dsa_split_qk_fused_forward_cuda
+        )
+        (
+            output,
+            topk_indices,
+            selected_scores,
+            teacher_probs,
+            lse,
+        ) = fused_forward_impl(
+            q_indexer,
+            weights,
+            k_indexer,
+            block_reps,
+            prefix_lens,
+            query_nope,
+            query_pe,
+            key_nope,
+            key_pe,
+            value,
+            q_pos_arg,
+            k_pos_arg,
+            float(softmax_scale),
+            int(q_start),
+            int(block_size),
+            int(block_topk),
+            float(compression_ratio),
+            int(effective_block_topk),
+            int(topk_count),
+            bool(force_first),
+            bool(force_last),
+            bool(force_last_minus_one),
+        )
+        query_nope_c = query_nope if query_nope.stride(-1) == 1 else query_nope.contiguous()
+        query_pe_c = query_pe.contiguous()
+        key_nope_c = key_nope if key_nope.stride(-1) == 1 else key_nope.contiguous()
+        key_pe_c = key_pe.contiguous()
+        value_c = value if value.stride(-1) == 1 else value.contiguous()
+        ctx.mark_non_differentiable(teacher_probs, topk_indices)
+        ctx.save_for_backward(
+            q_indexer,
+            weights,
+            k_indexer,
+            query_nope_c,
+            query_pe_c,
+            key_nope_c,
+            key_pe_c,
+            value_c,
+            topk_indices,
+            query_positions,
+            key_positions,
+            output,
+            lse,
+        )
+        ctx.softmax_scale = float(softmax_scale)
+        ctx.q_start = int(q_start)
+        ctx.has_positions = bool(has_positions)
+        ctx.debug_call_id = debug_call_id
+        _log_hisa_indexer_loss_debug(
+            "hisa_dsa_fused.forward",
+            debug_call_id,
+            selected_scores=selected_scores,
+            teacher_probs=teacher_probs,
+            topk=topk_indices,
+            output=output,
+        )
+        q_len, bsz, num_heads, value_dim = output.shape
+        return (
+            output.reshape(q_len, bsz, num_heads * value_dim),
+            selected_scores.contiguous().float(),
+            teacher_probs,
+            topk_indices,
+        )
+
+    @staticmethod
+    def backward(
+        ctx,
+        grad_output: Optional[torch.Tensor],
+        grad_selected_scores: Optional[torch.Tensor],
+        grad_teacher_probs: Optional[torch.Tensor] = None,
+        grad_topk: Optional[torch.Tensor] = None,
+    ):
+        (
+            q_indexer,
+            weights,
+            k_indexer,
+            query_nope,
+            query_pe,
+            key_nope,
+            key_pe,
+            value,
+            topk_indices,
+            query_positions,
+            key_positions,
+            output,
+            lse,
+        ) = ctx.saved_tensors
+        q_len, bsz, num_heads, value_dim = output.shape
+        if grad_output is None:
+            grad_output_4d = torch.zeros_like(output)
+        else:
+            grad_output_4d = grad_output.reshape(q_len, bsz, num_heads, value_dim).contiguous()
+        _log_hisa_indexer_loss_debug(
+            "hisa_dsa_fused.backward_input",
+            ctx.debug_call_id,
+            grad_output=grad_output_4d,
+            grad_selected_scores=grad_selected_scores,
+        )
+
+        grad_dtype = (
+            query_nope.dtype
+            if _bf16_grad_atomics_enabled()
+            and query_nope.dtype in (torch.bfloat16, torch.float16)
+            else torch.float32
+        )
+        grad_query_nope = torch.empty_like(query_nope, dtype=grad_dtype)
+        grad_query_pe = torch.empty_like(query_pe, dtype=grad_dtype)
+        grad_key_nope = torch.zeros_like(key_nope, dtype=grad_dtype)
+        grad_key_pe = torch.zeros_like(key_pe, dtype=grad_dtype)
+        grad_value = torch.zeros_like(value, dtype=grad_dtype)
+        with fine_profile_range("dsa.split_qk.backward.row_cuda"):
+            _dsa_split_qk_backward_row_cuda(
+                query_nope,
+                query_pe,
+                key_nope,
+                key_pe,
+                value,
+                topk_indices,
+                query_positions if ctx.has_positions else None,
+                key_positions if ctx.has_positions else None,
+                output,
+                lse,
+                grad_output_4d,
+                grad_query_nope,
+                grad_query_pe,
+                grad_key_nope,
+                grad_key_pe,
+                grad_value,
+                float(ctx.softmax_scale),
+                int(ctx.q_start),
+                0,
+                key_nope.shape[0],
+                True,
+                True,
+                True,
+                True,
+            )
+
+        if grad_selected_scores is None:
+            grad_q_indexer = torch.zeros_like(q_indexer)
+            grad_weights = torch.zeros_like(weights)
+            grad_k_indexer = torch.zeros_like(k_indexer)
+        else:
+            grad_q_indexer, grad_weights, grad_k_indexer = _hisa_selected_score_backward_cuda_batched(
+                grad_selected_scores,
+                q_indexer,
+                weights,
+                k_indexer,
+                topk_indices,
+            )
+        _log_hisa_indexer_loss_debug(
+            "hisa_dsa_fused.backward_output",
+            ctx.debug_call_id,
+            grad_q_indexer=grad_q_indexer,
+            grad_weights=grad_weights,
+            grad_k_indexer=grad_k_indexer,
+            grad_query_nope=grad_query_nope,
+            grad_query_pe=grad_query_pe,
+            grad_key_nope=grad_key_nope,
+            grad_key_pe=grad_key_pe,
+            grad_value=grad_value,
+        )
+        grad_q_indexer = grad_q_indexer.to(q_indexer.dtype)
+        grad_weights = grad_weights.to(weights.dtype)
+        grad_k_indexer = grad_k_indexer.to(k_indexer.dtype)
+        grad_query_nope = grad_query_nope.to(query_nope.dtype)
+        grad_query_pe = grad_query_pe.to(query_pe.dtype)
+        grad_key_nope = grad_key_nope.to(key_nope.dtype)
+        grad_key_pe = grad_key_pe.to(key_pe.dtype)
+        grad_value = grad_value.to(value.dtype)
+        _log_hisa_indexer_loss_debug(
+            "hisa_dsa_fused.backward_return",
+            ctx.debug_call_id,
+            grad_q_indexer=grad_q_indexer,
+            grad_weights=grad_weights,
+            grad_k_indexer=grad_k_indexer,
+            grad_query_nope=grad_query_nope,
+            grad_query_pe=grad_query_pe,
+            grad_key_nope=grad_key_nope,
+            grad_key_pe=grad_key_pe,
+            grad_value=grad_value,
+        )
+
+        return (
+            grad_q_indexer,
+            grad_weights,
+            grad_k_indexer,
+            None,
+            None,
+            grad_query_nope,
+            grad_query_pe,
+            grad_key_nope,
+            grad_key_pe,
+            grad_value,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
             None,
             None,
             None,
@@ -2899,9 +3756,24 @@ class _SelectedScoresKLLoss(torch.autograd.Function):
         teacher_probs: torch.Tensor,
         valid: torch.Tensor,
     ) -> torch.Tensor:
+        global _HISA_INDEXER_LOSS_DEBUG_CALLS
+        _HISA_INDEXER_LOSS_DEBUG_CALLS += 1
+        debug_call_id = _HISA_INDEXER_LOSS_DEBUG_CALLS
         selected_scores_f = selected_scores.float()
         teacher_probs_f = teacher_probs.float()
         valid = valid.to(device=selected_scores.device, dtype=torch.bool)
+        _log_hisa_indexer_loss_debug(
+            "selected_kl.forward_input",
+            debug_call_id,
+            selected_scores=selected_scores_f,
+            teacher_probs=teacher_probs_f,
+            valid=valid,
+        )
+        teacher_probs_f = torch.where(
+            torch.isfinite(teacher_probs_f) & (teacher_probs_f >= 0.0),
+            teacher_probs_f,
+            torch.zeros_like(teacher_probs_f),
+        )
         masked_scores = selected_scores_f.masked_fill(~valid, float("-inf"))
         teacher_probs_f = teacher_probs_f.masked_fill(~valid, 0.0)
         if is_hisa_kl_grad_triton_supported(masked_scores, teacher_probs_f):
@@ -2909,8 +3781,21 @@ class _SelectedScoresKLLoss(torch.autograd.Function):
                 masked_scores.contiguous(), teacher_probs_f.contiguous()
             )
         else:
-            index_probs = torch.softmax(masked_scores, dim=-1, dtype=torch.float32)
-            index_probs = torch.where(valid, index_probs, torch.zeros_like(index_probs))
+            has_valid = valid.any(dim=-1, keepdim=True)
+            safe_scores = torch.where(has_valid, masked_scores, torch.zeros_like(masked_scores))
+            index_probs = torch.softmax(safe_scores, dim=-1, dtype=torch.float32)
+            index_probs = torch.where(valid & has_valid, index_probs, torch.zeros_like(index_probs))
+            teacher_probs_f = torch.where(
+                valid & has_valid,
+                teacher_probs_f,
+                torch.zeros_like(teacher_probs_f),
+            )
+            teacher_sum = teacher_probs_f.sum(dim=-1, keepdim=True)
+            teacher_probs_f = torch.where(
+                teacher_sum > 0.0,
+                teacher_probs_f / teacher_sum.clamp_min(1e-20),
+                torch.zeros_like(teacher_probs_f),
+            )
             kl = teacher_probs_f * (
                 torch.log(teacher_probs_f + 1e-10) - torch.log(index_probs + 1e-10)
             )
@@ -2921,7 +3806,14 @@ class _SelectedScoresKLLoss(torch.autograd.Function):
             grad_selected_scores = (
                 index_probs * row_scale - teacher_prob_ratio
             ).masked_fill(~valid, 0)
+        _log_hisa_indexer_loss_debug(
+            "selected_kl.forward_output",
+            debug_call_id,
+            loss_sum=loss_sum,
+            grad_selected_scores=grad_selected_scores,
+        )
         ctx.save_for_backward(grad_selected_scores.to(selected_scores.dtype))
+        ctx.debug_call_id = debug_call_id
         return loss_sum
 
     @staticmethod
@@ -2930,6 +3822,12 @@ class _SelectedScoresKLLoss(torch.autograd.Function):
         grad = grad_selected_scores
         if grad_output is not None:
             grad = grad * grad_output.to(dtype=grad.dtype)
+        _log_hisa_indexer_loss_debug(
+            "selected_kl.backward",
+            ctx.debug_call_id,
+            grad_output=grad_output,
+            grad_selected_scores=grad,
+        )
         return grad, None, None
 
 
@@ -2962,6 +3860,9 @@ class _HISAFusedIndexerLoss(torch.autograd.Function):
         config: IndexCacheHISAConfig,
         tp_group: Optional[torch.distributed.ProcessGroup],
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        global _HISA_INDEXER_LOSS_DEBUG_CALLS
+        _HISA_INDEXER_LOSS_DEBUG_CALLS += 1
+        debug_call_id = _HISA_INDEXER_LOSS_DEBUG_CALLS
         q_len, bsz, _, _ = q.shape
         topk_k = min(int(topk), int(k.shape[0]))
         config = _hisa_config_for_topk(config, topk_k)
@@ -2974,7 +3875,6 @@ class _HISAFusedIndexerLoss(torch.autograd.Function):
                 prefix_b = prefix_lens
             else:
                 prefix_b = prefix_lens[batch_idx * q_len : (batch_idx + 1) * q_len]
-            result = None
             query_b = query[:, batch_idx : batch_idx + 1]
             key_b = key[:, batch_idx : batch_idx + 1]
             selector_result = indexcache_hisa_select_with_scores(
@@ -2985,33 +3885,34 @@ class _HISAFusedIndexerLoss(torch.autograd.Function):
                 config=config,
                 prefix_lens=prefix_b,
             )
-            if selector_result is not None:
-                topk_i32, selected_scores = selector_result
-                if is_hisa_attention_target_probs_triton_supported(
-                    query_b, key_b, topk_i32.unsqueeze(0)
-                ):
-                    teacher_probs = hisa_attention_target_probs_triton(
-                        query_b,
-                        key_b,
-                        topk_i32.unsqueeze(0),
-                        float(softmax_scale),
-                    )
-                    result = (topk_i32, selected_scores, teacher_probs)
-            if result is None:
-                result = indexcache_hisa_cuda_select_scores_teacher(
+            if selector_result is None:
+                reason = describe_indexcache_hisa_select_with_scores(
                     q[:, batch_idx],
                     weights[:, batch_idx],
                     k[:, batch_idx],
-                    query[:, batch_idx],
-                    key[:, batch_idx],
                     topk_k,
                     config=config,
                     prefix_lens=prefix_b,
-                    softmax_scale=float(softmax_scale),
                 )
-            if result is None:
-                raise RuntimeError("fused HISA indexer loss cannot handle dense-fallback chunks")
-            topk_i32, selected_scores, teacher_probs = result
+                raise RuntimeError(
+                    "fused HISA indexer loss cannot produce selected scores without "
+                    f"dense fallback: {reason}"
+                )
+            topk_i32, selected_scores = selector_result
+            if not is_hisa_attention_target_probs_triton_supported(
+                query_b, key_b, topk_i32.unsqueeze(0)
+            ):
+                raise RuntimeError(
+                    "fused HISA indexer loss requires compact Triton teacher; "
+                    f"unsupported shapes query={tuple(query_b.shape)} key={tuple(key_b.shape)} "
+                    f"topk={tuple(topk_i32.unsqueeze(0).shape)}"
+                )
+            teacher_probs = hisa_attention_target_probs_triton(
+                query_b,
+                key_b,
+                topk_i32.unsqueeze(0),
+                float(softmax_scale),
+            )
             topk_batches.append(topk_i32)
             selected_score_batches.append(selected_scores)
             teacher_prob_batches.append(teacher_probs)
@@ -3021,13 +3922,25 @@ class _HISAFusedIndexerLoss(torch.autograd.Function):
             bsz * q_len, topk_k
         )
         teacher_probs = torch.stack(teacher_prob_batches, dim=0).reshape(bsz * q_len, topk_k)
-        topk_indices = topk_i32
-        ctx.mark_non_differentiable(topk_indices)
+        topk_compact = _maybe_compact_hisa_saved_topk_indices(topk_i32, k.shape[0])
+        ctx.mark_non_differentiable(topk_compact)
+        _log_hisa_indexer_loss_debug(
+            "forward_selected",
+            debug_call_id,
+            selected_scores=selected_scores,
+            teacher_probs_pre_reduce=teacher_probs,
+            topk=topk_i32,
+        )
 
         if _dsa_process_group_size(tp_group) > 1:
             torch.distributed.all_reduce(teacher_probs.contiguous(), group=tp_group)
-        teacher_probs = teacher_probs / teacher_probs.sum(dim=-1, keepdim=True).clamp_min(
-            1e-20
+        teacher_row_sum = teacher_probs.sum(dim=-1, keepdim=True)
+        teacher_probs = teacher_probs / teacher_row_sum.clamp_min(1e-20)
+        _log_hisa_indexer_loss_debug(
+            "forward_teacher_normalized",
+            debug_call_id,
+            teacher_probs=teacher_probs,
+            teacher_row_sum=teacher_row_sum,
         )
         if is_hisa_kl_grad_triton_supported(selected_scores, teacher_probs):
             loss_sum, grad_selected_scores = hisa_kl_loss_and_grad_triton(
@@ -3047,11 +3960,24 @@ class _HISAFusedIndexerLoss(torch.autograd.Function):
             grad_selected_scores = (
                 index_probs * row_scale - teacher_prob_ratio
             ).masked_fill(~valid, 0)
+        _log_hisa_indexer_loss_debug(
+            "forward_kl",
+            debug_call_id,
+            loss_sum=loss_sum,
+            grad_selected_scores=grad_selected_scores,
+        )
 
-        ctx.save_for_backward(q, weights, k, topk_i32, grad_selected_scores)
+        ctx.save_for_backward(
+            q,
+            weights,
+            k,
+            topk_compact,
+            grad_selected_scores,
+        )
         ctx.q_len = q_len
         ctx.bsz = bsz
-        return topk_indices, loss_sum
+        ctx.debug_call_id = debug_call_id
+        return topk_compact, loss_sum
 
     @staticmethod
     def backward(ctx, grad_topk_indices, grad_loss_sum):
@@ -3073,6 +3999,12 @@ class _HISAFusedIndexerLoss(torch.autograd.Function):
             )
         scale = grad_loss_sum.float() if torch.is_tensor(grad_loss_sum) else 1.0
         grad_selected_scores = grad_selected_scores * scale
+        _log_hisa_indexer_loss_debug(
+            "backward_input",
+            ctx.debug_call_id,
+            grad_loss_sum=grad_loss_sum if torch.is_tensor(grad_loss_sum) else None,
+            grad_selected_scores=grad_selected_scores,
+        )
 
         grad_q, grad_weights, grad_k = _hisa_selected_score_backward_cuda_batched(
             grad_selected_scores,
@@ -3080,6 +4012,13 @@ class _HISAFusedIndexerLoss(torch.autograd.Function):
             weights,
             k,
             topk_i32,
+        )
+        _log_hisa_indexer_loss_debug(
+            "backward_output",
+            ctx.debug_call_id,
+            grad_q=grad_q,
+            grad_weights=grad_weights,
+            grad_k=grad_k,
         )
         grad_q = grad_q.to(q.dtype)
         grad_weights = grad_weights.to(weights.dtype)
@@ -3117,6 +4056,8 @@ def chunked_dsa_forward(
     key_positions: Optional[torch.Tensor] = None,
     indexcache_hisa_config: Optional[IndexCacheHISAConfig] = None,
     dsa_split_qk: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    hisa_log_label: str = "DSAttention",
+    dsa_runtime_context: str = "",
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     sq, bsz, num_heads, head_dim = query.size()
     sk = key.size(0)
@@ -3197,6 +4138,101 @@ def chunked_dsa_forward(
     attention_teacher_score_chunks = []
     attention_teacher_row_indices = []
     stream_triton_attention_chunks = _env_flag_enabled(_DSA_STREAM_TRITON_ATTENTION_CHUNKS_ENV, "0")
+    hisa_selector_name = (
+        indexcache_hisa_selector_backend_name() if use_indexcache_hisa_topk else "disabled"
+    )
+    runtime_mode = "grad_loss" if loss_coeff > 0 else "grad_no_loss" if torch.is_grad_enabled() else "no_grad"
+    use_hisa_dsa_fused_forward = (
+        _hisa_dsa_fused_forward_enabled() or _hisa_dsa_persistent_forward_enabled()
+    )
+    fused_hisa_block_reps = None
+    fused_hisa_effective_block_topk = None
+    shared_hisa_block_reps = None
+
+    def get_fused_hisa_block_reps() -> tuple[torch.Tensor, int]:
+        nonlocal fused_hisa_block_reps, fused_hisa_effective_block_topk
+        if indexcache_hisa_config is None:
+            raise RuntimeError("fused HISA/DSA forward requested without HISA config")
+        if fused_hisa_block_reps is None:
+            with fine_profile_range(f"dsa.{hisa_log_label}.hisa_dsa_fused.block_reps"):
+                fused_hisa_block_reps = _hisa_block_reps_batched_cuda(
+                    k,
+                    int(indexcache_hisa_config.block_size),
+                )
+            fused_hisa_effective_block_topk = _hisa_fused_effective_block_topk(
+                sk,
+                indexcache_hisa_config,
+            )
+        return fused_hisa_block_reps, int(fused_hisa_effective_block_topk)
+
+    def get_shared_hisa_block_reps() -> Optional[torch.Tensor]:
+        nonlocal shared_hisa_block_reps
+        if indexcache_hisa_config is None:
+            return None
+        if indexcache_hisa_selector_backend_name() != "megakernel":
+            return None
+        if shared_hisa_block_reps is None:
+            with fine_profile_range(f"dsa.{hisa_log_label}.hisa.block_reps"):
+                shared_hisa_block_reps = _hisa_block_reps_batched_cuda(
+                    k,
+                    int(indexcache_hisa_config.block_size),
+                )
+        return shared_hisa_block_reps
+
+    def hisa_fail_closed(
+        reason: str,
+        *,
+        dense_indexer_fallback: int = 0,
+        dense_teacher_fallback: int = 0,
+    ) -> None:
+        raise RuntimeError(
+            "HISA fail-closed violation: "
+            f"{reason}; hisa_selector={hisa_selector_name} hisa_deferred_teacher=0 "
+            f"dense_indexer_fallback={dense_indexer_fallback} "
+            f"dense_teacher_fallback={dense_teacher_fallback} "
+            f"query_shape={tuple(query.shape)} key_shape={tuple(key.shape)} "
+            f"k_shape={tuple(k.shape)} topk={topk} chunk_size={chunk_size}"
+        )
+
+    def log_hisa_runtime(deferred_teacher: bool) -> None:
+        if not use_indexcache_hisa_topk:
+            return
+        _log_hisa_runtime_once(
+            hisa_log_label,
+            f"hisa_selector={hisa_selector_name} "
+            f"hisa_deferred_teacher={int(deferred_teacher)} "
+            "dense_indexer_fallback=0 dense_teacher_fallback=0 "
+            f"grad_enabled={int(torch.is_grad_enabled())} "
+            f"loss_enabled={int(loss_coeff > 0)} "
+            f"topk={topk} chunk_size={chunk_size} split_qk={int(split_query_pe is not None)}",
+            mode=runtime_mode,
+        )
+
+    def log_dsa_runtime(
+        *,
+        topk_source: str,
+        attention_backend: str,
+        teacher_backend: str,
+        hisa_deferred_teacher: bool,
+    ) -> None:
+        _log_dsa_runtime_once(
+            hisa_log_label,
+            f"attention_backend={attention_backend} topk_source={topk_source} "
+            f"teacher_backend={teacher_backend} "
+            f"hisa_selector={hisa_selector_name} "
+            f"hisa_deferred_teacher={int(hisa_deferred_teacher)} "
+            "dense_indexer_fallback=0 dense_teacher_fallback=0 "
+            f"split_qk={int(split_query_pe is not None)} "
+            f"stream_triton_chunks={int(stream_triton_attention_chunks)} "
+            f"loss_coeff={loss_coeff:g} sparse_loss={int(sparse_loss)} "
+            f"grad_enabled={int(torch.is_grad_enabled())} "
+            f"loss_enabled={int(loss_coeff > 0)} "
+            f"topk={topk} chunk_size={chunk_size} sq={sq} sk={sk} bsz={bsz} "
+            f"q_provider={int(q_weights_provider is not None)} "
+            f"positions={int(query_positions is not None or key_positions is not None)} "
+            f"{dsa_runtime_context}".strip(),
+            mode=runtime_mode,
+        )
 
     def append_output_chunk(chunk_output: torch.Tensor, q_start: int, q_end: int):
         nonlocal output_buffer
@@ -3211,35 +4247,33 @@ def chunked_dsa_forward(
         output_buffer[q_start:q_end].copy_(chunk_output)
 
     for q_start, q_end in iter_query_ranges():
-        if q_weights_provider is not None:
-            q_chunk, weights_chunk = q_weights_provider(q_start, q_end)
-        else:
-            q_chunk = q[q_start:q_end]
-            weights_chunk = weights[q_start:q_end]
-        query_chunk = query[q_start:q_end]
-        query_pe_chunk = None if split_query_pe is None else split_query_pe[q_start:q_end]
-        query_positions_chunk = (
-            None if query_positions is None else query_positions[q_start:q_end]
-        )
+        chunk_profile = f"dsa.{hisa_log_label}.chunk.{q_start}_{q_end}"
+        with fine_profile_range(f"{chunk_profile}.prepare_q_weights"):
+            if q_weights_provider is not None:
+                q_chunk, weights_chunk = q_weights_provider(q_start, q_end)
+            else:
+                q_chunk = q[q_start:q_end]
+                weights_chunk = weights[q_start:q_end]
+            query_chunk = query[q_start:q_end]
+            query_pe_chunk = None if split_query_pe is None else split_query_pe[q_start:q_end]
+            query_positions_chunk = (
+                None if query_positions is None else query_positions[q_start:q_end]
+            )
 
         topk_indices = None
         index_scores = None
         hisa_selected_scores = None
         hisa_loss_already_accumulated = False
         hisa_loss_deferred_to_attention = False
+        topk_source = "unset"
         if use_indexcache_hisa_topk:
             if loss_coeff > 0:
                 topk_k = min(topk, sk)
-                prefix_lens = None
-                if (
-                    _hisa_fused_indexer_loss_enabled()
-                    and q_chunk.is_cuda
-                    and k.is_cuda
-                    and query_chunk.is_cuda
-                    and key.is_cuda
-                    and q_chunk.size(-1) == 128
-                    and k.size(-1) == 128
-                ):
+                if not _hisa_fused_indexer_loss_enabled():
+                    hisa_fail_closed("MEGATRON_HISA_FUSED_INDEXER_LOSS is disabled")
+                if not (q_chunk.is_cuda and k.is_cuda and query_chunk.is_cuda and key.is_cuda):
+                    hisa_fail_closed("HISA training selected-score path requires CUDA tensors")
+                with fine_profile_range(f"{chunk_profile}.hisa.prefix_lens"):
                     prefix_lens = _hisa_prefix_lens_for_chunk(
                         q_end - q_start,
                         bsz,
@@ -3251,19 +4285,23 @@ def chunked_dsa_forward(
                         key_positions=key_positions,
                         device=work_device,
                     )
-                if (
-                    prefix_lens is not None
-                    and not (
-                        indexcache_hisa_config.fallback_to_dense_if_short
-                        and int(prefix_lens.max().item()) <= topk_k
+                if prefix_lens is None:
+                    hisa_fail_closed(
+                        "could not construct causal prefix lengths for HISA selected-score path"
                     )
+                if (
+                    indexcache_hisa_config.fallback_to_dense_if_short
+                    and int(prefix_lens.max().item()) <= topk_k
                 ):
+                    hisa_fail_closed("HISA config requested dense short-context fallback")
+
+                with fine_profile_range(f"{chunk_profile}.attention.teacher_support_check"):
                     dummy_topk = torch.empty(
                         (bsz, q_end - q_start, topk_k),
                         device=work_device,
                         dtype=torch.int32,
                     )
-                    if (
+                    teacher_supported = (
                         query_pe_chunk is not None
                         and split_key_pe is not None
                         and is_sparse_dsa_split_qk_triton_supported(
@@ -3291,73 +4329,139 @@ def chunked_dsa_forward(
                             query_positions=query_positions_chunk,
                             key_positions=key_positions,
                         )
-                    ):
-                        try:
-                            topk_i32, selected_scores = _HISASelectWithScoresBatched.apply(
-                                q_chunk,
-                                weights_chunk,
-                                k,
-                                prefix_lens,
-                                topk_k,
-                                indexcache_hisa_config,
-                            )
-                        except RuntimeError as exc:
-                            if "cannot handle this chunk" not in str(exc):
-                                raise
-                            topk_i32 = None
-                            selected_scores = None
-                        if topk_i32 is not None and selected_scores is not None:
-                            topk_indices = topk_i32
-                            hisa_selected_scores = selected_scores
-                            hisa_loss_deferred_to_attention = True
-                    if topk_indices is None:
-                        loss_query_chunk, loss_key = materialize_attention_qk(
-                            query_chunk, query_pe_chunk
+                    )
+                if not teacher_supported:
+                    hisa_fail_closed(
+                        "selected sparse-attention teacher path is unsupported for this chunk"
+                    )
+                if use_hisa_dsa_fused_forward:
+                    if query_pe_chunk is None or split_key_pe is None:
+                        hisa_fail_closed(
+                            "fused HISA/DSA forward currently requires split-QK MLA tensors"
                         )
-                        topk_indices, chunk_loss_sum = _HISAFusedIndexerLoss.apply(
+                    if indexcache_hisa_config.fallback_to_dense_if_short:
+                        hisa_fail_closed(
+                            "fused HISA/DSA forward refuses dense short-context fallback"
+                        )
+                    fused_block_reps, fused_effective_block_topk = get_fused_hisa_block_reps()
+                    forced = tuple(indexcache_hisa_config.forced_boundary_blocks or ())
+                    has_positions = query_positions_chunk is not None or key_positions is not None
+                    empty_positions = torch.empty(0, device=work_device, dtype=torch.long)
+                    with fine_profile_range(f"{chunk_profile}.hisa_dsa_fused.forward"):
+                        (
+                            chunk_output,
+                            hisa_selected_scores,
+                            attention_teacher_probs,
+                            topk_indices,
+                        ) = _HISADSASplitQKFusedForward.apply(
                             q_chunk,
                             weights_chunk,
                             k,
-                            loss_query_chunk,
-                            loss_key,
+                            fused_block_reps,
                             prefix_lens,
+                            query_chunk,
+                            query_pe_chunk,
+                            key,
+                            split_key_pe,
+                            value,
+                            query_positions_chunk if has_positions else empty_positions,
+                            key_positions if has_positions else empty_positions,
                             float(softmax_scale),
+                            int(q_start),
+                            int(indexcache_hisa_config.block_size),
+                            int(indexcache_hisa_config.block_topk),
+                            float(indexcache_hisa_config.compression_ratio),
+                            int(fused_effective_block_topk),
+                            int(topk_k),
+                            bool(has_positions),
+                            "first" in forced,
+                            "last" in forced,
+                            "last_minus_one" in forced,
+                        )
+                    if pg_collection is not None and _dsa_process_group_size(pg_collection.tp) > 1:
+                        with fine_profile_range(f"{chunk_profile}.attention.teacher_tp_all_reduce"):
+                            torch.distributed.all_reduce(
+                                attention_teacher_probs.contiguous(), group=pg_collection.tp
+                            )
+                    with fine_profile_range(f"{chunk_profile}.indexer_loss.selected_scores_kl"):
+                        attention_teacher_probs = attention_teacher_probs / attention_teacher_probs.sum(
+                            dim=-1, keepdim=True
+                        ).clamp_min(1e-20)
+                        flat_topk = topk_indices.reshape(bsz * (q_end - q_start), -1)
+                        valid = flat_topk >= 0
+                        chunk_loss_sum = _SelectedScoresKLLoss.apply(
+                            hisa_selected_scores,
+                            attention_teacher_probs.reshape_as(hisa_selected_scores),
+                            valid,
+                        )
+                    loss_sum = chunk_loss_sum if loss_sum is None else loss_sum + chunk_loss_sum
+                    loss_count += hisa_selected_scores.size(0)
+                    topk_source = "hisa_dsa_fused"
+                    log_hisa_runtime(deferred_teacher=True)
+                    log_dsa_runtime(
+                        topk_source=topk_source,
+                        attention_backend="fused_hisa_dsa_split_qk",
+                        teacher_backend="fused_hisa_dsa_local_teacher",
+                        hisa_deferred_teacher=True,
+                    )
+                    append_output_chunk(chunk_output, q_start, q_end)
+                    del chunk_output
+                    continue
+                try:
+                    with fine_profile_range(f"{chunk_profile}.hisa.select_with_scores"):
+                        topk_i32, selected_scores = _HISASelectWithScoresBatched.apply(
+                            q_chunk,
+                            weights_chunk,
+                            k,
+                            prefix_lens,
+                            get_shared_hisa_block_reps(),
                             topk_k,
                             indexcache_hisa_config,
-                            pg_collection.tp if pg_collection is not None else None,
                         )
-                        loss_sum = chunk_loss_sum if loss_sum is None else loss_sum + chunk_loss_sum
-                        loss_count += bsz * (q_end - q_start)
-                        hisa_loss_already_accumulated = True
-                else:
-                    hisa_result = indexcache_hisa_topk_with_scores(
+                except RuntimeError as exc:
+                    if "cannot handle this chunk" not in str(exc):
+                        raise
+                    hisa_fail_closed(str(exc))
+                topk_indices = topk_i32
+                hisa_selected_scores = selected_scores
+                hisa_loss_deferred_to_attention = True
+                topk_source = "hisa_selected_scores"
+                log_hisa_runtime(deferred_teacher=True)
+            else:
+                with fine_profile_range(f"{chunk_profile}.hisa.topk"):
+                    topk_indices = indexcache_hisa_topk(
                         q_chunk,
                         weights_chunk,
                         k,
-                        topk_k,
+                        topk,
                         config=indexcache_hisa_config,
                         q_start=q_start,
                         is_causal=is_causal,
                         mask=mask,
                         query_positions=query_positions_chunk,
                         key_positions=key_positions,
-                        return_scores=True,
                     )
-                    if hisa_result is not None:
-                        topk_indices, hisa_selected_scores = hisa_result
-            else:
-                topk_indices = indexcache_hisa_topk(
-                    q_chunk,
-                    weights_chunk,
-                    k,
-                    topk,
-                    config=indexcache_hisa_config,
-                    q_start=q_start,
-                    is_causal=is_causal,
-                    mask=mask,
-                    query_positions=query_positions_chunk,
-                    key_positions=key_positions,
-                )
+                if topk_indices is None:
+                    if q_chunk.is_cuda or k.is_cuda:
+                        hisa_fail_closed("HISA top-k selection returned None")
+                    with fine_profile_range(f"{chunk_profile}.dense_indexer_fallback.topk"):
+                        index_scores = _compute_index_scores(q_chunk, weights_chunk, k)
+                        index_scores = _apply_dsa_score_mask(
+                            index_scores,
+                            mask,
+                            q_start,
+                            q_end,
+                            sk,
+                            is_causal,
+                            query_positions=query_positions_chunk,
+                            key_positions=key_positions,
+                        )
+                        topk_k = min(topk, sk)
+                        topk_indices = index_scores.topk(topk_k, dim=-1, sorted=False)[1]
+                    topk_source = "dense_index_scores_topk_cpu_hisa_short"
+                else:
+                    topk_source = "hisa_topk"
+                    log_hisa_runtime(deferred_teacher=False)
 
         if topk_indices is not None:
             if (
@@ -3365,6 +4469,11 @@ def chunked_dsa_forward(
                 and hisa_selected_scores is None
                 and not hisa_loss_already_accumulated
             ):
+                if use_indexcache_hisa_topk:
+                    hisa_fail_closed(
+                        "HISA selected scores are missing; refusing full-prefix DSA index-score KL",
+                        dense_indexer_fallback=1,
+                    )
                 index_scores = _compute_index_scores(q_chunk, weights_chunk, k)
                 index_scores = _apply_dsa_score_mask(
                     index_scores,
@@ -3418,6 +4527,7 @@ def chunked_dsa_forward(
                     sorted=False,
                     out=(topk_values_buffer, topk_indices_buffer),
                 )
+                topk_source = "triton_indexer_scores_topk"
             else:
                 index_scores = None
                 topk_indices = _streaming_qk_topk(
@@ -3433,7 +4543,13 @@ def chunked_dsa_forward(
                     query_positions=query_positions_chunk,
                     key_positions=key_positions,
                 )
+                topk_source = "streaming_qk_topk"
         else:
+            if use_indexcache_hisa_topk:
+                hisa_fail_closed(
+                    "HISA top-k is unavailable; refusing full-prefix DSA indexer fallback",
+                    dense_indexer_fallback=1,
+                )
             index_scores = _compute_index_scores(q_chunk, weights_chunk, k)
             index_scores = _apply_dsa_score_mask(
                 index_scores,
@@ -3447,39 +4563,71 @@ def chunked_dsa_forward(
             )
             topk_k = min(topk, sk)
             topk_indices = index_scores.topk(topk_k, dim=-1, sorted=False)[1]
+            topk_source = "dense_index_scores_topk"
 
         if topk_indices is not None:
-            topk_indices = _maybe_narrow_dsa_topk_indices(topk_indices, sk)
+            with fine_profile_range(f"{chunk_profile}.topk.compact_dtype"):
+                topk_indices = _maybe_narrow_dsa_topk_indices(topk_indices, sk)
 
         if use_triton_attention is None:
-            if query_pe_chunk is not None and split_key_pe is not None:
-                use_triton_attention = is_sparse_dsa_split_qk_triton_supported(
-                    query_chunk,
-                    query_pe_chunk,
-                    key,
-                    split_key_pe,
-                    value,
-                    topk_indices,
-                    mask,
-                    is_causal,
-                    query_positions=query_positions_chunk,
-                    key_positions=key_positions,
-                )
-            else:
-                use_triton_attention = is_sparse_dsa_triton_supported(
-                    query_chunk,
-                    key,
-                    value,
-                    topk_indices,
-                    mask,
-                    is_causal,
-                    query_positions=query_positions_chunk,
-                    key_positions=key_positions,
-                )
+            with fine_profile_range(f"{chunk_profile}.attention.support_check"):
+                if query_pe_chunk is not None and split_key_pe is not None:
+                    use_triton_attention = is_sparse_dsa_split_qk_triton_supported(
+                        query_chunk,
+                        query_pe_chunk,
+                        key,
+                        split_key_pe,
+                        value,
+                        topk_indices,
+                        mask,
+                        is_causal,
+                        query_positions=query_positions_chunk,
+                        key_positions=key_positions,
+                    )
+                else:
+                    use_triton_attention = is_sparse_dsa_triton_supported(
+                        query_chunk,
+                        key,
+                        value,
+                        topk_indices,
+                        mask,
+                        is_causal,
+                        query_positions=query_positions_chunk,
+                        key_positions=key_positions,
+                    )
         if _env_flag_enabled(_DSA_VALIDATE_TOPK_INDICES_ENV, "0") and bool(
             (topk_indices < -1).any().item()
         ):
             use_triton_attention = False
+        if (
+            use_indexcache_hisa_topk
+            and not use_triton_attention
+            and (query_chunk.is_cuda or key.is_cuda or value.is_cuda)
+        ):
+            hisa_fail_closed(
+                "selected Sparse MLA/DSA Triton attention path is unsupported for HISA top-k"
+            )
+        if use_triton_attention:
+            attention_backend = (
+                "triton_split_qk" if query_pe_chunk is not None and split_key_pe is not None else "triton"
+            )
+            if loss_coeff > 0 and hisa_loss_deferred_to_attention:
+                teacher_backend = (
+                    "compact_triton_split_qk"
+                    if query_pe_chunk is not None and split_key_pe is not None
+                    else "compact_triton"
+                )
+            else:
+                teacher_backend = "none"
+        else:
+            attention_backend = "torch_sparse_chunk"
+            teacher_backend = "dense_teacher" if loss_coeff > 0 else "none"
+        log_dsa_runtime(
+            topk_source=topk_source,
+            attention_backend=attention_backend,
+            teacher_backend=teacher_backend,
+            hisa_deferred_teacher=hisa_loss_deferred_to_attention,
+        )
 
         if loss_coeff > 0 and hisa_loss_already_accumulated:
             pass
@@ -3488,6 +4636,11 @@ def chunked_dsa_forward(
             and hisa_selected_scores is not None
             and not hisa_loss_deferred_to_attention
         ):
+            if use_indexcache_hisa_topk:
+                hisa_fail_closed(
+                    "HISA selected scores were not deferred to sparse-attention teacher",
+                    dense_teacher_fallback=1,
+                )
             flat_topk = topk_indices.reshape(bsz * (q_end - q_start), -1)
             valid = flat_topk >= 0
             selected_scores = hisa_selected_scores.masked_fill(~valid, float("-inf"))
@@ -3510,6 +4663,11 @@ def chunked_dsa_forward(
             loss_sum = chunk_loss_sum if loss_sum is None else loss_sum + chunk_loss_sum
             loss_count += bsz * (q_end - q_start)
         elif loss_coeff > 0 and not hisa_loss_deferred_to_attention:
+            if use_indexcache_hisa_topk:
+                hisa_fail_closed(
+                    "refusing dense teacher score construction for HISA indexer loss",
+                    dense_teacher_fallback=1,
+                )
             loss_index_scores = index_scores
             attention_query_chunk, attention_key_full = materialize_attention_qk(
                 query_chunk, query_pe_chunk
@@ -3565,86 +4723,95 @@ def chunked_dsa_forward(
             del index_scores
 
         if use_triton_attention:
-            topk_indices, hisa_selected_scores = _maybe_sort_dsa_topk_indices_and_scores(
-                topk_indices, hisa_selected_scores
-            )
+            with fine_profile_range(f"{chunk_profile}.topk.sort_for_triton"):
+                topk_indices, hisa_selected_scores = _maybe_sort_dsa_topk_indices_and_scores(
+                    topk_indices, hisa_selected_scores
+                )
             if stream_triton_attention_chunks:
                 if hisa_loss_deferred_to_attention:
                     if query_pe_chunk is not None and split_key_pe is not None:
-                        (
-                            chunk_output,
-                            attention_teacher_probs,
-                        ) = sparse_dsa_attention_split_qk_with_teacher_triton(
-                            query_chunk,
-                            query_pe_chunk,
-                            key,
-                            split_key_pe,
-                            value,
-                            topk_indices,
-                            softmax_scale,
-                            q_start,
-                            query_positions=query_positions_chunk,
-                            key_positions=key_positions,
-                            kv_nope_value_ref=split_kv_nope_value_ref,
-                        )
+                        with fine_profile_range(
+                            f"{chunk_profile}.attention.triton_split_qk_with_teacher"
+                        ):
+                            (
+                                chunk_output,
+                                attention_teacher_probs,
+                            ) = sparse_dsa_attention_split_qk_with_teacher_triton(
+                                query_chunk,
+                                query_pe_chunk,
+                                key,
+                                split_key_pe,
+                                value,
+                                topk_indices,
+                                softmax_scale,
+                                q_start,
+                                query_positions=query_positions_chunk,
+                                key_positions=key_positions,
+                                kv_nope_value_ref=split_kv_nope_value_ref,
+                            )
                     else:
-                        (
-                            chunk_output,
-                            attention_teacher_probs,
-                        ) = sparse_dsa_attention_with_teacher_triton(
-                            query_chunk,
-                            key,
-                            value,
-                            topk_indices,
-                            softmax_scale,
-                            q_start,
-                            query_positions=query_positions_chunk,
-                            key_positions=key_positions,
-                        )
+                        with fine_profile_range(f"{chunk_profile}.attention.triton_with_teacher"):
+                            (
+                                chunk_output,
+                                attention_teacher_probs,
+                            ) = sparse_dsa_attention_with_teacher_triton(
+                                query_chunk,
+                                key,
+                                value,
+                                topk_indices,
+                                softmax_scale,
+                                q_start,
+                                query_positions=query_positions_chunk,
+                                key_positions=key_positions,
+                            )
                     if pg_collection is not None and _dsa_process_group_size(pg_collection.tp) > 1:
-                        torch.distributed.all_reduce(
-                            attention_teacher_probs.contiguous(), group=pg_collection.tp
+                        with fine_profile_range(f"{chunk_profile}.attention.teacher_tp_all_reduce"):
+                            torch.distributed.all_reduce(
+                                attention_teacher_probs.contiguous(), group=pg_collection.tp
+                            )
+                    with fine_profile_range(f"{chunk_profile}.indexer_loss.selected_scores_kl"):
+                        attention_teacher_probs = attention_teacher_probs / attention_teacher_probs.sum(
+                            dim=-1, keepdim=True
+                        ).clamp_min(1e-20)
+                        flat_topk = topk_indices.reshape(bsz * (q_end - q_start), -1)
+                        valid = flat_topk >= 0
+                        chunk_loss_sum = _SelectedScoresKLLoss.apply(
+                            hisa_selected_scores,
+                            attention_teacher_probs.reshape_as(hisa_selected_scores),
+                            valid,
                         )
-                    attention_teacher_probs = attention_teacher_probs / attention_teacher_probs.sum(
-                        dim=-1, keepdim=True
-                    ).clamp_min(1e-20)
-                    flat_topk = topk_indices.reshape(bsz * (q_end - q_start), -1)
-                    valid = flat_topk >= 0
-                    chunk_loss_sum = _SelectedScoresKLLoss.apply(
-                        hisa_selected_scores,
-                        attention_teacher_probs.reshape_as(hisa_selected_scores),
-                        valid,
-                    )
                     loss_sum = chunk_loss_sum if loss_sum is None else loss_sum + chunk_loss_sum
                     loss_count += hisa_selected_scores.size(0)
                     append_output_chunk(chunk_output, q_start, q_end)
                     del chunk_output
                 else:
                     if query_pe_chunk is not None and split_key_pe is not None:
-                        chunk_output = sparse_dsa_attention_split_qk_triton(
-                            query_chunk,
-                            query_pe_chunk,
-                            key,
-                            split_key_pe,
-                            value,
-                            topk_indices,
-                            softmax_scale,
-                            q_start,
-                            query_positions=query_positions_chunk,
-                            key_positions=key_positions,
-                            kv_nope_value_ref=split_kv_nope_value_ref,
-                        )
+                        with fine_profile_range(f"{chunk_profile}.attention.triton_split_qk"):
+                            chunk_output = sparse_dsa_attention_split_qk_triton(
+                                query_chunk,
+                                query_pe_chunk,
+                                key,
+                                split_key_pe,
+                                value,
+                                topk_indices,
+                                softmax_scale,
+                                q_start,
+                                query_positions=query_positions_chunk,
+                                key_positions=key_positions,
+                                kv_nope_value_ref=split_kv_nope_value_ref,
+                            )
                     else:
-                        chunk_output = sparse_dsa_attention_triton(
-                            query_chunk,
-                            key,
-                            value,
-                            topk_indices,
-                            softmax_scale,
-                            q_start,
-                            query_positions=query_positions_chunk,
-                            key_positions=key_positions,
-                        )
+                        with fine_profile_range(f"{chunk_profile}.attention.triton"):
+                            chunk_output = sparse_dsa_attention_triton(
+                                query_chunk,
+                                key,
+                                value,
+                                topk_indices,
+                                softmax_scale,
+                                q_start,
+                                query_positions=query_positions_chunk,
+                                key_positions=key_positions,
+                            )
                     append_output_chunk(chunk_output, q_start, q_end)
                     del chunk_output
                 continue
@@ -3822,6 +4989,7 @@ class DSAttention(MegatronModule):
         self.indexer = build_module(
             submodules.indexer, config=self.config, pg_collection=pg_collection
         )
+        self.indexer.layer_number = layer_number
         indexer_loss_coeff = getattr(self.config, 'dsa_indexer_loss_coeff', 0.0) or 0.0
         if indexer_loss_coeff <= 0:
             for param in self.indexer.parameters():
@@ -3864,6 +5032,17 @@ class DSAttention(MegatronModule):
         Returns:
             output: Output tensor [sq, b, hidden_size]
         """
+        if (
+            self.training
+            and _env_flag_enabled("MEGATRON_DSA_REQUIRE_SPLIT_QK", "0")
+            and dsa_split_qk is None
+        ):
+            raise RuntimeError(
+                "MEGATRON_DSA_REQUIRE_SPLIT_QK=1 but DSAttention did not receive "
+                "split-Q/K MLA tensors. Disable MLA RoPE fusion or unset the guard "
+                "for non-split DSA runs."
+            )
+
         if packed_seq_params is not None and packed_seq_params.qkv_format == "thd":
             cp_group = self.indexer.pg_collection.cp
             cp_size = _dsa_process_group_size(cp_group)
@@ -4150,6 +5329,9 @@ class DSAttention(MegatronModule):
 
         indexer_loss_coeff = getattr(self.config, 'dsa_indexer_loss_coeff', 0.0)
         chunk_size = int(self.config.dsa_chunk_size)
+        cp_group = self.indexer.pg_collection.cp
+        cp_size = _dsa_process_group_size(cp_group)
+        defer_indexcache_for_cp = cp_size > 1 and self.indexer.indexcache_config is not None
         use_sp_project_before_gather = (
             _env_flag_enabled(_DSA_SP_PROJECT_BEFORE_GATHER_ENV, "1")
             and self.config.sequence_parallel
@@ -4175,6 +5357,7 @@ class DSAttention(MegatronModule):
                 or streambp_sp_project_before_gather
             )
         )
+        sp_project_before_gather = False
         if chunk_indexer_q:
             sp_project_before_gather = (
                 use_sp_project_before_gather
@@ -4204,6 +5387,7 @@ class DSAttention(MegatronModule):
                     indexer_mscale,
                     indexer_orig_seqlen,
                     indexer_pad_len,
+                    apply_indexcache=not defer_indexcache_for_cp,
                 )
 
                 def q_weights_provider(q_start: int, q_end: int):
@@ -4281,6 +5465,7 @@ class DSAttention(MegatronModule):
                     indexer_mscale,
                     indexer_orig_seqlen,
                     indexer_pad_len,
+                    apply_indexcache=not defer_indexcache_for_cp,
                 )
 
                 def q_weights_provider(q_start: int, q_end: int):
@@ -4297,7 +5482,11 @@ class DSAttention(MegatronModule):
             weights = None
         else:
             q, k, weights = self.indexer.forward_before_topk(
-                x, qr, packed_seq_params, query_indices=streambp_query_indices
+                x,
+                qr,
+                packed_seq_params,
+                query_indices=streambp_query_indices,
+                apply_indexcache=not defer_indexcache_for_cp,
             )
         numeric_debug = None
         log_dsa_debug = False
@@ -4339,19 +5528,93 @@ class DSAttention(MegatronModule):
                     )
         query_positions = streambp_query_positions
         key_positions = streambp_key_positions
-        cp_group = self.indexer.pg_collection.cp
-        cp_size = _dsa_process_group_size(cp_group)
         if cp_size > 1:
             if streambp_positions is not None:
                 raise ValueError("StreamBP DSA currently requires context_parallel_size == 1")
             if not is_causal:
                 raise NotImplementedError("DSAttention CP path currently supports causal masks only")
             local_skv = key.size(0)
+            cp_sorted_gather = _env_flag_enabled(_DSA_CP_SORTED_ZIGZAG_GATHER_ENV, "0")
             query_positions = _dsa_cp_local_position_ids(sq, cp_group, query.device)
-            key_positions = _dsa_cp_gathered_position_ids(local_skv, cp_group, key.device)
-            k = gather_from_sequence_parallel_region(k, group=cp_group)
-            key = gather_from_sequence_parallel_region(key, group=cp_group)
-            value = gather_from_sequence_parallel_region(value, group=cp_group)
+            if cp_sorted_gather:
+                key_positions = torch.arange(
+                    local_skv * _dsa_process_group_size(cp_group),
+                    device=key.device,
+                    dtype=torch.long,
+                )
+                key_order = None
+            else:
+                key_positions = _dsa_cp_gathered_position_ids(local_skv, cp_group, key.device)
+                cp_sort_cache_key = (
+                    int(local_skv),
+                    _dsa_process_group_size(cp_group),
+                    _dsa_process_group_rank(cp_group),
+                    str(key.device),
+                )
+                cached_sort = getattr(self, "_dsa_cp_key_sort_cache", None)
+                if cached_sort is not None and cached_sort[0] == cp_sort_cache_key:
+                    key_positions, key_order = cached_sort[1], cached_sort[2]
+                else:
+                    key_order = None
+                    if key_positions.numel() > 1 and bool(
+                        (key_positions[1:] < key_positions[:-1]).any().item()
+                    ):
+                        key_order = torch.argsort(key_positions)
+                        key_positions = key_positions.index_select(0, key_order)
+                    setattr(
+                        self,
+                        "_dsa_cp_key_sort_cache",
+                        (cp_sort_cache_key, key_positions, key_order),
+                    )
+            k = _dsa_cp_sorted_zigzag_gather(k, cp_group)
+            key = _dsa_cp_sorted_zigzag_gather(key, cp_group)
+            value = _dsa_cp_sorted_zigzag_gather(value, cp_group)
+            if key_order is not None:
+                k = k.index_select(0, key_order)
+                key = key.index_select(0, key_order)
+                value = value.index_select(0, key_order)
+            if defer_indexcache_for_cp:
+                k = self.indexer._apply_indexcache_to_key(k)
+            if dsa_split_qk is not None:
+                split_query_pe, split_key_pe, *split_extra = dsa_split_qk
+                gathered_extra = []
+                if _env_flag_enabled(_DSA_CP_GATHER_SPLIT_KV_REF_ENV, "0"):
+                    for extra_tensor in split_extra:
+                        if extra_tensor is None:
+                            gathered_extra.append(None)
+                            continue
+                        gathered = _dsa_cp_sorted_zigzag_gather(extra_tensor, cp_group)
+                        if key_order is not None:
+                            gathered = gathered.index_select(0, key_order)
+                        gathered_extra.append(gathered)
+                else:
+                    # The packed kv reference is only a backward optimization.  Under CP it
+                    # requires another full-sequence gather and sort on the key side; the
+                    # split-Q/K Triton path can instead emit separate key/value grads.
+                    gathered_extra = [None for _ in split_extra]
+                gathered_split_key_pe = _dsa_cp_sorted_zigzag_gather(split_key_pe, cp_group)
+                if key_order is not None:
+                    gathered_split_key_pe = gathered_split_key_pe.index_select(0, key_order)
+                dsa_split_qk = (
+                    split_query_pe,
+                    gathered_split_key_pe,
+                    *gathered_extra,
+                )
+        indexcache_quantization = (
+            self.indexer.indexcache_config.quantization
+            if self.indexer.indexcache_config is not None
+            else "disabled"
+        )
+        dsa_runtime_context = (
+            f"cp_size={cp_size} defer_indexcache_for_cp={int(defer_indexcache_for_cp)} "
+            f"sequence_parallel={int(self.config.sequence_parallel)} "
+            f"chunk_indexer_q={int(chunk_indexer_q)} "
+            f"sp_project_before_gather={int(sp_project_before_gather)} "
+            f"streambp={int(streambp_positions is not None)} "
+            f"indexcache_quant={indexcache_quantization} "
+            f"hisa_enabled={int(self.indexer.indexcache_hisa_config is not None)}"
+            f" cp_sorted_zigzag_gather={int(cp_sorted_gather) if cp_size > 1 else 0}"
+        )
         output, indexer_loss = chunked_dsa_forward(
             q,
             k,
@@ -4371,12 +5634,17 @@ class DSAttention(MegatronModule):
             key_positions=key_positions,
             indexcache_hisa_config=self.indexer.indexcache_hisa_config,
             dsa_split_qk=dsa_split_qk,
+            hisa_log_label=f"DSAttention:{self.layer_number}",
+            dsa_runtime_context=dsa_runtime_context,
         )
         if indexer_loss is not None:
             DSAIndexerLossLoggingHelper.save_loss_to_tracker(
                 loss=indexer_loss, layer_number=self.layer_number, num_layers=self.config.num_layers
             )
-            DSAIndexerAuxLossState.add(indexer_loss)
+            if _dsa_indexer_aux_loss_autoscale_enabled():
+                output = DSAIndexerLossAutoScaler.apply(output, indexer_loss)
+            else:
+                DSAIndexerAuxLossState.add(indexer_loss)
         if numeric_debug is not None and log_dsa_debug:
             numeric_debug.log_tensor(
                 f"dsa.layer{self.layer_number}.output", output, force=force_debug

@@ -33,6 +33,13 @@ from megatron.core.transformer.streambp import (
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.lower() in ("1", "true", "yes", "on")
+
+
 class Router(ABC, MegatronModule):
     """Base Router class"""
 
@@ -76,6 +83,10 @@ class Router(ABC, MegatronModule):
         # So we need to know if the model is configured to calculate per token loss.
         self.calculate_per_token_loss = self.config.calculate_per_token_loss
         self.reset_parameters()
+        if _env_flag("MEGATRON_FREEZE_ROUTER", False):
+            self.weight.requires_grad_(False)
+            if self.bias is not None:
+                self.bias.requires_grad_(False)
 
     def reset_parameters(self):
         """Reset the router parameters."""
@@ -726,6 +737,10 @@ class TopKRouter(Router):
             self.enable_expert_bias
             and self.config.moe_router_expert_bias_update_method == "sign"
             and torch.is_grad_enabled()
+            and not _env_flag(
+                "MEGATRON_FREEZE_ROUTER_EXPERT_BIAS",
+                _env_flag("MEGATRON_FREEZE_ROUTER", False),
+            )
         ):
             with torch.no_grad():
                 if padding_mask is not None:

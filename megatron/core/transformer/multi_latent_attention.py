@@ -269,6 +269,100 @@ class MultiLatentAttention(Attention):
             # the quantized tensor.
             set_save_original_input(self.linear_proj)
 
+    def _checkpointed_attention_forward(
+        self,
+        query,
+        key,
+        value,
+        attention_mask,
+        rotary_pos_emb=None,
+        attn_mask_type=None,
+        attention_bias=None,
+        packed_seq_params=None,
+        dsa_x=None,
+        dsa_qr=None,
+        dsa_split_qk=None,
+        streambp_positions=None,
+    ):
+        """Forward method with selective activation checkpointing."""
+
+        split_query_pe = None
+        split_key_pe = None
+        split_kv = None
+        if dsa_split_qk is not None:
+            split_query_pe, split_key_pe, *split_extra = dsa_split_qk
+            split_kv = split_extra[0] if split_extra else None
+
+        streambp_query_positions = None
+        streambp_key_positions = None
+        if streambp_positions is not None:
+            streambp_query_positions, streambp_key_positions = streambp_positions
+
+        def custom_forward(*inputs):
+            query = inputs[0]
+            key = inputs[1]
+            value = inputs[2]
+            attention_mask = inputs[3]
+            attn_mask_type = inputs[5]
+            dsa_x = inputs[6]
+            dsa_qr = inputs[7]
+            split_query_pe = inputs[8]
+            split_key_pe = inputs[9]
+            split_kv = inputs[10]
+            streambp_query_positions = inputs[11]
+            streambp_key_positions = inputs[12]
+
+            attn_mask_type = AttnMaskType(attn_mask_type.item())
+            extra_kwargs = {}
+            if self.config.experimental_attention_variant == "dsa":
+                extra_kwargs["x"] = dsa_x
+                extra_kwargs["qr"] = dsa_qr
+                if split_query_pe is not None and split_key_pe is not None:
+                    dsa_split_qk = (split_query_pe, split_key_pe)
+                    if split_kv is not None:
+                        dsa_split_qk = (*dsa_split_qk, split_kv)
+                    extra_kwargs["dsa_split_qk"] = dsa_split_qk
+                if streambp_query_positions is not None and streambp_key_positions is not None:
+                    extra_kwargs["streambp_positions"] = (
+                        streambp_query_positions,
+                        streambp_key_positions,
+                    )
+
+            output_ = apply_module(self.core_attention)(
+                query,
+                key,
+                value,
+                attention_mask,
+                attn_mask_type=attn_mask_type,
+                attention_bias=attention_bias,
+                packed_seq_params=packed_seq_params,
+                **extra_kwargs,
+            )
+            return output_
+
+        if attn_mask_type is None:
+            attn_mask_type = self.attn_mask_type
+        attn_mask_type = torch.tensor([attn_mask_type.value], dtype=torch.int)
+        hidden_states = tensor_parallel.checkpoint(
+            custom_forward,
+            False,
+            query,
+            key,
+            value,
+            attention_mask,
+            rotary_pos_emb,
+            attn_mask_type,
+            dsa_x,
+            dsa_qr,
+            split_query_pe,
+            split_key_pe,
+            split_kv,
+            streambp_query_positions,
+            streambp_key_positions,
+        )
+
+        return hidden_states
+
     def forward(
         self,
         hidden_states,
@@ -598,29 +692,33 @@ class MultiLatentAttention(Attention):
         # core attention computation
         # ==================================
         # Need corresponding TE change
+        extra_kwargs = {}
+        if self.config.experimental_attention_variant == "dsa":
+            # DSA needs the original hidden states and compressed query representation.
+            extra_kwargs["x"] = hidden_states_for_dsa
+            extra_kwargs["qr"] = q_compressed_for_dsa
+            if self._dsa_split_qk_parts is not None:
+                extra_kwargs["dsa_split_qk"] = self._dsa_split_qk_parts
+            if chunk_range is not None:
+                extra_kwargs["streambp_positions"] = (
+                    streambp_query_positions,
+                    streambp_key_positions,
+                )
         if self.checkpoint_core_attention and self.training:
             core_attn_out = self._checkpointed_attention_forward(
                 query,
                 key,
                 value,
                 attention_mask,
+                attn_mask_type=attn_mask_type,
                 packed_seq_params=streambp_core_packed_seq_params,
+                dsa_x=extra_kwargs.get("x"),
+                dsa_qr=extra_kwargs.get("qr"),
+                dsa_split_qk=extra_kwargs.get("dsa_split_qk"),
+                streambp_positions=extra_kwargs.get("streambp_positions"),
             )
         else:
             if inference_context is None or inference_context.is_static_batching():
-                extra_kwargs = {}
-                if self.config.experimental_attention_variant == "dsa":
-                    # For dsa we need to pass in the original hidden states and the compressed
-                    # query representation.
-                    extra_kwargs["x"] = hidden_states_for_dsa
-                    extra_kwargs["qr"] = q_compressed_for_dsa
-                    if self._dsa_split_qk_parts is not None:
-                        extra_kwargs["dsa_split_qk"] = self._dsa_split_qk_parts
-                    if chunk_range is not None:
-                        extra_kwargs["streambp_positions"] = (
-                            streambp_query_positions,
-                            streambp_key_positions,
-                        )
                 with off_interface(
                     self.offload_core_attention and self.training, query, "core_attn"
                 ) as query:
@@ -1574,8 +1672,21 @@ class MLASelfAttention(MultiLatentAttention):
                     key = torch.cat([k_no_pe, k_pos_emb], dim=-1)
                     tensor_audit("mla/key_cat_output", key=key)
 
-            query = query.contiguous()
-            key = key.contiguous()
+            # Split-QK DSA kernels consume strided noPE views directly as long as
+            # the innermost dimension is contiguous. Avoid materializing full
+            # query/key noPE copies on the DSA path; those copies are especially
+            # expensive at 32k context and during replay/profile passes.
+            if (
+                self.config.experimental_attention_variant != "dsa"
+                or self._dsa_split_qk_parts is None
+            ):
+                query = query.contiguous()
+                key = key.contiguous()
+            else:
+                if query.stride(-1) != 1:
+                    query = query.contiguous()
+                if key.stride(-1) != 1:
+                    key = key.contiguous()
             if self.config.experimental_attention_variant != "dsa":
                 value = value.contiguous()
 

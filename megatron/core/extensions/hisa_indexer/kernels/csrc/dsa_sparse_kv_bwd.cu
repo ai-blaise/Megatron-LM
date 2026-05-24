@@ -52,6 +52,14 @@ __device__ __forceinline__ float load_typed(const void* ptr, int64_t idx, int dt
   return __half2float(reinterpret_cast<const __half*>(ptr)[idx]);
 }
 
+__device__ __forceinline__ bool finite_float(float v) {
+  return isfinite(v);
+}
+
+__device__ __forceinline__ bool valid_lse(float v) {
+  return finite_float(v) && v > -3.0e38f;
+}
+
 __device__ __forceinline__ int32_t load_topk(const void* ptr, int64_t idx, int dtype) {
   if (dtype == kTopkI16) {
     return static_cast<int32_t>(reinterpret_cast<const int16_t*>(ptr)[idx]);
@@ -82,6 +90,256 @@ __device__ __forceinline__ void store_typed(void* ptr, int64_t idx, float v, int
     reinterpret_cast<__nv_bfloat16*>(ptr)[idx] = __float2bfloat16(v);
   } else {
     reinterpret_cast<__half*>(ptr)[idx] = __float2half(v);
+  }
+}
+
+template <int WARPS>
+__global__ void dsa_split_qk_fwd_row_kernel(
+    const void* __restrict__ query_nope,      // [Q, B, H, D]
+    const void* __restrict__ query_pe,        // [Q, B, H, P]
+    const void* __restrict__ key_nope,        // [S, B, H, D]
+    const void* __restrict__ key_pe,          // [S, B, KPH, P]
+    const void* __restrict__ value,           // [S, B, H, V]
+    const void* __restrict__ topk,            // [B, Q, K]
+    const int64_t* __restrict__ query_pos,    // [Q], optional when has_positions=1
+    const int64_t* __restrict__ key_pos,      // [S], optional when has_positions=1
+    void* __restrict__ output,                // [Q, B, H, V]
+    float* __restrict__ lse,                  // [B * Q, H]
+    float* __restrict__ teacher_probs,        // [B * Q, K], optional
+    float* __restrict__ teacher_score_scratch,// [B * Q, H, K], optional
+    int Q,
+    int B,
+    int S,
+    int H,
+    int D,
+    int P,
+    int KPH,
+    int V,
+    int K,
+    int q_start,
+    int64_t query_nope_stride_s,
+    int64_t query_nope_stride_b,
+    int64_t query_nope_stride_h,
+    int64_t query_nope_stride_d,
+    int64_t key_nope_stride_s,
+    int64_t key_nope_stride_b,
+    int64_t key_nope_stride_h,
+    int64_t key_nope_stride_d,
+    int64_t value_stride_s,
+    int64_t value_stride_b,
+    int64_t value_stride_h,
+    int64_t value_stride_v,
+    float softmax_scale,
+    int scalar_dtype,
+    int topk_dtype,
+    int has_positions,
+    int emit_teacher,
+    int use_teacher_score_scratch) {
+  static_assert(WARPS > 0 && WARPS <= 16, "split-QK row forward supports 1..16 warps");
+  const int row = blockIdx.x;
+  const int batch = blockIdx.y;
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  if (row >= Q || batch >= B || warp >= WARPS) {
+    return;
+  }
+
+  extern __shared__ float smem[];
+  float* q_nope_s = smem;
+  float* q_pe_s = q_nope_s + static_cast<int64_t>(H) * D;
+  float* teacher_s = q_pe_s + static_cast<int64_t>(H) * P;
+
+  for (int idx = tid; idx < H * D; idx += WARPS * 32) {
+    const int head = idx / D;
+    const int d = idx - head * D;
+    const int64_t q_base =
+        static_cast<int64_t>(row) * query_nope_stride_s +
+        static_cast<int64_t>(batch) * query_nope_stride_b +
+        static_cast<int64_t>(head) * query_nope_stride_h;
+    q_nope_s[idx] = load_typed(query_nope, q_base + d * query_nope_stride_d, scalar_dtype);
+  }
+  for (int idx = tid; idx < H * P; idx += WARPS * 32) {
+    const int head = idx / P;
+    const int d = idx - head * P;
+    const int64_t q_base = ((static_cast<int64_t>(row) * B + batch) * H + head) * P;
+    q_pe_s[idx] = load_typed(query_pe, q_base + d, scalar_dtype);
+  }
+  if (emit_teacher) {
+    for (int slot = tid; slot < K; slot += WARPS * 32) {
+      teacher_s[slot] = 0.0f;
+    }
+  }
+  __syncthreads();
+
+  const int64_t q_abs = has_positions ? query_pos[row] : static_cast<int64_t>(q_start + row);
+  const int64_t row_batch = static_cast<int64_t>(batch) * Q + row;
+
+  for (int head = warp; head < H; head += WARPS) {
+    const int pe_head = min(head, KPH - 1);
+    float m_i = -FLT_MAX;
+    float l_i = 0.0f;
+
+    for (int slot = 0; slot < K; ++slot) {
+      int32_t selected = -1;
+      if (lane == 0) {
+        selected = load_topk(topk, row_batch * K + slot, topk_dtype);
+      }
+      selected = __shfl_sync(0xffffffff, selected, 0);
+      const int safe_selected = selected > 0 ? selected : 0;
+      bool valid = selected >= 0 && selected < S;
+      if (valid) {
+        const int64_t selected_abs = has_positions ? key_pos[safe_selected] : selected;
+        valid = selected_abs <= q_abs;
+      }
+
+      const int64_t k_nope_base =
+          static_cast<int64_t>(safe_selected) * key_nope_stride_s +
+          static_cast<int64_t>(batch) * key_nope_stride_b +
+          static_cast<int64_t>(head) * key_nope_stride_h;
+      const int64_t k_pe_base =
+          ((static_cast<int64_t>(safe_selected) * B + batch) * KPH + pe_head) * P;
+
+      float score_nope = 0.0f;
+      float score_pe = 0.0f;
+      if (valid) {
+        for (int d = lane; d < D; d += 32) {
+          score_nope += q_nope_s[head * D + d] *
+                        load_typed(key_nope, k_nope_base + d * key_nope_stride_d, scalar_dtype);
+        }
+        for (int d = lane; d < P; d += 32) {
+          score_pe += q_pe_s[head * P + d] * load_typed(key_pe, k_pe_base + d, scalar_dtype);
+        }
+      }
+      score_nope = warp_sum(score_nope);
+      score_pe = warp_sum(score_pe);
+      float score = (score_nope + score_pe) * softmax_scale;
+      if (lane == 0) {
+        score = valid && finite_float(score) ? score : -FLT_MAX;
+        if (use_teacher_score_scratch) {
+          teacher_score_scratch[(row_batch * H + head) * K + slot] = score;
+        }
+      }
+      score = __shfl_sync(0xffffffff, score, 0);
+      valid = valid && finite_float(score);
+      if (valid) {
+        const float m_new = fmaxf(m_i, score);
+        l_i = l_i * expf(m_i - m_new) + expf(score - m_new);
+        m_i = m_new;
+      }
+    }
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+    float acc3 = 0.0f;
+
+    for (int slot = 0; slot < K; ++slot) {
+      int32_t selected = -1;
+      if (lane == 0) {
+        selected = load_topk(topk, row_batch * K + slot, topk_dtype);
+      }
+      selected = __shfl_sync(0xffffffff, selected, 0);
+      const int safe_selected = selected > 0 ? selected : 0;
+      bool valid = selected >= 0 && selected < S;
+      if (valid) {
+        const int64_t selected_abs = has_positions ? key_pos[safe_selected] : selected;
+        valid = selected_abs <= q_abs;
+      }
+
+      float score = -FLT_MAX;
+      if (use_teacher_score_scratch) {
+        if (lane == 0) {
+          score = teacher_score_scratch[(row_batch * H + head) * K + slot];
+        }
+        score = __shfl_sync(0xffffffff, score, 0);
+        valid = valid && score > -3.0e38f && finite_float(score);
+      } else {
+        const int pe_head_local = min(head, KPH - 1);
+        const int64_t k_nope_base =
+            static_cast<int64_t>(safe_selected) * key_nope_stride_s +
+            static_cast<int64_t>(batch) * key_nope_stride_b +
+            static_cast<int64_t>(head) * key_nope_stride_h;
+        const int64_t k_pe_base =
+            ((static_cast<int64_t>(safe_selected) * B + batch) * KPH + pe_head_local) * P;
+        float score_nope = 0.0f;
+        float score_pe = 0.0f;
+        if (valid) {
+          for (int d = lane; d < D; d += 32) {
+            score_nope += q_nope_s[head * D + d] *
+                          load_typed(key_nope, k_nope_base + d * key_nope_stride_d, scalar_dtype);
+          }
+          for (int d = lane; d < P; d += 32) {
+            score_pe += q_pe_s[head * P + d] * load_typed(key_pe, k_pe_base + d, scalar_dtype);
+          }
+        }
+        score = (warp_sum(score_nope) + warp_sum(score_pe)) * softmax_scale;
+        if (lane == 0) {
+          score = valid && finite_float(score) ? score : -FLT_MAX;
+        }
+        score = __shfl_sync(0xffffffff, score, 0);
+      }
+      valid = valid && finite_float(score) && finite_float(m_i) && finite_float(l_i);
+      float prob = (valid && l_i > 0.0f) ? expf(score - m_i) / l_i : 0.0f;
+      if (!finite_float(prob)) {
+        prob = 0.0f;
+        valid = false;
+      }
+      if (emit_teacher && lane == 0 && prob != 0.0f) {
+        atomicAdd(teacher_s + slot, prob);
+      }
+
+      if (valid && prob != 0.0f) {
+        const int64_t v_base =
+            static_cast<int64_t>(safe_selected) * value_stride_s +
+            static_cast<int64_t>(batch) * value_stride_b +
+            static_cast<int64_t>(head) * value_stride_h;
+        const int d0 = lane;
+        const int d1 = lane + 32;
+        const int d2 = lane + 64;
+        const int d3 = lane + 96;
+        if (d0 < V) {
+          acc0 += prob * load_typed(value, v_base + d0 * value_stride_v, scalar_dtype);
+        }
+        if (d1 < V) {
+          acc1 += prob * load_typed(value, v_base + d1 * value_stride_v, scalar_dtype);
+        }
+        if (d2 < V) {
+          acc2 += prob * load_typed(value, v_base + d2 * value_stride_v, scalar_dtype);
+        }
+        if (d3 < V) {
+          acc3 += prob * load_typed(value, v_base + d3 * value_stride_v, scalar_dtype);
+        }
+      }
+    }
+
+    const int64_t out_base = ((static_cast<int64_t>(row) * B + batch) * H + head) * V;
+    const int d0 = lane;
+    const int d1 = lane + 32;
+    const int d2 = lane + 64;
+    const int d3 = lane + 96;
+    if (d0 < V) {
+      store_typed(output, out_base + d0, acc0, scalar_dtype);
+    }
+    if (d1 < V) {
+      store_typed(output, out_base + d1, acc1, scalar_dtype);
+    }
+    if (d2 < V) {
+      store_typed(output, out_base + d2, acc2, scalar_dtype);
+    }
+    if (d3 < V) {
+      store_typed(output, out_base + d3, acc3, scalar_dtype);
+    }
+    if (lane == 0) {
+      lse[row_batch * H + head] = l_i > 0.0f ? m_i + logf(l_i) : -FLT_MAX;
+    }
+  }
+
+  __syncthreads();
+  if (emit_teacher) {
+    for (int slot = tid; slot < K; slot += WARPS * 32) {
+      teacher_probs[row_batch * K + slot] = teacher_s[slot];
+    }
   }
 }
 
@@ -168,8 +426,15 @@ __global__ void dsa_sparse_kv_bwd_kernel(
   float ds = 0.0f;
   if (valid) {
     const float row_lse = lse[(static_cast<int64_t>(batch) * Q + q) * H + head];
-    prob = expf(dot_qk * softmax_scale - row_lse);
-    ds = prob * (dot_vg - dot_og) * softmax_scale;
+    const float score = dot_qk * softmax_scale;
+    valid = finite_float(score) && valid_lse(row_lse) && finite_float(dot_vg) &&
+            finite_float(dot_og);
+    if (valid) {
+      prob = expf(score - row_lse);
+      valid = finite_float(prob);
+      ds = valid ? prob * (dot_vg - dot_og) * softmax_scale : 0.0f;
+      valid = valid && finite_float(ds);
+    }
   }
 
   if (lane == 0) {
@@ -279,7 +544,7 @@ __global__ void dsa_sparse_bwd_from_scores_kernel(
         topk_dtype);
     score = selected_score[(static_cast<int64_t>(batch) * Q + q) * H * K +
                            static_cast<int64_t>(head) * K + slot];
-    valid = selected >= 0 && selected < S && score > -3.0e38f;
+    valid = selected >= 0 && selected < S && score > -3.0e38f && finite_float(score);
   }
 
   float dot_vg = 0.0f;
@@ -300,8 +565,13 @@ __global__ void dsa_sparse_bwd_from_scores_kernel(
   float ds = 0.0f;
   if (valid) {
     const float row_lse = lse[(static_cast<int64_t>(batch) * Q + q) * H + head];
-    prob = expf(score - row_lse);
-    ds = prob * (dot_vg - dot_og) * softmax_scale;
+    valid = valid_lse(row_lse) && finite_float(dot_vg) && finite_float(dot_og);
+    if (valid) {
+      prob = expf(score - row_lse);
+      valid = finite_float(prob);
+      ds = valid ? prob * (dot_vg - dot_og) * softmax_scale : 0.0f;
+      valid = valid && finite_float(ds);
+    }
   }
 
   if (lane == 0) {
@@ -422,7 +692,7 @@ __global__ void dsa_sparse_bwd_from_scores_row_kernel(
   for (int d = tid; d < V; d += WARPS * 32) {
     go_s[d] = load_typed(grad_output, q_base * V + d, scalar_dtype);
   }
-  for (int idx = tid; idx < WARPS * D; idx += WARPS * 32) {
+  for (int idx = tid; idx < WARPS * kMaxDim; idx += WARPS * 32) {
     reinterpret_cast<float*>(grad_q_s)[idx] = 0.0f;
   }
   __syncthreads();
@@ -454,7 +724,8 @@ __global__ void dsa_sparse_bwd_from_scores_row_kernel(
     }
     selected = __shfl_sync(0xffffffff, selected, 0);
     score = __shfl_sync(0xffffffff, score, 0);
-    const bool valid = selected >= 0 && selected < S && score > -3.0e38f;
+    bool valid = selected >= 0 && selected < S && score > -3.0e38f &&
+                 finite_float(score) && valid_lse(row_lse) && finite_float(delta);
     const int safe_selected = selected > 0 ? selected : 0;
     const int64_t selected_base =
         ((static_cast<int64_t>(safe_selected) * B + batch) * H + head);
@@ -468,8 +739,11 @@ __global__ void dsa_sparse_bwd_from_scores_row_kernel(
     dot_vg = warp_sum(dot_vg);
     dot_vg = __shfl_sync(0xffffffff, dot_vg, 0);
 
+    valid = valid && finite_float(dot_vg);
     const float prob = valid ? expf(score - row_lse) : 0.0f;
-    const float ds = prob * (dot_vg - delta) * softmax_scale;
+    valid = valid && finite_float(prob);
+    const float ds = valid ? prob * (dot_vg - delta) * softmax_scale : 0.0f;
+    valid = valid && finite_float(ds);
 
     if (valid) {
       for (int d = lane; d < D; d += 32) {
@@ -594,10 +868,10 @@ __global__ void dsa_split_qk_bwd_row_kernel(
   for (int d = tid; d < V; d += WARPS * 32) {
     go_s[d] = load_typed(grad_output, q_base * V + d, scalar_dtype);
   }
-  for (int idx = tid; idx < WARPS * D; idx += WARPS * 32) {
+  for (int idx = tid; idx < WARPS * kMaxDim; idx += WARPS * 32) {
     reinterpret_cast<float*>(grad_q_nope_s)[idx] = 0.0f;
   }
-  for (int idx = tid; idx < WARPS * P; idx += WARPS * 32) {
+  for (int idx = tid; idx < WARPS * kMaxDim; idx += WARPS * 32) {
     reinterpret_cast<float*>(grad_q_pe_s)[idx] = 0.0f;
   }
   if (tid == 0) {
@@ -658,6 +932,7 @@ __global__ void dsa_split_qk_bwd_row_kernel(
     score_pe = warp_sum(score_pe);
     float score = (score_nope + score_pe) * softmax_scale;
     score = __shfl_sync(0xffffffff, score, 0);
+    valid = valid && finite_float(score) && valid_lse(row_lse) && finite_float(delta);
 
     float dot_vg = 0.0f;
     if (valid) {
@@ -672,8 +947,11 @@ __global__ void dsa_split_qk_bwd_row_kernel(
     dot_vg = warp_sum(dot_vg);
     dot_vg = __shfl_sync(0xffffffff, dot_vg, 0);
 
+    valid = valid && finite_float(dot_vg);
     const float prob = valid ? expf(score - row_lse) : 0.0f;
-    const float ds = prob * (dot_vg - delta) * softmax_scale;
+    valid = valid && finite_float(prob);
+    const float ds = valid ? prob * (dot_vg - delta) * softmax_scale : 0.0f;
+    valid = valid && finite_float(ds);
 
     if (valid && emit_query) {
       for (int d = lane; d < D; d += 32) {
@@ -826,7 +1104,8 @@ __global__ void dsa_sorted_edge_stats_kernel(
   }
   selected = __shfl_sync(0xffffffff, selected, 0);
   score = __shfl_sync(0xffffffff, score, 0);
-  const bool valid = selected >= 0 && selected < S && score > -3.0e38f;
+  bool valid = selected >= 0 && selected < S && score > -3.0e38f &&
+               finite_float(score);
   const int safe_selected = selected > 0 ? selected : 0;
   const int64_t q_base = ((static_cast<int64_t>(row) * B + batch) * H + head);
   const int64_t selected_base =
@@ -845,15 +1124,21 @@ __global__ void dsa_sorted_edge_stats_kernel(
   if (lane == 0) {
     if (valid) {
       const float row_lse = lse[(static_cast<int64_t>(batch) * Q + row) * H + head];
-      const float prob = expf(score - row_lse);
       const float row_delta =
           delta[(static_cast<int64_t>(batch) * Q + row) * H + head];
-      edge_keys[edge] =
-          (static_cast<uint64_t>(static_cast<uint32_t>(head_batch)) << 32) |
-          static_cast<uint32_t>(selected);
-      edge_prob[edge] = prob;
-      edge_ds[edge] = prob * (dot_vg - row_delta) * softmax_scale;
-    } else {
+      valid = valid_lse(row_lse) && finite_float(dot_vg) && finite_float(row_delta);
+      const float prob = valid ? expf(score - row_lse) : 0.0f;
+      const float ds = valid ? prob * (dot_vg - row_delta) * softmax_scale : 0.0f;
+      valid = valid && finite_float(prob) && finite_float(ds);
+      if (valid) {
+        edge_keys[edge] =
+            (static_cast<uint64_t>(static_cast<uint32_t>(head_batch)) << 32) |
+            static_cast<uint32_t>(selected);
+        edge_prob[edge] = prob;
+        edge_ds[edge] = ds;
+      }
+    }
+    if (!valid) {
       edge_keys[edge] = kInvalidEdgeKey;
       edge_prob[edge] = 0.0f;
       edge_ds[edge] = 0.0f;
@@ -1215,6 +1500,131 @@ void launch_dsa_sparse_bwd_from_scores_row(
       topk_dtype,
       grad_dtype,
       stream);
+}
+
+template <int WARPS>
+void launch_split_qk_fwd_row(
+    const void* query_nope, const void* query_pe, const void* key_nope,
+    const void* key_pe, const void* value, const void* topk_indices,
+    const int64_t* query_positions, const int64_t* key_positions,
+    void* output, float* lse, float* teacher_probs,
+    float* teacher_score_scratch, int q_len, int bsz, int sk,
+    int num_heads, int head_dim, int pos_dim, int key_pe_heads,
+    int value_dim, int topk_count, int q_start,
+    int64_t query_nope_stride_s, int64_t query_nope_stride_b,
+    int64_t query_nope_stride_h, int64_t query_nope_stride_d,
+    int64_t key_nope_stride_s, int64_t key_nope_stride_b,
+    int64_t key_nope_stride_h, int64_t key_nope_stride_d,
+    int64_t value_stride_s, int64_t value_stride_b, int64_t value_stride_h,
+    int64_t value_stride_v, float softmax_scale, int scalar_dtype,
+    int topk_dtype, int has_positions, int emit_teacher,
+    int use_teacher_score_scratch, cudaStream_t stream) {
+  const size_t smem_bytes =
+      static_cast<size_t>(num_heads) * static_cast<size_t>(head_dim + pos_dim) * sizeof(float) +
+      (emit_teacher ? static_cast<size_t>(topk_count) * sizeof(float) : 0);
+  if (smem_bytes > 48 * 1024) {
+    cudaFuncSetAttribute(
+        dsa_split_qk_fwd_row_kernel<WARPS>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        static_cast<int>(smem_bytes));
+  }
+  const dim3 block(WARPS * 32);
+  const dim3 grid(q_len, bsz);
+  dsa_split_qk_fwd_row_kernel<WARPS><<<grid, block, smem_bytes, stream>>>(
+      query_nope,
+      query_pe,
+      key_nope,
+      key_pe,
+      value,
+      topk_indices,
+      query_positions,
+      key_positions,
+      output,
+      lse,
+      teacher_probs,
+      teacher_score_scratch,
+      q_len,
+      bsz,
+      sk,
+      num_heads,
+      head_dim,
+      pos_dim,
+      key_pe_heads,
+      value_dim,
+      topk_count,
+      q_start,
+      query_nope_stride_s,
+      query_nope_stride_b,
+      query_nope_stride_h,
+      query_nope_stride_d,
+      key_nope_stride_s,
+      key_nope_stride_b,
+      key_nope_stride_h,
+      key_nope_stride_d,
+      value_stride_s,
+      value_stride_b,
+      value_stride_h,
+      value_stride_v,
+      softmax_scale,
+      scalar_dtype,
+      topk_dtype,
+      has_positions,
+      emit_teacher,
+      use_teacher_score_scratch);
+}
+
+void launch_dsa_split_qk_fwd_row(
+    const void* query_nope, const void* query_pe, const void* key_nope,
+    const void* key_pe, const void* value, const void* topk_indices,
+    const int64_t* query_positions, const int64_t* key_positions,
+    void* output, float* lse, float* teacher_probs,
+    float* teacher_score_scratch, int q_len, int bsz, int sk,
+    int num_heads, int head_dim, int pos_dim, int key_pe_heads,
+    int value_dim, int topk_count, int q_start,
+    int64_t query_nope_stride_s, int64_t query_nope_stride_b,
+    int64_t query_nope_stride_h, int64_t query_nope_stride_d,
+    int64_t key_nope_stride_s, int64_t key_nope_stride_b,
+    int64_t key_nope_stride_h, int64_t key_nope_stride_d,
+    int64_t value_stride_s, int64_t value_stride_b, int64_t value_stride_h,
+    int64_t value_stride_v, float softmax_scale, int scalar_dtype,
+    int topk_dtype, int has_positions, int emit_teacher,
+    int use_teacher_score_scratch, int warps, cudaStream_t stream) {
+  if (warps == 16) {
+    launch_split_qk_fwd_row<16>(
+        query_nope, query_pe, key_nope, key_pe, value, topk_indices,
+        query_positions, key_positions, output, lse, teacher_probs,
+        teacher_score_scratch, q_len, bsz, sk, num_heads, head_dim, pos_dim,
+        key_pe_heads, value_dim, topk_count, q_start, query_nope_stride_s,
+        query_nope_stride_b, query_nope_stride_h, query_nope_stride_d,
+        key_nope_stride_s, key_nope_stride_b, key_nope_stride_h,
+        key_nope_stride_d, value_stride_s, value_stride_b, value_stride_h,
+        value_stride_v, softmax_scale, scalar_dtype, topk_dtype, has_positions,
+        emit_teacher, use_teacher_score_scratch, stream);
+    return;
+  }
+  if (warps == 4) {
+    launch_split_qk_fwd_row<4>(
+        query_nope, query_pe, key_nope, key_pe, value, topk_indices,
+        query_positions, key_positions, output, lse, teacher_probs,
+        teacher_score_scratch, q_len, bsz, sk, num_heads, head_dim, pos_dim,
+        key_pe_heads, value_dim, topk_count, q_start, query_nope_stride_s,
+        query_nope_stride_b, query_nope_stride_h, query_nope_stride_d,
+        key_nope_stride_s, key_nope_stride_b, key_nope_stride_h,
+        key_nope_stride_d, value_stride_s, value_stride_b, value_stride_h,
+        value_stride_v, softmax_scale, scalar_dtype, topk_dtype, has_positions,
+        emit_teacher, use_teacher_score_scratch, stream);
+    return;
+  }
+  launch_split_qk_fwd_row<8>(
+      query_nope, query_pe, key_nope, key_pe, value, topk_indices,
+      query_positions, key_positions, output, lse, teacher_probs,
+      teacher_score_scratch, q_len, bsz, sk, num_heads, head_dim, pos_dim,
+      key_pe_heads, value_dim, topk_count, q_start, query_nope_stride_s,
+      query_nope_stride_b, query_nope_stride_h, query_nope_stride_d,
+      key_nope_stride_s, key_nope_stride_b, key_nope_stride_h,
+      key_nope_stride_d, value_stride_s, value_stride_b, value_stride_h,
+      value_stride_v, softmax_scale, scalar_dtype, topk_dtype, has_positions,
+      emit_teacher, use_teacher_score_scratch, stream);
 }
 
 template <int WARPS>
