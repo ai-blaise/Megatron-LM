@@ -24,6 +24,13 @@ _installed = False
 _snapshot_state: dict[str, Any] = {}
 
 
+def _env_enabled(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.lower() in {"1", "true", "yes", "on"}
+
+
 def _write_json(path: str, payload: dict[str, Any]) -> None:
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
@@ -101,11 +108,15 @@ def _pre_snapshot_handler(signum: int, frame: Any) -> None:
     del signum, frame
     try:
         _clear_state_files()
-        _torch_cuda_synchronize()
-        dist_state = _distributed_state()
+        if _env_enabled("MEGATRON_CRIU_SYNC_IN_SIGNAL"):
+            _torch_cuda_synchronize()
+        dist_state = None
+        if _env_enabled("MEGATRON_CRIU_DISTRIBUTED_IN_SIGNAL"):
+            dist_state = _distributed_state()
         if dist_state is not None:
             _snapshot_state["distributed"] = dist_state
-        _torch_cuda_synchronize()
+        if _env_enabled("MEGATRON_CRIU_SYNC_IN_SIGNAL"):
+            _torch_cuda_synchronize()
         _write_json(
             READY_FILE,
             {
@@ -126,7 +137,8 @@ def _post_restore_handler(signum: int, frame: Any) -> None:
         dist_state = _snapshot_state.pop("distributed", None)
         if dist_state is not None:
             _restore_distributed(dist_state)
-        _torch_cuda_synchronize()
+        if _env_enabled("MEGATRON_CRIU_SYNC_IN_SIGNAL"):
+            _torch_cuda_synchronize()
         _write_json(
             RESUME_FILE,
             {
