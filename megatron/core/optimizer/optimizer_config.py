@@ -294,6 +294,11 @@ class OptimizerConfig:
     by injecting quantization error back into the momentum buffer. Reserved for future Mode B
     integration where FlashAdamW operates on bf16 param shards directly."""
 
+    flash_adamw_fsdp_eco_inject: bool = False
+    """If true, inject NVFP4 cast-back error into FlashAdamW moments when Megatron-FSDP
+    preserves fp32 main weights and casts them back to NVFP4 model weights after the
+    optimizer step. This is an explicit experimental bridge for the FSDP fp32-main path."""
+
     flash_adamw_compress_state_dict: bool = False
     """If true, checkpoint FlashAdamW quantized optimizer states as their int8 values and
     fp16 scales instead of materializing bf16 state tensors. This reduces checkpoint peak memory,
@@ -514,6 +519,13 @@ class OptimizerConfig:
             assert (
                 self.flash_adamw_quantize or not self.flash_adamw_compress_state_dict
             ), '--flash-adamw-compress-state-dict requires quantized FlashAdamW states'
+            assert self.flash_adamw_eco or not self.flash_adamw_fsdp_eco_inject, (
+                '--flash-adamw-fsdp-eco-inject requires --flash-adamw-eco'
+            )
+        else:
+            assert not self.flash_adamw_fsdp_eco_inject, (
+                '--flash-adamw-fsdp-eco-inject requires --optimizer flash_adamw'
+            )
         assert self.zcc_durable_interval >= 1, '--zcc-durable-interval must be positive'
         assert self.zcc_workers_num >= 1, '--zcc-workers-num must be positive'
         assert self.zcc_retain_latest >= 0, '--zcc-retain-latest must be non-negative'

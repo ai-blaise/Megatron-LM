@@ -33,6 +33,13 @@ from ..utils import (
 )
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.lower() in ("1", "true", "yes", "on")
+
+
 def _get_main_grad_attr(param: torch.nn.Parameter):
     if hasattr(param, "main_grad"):
         return "main_grad"
@@ -40,14 +47,28 @@ def _get_main_grad_attr(param: torch.nn.Parameter):
 
 
 def _numeric_debug_log_grads(model: List[torch.nn.Module], stage: str) -> None:
-    if os.getenv("MEGATRON_NUMERIC_DEBUG_FINALIZE_GRAD", "").lower() not in (
+    summary_enabled = os.getenv("MEGATRON_NUMERIC_DEBUG_GRAD_SUMMARY", "").lower() in (
         "1",
         "true",
         "yes",
         "on",
-    ):
+    )
+    detailed_enabled = os.getenv("MEGATRON_NUMERIC_DEBUG_FINALIZE_GRAD", "").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    if not summary_enabled and not detailed_enabled:
         return
     from megatron.core import numeric_debug
+
+    if summary_enabled:
+        numeric_debug.set_context(phase=f"finalize_{stage}")
+        numeric_debug.log_grad_summary(model, phase=f"finalize_{stage}")
+
+    if not detailed_enabled:
+        return
 
     if not numeric_debug.rank_allowed_for("FINALIZE_GRAD") or not numeric_debug.active_for(
         "FINALIZE_GRAD"
@@ -352,6 +373,14 @@ def reset_model_temporary_tensors(config: TransformerConfig, model: List[torch.n
     for model_chunk in model:
         for module in get_attr_wrapped_model(model_chunk, 'modules')():
             if config.moe_router_enable_expert_bias and hasattr(module, 'expert_bias'):
+                if (
+                    hasattr(module, 'local_tokens_per_expert')
+                    and module.local_tokens_per_expert is not None
+                    and module.local_tokens_per_expert.dtype != torch.float32
+                ):
+                    module.local_tokens_per_expert.data = module.local_tokens_per_expert.data.to(
+                        torch.float32
+                    )
                 module.local_tokens_per_expert.zero_()
                 if hasattr(module, 'quantile_expert_bias_sum'):
                     module.quantile_expert_bias_sum.zero_()
@@ -368,6 +397,9 @@ def _update_router_expert_bias(model: List[torch.nn.Module], config: Transformer
     Update the expert bias of the router for a global batch.
     This requires all-reduce of local_tokens_per_expert across TPxCPxDP ranks
     """
+    if _env_flag("MEGATRON_FREEZE_ROUTER_EXPERT_BIAS", _env_flag("MEGATRON_FREEZE_ROUTER", False)):
+        return
+
     if config.moe_router_expert_bias_update_method == "quantile":
         quantile_bias_sum_list = []
         quantile_bias_steps_list = []
@@ -431,6 +463,10 @@ def _update_router_expert_bias(model: List[torch.nn.Module], config: Transformer
             # when using online knoweldge-distillation with Model-Optimizer. In this case, we want
             # to avoid updating teacher's expert_bias.
             if hasattr(module, 'expert_bias') and module.training:
+                if module.local_tokens_per_expert.dtype != torch.float32:
+                    module.local_tokens_per_expert.data = module.local_tokens_per_expert.data.to(
+                        torch.float32
+                    )
                 tokens_per_expert_list.append(module.local_tokens_per_expert)
                 expert_bias_list.append(module.expert_bias)
     # For hybrid models with both MoE and Dense layers, this list can be empty.

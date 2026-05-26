@@ -1,5 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+import os
+
 import torch
 
 from megatron.core.utils import is_torch_min_version
@@ -30,4 +32,12 @@ def disable_jit_fuser():
     jit_fuser = noop_decorator
 
 
-enable_jit_fuser()
+def _env_enabled(name: str, default: str = "0") -> bool:
+    value = os.getenv(name, default).strip().lower()
+    return value not in ("", "0", "false", "off", "no")
+
+
+if _env_enabled("MEGATRON_DISABLE_JIT_FUSER"):
+    disable_jit_fuser()
+else:
+    enable_jit_fuser()

@@ -5,6 +5,7 @@
 import contextlib
 import json
 import os
+import pickle
 import random
 import shutil
 import sys
@@ -67,9 +68,176 @@ except Exception:
 
 _CHECKPOINT_VERSION = None
 _LOADED_ITERATION = None
+_CHECKPOINT_NODE_LEADER_GROUP = None
+_CHECKPOINT_NODE_LEADER_RANKS = None
 
 logger = getLogger(__name__)
 _NON_PERSISTENT_CKPT_SUBDIR = 'non_persistent'
+
+
+def _get_checkpoint_node_leader_group():
+    """Return a process group containing one rank per node for checkpoint control files."""
+    global _CHECKPOINT_NODE_LEADER_GROUP, _CHECKPOINT_NODE_LEADER_RANKS
+
+    if not torch.distributed.is_initialized():
+        return None, (0,)
+
+    world_size = torch.distributed.get_world_size()
+    try:
+        local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
+    except ValueError:
+        local_world_size = 1
+
+    if local_world_size <= 0 or world_size % local_world_size != 0:
+        # If torchrun locality is not available, fall back to every rank. This is
+        # heavier but preserves correctness on local filesystems.
+        leader_ranks = tuple(range(world_size))
+    else:
+        leader_ranks = tuple(range(0, world_size, local_world_size))
+
+    if (
+        _CHECKPOINT_NODE_LEADER_GROUP is None
+        or _CHECKPOINT_NODE_LEADER_RANKS != leader_ranks
+    ):
+        if len(leader_ranks) == world_size:
+            group = torch.distributed.group.WORLD
+        else:
+            group = torch.distributed.new_group(ranks=list(leader_ranks))
+        _CHECKPOINT_NODE_LEADER_GROUP = group
+        _CHECKPOINT_NODE_LEADER_RANKS = leader_ranks
+
+    return _CHECKPOINT_NODE_LEADER_GROUP, _CHECKPOINT_NODE_LEADER_RANKS
+
+
+def _broadcast_fsdp_dtensor_checkpoint_file(path: str, *, required: bool = False) -> None:
+    """Replicate a coordinator-written checkpoint control file to every node."""
+    if not torch.distributed.is_initialized():
+        return
+
+    rank = torch.distributed.get_rank()
+    group, leader_ranks = _get_checkpoint_node_leader_group()
+    is_node_leader = rank in leader_ranks
+
+    if is_node_leader:
+        if rank == 0:
+            try:
+                if os.path.exists(path):
+                    with open(path, "rb") as f:
+                        payload = ("data", f.read())
+                elif required:
+                    payload = ("error", f"required fsdp_dtensor checkpoint file is missing: {path}")
+                else:
+                    payload = ("missing", None)
+            except Exception as exc:
+                payload = ("error", f"failed to read fsdp_dtensor checkpoint file {path}: {exc}")
+        else:
+            payload = None
+
+        object_list = [payload]
+        torch.distributed.broadcast_object_list(object_list, src=0, group=group)
+        status, data = object_list[0]
+        if status == "error":
+            raise RuntimeError(data)
+        if status == "data" and rank != 0:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp_path = f"{path}.tmp_rank{rank}"
+            with open(tmp_path, "wb") as f:
+                f.write(data)
+            os.replace(tmp_path, path)
+
+
+def _sync_fsdp_dtensor_checkpoint_control_files(
+    save_dir: str,
+    checkpoint_name: str,
+    iteration: int,
+) -> None:
+    """Make rank-0 DCP metadata usable from node-local checkpoint directories."""
+    if not torch.distributed.is_initialized():
+        return
+
+    control_files = [
+        (os.path.join(checkpoint_name, ".metadata"), True),
+        (os.path.join(checkpoint_name, "data_manifest.json"), False),
+        (get_checkpoint_tracker_filename(save_dir), True),
+        (os.path.join(save_dir, "latest_data_manifest.json"), False),
+    ]
+    for path, required in control_files:
+        _broadcast_fsdp_dtensor_checkpoint_file(path, required=required)
+
+    torch.distributed.barrier()
+
+
+def _validate_fsdp_dtensor_checkpoint_save(
+    checkpoint_name: str,
+    *,
+    expect_optimizer: bool,
+) -> None:
+    """Fail before tracker update if an fsdp_dtensor checkpoint is structurally incomplete."""
+    metadata_path = os.path.join(checkpoint_name, ".metadata")
+    if not os.path.exists(metadata_path):
+        raise RuntimeError(
+            f"fsdp_dtensor checkpoint at {checkpoint_name} did not write .metadata"
+        )
+
+    with open(metadata_path, "rb") as f:
+        metadata = pickle.load(f)
+    state_keys = set(getattr(metadata, "state_dict_metadata", {}).keys())
+
+    if expect_optimizer and not any(key.startswith("optimizer") for key in state_keys):
+        raise RuntimeError(
+            f"fsdp_dtensor checkpoint at {checkpoint_name} is missing optimizer state; "
+            "refusing to advance latest_checkpointed_iteration.txt"
+        )
+
+    split_w = [
+        key
+        for key in state_keys
+        if ".linear_fc1." in key and (key.endswith("_w") or ".weight_w." in key)
+    ]
+    unsplit_fc1 = [
+        key
+        for key in state_keys
+        if ".linear_fc1." in key
+        and (key.endswith(".weight") or ".weight." in key or key.endswith("linear_fc1.weight"))
+    ]
+
+    if not split_w and not unsplit_fc1:
+        raise RuntimeError(
+            f"fsdp_dtensor checkpoint at {checkpoint_name} has neither unsplit "
+            "linear_fc1.weight metadata nor split linear_fc1 W/V metadata; refusing "
+            "to advance latest_checkpointed_iteration.txt"
+        )
+
+    # If any synthetic SWiGLU split tensors are present, validate the split schema
+    # instead of silently accepting a half-written checkpoint. Normal fsdp_dtensor
+    # checkpoints should remain unsplit; the converted base checkpoint uses that
+    # schema, and DCP can round-trip it directly.
+    missing_v = []
+    for key in sorted(state_keys):
+        if ".linear_fc1." not in key:
+            continue
+        if key.endswith("_w"):
+            paired_key = f"{key[:-2]}_v"
+        elif ".weight_w." in key:
+            paired_key = key.replace(".weight_w.", ".weight_v.", 1)
+        else:
+            continue
+        if paired_key not in state_keys:
+            missing_v.append((key, paired_key))
+            if len(missing_v) >= 8:
+                break
+
+    if missing_v:
+        examples = "\n".join(f"  have {w}\n  need {v}" for w, v in missing_v)
+        raise RuntimeError(
+            f"fsdp_dtensor checkpoint at {checkpoint_name} is missing SwiGLU V-half "
+            f"metadata; refusing to advance latest checkpoint.\n{examples}"
+        )
+
+
+def _fsdp_dtensor_split_swiglu_enabled() -> bool:
+    value = os.environ.get("MEGATRON_FSDP_DTENSOR_SPLIT_SWIGLU", "0").strip().lower()
+    return value in {"1", "true", "yes", "on"}
 
 def set_checkpoint_version(value):
     global _CHECKPOINT_VERSION
@@ -822,6 +990,18 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                 state_dict=state_dict,
                 storage_writer=fs_storage_writer,
             )
+            if (
+                ckpt_format == "fsdp_dtensor"
+                and (not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0)
+            ):
+                _validate_fsdp_dtensor_checkpoint_save(
+                    checkpoint_name,
+                    expect_optimizer=(
+                        not args.no_save_optim
+                        and optimizer is not None
+                        and not optimizer.is_stub_optimizer
+                    ),
+                )
         else:
             # [ModelOpt]: Inject modelopt_state into state_dict
             if has_nvidia_modelopt:
@@ -941,6 +1121,13 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             async_save_request.add_finalize_fn(iter_finalize_fn)
         else:
             iter_finalize_fn()
+
+    if (
+        ckpt_type == CheckpointType.GLOBAL
+        and ckpt_format == "fsdp_dtensor"
+        and not args.async_save
+    ):
+        _sync_fsdp_dtensor_checkpoint_control_files(save_dir, checkpoint_name, iteration)
 
     # Additional callback for one_logger (last rank)
     if not torch.distributed.is_initialized() \
@@ -1131,7 +1318,7 @@ def generate_state_dict(
 def preprocess_fsdp_dtensor_state_dict(args, raw_state_dict, model):
     state_dict = raw_state_dict.copy()
     handle_fp8_extra_state_case(state_dict["model"])
-    if args.swiglu:
+    if args.swiglu and _fsdp_dtensor_split_swiglu_enabled():
         if "optimizer" in state_dict:
             model_state_dict, optimizer_state_dict = handle_swiglu_in_state_dict(
                 model, state_dict["model"], state_dict["optimizer"]
@@ -1296,17 +1483,26 @@ def _load_global_dist_base_checkpoint(
 
     checkpoint_name = get_checkpoint_name(load_dir, iteration, release, return_base_dir=True)
     load_strategy = get_default_load_sharded_strategy(checkpoint_name)
+    if hasattr(load_strategy, 'process_group'):
+        load_strategy.process_group = None
     # NOTE: `args.ckpt_fully_parallel_load` applies to both persistent and non-persistent checkpoints.
     if args.ckpt_fully_parallel_load:
         if args.ckpt_fully_parallel_load_process_group == 'dp':
             process_group = mpu.get_data_parallel_group(with_context_parallel=True)
+            metadata_group = mpu.get_data_parallel_group_gloo(with_context_parallel=True)
         elif args.ckpt_fully_parallel_load_process_group == 'ep_dp':
             process_group = mpu.get_expert_data_parallel_group()
+            metadata_group = mpu.get_expert_data_parallel_group_gloo()
         else:
             raise ValueError(f"Invalid load process group: {args.ckpt_fully_parallel_load_process_group}")
 
+        if hasattr(load_strategy, 'process_group'):
+            load_strategy.process_group = metadata_group
         load_strategy = FullyParallelLoadStrategyWrapper(
-            load_strategy, process_group, exchange_algo=args.ckpt_fully_parallel_load_exchange_algo
+            load_strategy,
+            process_group,
+            metadata_group=metadata_group,
+            exchange_algo=args.ckpt_fully_parallel_load_exchange_algo,
         )
     if checkpointing_context is not None:
         checkpointing_context["load_strategy"] = load_strategy

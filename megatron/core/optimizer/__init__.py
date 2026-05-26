@@ -1,6 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 import copy
 import logging
+import os
 import warnings
 from collections import defaultdict
 from dataclasses import astuple
@@ -76,10 +77,235 @@ from .optimizer_config import (
 logger = logging.getLogger(__name__)
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.lower() in ("1", "true", "yes", "on")
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    return float(value)
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    return int(value)
+
+
+def _all_optimizer_params_fp32(param_groups) -> bool:
+    """Return true when every optimizer parameter is already fp32."""
+
+    seen_param = False
+    for group in param_groups:
+        for param in group.get("params", ()):
+            seen_param = True
+            local_param = param.to_local() if hasattr(param, "to_local") else param
+            if getattr(local_param, "dtype", None) != torch.float32:
+                return False
+    return seen_param
+
+
 def _maybe_enable_zero_cost_checkpoint(optimizer, config):
     from .zero_cost_checkpoint import install_zero_cost_checkpoint
 
     return install_zero_cost_checkpoint(optimizer, config)
+
+
+def _normalize_optimizer_param_name(name: str) -> str:
+    while name.startswith("chunk") and "." in name:
+        head, tail = name.split(".", 1)
+        if head[5:].isdigit():
+            name = tail
+        else:
+            break
+    while name.startswith("module."):
+        name = name[len("module.") :]
+    return name
+
+
+def _is_new_component_lr_param(name: str) -> bool:
+    """Return true for train-from-scratch additions that should keep full LR."""
+
+    name = _normalize_optimizer_param_name(name)
+    return any(
+        marker in name
+        for marker in (
+            ".core_attention.indexer.",
+            ".linear_gate_proj.",
+            ".input_gated_norm_",
+            ".pre_mlp_gated_norm_",
+            "indexcache",
+            "hisa",
+        )
+    )
+
+
+def _is_pretrained_backbone_lr_param(name: str) -> bool:
+    """Return true for pretrained/calibrated weights that should warm up gently."""
+
+    name = _normalize_optimizer_param_name(name)
+    if _is_new_component_lr_param(name):
+        return False
+    return (
+        name.startswith("decoder.layers.")
+        or name.startswith("decoder.final_layernorm.")
+        or name.startswith("embedding.")
+        or name.startswith("output_layer.")
+        or ".output_layer." in name
+    )
+
+
+def _scaled_lr(value: Optional[float], multiplier: float) -> Optional[float]:
+    return None if value is None else float(value) * multiplier
+
+
+def _maybe_add_reap_lr_group_overrides(
+    config_overrides: Dict[ParamKey, ParamGroupOverride],
+    config: OptimizerConfig,
+) -> None:
+    if not _env_flag("MEGATRON_REAP_LR_GROUPS", default=False):
+        return
+
+    backbone_mult = _env_float("MEGATRON_REAP_BACKBONE_LR_MULT", 0.2)
+    new_component_mult = _env_float("MEGATRON_REAP_NEW_COMPONENT_LR_MULT", 1.0)
+    cap_ratio = _env_float("MEGATRON_REAP_BACKBONE_UPDATE_CAP_RATIO", 2.0e-3)
+    cap_steps = _env_int("MEGATRON_REAP_BACKBONE_UPDATE_CAP_STEPS", 500)
+    cap_floor = _env_float("MEGATRON_REAP_BACKBONE_UPDATE_CAP_PARAM_RMS_FLOOR", 0.0)
+
+    if backbone_mult <= 0.0:
+        raise ValueError("MEGATRON_REAP_BACKBONE_LR_MULT must be positive.")
+    if new_component_mult <= 0.0:
+        raise ValueError("MEGATRON_REAP_NEW_COMPONENT_LR_MULT must be positive.")
+    if cap_ratio < 0.0:
+        raise ValueError("MEGATRON_REAP_BACKBONE_UPDATE_CAP_RATIO must be non-negative.")
+    if cap_steps < 0:
+        raise ValueError("MEGATRON_REAP_BACKBONE_UPDATE_CAP_STEPS must be non-negative.")
+    if cap_floor < 0.0:
+        raise ValueError(
+            "MEGATRON_REAP_BACKBONE_UPDATE_CAP_PARAM_RMS_FLOOR must be non-negative."
+        )
+
+    backbone_override: ParamGroupOverride = {
+        "max_lr": _scaled_lr(config.lr, backbone_mult),
+        "lr_mult": backbone_mult,
+        "update_cap_ratio": cap_ratio,
+        "update_cap_steps": cap_steps,
+        "update_cap_param_rms_floor": cap_floor,
+    }
+    min_lr = _scaled_lr(config.min_lr, backbone_mult)
+    if min_lr is not None:
+        backbone_override["min_lr"] = min_lr
+    config_overrides[
+        ParamKey(
+            with_name_predicate=ParamWithNamePredicate(
+                name="reap_pretrained_backbone",
+                fn=lambda param, name: _is_pretrained_backbone_lr_param(name),
+            )
+        )
+    ] = backbone_override
+
+    if new_component_mult != 1.0:
+        new_component_override: ParamGroupOverride = {
+            "max_lr": _scaled_lr(config.lr, new_component_mult),
+            "lr_mult": new_component_mult,
+        }
+        min_lr = _scaled_lr(config.min_lr, new_component_mult)
+        if min_lr is not None:
+            new_component_override["min_lr"] = min_lr
+        config_overrides[
+            ParamKey(
+                with_name_predicate=ParamWithNamePredicate(
+                    name="reap_new_components",
+                    fn=lambda param, name: _is_new_component_lr_param(name),
+                )
+            )
+        ] = new_component_override
+
+
+def _reap_lr_group_name(name: str) -> str:
+    if not _env_flag("MEGATRON_REAP_LR_GROUPS", default=False):
+        return "default"
+    if _is_new_component_lr_param(name):
+        return "new_component_full_lr"
+    if _is_pretrained_backbone_lr_param(name):
+        return "pretrained_backbone_low_lr_capped"
+    return "default_full_lr"
+
+
+def _maybe_log_reap_lr_group_audit(model_chunks: List[MegatronModule]) -> None:
+    if not _env_flag("MEGATRON_REAP_LR_GROUP_AUDIT", default=False):
+        return
+
+    local: dict[str, dict[str, Any]] = {}
+    for model_chunk in model_chunks:
+        for name, param in model_chunk.named_parameters():
+            if not param.requires_grad:
+                continue
+            group_name = _reap_lr_group_name(name)
+            entry = local.setdefault(group_name, {"names": set(), "tensors": 0, "numel": 0})
+            entry["names"].add(_normalize_optimizer_param_name(name))
+            entry["tensors"] += 1
+            entry["numel"] += int(param.numel())
+
+    serializable = {
+        group: {
+            "names": sorted(entry["names"]),
+            "tensors": entry["tensors"],
+            "numel": entry["numel"],
+        }
+        for group, entry in local.items()
+    }
+    gathered = [serializable]
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        gathered = [None for _ in range(torch.distributed.get_world_size())]
+        torch.distributed.all_gather_object(gathered, serializable)
+
+    merged: dict[str, dict[str, Any]] = {}
+    for rank_entry in gathered:
+        if rank_entry is None:
+            continue
+        for group, entry in rank_entry.items():
+            merged_entry = merged.setdefault(
+                group, {"names": set(), "tensors": 0, "numel": 0}
+            )
+            merged_entry["names"].update(entry["names"])
+            merged_entry["tensors"] += int(entry["tensors"])
+            merged_entry["numel"] += int(entry["numel"])
+
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        if torch.distributed.get_rank() != 0:
+            return
+
+    sample_limit = _env_int("MEGATRON_REAP_LR_GROUP_AUDIT_SAMPLE", 24)
+    base_lr = _env_float("LR", float("nan")) if os.getenv("LR") else None
+    print(
+        "[optimizer_lr_audit] "
+        f"enabled={_env_flag('MEGATRON_REAP_LR_GROUPS')} "
+        f"base_lr_env={base_lr} "
+        f"backbone_mult={_env_float('MEGATRON_REAP_BACKBONE_LR_MULT', 0.2)} "
+        f"new_component_mult={_env_float('MEGATRON_REAP_NEW_COMPONENT_LR_MULT', 1.0)} "
+        f"backbone_update_cap_ratio={_env_float('MEGATRON_REAP_BACKBONE_UPDATE_CAP_RATIO', 2.0e-3)} "
+        f"backbone_update_cap_steps={_env_int('MEGATRON_REAP_BACKBONE_UPDATE_CAP_STEPS', 500)}",
+        flush=True,
+    )
+    for group in sorted(merged):
+        entry = merged[group]
+        names = sorted(entry["names"])
+        sample = ", ".join(names[:sample_limit])
+        if len(names) > sample_limit:
+            sample += f", ... (+{len(names) - sample_limit} more)"
+        print(
+            "[optimizer_lr_audit] "
+            f"group={group} unique_names={len(names)} local_tensor_entries={entry['tensors']} "
+            f"local_numel_entries={entry['numel']} sample=[{sample}]",
+            flush=True,
+        )
 
 
 def get_standard_config_overrides(config: OptimizerConfig) -> Dict[ParamKey, ParamGroupOverride]:
@@ -117,6 +343,8 @@ def get_standard_config_overrides(config: OptimizerConfig) -> Dict[ParamKey, Par
             decoupled_lr_config["min_lr"] = config.decoupled_min_lr
         config_overrides[decoupled_param_key] = decoupled_lr_config
 
+    _maybe_add_reap_lr_group_overrides(config_overrides, config)
+
     return config_overrides
 
 
@@ -148,6 +376,7 @@ def _get_param_groups(
 
     # Map (pg_overrides, is_expert_parallel) to params.
     params_map = {}
+    _maybe_log_reap_lr_group_audit(model_chunks)
 
     for model_chunk in model_chunks:
         for name, param in model_chunk.named_parameters():
@@ -444,7 +673,13 @@ def _get_megatron_optimizer_based_on_param_groups(
 
             # ECO eliminates master weights via error feedback through momentum.
             # Without ECO, ECC provides 24-bit effective precision from BF16+int8.
-            master_bits = None if config.flash_adamw_eco else 24
+            # In Megatron-FSDP's fp32-main path, the optimizer params are already
+            # fp32 master shards, so ECC master bits are ineffective and rejected
+            # by FlashAdamW. Keep FlashAdamW moments available without enabling
+            # ECO or ECC on those fp32 shards.
+            master_bits = (
+                None if config.flash_adamw_eco or _all_optimizer_params_fp32(param_groups) else 24
+            )
             optimizer = FlashAdamW(
                 params=param_groups,
                 lr=config.lr,
@@ -456,6 +691,11 @@ def _get_megatron_optimizer_based_on_param_groups(
                 master_weight_bits=master_bits,
                 fused=config.flash_adamw_fused,
                 eco=config.flash_adamw_eco,
+            )
+            setattr(
+                optimizer,
+                "_fsdp_eco_inject",
+                bool(getattr(config, "flash_adamw_fsdp_eco_inject", False)),
             )
 
             def init_state_fn(opt, config=None):

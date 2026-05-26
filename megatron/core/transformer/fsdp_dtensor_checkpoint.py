@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 try:
     from torch.distributed import DeviceMesh
     from torch.distributed._tensor import DTensor
+    from torch.distributed.checkpoint.metadata import ChunkStorageMetadata
     from torch.distributed.checkpoint.metadata import TensorStorageMetadata
     from torch.distributed.tensor.placement_types import Replicate, Shard
 
@@ -32,10 +33,12 @@ try:
     )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
         gather_uneven_dtensor_to_full_tensor,
+        set_dtensor_chunk_metadata,
     )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import (
         get_mcore_tensor_parallel_partition_dim,
         is_mcore_tensor_model_parallel,
+        is_mcore_tensor_parallel_duplicated,
     )
 
     HAVE_MEGATRON_FSDP = True
@@ -239,6 +242,12 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
         """
         Split the SWiGLU linear_fc1 parameter into two parts: weight_w and weight_v.
         """
+        if hasattr(data, "materialize"):
+            # FlashAdamW may store exp_avg/exp_avg_sq as a _MaybeQuantizedTensor.
+            # Normal fsdp_dtensor checkpoints are uncompressed, so split the
+            # materialized tensor just like the model/main-param state.
+            data = data.materialize()
+
         assert data.shape[swiglu_shard_axis] % 2 == 0, (
             f"SWiGLU weights must have an even size along the shard axis {swiglu_shard_axis}, "
             f"got {data.shape[swiglu_shard_axis]}"
@@ -250,51 +259,130 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
         tp_mesh = megatron_fsdp_dist_index.get_submesh(
             [megatron_fsdp_dist_index.tp_dim], is_expert_parallel=is_expert_param
         )
-        data_size = data.numel() // tp_mesh.mesh.numel()
+        # The FSDP slice is expressed in coordinates of the original per-TP
+        # parameter item inside the flattened FSDP buffer. When FlashAdamW
+        # materializes optimizer state, `data` can be only this rank's local
+        # FSDP shard, so `data.numel()` is not the global item length. Use the
+        # original parameter shape for the W/V split boundary.
+        item_param = getattr(dist_param, "orig_param", dist_param)
+        data_size = item_param.numel()
         w_slice = slice(0, data_size // 2)
         v_slice = slice(data_size // 2, data_size)
 
         view_shape = list(data.shape)
         view_shape[swiglu_shard_axis] = -1
-        local_tensor = data.to_local()
+        local_tensor = data.to_local() if hasattr(data, "to_local") else data
         weight_w = local_tensor.view(-1)[
             offset_slice(intersection(fsdp_slice, w_slice), -fsdp_slice.start)
         ]
         weight_v = local_tensor.view(-1)[
             offset_slice(intersection(fsdp_slice, v_slice), -fsdp_slice.start)
         ]
+        w_intersection = intersection(fsdp_slice, w_slice)
+        v_intersection = intersection(fsdp_slice, v_slice)
         weight_w = weight_w.reshape(view_shape)
         weight_v = weight_v.reshape(view_shape)
 
-        # Fake parameters w and v are used to provide the correct parameter
-        # shape and Tensor-Parallelism information.
-        per_tp_rank_shape = list(data.shape)
-        if is_mcore_tensor_model_parallel(dist_param):
-            tp_dim = get_mcore_tensor_parallel_partition_dim(dist_param)
+        # Fake parameters w and v provide the checkpoint-global shape and
+        # Tensor-Parallelism metadata. Optimizer state tensors can be only this
+        # rank's current FSDP shard, so their local shape is not a valid
+        # template for the global W/V tensor.
+        per_tp_rank_shape = list(item_param.shape)
+        tp_dim = None
+        tp_rank_offset = 0
+        if is_mcore_tensor_model_parallel(item_param):
+            tp_dim = get_mcore_tensor_parallel_partition_dim(item_param)
             assert tp_dim is not None, "Tensor model parallel dimension not found"
-            per_tp_rank_shape[tp_dim] //= tp_mesh.mesh.numel()
         linear_fc1_meta = torch.empty(*per_tp_rank_shape, device="meta")
         w_meta, v_meta = torch.chunk(linear_fc1_meta, 2, dim=swiglu_shard_axis)
+        if tp_dim is not None and not is_mcore_tensor_parallel_duplicated(item_param):
+            tp_rank = dist.get_rank(tp_mesh.get_group())
+            tp_rank_offset = tp_rank * int(w_meta.shape[tp_dim])
         copy_tensor_model_parallel_attributes(w_meta, dist_param)
         copy_tensor_model_parallel_attributes(v_meta, dist_param)
 
+        # SWiGLU W/V splitting can leave legitimate empty local shards on early
+        # FSDP ranks. Install deterministic metadata here: optimizer-state key
+        # ordering can differ across ranks, and a fallback full-mesh object
+        # collective can hang before checkpoint save reaches the write phase.
         weight_w = make_fsdp_dtensor(
             weight_w.data,
             w_meta,
             dist_index=megatron_fsdp_dist_index,
             is_expert_param=is_expert_param,
-            run_check=True,
-            update_uneven_dtensor_chunk_meta=True,
+            run_check=False,
+            update_uneven_dtensor_chunk_meta=False,
         )
         weight_v = make_fsdp_dtensor(
             weight_v.data,
             v_meta,
             dist_index=megatron_fsdp_dist_index,
             is_expert_param=is_expert_param,
-            run_check=True,
-            update_uneven_dtensor_chunk_meta=True,
+            run_check=False,
+            update_uneven_dtensor_chunk_meta=False,
+        )
+        install_swiglu_split_metadata(
+            weight_w,
+            w_intersection,
+            split_start=w_slice.start,
+            split_dim=swiglu_shard_axis,
+            tp_dim=tp_dim,
+            tp_rank_offset=tp_rank_offset,
+            split_name="weight_w",
+        )
+        install_swiglu_split_metadata(
+            weight_v,
+            v_intersection,
+            split_start=v_slice.start,
+            split_dim=swiglu_shard_axis,
+            tp_dim=tp_dim,
+            tp_rank_offset=tp_rank_offset,
+            split_name="weight_v",
         )
         return weight_w, weight_v
+
+    def install_swiglu_split_metadata(
+        dtensor, local_intersection, split_start, split_dim, tp_dim, tp_rank_offset, split_name
+    ):
+        """Install deterministic chunk metadata for a save-time SWiGLU half.
+
+        The local slice is derived from the original FSDP flattened parameter
+        slice, so offsets can be computed without synchronizing every W/V
+        optimizer-state tensor across the full flattened mesh.
+        """
+
+        local_shape = tuple(dtensor.to_local().shape)
+        offsets = [0] * len(dtensor.shape)
+        if local_intersection.start < local_intersection.stop:
+            trailing = 1
+            for dim_size in dtensor.shape[split_dim + 1 :]:
+                trailing *= int(dim_size)
+            flat_offset = int(local_intersection.start - split_start)
+            local_numel = int(local_intersection.stop - local_intersection.start)
+            if flat_offset % trailing != 0 or local_numel % trailing != 0:
+                raise ValueError(
+                    f"Unaligned SWiGLU {split_name} split metadata: "
+                    f"flat_offset={flat_offset}, local_numel={local_numel}, "
+                    f"trailing={trailing}, shape={tuple(dtensor.shape)}"
+                )
+            offsets[split_dim] = flat_offset // trailing
+            if tp_dim == split_dim:
+                offsets[split_dim] += tp_rank_offset
+            elif tp_dim is not None:
+                offsets[tp_dim] += tp_rank_offset
+            for dim, (offset, size, global_size) in enumerate(
+                zip(offsets, local_shape, dtensor.shape)
+            ):
+                if offset < 0 or offset + size > int(global_size):
+                    raise ValueError(
+                        f"Out-of-bounds SWiGLU {split_name} split metadata on dim {dim}: "
+                        f"offset={offset}, size={size}, global_size={int(global_size)}, "
+                        f"local_shape={local_shape}, dtensor_shape={tuple(dtensor.shape)}, "
+                        f"tp_dim={tp_dim}, tp_rank_offset={tp_rank_offset}"
+                    )
+        set_dtensor_chunk_metadata(
+            dtensor, ChunkStorageMetadata(offsets=tuple(offsets), sizes=local_shape)
+        )
 
     model_state_dict = model_state_dict.copy()
     for key in list(model_state_dict.keys()):

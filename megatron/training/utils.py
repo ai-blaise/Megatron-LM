@@ -58,21 +58,28 @@ def _prepare_thd_packed_batch_for_tp_broadcast(batch):
     if cu_seqlens is None:
         return batch
 
-    if cu_seqlens.dim() == 2:
-        combined = []
-        offset = cu_seqlens.new_zeros(())
-        for row in cu_seqlens:
-            row = row.contiguous()
-            if len(combined) == 0:
-                combined.append(row)
-            else:
-                combined.append(row[1:] + offset)
-            offset = offset + row[-1]
-        batch['cu_seqlens'] = torch.cat(combined).contiguous()
-    elif cu_seqlens.dim() == 1:
-        batch['cu_seqlens'] = cu_seqlens.contiguous()
-    else:
-        raise ValueError(f"cu_seqlens must be 1D or 2D, got shape {tuple(cu_seqlens.shape)}")
+    def _combine_cu(name):
+        value = batch.get(name)
+        if value is None:
+            return
+        if value.dim() == 2:
+            combined = []
+            offset = value.new_zeros(())
+            for row in value:
+                row = row.contiguous()
+                if len(combined) == 0:
+                    combined.append(row)
+                else:
+                    combined.append(row[1:] + offset)
+                offset = offset + row[-1]
+            batch[name] = torch.cat(combined).contiguous()
+        elif value.dim() == 1:
+            batch[name] = value.contiguous()
+        else:
+            raise ValueError(f"{name} must be 1D or 2D, got shape {tuple(value.shape)}")
+
+    _combine_cu('cu_seqlens')
+    _combine_cu('cu_seqlens_padded')
 
     max_seqlen = batch.get('max_seqlen')
     if max_seqlen is not None:
@@ -648,6 +655,11 @@ def get_batch_on_this_tp_rank(
                 if "cu_seqlens" not in data
                 else data["cu_seqlens"].cuda(non_blocking=True)
             ),
+            'cu_seqlens_padded': (
+                None
+                if "cu_seqlens_padded" not in data
+                else data["cu_seqlens_padded"].cuda(non_blocking=True)
+            ),
             'max_seqlen': (
                 None
                 if "max_seqlen" not in data
@@ -686,6 +698,7 @@ def get_batch_on_this_tp_rank(
             _broadcast(batch['position_ids'])
             _broadcast(batch['padding_mask'])
             _broadcast_cu_seqlens(batch['cu_seqlens'])
+            _broadcast_cu_seqlens(batch['cu_seqlens_padded'])
             _broadcast(batch['max_seqlen'])
             _broadcast(batch['local_cp_size'])
 
@@ -700,6 +713,7 @@ def get_batch_on_this_tp_rank(
                 _broadcast(batch['position_ids'])
                 _broadcast(batch['padding_mask'])
                 _broadcast_cu_seqlens(batch['cu_seqlens'])
+                _broadcast_cu_seqlens(batch['cu_seqlens_padded'])
                 _broadcast(batch['max_seqlen'])
 
             if is_last_stage:
@@ -715,11 +729,13 @@ def get_batch_on_this_tp_rank(
                 _broadcast(batch['attention_mask'])
                 _broadcast(batch['padding_mask'])
                 _broadcast_cu_seqlens(batch['cu_seqlens'])
+                _broadcast_cu_seqlens(batch['cu_seqlens_padded'])
                 _broadcast(batch['max_seqlen'])
 
             if args.sft and not is_first_stage and not is_last_stage:
                 _broadcast(batch['padding_mask'])
                 _broadcast_cu_seqlens(batch['cu_seqlens'])
+                _broadcast_cu_seqlens(batch['cu_seqlens_padded'])
                 _broadcast(batch['max_seqlen'])
                 batch['tokens'] = None
                 batch['labels'] = None
@@ -772,6 +788,7 @@ def get_batch_on_this_tp_rank(
             else None
         )
         cu_seqlens = None
+        cu_seqlens_padded = None
         if args.hybrid_context_parallel or args.sft:
             max_seqlen = torch.empty(
                 1,
@@ -810,6 +827,7 @@ def get_batch_on_this_tp_rank(
             _broadcast(position_ids)
             _broadcast(padding_mask)
             cu_seqlens = _broadcast_cu_seqlens()
+            cu_seqlens_padded = _broadcast_cu_seqlens()
             _broadcast(max_seqlen)
             _broadcast(local_cp_size)
 
@@ -824,6 +842,7 @@ def get_batch_on_this_tp_rank(
                 _broadcast(position_ids)
                 _broadcast(padding_mask)
                 cu_seqlens = _broadcast_cu_seqlens()
+                cu_seqlens_padded = _broadcast_cu_seqlens()
                 _broadcast(max_seqlen)
 
             if is_last_stage:
@@ -839,6 +858,7 @@ def get_batch_on_this_tp_rank(
                 _broadcast(attention_mask)
                 _broadcast(padding_mask)
                 cu_seqlens = _broadcast_cu_seqlens()
+                cu_seqlens_padded = _broadcast_cu_seqlens()
                 _broadcast(max_seqlen)
 
             if args.sft and not is_first_stage and not is_last_stage:
@@ -850,6 +870,7 @@ def get_batch_on_this_tp_rank(
 
                 _broadcast(padding_mask)
                 cu_seqlens = _broadcast_cu_seqlens()
+                cu_seqlens_padded = _broadcast_cu_seqlens()
                 _broadcast(max_seqlen)
 
         batch = {
@@ -860,6 +881,7 @@ def get_batch_on_this_tp_rank(
             'position_ids': position_ids,
             'padding_mask': padding_mask,
             'cu_seqlens': cu_seqlens,
+            'cu_seqlens_padded': cu_seqlens_padded,
             'max_seqlen': max_seqlen,
             'local_cp_size': local_cp_size,
         }

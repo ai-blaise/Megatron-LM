@@ -830,8 +830,9 @@ def _get_filesystem_reader(
 class TorchDistLoadShardedStrategy(LoadShardedStrategy):
     """Basic load strategy for the PyT Distributed format."""
 
-    def __init__(self):
+    def __init__(self, process_group: Optional[torch.distributed.ProcessGroup] = None):
         self.cached_global_metadata: Optional[Metadata] = None
+        self.process_group = process_group
         super().__init__()
 
     def load(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path) -> StateDict:
@@ -866,6 +867,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         checkpoint.load_state_dict(
             pyt_state_dict,
             fsr,
+            process_group=self.process_group,
             planner=MCoreLoadPlanner(
                 shapes_validation_sharded_tensors=flexible_shape_sharded_tensors,
                 allow_shape_mismatch_sharded_tensors=allow_shape_mismatch_sharded_tensors,

@@ -47,7 +47,12 @@ def get_model_for_inference() -> MegatronModule:
         raise ValueError(f"Invalid model provider {args.model_provider}")
 
     # Build model.
-    model = _get_model(partial(model_provider, model_builder), wrap_with_ddp=False)
+    # Megatron-FSDP fsdp_dtensor checkpoints expect checkpoint preprocessing to
+    # see the same wrapper shape used at save time (`model.module`).
+    model = _get_model(
+        partial(model_provider, model_builder),
+        wrap_with_ddp=getattr(args, "use_megatron_fsdp", False),
+    )
 
     # Load checkpoint.
     assert args.load is not None

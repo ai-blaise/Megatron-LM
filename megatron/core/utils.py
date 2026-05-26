@@ -2334,6 +2334,8 @@ def get_thd_batch_on_this_cp_rank(
                 "max_seqlen",
             }:
                 continue
+            if data is None:
+                continue
             batch[key] = data.index_select(1, index)
 
     return batch, packed_seq_params

@@ -38,6 +38,18 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import internal_api
 
+
+def _grad_provenance(name: str, **tensors) -> None:
+    if not (
+        os.getenv("MEGATRON_GRAD_PROVENANCE")
+        or os.getenv("MEGATRON_NUMERIC_DEBUG_GRAD_PROVENANCE")
+    ):
+        return
+    from megatron.core import numeric_debug
+
+    if numeric_debug.grad_provenance_enabled():
+        numeric_debug.log_grad_function(name, tensors=tensors)
+
 try:
     import transformer_engine as te  # pylint: disable=unused-import
 
@@ -668,6 +680,10 @@ class _RecordExpertDgradCompletion(torch.autograd.Function):
     def backward(ctx, *grad_outputs):
         ctx.event.record(torch.cuda.current_stream())
         ctx.event = None
+        _grad_provenance(
+            "moe.moe_layer._RecordExpertDgradCompletion.backward",
+            grad_outputs=grad_outputs,
+        )
         return (None,) + grad_outputs
 
 
@@ -698,4 +714,8 @@ class _RegisterDelayedWgradForExperts(torch.autograd.Function):
                 param.post_wgrad_grad_acc_hook()
 
         ctx.module = None
+        _grad_provenance(
+            "moe.moe_layer._RegisterDelayedWgradForExperts.backward",
+            grad_outputs=grad_outputs,
+        )
         return (None,) + grad_outputs

@@ -2,7 +2,7 @@
 # Convert the Blaise DeepSeek-V3.2 REAP NVFP4 HF checkpoint to Megatron torch_dist.
 
 #SBATCH --job-name=deepseek_v32_reap_convert
-#SBATCH --nodes=2
+#SBATCH --nodes=15
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=8
 
@@ -23,7 +23,7 @@ MODEL_ID="${MODEL_ID:-BlaiseAI/DeepSeek-V3.2-REAP-345B-SpinQuant-ActKV-NVFP4}"
 LOAD_CKPT="${LOAD_CKPT:-"$HOME/checkpoints/deepseek_v32_reap_spinquant_actkv_nvfp4_megatron"}"
 
 GPUS_PER_NODE="${GPUS_PER_NODE:-8}"
-NNODES="${SLURM_NNODES:-${NNODES:-2}}"
+NNODES="${SLURM_NNODES:-${NNODES:-15}}"
 NODE_RANK="${SLURM_NODEID:-${NODE_RANK:-0}}"
 MASTER_ADDR="${MASTER_ADDR:-}"
 if [[ -z "$MASTER_ADDR" && -n "${SLURM_JOB_NODELIST:-}" ]]; then
@@ -32,14 +32,14 @@ fi
 MASTER_ADDR="${MASTER_ADDR:-localhost}"
 MASTER_PORT="${MASTER_PORT:-29501}"
 
-TP="${TP:-4}"
-PP="${PP:-4}"
+TP="${TP:-8}"
+PP="${PP:-5}"
 CP="${CP:-1}"
-EP="${EP:-4}"
+EP="${EP:-8}"
 ETP="${ETP:-1}"
 SEQ_LENGTH="${SEQ_LENGTH:-32768}"
-DECODER_FIRST_PIPELINE_NUM_LAYERS="${DECODER_FIRST_PIPELINE_NUM_LAYERS:-17}"
-DECODER_LAST_PIPELINE_NUM_LAYERS="${DECODER_LAST_PIPELINE_NUM_LAYERS:-14}"
+DECODER_FIRST_PIPELINE_NUM_LAYERS="${DECODER_FIRST_PIPELINE_NUM_LAYERS:-13}"
+DECODER_LAST_PIPELINE_NUM_LAYERS="${DECODER_LAST_PIPELINE_NUM_LAYERS:-12}"
 
 CMD=(
     uv run --no-sync torchrun
@@ -63,6 +63,9 @@ CMD=(
 
 if [[ "${METADATA_ONLY:-0}" == "1" ]]; then
     CMD+=(--metadata-only)
+fi
+if [[ "${STRUCTURE_ONLY:-0}" == "1" ]]; then
+    CMD+=(--structure-only)
 fi
 if [[ -n "${VALIDATE_SOURCE_KEY:-}" ]]; then
     CMD+=(--validate-source-key "$VALIDATE_SOURCE_KEY")

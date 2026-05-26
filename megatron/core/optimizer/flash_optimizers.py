@@ -23,6 +23,7 @@ import abc
 import functools
 import math
 import os
+import re
 import warnings
 import weakref
 from collections.abc import Iterable
@@ -68,6 +69,469 @@ _TORCH_DTYPE_TO_TRITON_DTYPE = {
 
 _VALID_MASTER_WEIGHT_BITS = (None, 24, 32)
 _BITS_TO_BYTES = {None: 0, 24: 3, 32: 4}
+
+_UPDATE_DELTA_COUNTS: dict[tuple[int, int, str], int] = {}
+_UPDATE_DELTA_FORCE_COUNTS: dict[tuple[int, int, str], int] = {}
+
+
+def _flash_env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.lower() in ("1", "true", "yes", "on")
+
+
+def _flash_parse_rank_filter(value: str) -> set[int] | None:
+    value = value.strip().lower()
+    if not value or value in ("all", "*"):
+        return None
+    ranks: set[int] = set()
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start, end = part.split("-", 1)
+            ranks.update(range(int(start), int(end) + 1))
+        else:
+            ranks.add(int(part))
+    return ranks
+
+
+def _flash_rank_allowed(env_name: str) -> bool:
+    try:
+        rank = int(os.getenv("RANK", "0"))
+    except Exception:
+        rank = 0
+    ranks = _flash_parse_rank_filter(os.getenv(env_name, "all"))
+    return ranks is None or rank in ranks
+
+
+def _flash_context_iteration() -> int:
+    try:
+        from megatron.core import numeric_debug
+
+        return numeric_debug.context_iteration(0)
+    except Exception:
+        return 0
+
+
+def _debug_name_for_optimizer_param(param: torch.Tensor) -> str:
+    for attr_name in ("_numeric_debug_name", "_megatron_fsdp_name"):
+        name = getattr(param, attr_name, None)
+        if name:
+            return str(name)
+    orig_param = getattr(param, "orig_param", None)
+    if orig_param is not None:
+        for attr_name in ("_numeric_debug_name", "_megatron_fsdp_name"):
+            name = getattr(orig_param, attr_name, None)
+            if name:
+                return str(name)
+    return "<unnamed>"
+
+
+def _update_delta_owner_for_name(name: str) -> str:
+    name = re.sub(r"^chunk\d+\.", "", str(name))
+    if "dsa_indexer" in name or "indexer" in name or "indexcache" in name or "hisa" in name:
+        return "dsa_hisa_indexer"
+    if "word_embeddings" in name or ".embedding" in name or "embedding" in name:
+        return "embedding"
+    if "output_layer" in name or "final_linear" in name:
+        return "output_lm_head"
+    if ".router" in name or "router." in name:
+        return "moe_router"
+    if ".shared_experts." in name:
+        return "moe_shared_expert"
+    if ".experts.linear_fc1." in name:
+        return "moe_routed_expert_fc1"
+    if ".experts.linear_fc2." in name:
+        return "moe_routed_expert_fc2"
+    if ".experts." in name:
+        return "moe_routed_expert"
+    if "self_attention" in name or ".attention." in name:
+        if "linear_q" in name or ".q_" in name or "q_layernorm" in name:
+            return "attention_mla_q"
+        if "linear_kv_down_proj" in name:
+            return "attention_mla_kv_down"
+        if "linear_kv_up_proj" in name:
+            return "attention_mla_kv_up"
+        if "kv_layernorm" in name:
+            return "attention_mla_kv_norm"
+        if "linear_gate_proj" in name or "attention_output_gate" in name:
+            return "attention_mla_gate"
+        if "linear_proj" in name or ".proj" in name:
+            return "attention_mla_out"
+        return "attention_mla_other"
+    if "gated_norm" in name or "gatednorm" in name:
+        return "gated_norm"
+    if "norm" in name or "layernorm" in name:
+        return "norm"
+    if "linear_fc" in name or ".mlp." in name:
+        return "dense_mlp"
+    return "other"
+
+
+def _update_delta_name_allowed(name: str, owner: str) -> bool:
+    pattern = os.getenv(
+        "MEGATRON_UPDATE_DELTA_REGEX",
+        (
+            "dense_mlp|mlp|self_attention|linear_q|linear_kv|linear_proj|"
+            "shared_experts|experts|gated_norm|norm|dsa|hisa|indexer|indexcache|"
+            "output_layer|word_embeddings|router"
+        ),
+    )
+    try:
+        return re.search(pattern, name) is not None or re.search(pattern, owner) is not None
+    except re.error:
+        return pattern in name or pattern in owner
+
+
+def _update_delta_pattern_matches(pattern: str, name: str, owner: str) -> bool:
+    pattern = pattern.strip()
+    if not pattern:
+        return False
+    try:
+        return re.search(pattern, name) is not None or re.search(pattern, owner) is not None
+    except re.error:
+        return pattern in name or pattern in owner
+
+
+def _update_delta_force_allowed(name: str, owner: str) -> bool:
+    return _update_delta_pattern_matches(
+        os.getenv("MEGATRON_UPDATE_DELTA_FORCE_REGEX", ""),
+        name,
+        owner,
+    )
+
+
+def _update_delta_should_log(name: str, stage: str) -> bool:
+    if not _flash_env_flag("MEGATRON_UPDATE_DELTA_DEBUG"):
+        return False
+    if not _flash_rank_allowed("MEGATRON_UPDATE_DELTA_RANKS"):
+        return False
+    iteration = _flash_context_iteration()
+    start = int(os.getenv("MEGATRON_UPDATE_DELTA_START_ITER", "1"))
+    if iteration and iteration < start:
+        return False
+    first_n = int(os.getenv("MEGATRON_UPDATE_DELTA_FIRST_N", "8"))
+    interval = int(os.getenv("MEGATRON_UPDATE_DELTA_INTERVAL", "1"))
+    if iteration and iteration > first_n and not (interval > 0 and iteration % interval == 0):
+        return False
+    owner = _update_delta_owner_for_name(name)
+    force = _update_delta_force_allowed(name, owner)
+    if not force and not _update_delta_name_allowed(name, owner):
+        return False
+    try:
+        rank = int(os.getenv("RANK", "0"))
+    except Exception:
+        rank = 0
+    if force:
+        force_limit = int(os.getenv("MEGATRON_UPDATE_DELTA_FORCE_PARAM_LIMIT", "256"))
+        force_key = (rank, iteration, stage)
+        force_count = _UPDATE_DELTA_FORCE_COUNTS.get(force_key, 0)
+        if force_limit >= 0 and force_count >= force_limit:
+            return False
+        _UPDATE_DELTA_FORCE_COUNTS[force_key] = force_count + 1
+        return True
+    limit = int(os.getenv("MEGATRON_UPDATE_DELTA_PARAM_LIMIT", "96"))
+    key = (rank, iteration, stage)
+    count = _UPDATE_DELTA_COUNTS.get(key, 0)
+    if limit >= 0 and count >= limit:
+        return False
+    _UPDATE_DELTA_COUNTS[key] = count + 1
+    return True
+
+
+def _update_delta_sample_indices(numel: int, device: torch.device) -> torch.Tensor:
+    sample_elems = int(os.getenv("MEGATRON_UPDATE_DELTA_SAMPLE_ELEMS", "4096"))
+    sample_elems = max(1, min(sample_elems, int(numel)))
+    if int(numel) <= sample_elems:
+        return torch.arange(int(numel), device=device, dtype=torch.long)
+    # Keep this integer-only. CUDA float linspace can round the endpoint above
+    # ``numel - 1`` for large expert shards, and the resulting index_select
+    # failure masks the optimizer issue we are trying to diagnose.
+    stride = max(1, math.ceil(int(numel) / sample_elems))
+    indices = torch.arange(0, int(numel), stride, device=device, dtype=torch.long)
+    return indices[:sample_elems].clamp_(max=int(numel) - 1)
+
+
+def _update_delta_stats(tensor: torch.Tensor) -> dict[str, float]:
+    values = tensor.detach().float().view(-1)
+    if values.numel() == 0:
+        return {
+            "mean": 0.0,
+            "rms": 0.0,
+            "absmax": 0.0,
+            "nonfinite": 0.0,
+            "zero_frac": 1.0,
+        }
+    finite = torch.isfinite(values)
+    nonfinite = values.numel() - int(finite.count_nonzero().item())
+    values = torch.where(finite, values, torch.zeros_like(values))
+    return {
+        "mean": float(values.mean().item()),
+        "rms": float(torch.sqrt(torch.mean(values * values)).item()),
+        "absmax": float(values.abs().max().item()),
+        "nonfinite": float(nonfinite),
+        "zero_frac": float((values == 0).float().mean().item()),
+    }
+
+
+def _update_delta_begin(
+    *,
+    stage: str,
+    name: str,
+    param: torch.Tensor,
+    grad: torch.Tensor,
+    lr: float,
+    step: int,
+    shard_offset: int = 0,
+) -> dict[str, Any] | None:
+    if not _update_delta_should_log(name, stage):
+        return None
+    try:
+        flat_param = param.detach().view(-1)
+        flat_grad = grad.detach().view(-1)
+        if flat_param.numel() != flat_grad.numel():
+            print(
+                "[update_delta.error] "
+                f"rank={os.getenv('RANK', '0')} iter={_flash_context_iteration()} "
+                f"stage={stage} name={name} param_numel={flat_param.numel()} "
+                f"grad_numel={flat_grad.numel()} reason=numel_mismatch",
+                flush=True,
+            )
+            return None
+        idx = _update_delta_sample_indices(int(flat_param.numel()), flat_param.device)
+        return {
+            "stage": stage,
+            "name": name,
+            "owner": _update_delta_owner_for_name(name),
+            "rank": int(os.getenv("RANK", "0")),
+            "iter": _flash_context_iteration(),
+            "step": int(step),
+            "lr": float(lr),
+            "numel": int(flat_param.numel()),
+            "sample": int(idx.numel()),
+            "shard_offset": int(shard_offset),
+            "idx": idx,
+            "pre": flat_param.index_select(0, idx).float().clone(),
+            "grad": flat_grad.index_select(0, idx).float().clone(),
+        }
+    except Exception as exc:
+        print(
+            "[update_delta.error] "
+            f"rank={os.getenv('RANK', '0')} iter={_flash_context_iteration()} "
+            f"stage={stage} name={name} reason=begin_failed error={exc}",
+            flush=True,
+        )
+        return None
+
+
+def _update_delta_finish(snapshot: dict[str, Any] | None, param: torch.Tensor) -> None:
+    if snapshot is None:
+        return
+    try:
+        idx = snapshot["idx"]
+        pre = snapshot["pre"]
+        grad = snapshot["grad"]
+        post = param.detach().view(-1).index_select(0, idx).float()
+        delta = post - pre
+        grad_stats = _update_delta_stats(grad)
+        pre_stats = _update_delta_stats(pre)
+        post_stats = _update_delta_stats(post)
+        delta_stats = _update_delta_stats(delta)
+        denom = max(float(grad.norm().item()) * max(float(snapshot["lr"]), 1.0e-30), 1.0e-30)
+        delta_norm = float(delta.norm().item())
+        grad_norm = float(grad.norm().item())
+        pre_norm = float(pre.norm().item())
+        cos = float(torch.sum(delta * grad).item()) / max(delta_norm * grad_norm, 1.0e-30)
+        rel_param = delta_norm / max(pre_norm, 1.0e-30)
+        over_lr_grad = delta_norm / denom
+        print(
+            "[update_delta.adam] "
+            f"rank={snapshot['rank']} iter={snapshot['iter']} step={snapshot['step']} "
+            f"owner={snapshot['owner']} name={snapshot['name']} "
+            f"numel={snapshot['numel']} sample={snapshot['sample']} "
+            f"shard_offset={snapshot['shard_offset']} lr={snapshot['lr']:.9e} "
+            f"grad_rms={grad_stats['rms']:.6e} grad_absmax={grad_stats['absmax']:.6e} "
+            f"pre_rms={pre_stats['rms']:.6e} post_rms={post_stats['rms']:.6e} "
+            f"delta_rms={delta_stats['rms']:.6e} delta_absmax={delta_stats['absmax']:.6e} "
+            f"delta_over_param_norm={rel_param:.6e} delta_over_lr_grad_norm={over_lr_grad:.6e} "
+            f"delta_grad_cos={cos:.6e} delta_nonfinite={delta_stats['nonfinite']:.0f} "
+            f"post_nonfinite={post_stats['nonfinite']:.0f} delta_zero_frac={delta_stats['zero_frac']:.6e}",
+            flush=True,
+        )
+    except Exception as exc:
+        print(
+            "[update_delta.error] "
+            f"rank={os.getenv('RANK', '0')} iter={_flash_context_iteration()} "
+            f"stage={snapshot.get('stage', 'unknown')} name={snapshot.get('name', '<unknown>')} "
+            f"reason=finish_failed error={exc}",
+            flush=True,
+        )
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    return float(value)
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    return int(value)
+
+
+def _adam_update_cap_config(hparams: dict[str, Any], step: int) -> tuple[bool, float, float]:
+    """Return whether to apply a block-RMS Adam update cap for this group."""
+
+    ratio = float(
+        hparams.get(
+            "update_cap_ratio",
+            _env_float("MEGATRON_FLASH_ADAMW_UPDATE_CAP_RATIO", 0.0),
+        )
+    )
+    steps = int(
+        hparams.get(
+            "update_cap_steps",
+            _env_int("MEGATRON_FLASH_ADAMW_UPDATE_CAP_STEPS", 0),
+        )
+    )
+    param_floor = float(
+        hparams.get(
+            "update_cap_param_rms_floor",
+            _env_float("MEGATRON_FLASH_ADAMW_UPDATE_CAP_PARAM_RMS_FLOOR", 0.0),
+        )
+    )
+    enabled = ratio > 0.0 and steps > 0 and step <= steps
+    return enabled, ratio, param_floor
+
+
+def _nvfp4_e2m1_lookup(device: torch.device) -> torch.Tensor:
+    return torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+        dtype=torch.float32,
+        device=device,
+    )
+
+
+def _decode_nvfp4_rowwise_sample(
+    *,
+    model_param: torch.Tensor,
+    rowwise_data: torch.Tensor | None,
+    sample_idx: torch.Tensor,
+    shard_offset: int,
+    rowwise_byte_offset: int,
+) -> torch.Tensor:
+    if rowwise_data is None:
+        rowwise_data = getattr(model_param, "_rowwise_data", None)
+    rowwise_scale_inv = getattr(model_param, "_rowwise_scale_inv", None)
+    amax_rowwise = getattr(model_param, "_amax_rowwise", None)
+    if rowwise_data is None or rowwise_scale_inv is None or amax_rowwise is None:
+        raise RuntimeError("missing NVFP4 rowwise storage, scale, or amax metadata")
+
+    def _check_index_range(indices: torch.Tensor, limit: int, label: str) -> None:
+        if indices.numel() == 0:
+            return
+        min_idx = int(indices.min().item())
+        max_idx = int(indices.max().item())
+        if min_idx < 0 or max_idx >= int(limit):
+            raise RuntimeError(
+                f"{label} index out of range min={min_idx} max={max_idx} limit={int(limit)} "
+                f"sample_numel={int(indices.numel())} shard_offset={int(shard_offset)} "
+                f"rowwise_byte_offset={int(rowwise_byte_offset)} model_shape={tuple(model_param.shape)}"
+            )
+
+    flat = sample_idx.to(torch.long) + int(shard_offset)
+    packed_byte = torch.div(flat, 2, rounding_mode="floor") - int(rowwise_byte_offset)
+    rowwise_flat = rowwise_data.detach().view(-1)
+    _check_index_range(packed_byte, int(rowwise_flat.numel()), "rowwise_data")
+    packed = rowwise_flat.index_select(0, packed_byte).to(torch.int64)
+    codes = torch.where((flat & 1) == 0, packed & 0xF, (packed >> 4) & 0xF).to(torch.long)
+    fp4 = _nvfp4_e2m1_lookup(sample_idx.device).index_select(0, codes)
+
+    full_w = int(model_param.shape[-1])
+    if full_w <= 0:
+        raise RuntimeError(f"invalid NVFP4 model width: {full_w}")
+    scale_row_stride = int(rowwise_scale_inv.shape[1])
+    row = torch.div(flat, full_w, rounding_mode="floor")
+    col = flat - row * full_w
+    scale_col = torch.div(col, 16, rounding_mode="floor")
+    scale_idx = row * scale_row_stride + scale_col
+    scale_flat = rowwise_scale_inv.detach().view(-1)
+    _check_index_range(scale_idx, int(scale_flat.numel()), "rowwise_scale_inv")
+    scale_bits = scale_flat.index_select(0, scale_idx)
+    if scale_bits.dtype == torch.float8_e4m3fn:
+        block_scale = scale_bits.float()
+    else:
+        block_scale = scale_bits.to(torch.uint8).view(torch.float8_e4m3fn).float()
+    amax_flat = amax_rowwise.detach().view(-1)
+    if amax_flat.numel() == 0:
+        raise RuntimeError("empty NVFP4 amax_rowwise metadata")
+    global_amax = amax_flat[0].float()
+    global_scale = torch.where(
+        global_amax > 0.0,
+        torch.full_like(global_amax, 2688.0) / global_amax,
+        torch.ones_like(global_amax),
+    )
+    return fp4 * block_scale / global_scale
+
+
+def _update_delta_log_nvfp4_cast(
+    *,
+    name: str,
+    model_param: torch.Tensor,
+    rowwise_data: torch.Tensor | None,
+    pre_cast: torch.Tensor,
+    shard_offset: int,
+    rowwise_byte_offset: int,
+    lr: float,
+    step: int,
+) -> None:
+    stage = "nvfp4_cast"
+    if not _update_delta_should_log(name, stage):
+        return
+    try:
+        flat_pre = pre_cast.detach().view(-1)
+        idx = _update_delta_sample_indices(int(flat_pre.numel()), flat_pre.device)
+        pre = flat_pre.index_select(0, idx).float()
+        post = _decode_nvfp4_rowwise_sample(
+            model_param=model_param,
+            rowwise_data=rowwise_data,
+            sample_idx=idx,
+            shard_offset=int(shard_offset),
+            rowwise_byte_offset=int(rowwise_byte_offset),
+        )
+        error = post - pre
+        pre_stats = _update_delta_stats(pre)
+        post_stats = _update_delta_stats(post)
+        error_stats = _update_delta_stats(error)
+        pre_norm = float(pre.norm().item())
+        error_norm = float(error.norm().item())
+        rel = error_norm / max(pre_norm, 1.0e-30)
+        print(
+            "[update_delta.nvfp4_cast] "
+            f"rank={os.getenv('RANK', '0')} iter={_flash_context_iteration()} step={int(step)} "
+            f"owner={_update_delta_owner_for_name(name)} name={name} "
+            f"numel={int(flat_pre.numel())} sample={int(idx.numel())} "
+            f"shard_offset={int(shard_offset)} rowwise_byte_offset={int(rowwise_byte_offset)} "
+            f"lr={float(lr):.9e} pre_rms={pre_stats['rms']:.6e} "
+            f"post_rms={post_stats['rms']:.6e} cast_error_rms={error_stats['rms']:.6e} "
+            f"cast_error_absmax={error_stats['absmax']:.6e} "
+            f"cast_error_over_param_norm={rel:.6e} cast_error_nonfinite={error_stats['nonfinite']:.0f} "
+            f"post_nonfinite={post_stats['nonfinite']:.0f} cast_error_zero_frac={error_stats['zero_frac']:.6e}",
+            flush=True,
+        )
+    except Exception as exc:
+        print(
+            "[update_delta.error] "
+            f"rank={os.getenv('RANK', '0')} iter={_flash_context_iteration()} "
+            f"stage={stage} name={name} reason=nvfp4_cast_failed error={exc}",
+            flush=True,
+        )
 
 
 @dataclass(frozen=True)
@@ -201,6 +665,12 @@ class _MaybeQuantizedTensor:
                     f"If state dict specifies {name}, it must not "
                     + f"specify other keys. Got {list(d.keys())}"
                 )
+            if isinstance(d[name], _MaybeQuantizedTensor):
+                other = d[name]
+                self._data = other._data
+                self._quantized = other._quantized
+                self._scales = other._scales
+                return
             self.set_data(d[name])
             return
 
@@ -799,6 +1269,10 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
         # to_local() returns a view of the local shard, so in-place ops work correctly.
         p_local = self._get_local_tensor(p)
         grad_local = self._get_local_tensor(p_grad)
+        try:
+            setattr(p_local, "_numeric_debug_name", _debug_name_for_optimizer_param(p))
+        except Exception:
+            pass
 
         # Triton kernels use flat pointer arithmetic (ptr + offset) which
         # assumes contiguous memory. Non-contiguous tensors (e.g. transposed
@@ -888,15 +1362,18 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
                 # "exp_avg::quantized" and "exp_avg::scales", depending on
                 # whether we saved it as quantized or not. The former case
                 # also gives us interop with non-quantized optimizers.
-                qtensor = _MaybeQuantizedTensor.from_state_dict(
-                    param_state,
-                    name=key_quant,
-                    try_quantize=quantize,
-                    signed=spec.signed,
-                    sqrt=spec.sqrt,
-                    softsign=spec.softsign,
-                    storage_dtype=param.dtype,
-                )
+                if isinstance(param_state.get(key_quant), _MaybeQuantizedTensor):
+                    qtensor = param_state[key_quant]
+                else:
+                    qtensor = _MaybeQuantizedTensor.from_state_dict(
+                        param_state,
+                        name=key_quant,
+                        try_quantize=quantize,
+                        signed=spec.signed,
+                        sqrt=spec.sqrt,
+                        softsign=spec.softsign,
+                        storage_dtype=param.dtype,
+                    )
                 new_state[key_quant] = qtensor
 
         # State dict change 3 of 3: load+check error correction state if present
@@ -1010,6 +1487,13 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
                 for key, val in param_state.items():
                     if isinstance(val, torch.Tensor):
                         param_state[key] = self._get_local_tensor(val)
+                    elif isinstance(val, _MaybeQuantizedTensor):
+                        if isinstance(val._data, torch.Tensor):
+                            val._data = self._get_local_tensor(val._data)
+                        if isinstance(val._quantized, torch.Tensor):
+                            val._quantized = self._get_local_tensor(val._quantized)
+                        if isinstance(val._scales, torch.Tensor):
+                            val._scales = self._get_local_tensor(val._scales)
                 opt_state[param] = self._load_state_for_param(
                     param, opt_state, hparams=group
                 )
@@ -2047,8 +2531,19 @@ class FlashAdam(FlashOptimizer):
             step_int = int(param_state["step"].item())
 
             eco_scalar = self._adam_eco_scalar(hparams, step_int)
+            update_cap_enabled, update_cap_ratio, update_cap_param_floor = (
+                _adam_update_cap_config(hparams, step_int)
+            )
+            update_delta = _update_delta_begin(
+                stage="adam",
+                name=_debug_name_for_optimizer_param(param),
+                param=param,
+                grad=grad,
+                lr=lr,
+                step=step_int,
+            )
 
-            return _fused_adam_step(
+            _fused_adam_step(
                 mom=exp_avg.kernel_tensor,
                 mom_scales_f16=exp_avg.kernel_scales_or_self,
                 var=exp_avg_sq.kernel_tensor,
@@ -2066,7 +2561,12 @@ class FlashAdam(FlashOptimizer):
                 quantize_optim_states=is_quantized,
                 eco=self._eco,
                 eco_scalar=eco_scalar,
+                update_cap_enabled=update_cap_enabled,
+                update_cap_ratio=update_cap_ratio,
+                update_cap_param_rms_floor=update_cap_param_floor,
             )
+            _update_delta_finish(update_delta, param)
+            return
 
         # ------------------------ unfused Adam step
         # Get state variables
@@ -2105,9 +2605,21 @@ class FlashAdam(FlashOptimizer):
         if decoupled and weight_decay > 0:
             param_f32.mul_(1 - weight_decay)
 
-        # Update parameter in fp32
+        # Update parameter in fp32.
         denom = corrected_exp_avg_sq.sqrt().add_(eps)
-        param_f32.addcdiv_(corrected_exp_avg, denom, value=-lr)
+        update = corrected_exp_avg.div(denom).mul_(lr)
+        step_int = int(step.item())
+        update_cap_enabled, update_cap_ratio, update_cap_param_floor = _adam_update_cap_config(
+            hparams, step_int
+        )
+        if update_cap_enabled and update.numel() > 0:
+            param_rms = param_f32.float().pow(2).mean().sqrt()
+            update_rms = update.float().pow(2).mean().sqrt()
+            max_update_rms = update_cap_ratio * torch.maximum(
+                param_rms, param_rms.new_tensor(update_cap_param_floor)
+            )
+            update.mul_(torch.clamp(max_update_rms / torch.clamp(update_rms, min=1.0e-30), max=1.0))
+        param_f32.sub_(update)
 
         # Write back
         param.copy_(param_f32.to(param.dtype))
@@ -2241,6 +2753,9 @@ class FlashAdam(FlashOptimizer):
         exp_avg_sq = param_state["exp_avg_sq"]
         param_state["step"] += 1
         step_int = int(param_state["step"].item())
+        update_cap_enabled, update_cap_ratio, update_cap_param_floor = _adam_update_cap_config(
+            group, step_int
+        )
 
         numeric_debug = None
         flashopt_log_event = False
@@ -2337,11 +2852,16 @@ class FlashAdam(FlashOptimizer):
                 enabled=flashopt_log_event or flashopt_check_precast,
                 abort=False,
             )
-            grad_bad = (
-                numeric_debug.tensor_stats(grad_local, full_finite=True)
-                if flashopt_abort_bad
-                else None
-            )
+            grad_bad = None
+            if flashopt_abort_bad:
+                try:
+                    grad_bad = numeric_debug.tensor_stats(grad_local, full_finite=True)
+                except Exception as exc:
+                    numeric_debug.log_line(
+                        "flashopt.nvfp4_adam",
+                        f"grad_stats_error name={debug_param_name} step={step_int} error={exc}",
+                        force=True,
+                    )
             if main_grad_shard is not None:
                 _log_flashopt_tensor(
                     "main_grad_shard.before_adam",
@@ -2377,6 +2897,15 @@ class FlashAdam(FlashOptimizer):
 
         # Run fused Adam step on the BF16 shard (in-kernel ECO disabled —
         # NVFP4 error is injected post-cast by distrib_optimizer).
+        update_delta = _update_delta_begin(
+            stage="adam",
+            name=debug_param_name,
+            param=bf16_shard,
+            grad=grad_local,
+            lr=lr,
+            step=step_int,
+            shard_offset=int(shard_offset),
+        )
         _fused_adam_step(
             mom=exp_avg.kernel_tensor,
             mom_scales_f16=exp_avg.kernel_scales_or_self,
@@ -2395,7 +2924,11 @@ class FlashAdam(FlashOptimizer):
             quantize_optim_states=exp_avg.is_quantized(),
             eco=False,
             eco_scalar=0.0,
+            update_cap_enabled=update_cap_enabled,
+            update_cap_ratio=update_cap_ratio,
+            update_cap_param_rms_floor=update_cap_param_floor,
         )
+        _update_delta_finish(update_delta, bf16_shard)
 
         if numeric_debug is not None and (flashopt_log_event or flashopt_check_all):
             if flashopt_log_event:
@@ -2512,6 +3045,7 @@ class FlashAdam(FlashOptimizer):
 
         exp_avg = param_state["exp_avg"]
         exp_avg_sq = param_state["exp_avg_sq"]
+        debug_param_name = _debug_name_for_optimizer_param(param)
 
         numeric_debug = None
         log_flashopt_debug = False
@@ -2602,6 +3136,9 @@ class FlashAdam(FlashOptimizer):
         param: torch.Tensor,
         pre_cast: torch.Tensor,
         shard_offset: int,
+        model_param: Optional[torch.Tensor] = None,
+        rowwise_byte_offset: int = 0,
+        rowwise_data: Optional[torch.Tensor] = None,
     ) -> None:
         """Inject ECO error by decoding the post-cast NVFP4 shard in-kernel.
 
@@ -2610,6 +3147,13 @@ class FlashAdam(FlashOptimizer):
         which can allocate tens of GiB for DeepSeek FFN shards. This variant
         reads the packed rowwise NVFP4 bytes/scales directly inside the ECO
         injection kernel, so no dense post-cast tensor is materialized.
+
+        ``param`` is the optimizer state key. In the pure transient-master path
+        it is also the NVFP4 model tensor. In Megatron-FSDP's fp32-main path,
+        ``param`` is the FSDP optimizer shard and ``model_param`` supplies the
+        NVFP4 rowwise storage that was just cast from the fp32 main shard.
+        ``rowwise_data`` can override the byte storage source when FSDP cast-back
+        writes into a bucket fragment instead of ``model_param._rowwise_data``.
         """
         if not self._eco:
             return
@@ -2636,6 +3180,7 @@ class FlashAdam(FlashOptimizer):
 
         exp_avg = param_state["exp_avg"]
         exp_avg_sq = param_state["exp_avg_sq"]
+        debug_param_name = _debug_name_for_optimizer_param(param)
 
         numeric_debug = None
         log_flashopt_debug = False
@@ -2662,11 +3207,10 @@ class FlashAdam(FlashOptimizer):
                     "MEGATRON_NUMERIC_DEBUG_FLASHOPT_ABORT",
                     os.getenv("MEGATRON_NUMERIC_DEBUG_ABORT_ON_NONFINITE", "0"),
                 ).lower() in ("1", "true", "yes", "on")
-                param_name = getattr(param, "_numeric_debug_name", "<unnamed>")
                 numeric_debug.log_line(
                     "flashopt.eco_nvfp4",
                     "pre_kernel "
-                    f"name={param_name} step={step_int} lr={lr:.9e} eco_scalar={eco_scalar:.9e} "
+                    f"name={debug_param_name} step={step_int} lr={lr:.9e} eco_scalar={eco_scalar:.9e} "
                     f"bc2={bc2:.9e} eps={eps:.3e} shard_offset={int(shard_offset)} "
                     f"param_shape={tuple(param.shape)} pre_cast_shape={tuple(pre_cast.shape)} "
                     f"projection={self._eco_projection} "
@@ -2693,16 +3237,29 @@ class FlashAdam(FlashOptimizer):
                 if bad and abort_bad:
                     raise RuntimeError(
                         "FlashAdamW numeric debug found nonfinite ECO input "
-                        f"for {param_name} at step {step_int}"
+                        f"for {debug_param_name} at step {step_int}"
                     )
+        nvfp4_param = model_param if model_param is not None else param
+        _update_delta_log_nvfp4_cast(
+            name=debug_param_name,
+            model_param=nvfp4_param,
+            rowwise_data=rowwise_data,
+            pre_cast=pre_cast,
+            shard_offset=int(shard_offset),
+            rowwise_byte_offset=int(rowwise_byte_offset),
+            lr=lr,
+            step=step_int,
+        )
         _fused_eco_inject_from_nvfp4_rowwise(
             mom=exp_avg.kernel_tensor,
             mom_scales_f16=exp_avg.kernel_scales_or_self,
             var=exp_avg_sq.kernel_tensor,
             var_scales_f16=exp_avg_sq.kernel_scales_or_self,
-            model_param=param,
+            model_param=nvfp4_param,
+            rowwise_data=rowwise_data,
             pre_cast=pre_cast.contiguous(),
             shard_offset=int(shard_offset),
+            rowwise_byte_offset=int(rowwise_byte_offset),
             eco_scalar=eco_scalar,
             eps=eps,
             bc2=bc2,
@@ -2728,7 +3285,7 @@ class FlashAdam(FlashOptimizer):
             if bad and abort_bad:
                 raise RuntimeError(
                     "FlashAdamW numeric debug found nonfinite ECO output "
-                    f"for {param_name} at step {step_int}"
+                    f"for {debug_param_name} at step {step_int}"
                 )
 
 
@@ -2975,6 +3532,9 @@ def _fused_adam_step(
     group_size: int = 32,
     eco: bool = False,
     eco_scalar: float = 0.0,
+    update_cap_enabled: bool = False,
+    update_cap_ratio: float = 0.0,
+    update_cap_param_rms_floor: float = 0.0,
 ) -> None:
     N = param.numel()
     if N == 0:
@@ -2998,11 +3558,14 @@ def _fused_adam_step(
         weight_decay,
         step,
         eco_scalar,
+        update_cap_ratio,
+        update_cap_param_rms_floor,
         GROUP_SIZE=group_size,
         DECOUPLED_WEIGHT_DECAY=decoupled,
         PARAM_DTYPE=_TORCH_DTYPE_TO_TRITON_DTYPE[param.dtype],
         USE_ECC=use_ecc,
         USE_ECO=eco,
+        UPDATE_CAP_ENABLED=update_cap_enabled,
         QUANTIZE_OPTIM_STATES=quantize_optim_states,
         SIGNED_ERROR_T=signed_error_t,
         NUM_MANTISSA_BITS=_NUM_MANTISSA_BITS[param.dtype],
@@ -3029,11 +3592,14 @@ def _triton_adam_kernel(
     weight_decay: float,  # weight decay scalar
     step: int,  # current step number for bias correction
     eco_scalar: float,  # ECO scalar injection coefficient (only used if USE_ECO)
+    update_cap_ratio: float,  # max block update RMS as a fraction of parameter RMS
+    update_cap_param_rms_floor: float,  # optional lower bound for the parameter RMS denominator
     GROUP_SIZE: tl.constexpr,  # number of elements per quantization group
     DECOUPLED_WEIGHT_DECAY: tl.constexpr,  # bool for decoupled weight decay
     PARAM_DTYPE: tl.constexpr,  # dtype of the parameter
     USE_ECC: tl.constexpr,  # whether to use error correction bits
     USE_ECO: tl.constexpr,  # whether to use ECO error injection into momentum
+    UPDATE_CAP_ENABLED: tl.constexpr,  # whether to apply block-RMS update cap
     QUANTIZE_OPTIM_STATES: tl.constexpr,  # whether optimizer states are quantized to int8
     SIGNED_ERROR_T: tl.constexpr,  # signed error type for ECC
     NUM_MANTISSA_BITS: tl.constexpr,  # mantissa bits in narrow dtype
@@ -3134,7 +3700,22 @@ def _triton_adam_kernel(
 
         # Adam update: param -= lr * corrected_mom / (sqrt(corrected_var) + eps)
         denom = tl.sqrt(corrected_var) + eps
-        param -= lr * corrected_mom / denom
+        update = lr * corrected_mom / denom
+        if UPDATE_CAP_ENABLED:
+            valid = mask.to(tl.float32)
+            valid_count = tl.maximum(tl.sum(valid, axis=0), 1.0)
+            param_sq = tl.where(mask, param * param, 0.0)
+            update_sq = tl.where(mask, update * update, 0.0)
+            param_rms = tl.sqrt(tl.sum(param_sq, axis=0) / valid_count)
+            update_rms = tl.sqrt(tl.sum(update_sq, axis=0) / valid_count)
+            max_update_rms = update_cap_ratio * tl.maximum(
+                param_rms, update_cap_param_rms_floor
+            )
+            cap_scale = tl.minimum(
+                1.0, max_update_rms / tl.maximum(update_rms, 1.0e-30)
+            )
+            update *= cap_scale
+        param -= update
 
         param_narrow = param.to(PARAM_DTYPE)
         tl.store(param_ptr + absolute_offsets, param_narrow, mask=mask)
@@ -3501,8 +4082,10 @@ def _fused_eco_inject_from_nvfp4_rowwise(
     var: torch.Tensor,
     var_scales_f16: torch.Tensor,
     model_param: torch.Tensor,
+    rowwise_data: Optional[torch.Tensor],
     pre_cast: torch.Tensor,
     shard_offset: int,
+    rowwise_byte_offset: int,
     eco_scalar: float,
     eps: float,
     bc2: float,
@@ -3518,7 +4101,8 @@ def _fused_eco_inject_from_nvfp4_rowwise(
     if N == 0:
         return
 
-    rowwise_data = model_param._rowwise_data
+    if rowwise_data is None:
+        rowwise_data = model_param._rowwise_data
     rowwise_scale_inv = model_param._rowwise_scale_inv
     amax_rowwise = model_param._amax_rowwise
     if rowwise_data is None or rowwise_scale_inv is None or amax_rowwise is None:
@@ -3541,6 +4125,7 @@ def _fused_eco_inject_from_nvfp4_rowwise(
         pre_cast,
         N,
         int(shard_offset),
+        int(rowwise_byte_offset),
         int(full_w),
         int(scale_row_stride),
         eco_scalar,
@@ -3616,6 +4201,7 @@ def _triton_eco_inject_nvfp4_rowwise_kernel(
     pre_cast_ptr: "Any",
     N: int,
     shard_start_offset: int,
+    rowwise_byte_offset: int,
     full_w: int,
     scale_row_stride: int,
     eco_scalar: float,
@@ -3681,7 +4267,8 @@ def _triton_eco_inject_nvfp4_rowwise_kernel(
         )
 
         flat = shard_start_offset + absolute_offsets
-        packed = tl.load(rowwise_data_ptr + (flat // 2), mask=mask, other=0).to(
+        packed_byte = (flat // 2) - rowwise_byte_offset
+        packed = tl.load(rowwise_data_ptr + packed_byte, mask=mask, other=0).to(
             tl.int32
         )
         code = tl.where((flat & 1) == 0, packed & 0xF, (packed >> 4) & 0xF)

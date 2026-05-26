@@ -521,6 +521,13 @@ class DistributedDataParallel(_BaseDataParallel):
                     or grad_already_added_to_main_grad
                     or act_eco_correction is not None
                 ):
+                    should_add_param_grad = (
+                        param.grad is not None
+                        and (
+                            not param.grad_added_to_main_grad
+                            or getattr(param, 'zero_out_wgrad', False)
+                        )
+                    )
                     numeric_debug = None
                     debug_this_grad = False
                     if os.getenv("MEGATRON_NUMERIC_DEBUG_DDP_GRAD", "").lower() in (
@@ -543,13 +550,14 @@ class DistributedDataParallel(_BaseDataParallel):
                         ):
                             numeric_debug = _numeric_debug
                             debug_this_grad = True
-                            numeric_debug.log_tensor(
-                                f"ddp_grad.{param_name}.param_grad.before_add",
-                                param.grad,
-                                force=True,
-                                periodic=False,
-                                full_finite=True,
-                            )
+                            if should_add_param_grad:
+                                numeric_debug.log_tensor(
+                                    f"ddp_grad.{param_name}.param_grad.before_add",
+                                    param.grad,
+                                    force=True,
+                                    periodic=False,
+                                    full_finite=True,
+                                )
                             numeric_debug.log_tensor(
                                 f"ddp_grad.{param_name}.main_grad.before_add",
                                 param.main_grad,
@@ -557,13 +565,6 @@ class DistributedDataParallel(_BaseDataParallel):
                                 periodic=False,
                                 full_finite=True,
                             )
-                    should_add_param_grad = (
-                        param.grad is not None
-                        and (
-                            not param.grad_added_to_main_grad
-                            or getattr(param, 'zero_out_wgrad', False)
-                        )
-                    )
                     param_name = getattr(self, "param_to_name", {}).get(param, "<unnamed>")
                     if should_add_param_grad:
                         _ddp_grad_debug_sync(

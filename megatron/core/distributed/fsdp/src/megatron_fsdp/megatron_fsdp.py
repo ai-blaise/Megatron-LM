@@ -16,7 +16,7 @@ import functools
 import importlib
 import os
 import logging
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from enum import Enum, auto
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -49,12 +49,16 @@ try:
     from megatron.core.distributed.distributed_data_parallel_config import (
         DistributedDataParallelConfig,
     )
+    from megatron.core.fine_profile import fine_profile_range
     from megatron.core.utils import is_submodule
 except ImportError:
     # Megatron-LM is not installed, use Megatron-FSDP as a standalone module.
     logger.info("Megatron Core is not installed, Megatron-FSDP will run without Megatron Core.")
     from .distributed_data_parallel_config import DistributedDataParallelConfig
     from .utils import is_submodule
+
+    def fine_profile_range(name: str):
+        return nullcontext()
 
 
 class TrainingState(Enum):
@@ -464,26 +468,29 @@ class MegatronFSDP(torch.nn.Module):
         # Only all-gather HSDP buffer parameters in the beginning of a new optimization
         # step cycle, or on every step if model_auto_sync is enabled, i.e. update
         # the model training weights to reflect the reduced gradient descent step.
-        ag_pipeline.all_gather_params(
-            params=params,
-            prefetch=prefetch,
-            prefetch_order=prefetch_order,
-            suggested_AG_prefetch_size=self.suggested_AG_prefetch_size,
-            outer_fsdp_group_param_gather=(
-                # All-gather the (DP-Outer, DP-Shard) weight shards from the DP-backed
-                # main weight buffer into the (DP-Shard)-backed hybrid weight buffer.
-                # This is performed at the beginning of a new optimization step cycle,
-                # and only necessary when at least the optimizer state is sharded.
-                self.dist_index.use_hybrid_fsdp
-                and self.ddp_config.outer_dp_sharding_strategy != "no_shard"
-                and (self.microbatch_count == 0 or self.model_auto_sync)
-            ),
-            bwd=bwd,
-        )
+        profile_prefix = "fsdp.bwd" if bwd else "fsdp.fwd"
+        with fine_profile_range(f"{profile_prefix}.all_gather_params"):
+            ag_pipeline.all_gather_params(
+                params=params,
+                prefetch=prefetch,
+                prefetch_order=prefetch_order,
+                suggested_AG_prefetch_size=self.suggested_AG_prefetch_size,
+                outer_fsdp_group_param_gather=(
+                    # All-gather the (DP-Outer, DP-Shard) weight shards from the DP-backed
+                    # main weight buffer into the (DP-Shard)-backed hybrid weight buffer.
+                    # This is performed at the beginning of a new optimization step cycle,
+                    # and only necessary when at least the optimizer state is sharded.
+                    self.dist_index.use_hybrid_fsdp
+                    and self.ddp_config.outer_dp_sharding_strategy != "no_shard"
+                    and (self.microbatch_count == 0 or self.model_auto_sync)
+                ),
+                bwd=bwd,
+            )
         if wait_bucket_ready:
             for param in params:
                 bucket_id = self.param_and_grad_buffer.param_to_param_group[param]
-                ag_pipeline.wait_bucket_ready(bucket_id, bwd)
+                with fine_profile_range(f"{profile_prefix}.wait_bucket_ready"):
+                    ag_pipeline.wait_bucket_ready(bucket_id, bwd)
                 if bwd and is_float8tensor(param):
                     fp8_create_transpose_cache(param)
 
@@ -592,6 +599,45 @@ class MegatronFSDP(torch.nn.Module):
 
             # Sharded Gradient Buffer
             gbuf = group.hsdp_gbuf if group.hsdp_gbuf else group.main_grad_buffer
+            debug_grad = None
+            debug_name = None
+            if os.getenv("MEGATRON_NUMERIC_DEBUG_FSDP_GRAD", "").lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            ):
+                from megatron.core import numeric_debug
+
+                debug_name = self.param_and_grad_buffer.param_to_name.get(param, "<unknown-param>")
+                if (
+                    numeric_debug.rank_allowed_for("FSDP_GRAD")
+                    and numeric_debug.active_for("FSDP_GRAD")
+                    and numeric_debug.name_matches(
+                        debug_name,
+                        "FSDP_GRAD",
+                        r"linear_q_down_proj|linear_gate_proj|core_attention\.indexer|"
+                        r"input_gated_norm|linear_kv_up_proj|linear_kv_down_proj|"
+                        r"linear_proj|embedding\.word_embeddings",
+                    )
+                ):
+                    debug_grad = numeric_debug
+                    # Some Megatron fused wgrad paths write directly into
+                    # ``main_grad`` and return a dummy ``param.grad`` only to
+                    # force post-accumulate hooks onto the main autograd thread.
+                    # That dummy buffer may be uninitialized; sampling it creates
+                    # false NaN/Inf ownership signals. When the flag is set, the
+                    # real pre-reduce gradient is already in ``main_grad``.
+                    grad_already_added = getattr(param, "grad_added_to_main_grad", False)
+                    debug_value = getattr(param, "main_grad", None) if grad_already_added else param.grad
+                    debug_suffix = "main_grad_pre_reduce" if grad_already_added else "param_grad"
+                    debug_grad.log_tensor(
+                        f"fsdp_grad.before_accum.{debug_name}.{debug_suffix}",
+                        debug_value,
+                        force=False,
+                        periodic=False,
+                        full_finite=True,
+                    )
             if gbuf.is_data_distributed:
                 if not param.grad_added_to_main_grad:
                     # Get `main_grad` will allocate bucket, check that the currently
@@ -617,6 +663,22 @@ class MegatronFSDP(torch.nn.Module):
                         param.main_grad = param.get_main_grad()
                         param.main_grad.add_(to_local_if_dtensor(param.grad))
                         del param.grad
+
+            if debug_grad is not None:
+                bad = debug_grad.log_tensor(
+                    f"fsdp_grad.after_accum.{debug_name}.main_grad",
+                    getattr(param, "main_grad", None),
+                    force=False,
+                    periodic=False,
+                    full_finite=True,
+                )
+                if bad and os.getenv(
+                    "MEGATRON_NUMERIC_DEBUG_FSDP_GRAD_ABORT",
+                    os.getenv("MEGATRON_NUMERIC_DEBUG_ABORT_ON_NONFINITE", "1"),
+                ).lower() in ("1", "true", "yes", "on"):
+                    raise RuntimeError(
+                        f"numeric debug found nonfinite FSDP accumulated grad for {debug_name}"
+                    )
 
             if param.grad_added_to_main_grad and param.grad is not None:
                 del param.grad
@@ -933,7 +995,8 @@ class MegatronFSDP(torch.nn.Module):
             ), "_post_forward hook should only be registered on FSDP unit modules."
 
             # Release the module parameters after the forward pass to save memory.
-            release_module_parameters(module, bwd=False, lazy=lazy_release)
+            with fine_profile_range("fsdp.fwd.release_module_parameters"):
+                release_module_parameters(module, bwd=False, lazy=lazy_release)
 
             return output
 
@@ -1161,30 +1224,32 @@ class MegatronFSDP(torch.nn.Module):
                 other settings.
             force_dispatch (bool, optional): force dispatch regardless of other settings.
         """
-        self._replace_param_with_raw_if_needed()
+        with fine_profile_range("fsdp.start_param_sync.replace_raw"):
+            self._replace_param_with_raw_if_needed()
 
-        if not force_sync and self.ddp_config.overlap_param_gather:
-            # All-gather the first bucket before the forward pass.
-            if self.ddp_config.fsdp_all_gather_in_start_param_sync:
-                first_param = list(self.module.parameters())[0]
-                self.all_gather_and_wait_parameters_ready(
-                    params=[first_param], prefetch=True, wait_bucket_ready=False
-                )
-        else:
-            self.synchronize_param_gather()
-            for bucket_id in range(self.all_gather_pipeline.num_buckets):
-                self.all_gather_pipeline.async_bucket_gather(bucket_id=bucket_id, bwd=False)
-                group = self.param_and_grad_buffer.parameter_groups[bucket_id]
-                if group.model_weight_buffer is None:
-                    continue
+        with fine_profile_range("fsdp.start_param_sync.dispatch"):
+            if not force_sync and self.ddp_config.overlap_param_gather:
+                # All-gather the first bucket before the forward pass.
+                if self.ddp_config.fsdp_all_gather_in_start_param_sync:
+                    first_param = list(self.module.parameters())[0]
+                    self.all_gather_and_wait_parameters_ready(
+                        params=[first_param], prefetch=True, wait_bucket_ready=False
+                    )
+            else:
+                self.synchronize_param_gather()
+                for bucket_id in range(self.all_gather_pipeline.num_buckets):
+                    self.all_gather_pipeline.async_bucket_gather(bucket_id=bucket_id, bwd=False)
+                    group = self.param_and_grad_buffer.parameter_groups[bucket_id]
+                    if group.model_weight_buffer is None:
+                        continue
 
-                if group.model_weight_buffer.is_data_distributed:
-                    # If model weight is sharded, we wait for the all-gather to complete and
-                    # then release the bucket immediately to save memory usage.
+                    if group.model_weight_buffer.is_data_distributed:
+                        # If model weight is sharded, we wait for the all-gather to complete and
+                        # then release the bucket immediately to save memory usage.
+                        self.all_gather_pipeline.wait_bucket_ready(bucket_id, False)
+
+                for bucket_id in range(self.all_gather_pipeline.num_buckets):
                     self.all_gather_pipeline.wait_bucket_ready(bucket_id, False)
-
-            for bucket_id in range(self.all_gather_pipeline.num_buckets):
-                self.all_gather_pipeline.wait_bucket_ready(bucket_id, False)
 
     def start_grad_sync(self, *unused):
         """
@@ -1207,8 +1272,10 @@ class MegatronFSDP(torch.nn.Module):
         """
         Synchronize parameter all-gather operations for all model parameters.
         """
-        self.all_gather_pipeline.reset()
-        self._replace_param_with_distributed_if_needed()
+        with fine_profile_range("fsdp.synchronize_param_gather.reset"):
+            self.all_gather_pipeline.reset()
+        with fine_profile_range("fsdp.synchronize_param_gather.replace_distributed"):
+            self._replace_param_with_distributed_if_needed()
 
     def synchronize_gradient_reduce(self):
         """
@@ -1343,12 +1410,12 @@ class MegatronFSDP(torch.nn.Module):
                 param.grad_added_to_main_grad = False
         self.param_and_grad_buffer.zero_grad()
 
-    def install_optimized_model_weights(self):
+    def install_optimized_model_weights(self, optimizer: Optional[torch.optim.Optimizer] = None):
         """
         Copies optimized parameter values into the model training parameters
         managed by Megatron-FSDP. Should be called after the optimizer.step().
         """
-        self.param_and_grad_buffer.copy_main_weights_to_model_weights()
+        self.param_and_grad_buffer.copy_main_weights_to_model_weights(optimizer=optimizer)
 
     def broadcast_params(self):
         """
@@ -1370,10 +1437,12 @@ class MegatronFSDP(torch.nn.Module):
         """
         Wrapped forward pass of the model managed by FSDP.
         """
-        self._replace_param_with_raw_if_needed()
+        with fine_profile_range("fsdp.forward.replace_raw"):
+            self._replace_param_with_raw_if_needed()
         with torch.autograd.profiler.record_function("CustomFSDP.forward"):
             # Call the forward pass of the wrapped module.
-            output = self.module.forward(*inputs, **kwargs)
+            with fine_profile_range("fsdp.forward.module"):
+                output = self.module.forward(*inputs, **kwargs)
             return output
 
 

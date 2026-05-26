@@ -28,6 +28,83 @@ def _build_loss_mask(labels: torch.Tensor, target_padding_mask: torch.Tensor) ->
     return loss_mask
 
 
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in ("0", "false", "no", "off")
+
+
+def _sft_shuffle_index_path(dataset_path: Optional[str], seed: int) -> Optional[str]:
+    explicit_path = os.getenv("MEGATRON_SFT_SHUFFLE_INDEX_PATH")
+    if explicit_path:
+        return explicit_path
+    if not dataset_path or dataset_path == "mock":
+        return None
+    return f"{dataset_path}.shuffle.seed{seed}.npy"
+
+
+def _load_or_build_sft_row_shuffle_index(
+    dataset_path: Optional[str],
+    total_rows: int,
+    seed: int,
+) -> Optional[np.ndarray]:
+    """Load or build a deterministic full-row shuffle for file-backed SFT data.
+
+    Megatron's cyclic sampler shuffles only over `len(SFTDataset)`, which is the
+    requested training sample count. Short diagnostics with small
+    `--train-samples` can therefore randomize only the JSONL prefix. This row
+    permutation decouples physical JSONL row order from the logical sample
+    number before `SFTLowLevelDataset` reads a row.
+    """
+
+    if not _env_flag("MEGATRON_SFT_SHUFFLE_ROWS", False):
+        return None
+    if total_rows <= 0:
+        return None
+
+    path = _sft_shuffle_index_path(dataset_path, seed)
+    if path is None:
+        return None
+
+    def _load(path_to_load: str) -> np.ndarray:
+        loaded = np.load(path_to_load, mmap_mode="r")
+        if len(loaded) != total_rows:
+            raise ValueError(
+                f"SFT shuffle index length mismatch for {path_to_load}: "
+                f"{len(loaded)} != {total_rows}"
+            )
+        return loaded
+
+    if os.path.exists(path):
+        return _load(path)
+
+    if not _env_flag("MEGATRON_SFT_SHUFFLE_BUILD_IF_MISSING", True):
+        raise FileNotFoundError(f"missing SFT shuffle index: {path}")
+
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    rng = np.random.RandomState(seed)
+    permutation = np.arange(total_rows, dtype=np.int64)
+    rng.shuffle(permutation)
+    tmp_path = f"{path}.{os.getpid()}.tmp.npy"
+    np.save(tmp_path, permutation)
+    try:
+        os.replace(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+    rank = os.getenv("RANK")
+    if rank in (None, "", "0"):
+        preview = ",".join(str(int(item)) for item in permutation[:16])
+        print(
+            f"[SFTDataset] built row shuffle index path={path} "
+            f"seed={seed} rows={total_rows} preview={preview}",
+            flush=True,
+        )
+    return _load(path)
+
+
 def _json_loads_maybe(value: Any, default: Any = None) -> Any:
     if value is None:
         return default
@@ -79,12 +156,24 @@ def _synthetic_tool_call(tool_name: str, query: str, row_idx: int, call_idx: int
     }
 
 
-def _normalize_sft_messages(item: Dict[str, Any], row_idx: int) -> Optional[List[Dict[str, Any]]]:
+def _normalize_sft_messages(
+    item: Dict[str, Any], row_idx: int
+) -> Optional[Union[List[Dict[str, Any]], Dict[str, Any]]]:
     """Normalize common OpenAI-style tool traces for the DeepSeek SFT tokenizer."""
+    raw_text = item.get("text") or item.get("e2e_trajectory")
+    if isinstance(raw_text, str) and raw_text:
+        return {
+            "_sft_raw_text": raw_text,
+            "source_dataset": item.get("source_dataset"),
+            "source": item.get("source"),
+            "row_id": item.get("row_id") or item.get("id"),
+        }
+
     messages = item.get("messages", item.get("conversations"))
     if not isinstance(messages, list):
         return messages
 
+    enable_thinking = item.get("enable_thinking")
     tools = _normalize_tools(item.get("tools"))
     tool_name = _default_tool_name(tools)
     output: List[Dict[str, Any]] = []
@@ -126,6 +215,8 @@ def _normalize_sft_messages(item: Dict[str, Any], row_idx: int) -> Optional[List
                     lookahead += 1
                 if tool_calls:
                     normalized["tool_calls"] = tool_calls
+                    normalized["_synthetic_tool_calls"] = True
+                    normalized["_synthetic_tool_call_count"] = len(tool_calls)
             output.append(normalized)
             continue
 
@@ -140,6 +231,10 @@ def _normalize_sft_messages(item: Dict[str, Any], row_idx: int) -> Optional[List
 
     if output and output[0].get("role") != "system" and tools:
         output.insert(0, {"role": "system", "content": "", "tools": tools})
+
+    if output and enable_thinking is not None:
+        output[0] = dict(output[0])
+        output[0]["_deepseek_enable_thinking"] = bool(enable_thinking)
 
     return output
 
@@ -239,6 +334,34 @@ class SFTDataset(MegatronDataset):
         config: GPTDatasetConfig,
     ) -> None:
         super().__init__(dataset, dataset_path, indices, num_samples, index_split, config)
+        shuffle_seed = int(
+            os.getenv(
+                "MEGATRON_SFT_SHUFFLE_SEED",
+                str(getattr(config, "random_seed", 1234)),
+            )
+        )
+        self._sft_row_shuffle_index = _load_or_build_sft_row_shuffle_index(
+            dataset_path=dataset_path,
+            total_rows=len(dataset),
+            seed=shuffle_seed,
+        )
+        fixed_row = os.getenv("MEGATRON_SFT_FIXED_ROW_INDEX")
+        self._sft_fixed_row_index = None
+        if fixed_row not in (None, ""):
+            self._sft_fixed_row_index = int(fixed_row) % len(dataset)
+        if self._sft_row_shuffle_index is not None and os.getenv("RANK") in (None, "", "0"):
+            print(
+                f"[SFTDataset] row shuffle active split={index_split.name} "
+                f"seed={shuffle_seed} logical_indices={len(indices)} rows={len(dataset)} "
+                f"num_samples={num_samples}",
+                flush=True,
+            )
+        if self._sft_fixed_row_index is not None and os.getenv("RANK") in (None, "", "0"):
+            print(
+                f"[SFTDataset] fixed row diagnostic active "
+                f"raw_row={self._sft_fixed_row_index} split={index_split.name}",
+                flush=True,
+            )
 
     @staticmethod
     def numel_low_level_dataset(low_level_dataset: LowLevelDataset) -> int:
@@ -291,8 +414,16 @@ class SFTDataset(MegatronDataset):
         tokenizer = self.config.tokenizer
         pack_length = self.config.sequence_length
 
-        merged_conversations = self.dataset[int(self.indices[idx % len(self.indices)])]
-        split_conversations = self._split_conversations(merged_conversations)
+        fixed_row = getattr(self, "_sft_fixed_row_index", None)
+        if fixed_row is not None:
+            row_idx = fixed_row
+        else:
+            row_idx = int(self.indices[idx % len(self.indices)])
+            shuffle_index = getattr(self, "_sft_row_shuffle_index", None)
+            if shuffle_index is not None:
+                row_idx = int(shuffle_index[row_idx % len(shuffle_index)])
+        sample = self.dataset[row_idx]
+        raw_text = sample.get("_sft_raw_text") if isinstance(sample, dict) else None
 
         def extend_with_padding(tokens, targets, positions, padding_mask, pad_len):
             tokens.extend([pad] * pad_len)
@@ -305,14 +436,32 @@ class SFTDataset(MegatronDataset):
         pack_positions = []
         pack_padding_mask = []
         cu_seqlens = [0]
+        cu_seqlens_padded = [0]
         eod = tokenizer.eod
         pad = tokenizer.pad
         # TODO(duncan): Track number of convs dropped and/or truncated and amount of end-padding
-        for conversation in split_conversations:
+        if raw_text is not None:
+            rendered_tokenizer = tokenizer
+            if not hasattr(rendered_tokenizer, "tokenize_rendered_deepseek_text"):
+                rendered_tokenizer = getattr(tokenizer, "_tokenizer", tokenizer)
+            if not hasattr(rendered_tokenizer, "tokenize_rendered_deepseek_text"):
+                raise AttributeError(
+                    f"{type(tokenizer).__name__} does not expose "
+                    "tokenize_rendered_deepseek_text"
+                )
+            token_target_pairs = [
+                rendered_tokenizer.tokenize_rendered_deepseek_text(raw_text, return_target=True)
+            ]
+        else:
+            split_conversations = self._split_conversations(sample)
+            token_target_pairs = [
+                tokenizer.tokenize_conversation(
+                    conversation, return_target=True, add_generation_prompt=False
+                )
+                for conversation in split_conversations
+            ]
 
-            tokens, targets = tokenizer.tokenize_conversation(
-                conversation, return_target=True, add_generation_prompt=False
-            )
+        for tokens, targets in token_target_pairs:
 
             tokens_list = tokens.tolist()
             targets_list = targets.tolist()
@@ -336,7 +485,8 @@ class SFTDataset(MegatronDataset):
             # TODO(duncan): Consider also padding to multiple of number of tokens here. This might
             # be needed for efficiency (and potentially set via command-line argument).
 
-            cu_seqlens.append(len(pack_tokens))
+            cu_seqlens.append(cu_seqlens[-1] + len(tokens_list))
+            cu_seqlens_padded.append(len(pack_tokens))
 
             # Handle any necessary truncation
             if len(pack_tokens) >= pack_length + 1:  # +1 here to account for later alignment
@@ -350,7 +500,7 @@ class SFTDataset(MegatronDataset):
                 pack_padding_mask.append(True)
                 pack_positions = pack_positions[:pack_length+1]
                 # Note len({pack_tokens, pack_targets, pack_positions}) should be pack_length + 1
-                cu_seqlens[-1] = len(pack_tokens) - 1
+                cu_seqlens_padded[-1] = len(pack_tokens) - 1
                 break
 
         # Handle any necessary padding
@@ -360,7 +510,7 @@ class SFTDataset(MegatronDataset):
                 pack_tokens, pack_targets, pack_positions, pack_padding_mask, pad_len
             )
             # Note len({pack_tokens, pack_targets, pack_positions}) should be pack_length + 1
-            cu_seqlens[-1] = len(pack_tokens) - 1
+            cu_seqlens_padded[-1] = len(pack_tokens) - 1
 
         assert len(pack_tokens) == pack_length + 1
         assert len(pack_targets) == pack_length + 1
@@ -382,10 +532,32 @@ class SFTDataset(MegatronDataset):
         # attention_mask = None
 
         assert len(cu_seqlens) >= 2
-        cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32)
+        assert len(cu_seqlens_padded) == len(cu_seqlens)
+        # THD kernels need both logical sequence lengths and padded layout
+        # offsets.  The final right-padding tail is layout padding for the last
+        # packed sequence, not real context.
+        input_length = len(pack_tokens) - 1
+        cu_seqlens_padded[-1] = input_length
+        clipped_padded = [min(max(int(offset), 0), input_length) for offset in cu_seqlens_padded]
+        logical_cu = [0]
+        padded_cu = [clipped_padded[0]]
+        for padded_end in clipped_padded[1:]:
+            padded_start = padded_cu[-1]
+            if padded_end <= padded_start:
+                continue
+            real_tokens = sum(1 for is_padding in pack_padding_mask[padded_start:padded_end] if not is_padding)
+            logical_cu.append(logical_cu[-1] + real_tokens)
+            padded_cu.append(padded_end)
+
+        assert len(logical_cu) >= 2
+        assert padded_cu[-1] == input_length
+        assert logical_cu[-1] <= padded_cu[-1]
+
+        cu_seqlens = torch.tensor(logical_cu, dtype=torch.int32)
+        cu_seqlens_padded = torch.tensor(padded_cu, dtype=torch.int32)
         # Calculating max_seqlen here, rather than incrementally above, because of possible
         # effects of truncation and padding
-        adjacent_diffs = cu_seqlens[1:] - cu_seqlens[:-1]
+        adjacent_diffs = cu_seqlens_padded[1:] - cu_seqlens_padded[:-1]
         max_seqlen = adjacent_diffs.max()  # max_seqlen is a 0-D tensor
 
         return {
@@ -396,6 +568,7 @@ class SFTDataset(MegatronDataset):
             'position_ids': position_ids,
             'padding_mask': padding_mask,
             'cu_seqlens': cu_seqlens,
+            'cu_seqlens_padded': cu_seqlens_padded,
             'max_seqlen': max_seqlen,
         }
 

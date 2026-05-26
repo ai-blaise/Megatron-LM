@@ -183,6 +183,33 @@ class MegatronOptimizer(ABC):
             return self.grad_stats_parallel_group
         return parallel_state.get_model_parallel_group()
 
+    def _should_skip_nonfinite_grad_norm(self, grad_norm: Optional[float]) -> bool:
+        """Return whether a nonfinite grad norm should suppress the optimizer step."""
+        if grad_norm is None:
+            return False
+        try:
+            grad_norm_value = float(grad_norm)
+        except (TypeError, ValueError):
+            return False
+        if math.isfinite(grad_norm_value):
+            return False
+
+        should_skip = os.getenv("MEGATRON_SKIP_NONFINITE_GRAD_NORM", "1").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        log_single_rank(
+            logger,
+            logging.WARNING,
+            "Nonfinite gradient norm detected before optimizer step: "
+            f"grad_norm={grad_norm_value}. "
+            f"{'Skipping' if should_skip else 'Continuing'} this optimizer update "
+            "according to MEGATRON_SKIP_NONFINITE_GRAD_NORM.",
+        )
+        return should_skip
+
     @abstractmethod
     def prepare_grads(self) -> bool:
         """Pre-processing gradients before the optimizer step, returns whether inf/nan is found."""
@@ -689,10 +716,14 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
                 barrier=self.config.barrier_with_L1_time
             )
         grad_norm = 0.0
+        skip_nonfinite_grad_norm = False
         if self.config.clip_grad > 0.0:
             grad_norm = self.clip_grad_norm(self.config.clip_grad)
+            skip_nonfinite_grad_norm = self._should_skip_nonfinite_grad_norm(grad_norm)
         if timers is not None:
             timers('optimizer-clip-main-grad').stop()
+        if skip_nonfinite_grad_norm:
+            return False, grad_norm, None
 
         # Count the zeros in the grads.
         if timers is not None:
@@ -1061,10 +1092,14 @@ class FP32Optimizer(MegatronOptimizer):
                 barrier=self.config.barrier_with_L1_time
             )
         grad_norm = None
+        skip_nonfinite_grad_norm = False
         if self.config.clip_grad > 0.0:
             grad_norm = self.clip_grad_norm(self.config.clip_grad)
+            skip_nonfinite_grad_norm = self._should_skip_nonfinite_grad_norm(grad_norm)
         if timers is not None:
             timers('optimizer-clip-main-grad').stop()
+        if skip_nonfinite_grad_norm:
+            return False, grad_norm, None
 
         # Count the zeros in the grads.
         if timers is not None:
@@ -1432,6 +1467,8 @@ class ChainedOptimizer(MegatronOptimizer):
             return False, None, None
 
         grad_norm = self.get_grad_norm()
+        if self._should_skip_nonfinite_grad_norm(grad_norm):
+            return False, grad_norm, None
 
         # Clip gradients.
         for optimizer in self.chained_optimizers:

@@ -50,6 +50,15 @@ class ProfilingConfig:
     pytorch_profiler_collect_chakra: bool = False                
     """Collect chakra trace in pytorch profiler."""
 
+    pytorch_profiler_profile_memory: bool = False
+    """Track tensor memory allocation/free events in pytorch profiler."""
+
+    pytorch_profiler_with_flops: bool = False
+    """Estimate FLOPs for supported pytorch profiler operators."""
+
+    pytorch_profiler_with_modules: bool = False
+    """Record module hierarchy in pytorch profiler when the runtime supports it."""
+
     profile_ranks: list[int] = field(default_factory=lambda: [])
     """Global ranks to profile."""
 

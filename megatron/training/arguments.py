@@ -3191,6 +3191,14 @@ def _add_regularization_args(parser):
         "Reserved for future Mode B integration.",
     )
     group.add_argument(
+        "--flash-adamw-fsdp-eco-inject",
+        action="store_true",
+        default=False,
+        help="FlashAdamW/Megatron-FSDP: after FSDP casts fp32 main weights back "
+        "to NVFP4 model weights, inject the cast quantization error into "
+        "FlashAdamW's first moment. Requires --flash-adamw-eco.",
+    )
+    group.add_argument(
         "--flash-adamw-compress-state-dict",
         action="store_true",
         default=False,

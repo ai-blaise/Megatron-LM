@@ -15,6 +15,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 
 from megatron.core.datasets.utils import Split
+from megatron.core.tokenizers.text.libraries.sft_tokenizer import (
+    DEEPSEEK_ASSISTANT_TOKEN,
+    DEEPSEEK_EOS_TOKEN,
+    DEEPSEEK_THINKING_END_TOKEN,
+    DEEPSEEK_THINKING_START_TOKEN,
+    SFTTokenizer,
+)
 from megatron.training.datasets.sft_dataset import IGNORE_INDEX, SFTDataset, SFTLowLevelDataset
 
 
@@ -88,6 +95,80 @@ class TestSFTLowLevelDataset:
             "query": "first"
         }
 
+    def test_synthetic_assistant_tool_calls_are_masked_by_default(self, monkeypatch):
+        monkeypatch.delenv("MEGATRON_SFT_MASK_SYNTHETIC_TOOL_CALLS", raising=False)
+
+        assert SFTTokenizer._mask_deepseek_message_from_loss(
+            {"role": "assistant", "_synthetic_tool_calls": True}
+        )
+        assert not SFTTokenizer._mask_deepseek_message_from_loss(
+            {"role": "assistant", "content": "real assistant target"}
+        )
+
+    def test_synthetic_assistant_tool_call_mask_can_be_disabled(self, monkeypatch):
+        monkeypatch.setenv("MEGATRON_SFT_MASK_SYNTHETIC_TOOL_CALLS", "0")
+
+        assert not SFTTokenizer._mask_deepseek_message_from_loss(
+            {"role": "assistant", "_synthetic_tool_calls": True}
+        )
+
+    def test_deepseek_implicit_thought_content_stays_inside_thinking(self):
+        conversation = [
+            {"role": "user", "content": "answer"},
+            {
+                "role": "assistant",
+                "content": "**Thought:** verify the answer.\n\n**Final Answer: Taiwan**",
+            },
+        ]
+
+        user_rendered = SFTTokenizer._deepseek_render_message(
+            0, conversation, thinking_mode="thinking"
+        )
+        assistant_rendered = SFTTokenizer._deepseek_render_message(
+            1, conversation, thinking_mode="thinking"
+        )
+
+        assert user_rendered.endswith(
+            f"{DEEPSEEK_ASSISTANT_TOKEN}{DEEPSEEK_THINKING_START_TOKEN}"
+        )
+        assert assistant_rendered.startswith("**Thought:** verify")
+        assert not assistant_rendered.startswith(DEEPSEEK_THINKING_END_TOKEN)
+        assert (
+            assistant_rendered.index(DEEPSEEK_THINKING_END_TOKEN)
+            < assistant_rendered.index("Final Answer:")
+        )
+        assert assistant_rendered.endswith(DEEPSEEK_EOS_TOKEN)
+
+    def test_deepseek_plain_answer_still_skips_thinking(self):
+        conversation = [
+            {"role": "user", "content": "answer"},
+            {"role": "assistant", "content": "Final Answer: Taiwan"},
+        ]
+
+        assistant_rendered = SFTTokenizer._deepseek_render_message(
+            1, conversation, thinking_mode="thinking"
+        )
+
+        assert assistant_rendered.startswith(DEEPSEEK_THINKING_END_TOKEN)
+
+    def test_deepseek_explicit_think_content_is_not_rewrapped(self):
+        conversation = [
+            {"role": "user", "content": "answer"},
+            {
+                "role": "assistant",
+                "content": "<think>reason</think>Final Answer: Taiwan",
+            },
+        ]
+
+        assistant_rendered = SFTTokenizer._deepseek_render_message(
+            1, conversation, thinking_mode="thinking"
+        )
+
+        assert (
+            assistant_rendered
+            == "reason</think>Final Answer: Taiwan" + DEEPSEEK_EOS_TOKEN
+        )
+
 
 class _FakeTokenizer:
     eod = 2
@@ -154,6 +235,9 @@ def test_sft_dataset_returns_true_padding_mask_not_loss_mask_or_pad_id():
     ]
     assert sample["padding_mask"][1].item() is False
     assert sample["loss_mask"].tolist()[:2] == [0.0, 1.0]
+    assert sample["cu_seqlens"].tolist() == [0, 4]
+    assert sample["cu_seqlens_padded"].tolist() == [0, 8]
+    assert sample["max_seqlen"].item() == 8
 
 
 def test_sft_dataset_masks_padding_positions_not_ambiguous_pad_id():
@@ -164,6 +248,8 @@ def test_sft_dataset_masks_padding_positions_not_ambiguous_pad_id():
     assert sample["labels"].tolist() == [12, 2, 2, 2, 2]
     assert sample["padding_mask"].tolist() == [False, False, False, True, True]
     assert sample["loss_mask"].tolist() == [1.0, 1.0, 0.0, 0.0, 0.0]
+    assert sample["cu_seqlens"].tolist() == [0, 3]
+    assert sample["cu_seqlens_padded"].tolist() == [0, 5]
 
 
 def test_sft_dataset_does_not_warn_for_ambiguous_pad_id():

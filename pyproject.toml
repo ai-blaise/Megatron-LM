@@ -158,7 +158,14 @@ build = [
     "hatchling",
     "pybind11",
     "Cython>=3.0.0",
+    "cmake",
+    "ninja",
     "torch>=2.11",
+    "nvidia-cuda-cccl==13.0.85",
+    "nvidia-cuda-crt==13.0.88",
+    "nvidia-cuda-nvcc==13.0.88", # for CUDA extension builds
+    "nvidia-nvvm==13.0.88",
+    "nvidia-nvml-dev==13.0.87",
     "nvidia-mathdx",              # for TE
 ]
 linting = [
