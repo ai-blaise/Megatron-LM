@@ -113,7 +113,13 @@ class PromptConfig:
 class SFTTokenizer:
     """SFT Tokenizer."""
 
-    def __init__(self, tokenizer_path: str, prompt_format: str):
+    def __init__(
+        self,
+        tokenizer_path: str,
+        prompt_format: str,
+        trust_remote_code: bool = False,
+        revision: str | None = None,
+    ):
         """
         Note: Currently, only HuggingFaceTokenizer is supported as the underlying text tokenizer.
 
@@ -128,6 +134,8 @@ class SFTTokenizer:
                 tokenizer_kwargs["fix_mistral_regex"] = True
             tokenizer = transformers.AutoTokenizer.from_pretrained(
                 pretrained_model_name_or_path=tokenizer_path,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
                 **tokenizer_kwargs,
             )
         else:

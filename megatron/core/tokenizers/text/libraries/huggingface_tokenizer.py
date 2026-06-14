@@ -38,6 +38,7 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
         additional_special_tokens: Optional[List] = [],
         use_fast: Optional[bool] = True,
         trust_remote_code: Optional[bool] = False,
+        revision: Optional[str] = None,
         include_special_tokens: bool = True,
         chat_template: str = None,
     ):
@@ -71,6 +72,7 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
                     pretrained_model_name_or_path=tokenizer_path,
                     use_fast=use_fast,
                     trust_remote_code=trust_remote_code,
+                    revision=revision,
                 )
             elif merges_file is None:
                 self.tokenizer = AutoTokenizer.from_pretrained(
@@ -78,6 +80,7 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
                     vocab_file=vocab_file,
                     use_fast=use_fast,
                     trust_remote_code=trust_remote_code,
+                    revision=revision,
                 )
             else:
                 self.tokenizer = AutoTokenizer.from_pretrained(
@@ -86,6 +89,7 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
                     merge_files=merges_file,
                     use_fast=use_fast,
                     trust_remote_code=trust_remote_code,
+                    revision=revision,
                 )
         except Exception as e:
             raise ValueError(

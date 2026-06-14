@@ -4422,6 +4422,12 @@ def _add_tokenizer_args(parser):
         help="Sentencepiece tokenizer model.",
     )
     group.add_argument(
+        "--tokenizer-revision",
+        type=str,
+        default=None,
+        help="Hugging Face tokenizer revision, branch, tag, or commit.",
+    )
+    group.add_argument(
         "--tokenizer-metadata",
         type=str,
         default=None,
