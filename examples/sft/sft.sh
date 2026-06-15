@@ -74,6 +74,7 @@ Profiles:
     single_gpu            TP/PP/CP/EP all 1
     single_node_8gpu      8 GPUs, TP 1, PP 1, CP 1, EP 1
     two_node_8gpu         2 nodes, 8 GPUs per node, TP 8, PP 1, CP 1, EP 1
+    two_node_dp16         2 nodes, 8 GPUs per node, TP 1, PP 1, CP 1, EP 1
     deepseek_tp4_pp2_ep4  DeepSeek-ish 8 GPU shape
     deepseek_tp8_pp5_ep8  Large DeepSeek shape for multi-node jobs
 
@@ -607,6 +608,15 @@ case "$PARALLEL_PROFILE" in
         GPUS_PER_NODE="${GPUS_PER_NODE:-8}"
         NNODES="${NNODES:-2}"
         TP="${TP:-8}"
+        PP="${PP:-1}"
+        CP="${CP:-1}"
+        EP="${EP:-1}"
+        ETP="${ETP:-1}"
+        ;;
+    two_node_dp16)
+        GPUS_PER_NODE="${GPUS_PER_NODE:-8}"
+        NNODES="${NNODES:-2}"
+        TP="${TP:-1}"
         PP="${PP:-1}"
         CP="${CP:-1}"
         EP="${EP:-1}"
