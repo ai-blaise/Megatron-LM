@@ -4,7 +4,7 @@ set -euo pipefail
 REPO_URL="${REPO_URL:-https://github.com/ai-blaise/Megatron-LM.git}"
 REPO_DIR="${REPO_DIR:-/home/sjpat/Megatron-LM}"
 BRANCH="${BRANCH:-flashtraining}"
-TORCHCOMMS_WHEEL="${TORCHCOMMS_WHEEL:-/home/sjpat/wheelhouse/torchcomms-0.2.0-cp312-cp312-linux_x86_64.whl}"
+TORCHCOMMS_WHEEL="${TORCHCOMMS_WHEEL:-$HOME/wheelhouse/torchcomms-0.2.0-cp312-cp312-linux_x86_64.whl}"
 EXPECTED_GPUS="${EXPECTED_GPUS:-8}"
 INSTALL_LIVE_EXTRAS="${INSTALL_LIVE_EXTRAS:-1}"
 INSTALL_SYSTEM_DEPS="${INSTALL_SYSTEM_DEPS:-1}"

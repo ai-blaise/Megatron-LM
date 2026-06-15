@@ -19,7 +19,7 @@ export CC="${CC:-/usr/bin/gcc}"
 export CXX="${CXX:-/usr/bin/g++}"
 export DG_JIT_CACHE_DIR="${DG_JIT_CACHE_DIR:-$HOME/.cache/deep_gemm/deepseek_v32_reap_sft}"
 
-TORCHCOMMS_WHEEL="${TORCHCOMMS_WHEEL:-/home/sjpat/wheelhouse/torchcomms-0.2.0-cp312-cp312-linux_x86_64.whl}"
+TORCHCOMMS_WHEEL="${TORCHCOMMS_WHEEL:-$HOME/wheelhouse/torchcomms-0.2.0-cp312-cp312-linux_x86_64.whl}"
 if [[ -f "$TORCHCOMMS_WHEEL" ]]; then
   uv pip install "$TORCHCOMMS_WHEEL"
 else
