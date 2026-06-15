@@ -169,6 +169,7 @@ build = [
     "nvidia-nvvm==13.0.88",
     "nvidia-nvml-dev==13.0.87",
     "nvidia-mathdx",              # for TE
+    "nvidia-cudnn-cu13",         # for TE fused-RoPE
 ]
 linting = [
     "ruff~=0.9.0",
