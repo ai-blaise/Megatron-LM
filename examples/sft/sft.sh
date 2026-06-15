@@ -299,6 +299,22 @@ case "$MODEL_PROFILE" in
             --use-mcore-models
             --use-checkpoint-args
             --no-use-tokenizer-model-from-checkpoint-args
+            --num-layers 40
+            --hidden-size 4096
+            --num-attention-heads 32
+            --group-query-attention
+            --num-query-groups 8
+            --kv-channels 128
+            --max-position-embeddings 131072
+            --position-embedding-type rope
+            --rotary-base 1000000
+            --rotary-percent 1.0
+            --normalization RMSNorm
+            --swiglu
+            --attention-backend fused
+            --attention-softmax-in-fp32
+            --untie-embeddings-and-output-weights
+            --disable-bias-linear
             --seq-length "$SEQ_LENGTH"
         )
         if [[ "${TRUST_REMOTE_CODE:-1}" == "1" ]]; then
