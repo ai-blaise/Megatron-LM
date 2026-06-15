@@ -52,6 +52,7 @@ Profiles:
 
   DATA_PROFILE:
     jsonl_messages        JSONL records with a messages list
+    hf_blaise_mix         Hugging Face dataset repo passed via DATA_PATH
     mock_sft              SFT mock data
 
   PRECISION_PROFILE:
@@ -72,6 +73,7 @@ Profiles:
     auto                  Small local-safe defaults unless model overrides them
     single_gpu            TP/PP/CP/EP all 1
     single_node_8gpu      8 GPUs, TP 1, PP 1, CP 1, EP 1
+    two_node_8gpu         2 nodes, 8 GPUs per node, TP 8, PP 1, CP 1, EP 1
     deepseek_tp4_pp2_ep4  DeepSeek-ish 8 GPU shape
     deepseek_tp8_pp5_ep8  Large DeepSeek shape for multi-node jobs
 
@@ -433,6 +435,19 @@ case "$DATA_PROFILE" in
             --num-workers "${NUM_WORKERS:-1}"
         )
         ;;
+    hf_blaise_mix)
+        if [[ -z "${DATA_PATH:-}" ]]; then
+            echo "DATA_PROFILE=hf_blaise_mix requires DATA_PATH to be set to a Hugging Face dataset repo" >&2
+            exit 2
+        fi
+        DATA_ARGS+=(
+            --data-path "$DATA_PATH"
+            --split "${SPLIT:-100,0,0}"
+            --dataloader-type "${DATALOADER_TYPE:-cyclic}"
+            --no-create-attention-mask-in-dataloader
+            --num-workers "${NUM_WORKERS:-1}"
+        )
+        ;;
     mock_sft|mock)
         DATA_ARGS+=(
             --mock-data
@@ -583,6 +598,15 @@ case "$PARALLEL_PROFILE" in
         GPUS_PER_NODE="${GPUS_PER_NODE:-8}"
         NNODES="${NNODES:-1}"
         TP="${TP:-1}"
+        PP="${PP:-1}"
+        CP="${CP:-1}"
+        EP="${EP:-1}"
+        ETP="${ETP:-1}"
+        ;;
+    two_node_8gpu)
+        GPUS_PER_NODE="${GPUS_PER_NODE:-8}"
+        NNODES="${NNODES:-2}"
+        TP="${TP:-8}"
         PP="${PP:-1}"
         CP="${CP:-1}"
         EP="${EP:-1}"
