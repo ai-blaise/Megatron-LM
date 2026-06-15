@@ -231,7 +231,7 @@ apex = { git = "https://github.com/NVIDIA/apex.git" }
 [tool.uv.extra-build-dependencies]
 fast-hadamard-transform = ["setuptools", "torch"]
 flash_mla = ["torch"]
-transformer-engine = ["torch", "pybind11"]
+transformer-engine = ["pybind11"]
 apex = ["torch", "pybind11"]
 
 [tool.isort]
