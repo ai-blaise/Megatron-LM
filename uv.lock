@@ -6272,7 +6272,7 @@ wheels = [
 [[package]]
 name = "torchcomms"
 version = "0.2.0"
-source = { path = "/home/sjpat/wheelhouse/torchcomms-0.2.0-cp312-cp312-linux_x86_64.whl" }
+source = { path = "wheelhouse/torchcomms-0.2.0-cp312-cp312-linux_x86_64.whl" }
 dependencies = [
     { name = "expecttest", marker = "(python_full_version == '3.12.*' and sys_platform == 'linux') or (python_full_version == '3.13.*' and sys_platform == 'linux' and extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts') or (python_full_version < '3.12' and extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (python_full_version >= '3.14' and extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (python_full_version == '3.13.*' and extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (sys_platform != 'linux' and extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
     { name = "packaging", marker = "(python_full_version == '3.12.*' and sys_platform == 'linux') or (python_full_version == '3.13.*' and sys_platform == 'linux' and extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts') or (python_full_version < '3.12' and extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (python_full_version >= '3.14' and extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (python_full_version == '3.13.*' and extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (sys_platform != 'linux' and extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
