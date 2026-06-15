@@ -898,7 +898,11 @@ def pretrain(
         }
         for name, delta in startup_timers.items():
             timers(name, log_level=0).set_elapsed(delta)
-        timers.log(list(startup_timers.keys()), barrier=True)
+        if torch.distributed.get_rank() == 0:
+            startup_timer_lines = [
+                f"{name}: {delta * 1000.0:.2f} ms" for name, delta in startup_timers.items()
+            ]
+            print_rank_0('startup timers (ms):\n  ' + '\n  '.join(startup_timer_lines))
 
         # Print rank 0's absolute timestamps
         startup_timestamps = {
