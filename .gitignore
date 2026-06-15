@@ -29,6 +29,7 @@ docs/apidocs
 snapshots/*
 megatron/core/datasets/helpers_cpp
 artifacts/
+uv.lock
 
 blaise-docs/goal.md
 final_stretch.md
