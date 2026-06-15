@@ -227,7 +227,7 @@ fast-hadamard-transform = { git = "https://github.com/Dao-AILab/fast-hadamard-tr
 [tool.uv.extra-build-dependencies]
 fast-hadamard-transform = ["setuptools", "torch"]
 flash_mla = ["torch"]
-transformer-engine = ["torch"]
+transformer-engine = ["torch", "pybind11"]
 
 [tool.isort]
 profile = "black"                                                          # black-compatible
