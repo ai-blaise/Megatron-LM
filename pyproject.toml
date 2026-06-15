@@ -32,6 +32,7 @@ dependencies = [
     "pandas",
     "datasets",
     "nvidia-cutlass-dsl==4.4.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "apex",
 ]
 authors = [{ name = "NVIDIA", email = "nemo-toolkit@nvidia.com" }]
 maintainers = [{ name = "NVIDIA", email = "nemo-toolkit@nvidia.com" }]
@@ -192,6 +193,7 @@ no-build-isolation-package = [
     "transformer-engine",
     "transformer-engine-torch",
     "fast-hadamard-transform",
+    "apex",
 ]
 link-mode = "copy"
 conflicts = [[{ extra = "lts" }, { extra = "dev" }]]
@@ -224,11 +226,13 @@ flash_mla = [
 transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "84fa28d2477c2243ab32cc02ba83faebc59a9e6b" }
 emerging_optimizers = { git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git", rev = "v0.1.0" }
 fast-hadamard-transform = { git = "https://github.com/Dao-AILab/fast-hadamard-transform.git", rev = "f134af63deb2df17e1171a9ec1ea4a7d8604d5ca" }
+apex = { git = "https://github.com/NVIDIA/apex.git" }
 
 [tool.uv.extra-build-dependencies]
 fast-hadamard-transform = ["setuptools", "torch"]
 flash_mla = ["torch"]
 transformer-engine = ["torch", "pybind11"]
+apex = ["torch", "pybind11"]
 
 [tool.isort]
 profile = "black"                                                          # black-compatible
