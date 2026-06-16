@@ -138,6 +138,12 @@ export NCCL_TIMEOUT="${NCCL_TIMEOUT:-3600}"
 export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 export SUPPRESS_UNBATCHED_P2P_WARN="${SUPPRESS_UNBATCHED_P2P_WARN:-1}"
 
+# Unset any inherited NCCL_ALGO/NCCL_PROTO that may conflict with
+# timers all_gather (TREE+SIMPLE doesn't support ncclInt8 AllGather).
+# See examples/sft/run_sft_llama_nvfp4_minimal.sh:53-54 for precedent.
+unset NCCL_ALGO
+unset NCCL_PROTO
+
 if [[ -z "${CUDA_HOME:-}" && -x "$MEGATRON_DIR/.venv/lib/python3.12/site-packages/nvidia/cu13/bin/nvcc" ]]; then
     export CUDA_HOME="$MEGATRON_DIR/.venv/lib/python3.12/site-packages/nvidia/cu13"
 fi
