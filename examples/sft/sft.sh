@@ -19,6 +19,8 @@ Required for a real JSONL run:
 Useful checkpoint/tokenizer variables:
   LOAD_CKPT=/path/to/megatron/checkpoint
   SAVE_CKPT=/path/to/output/checkpoint
+  SAVE_INTERVAL=2000           Save checkpoint every N iterations (default: 500)
+  SAVE_RETAIN_INTERVAL=4000    Keep only every Nth checkpoint, delete in-betweens
   MODEL_ID=hf-or-local-model-id
   TOKENIZER_MODEL=hf-or-local-tokenizer
   TOKENIZER_REVISION=hf-tokenizer-commit
@@ -763,6 +765,9 @@ if [[ "${NO_LOAD_RNG:-1}" == "1" ]]; then
 fi
 if [[ "${DISABLE_SAVE:-0}" != "1" ]]; then
     CKPT_ARGS+=(--save-interval "${SAVE_INTERVAL:-500}" --save "$SAVE_CKPT")
+fi
+if [[ -n "${SAVE_RETAIN_INTERVAL:-}" ]]; then
+    CKPT_ARGS+=(--save-retain-interval "$SAVE_RETAIN_INTERVAL")
 fi
 if [[ "${NO_SAVE_OPTIM:-0}" == "1" ]]; then
     CKPT_ARGS+=(--no-save-optim)
