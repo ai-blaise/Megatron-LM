@@ -15,9 +15,6 @@ import json
 import os
 import pathlib
 import sys
-import types
-from contextlib import nullcontext
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -102,92 +99,7 @@ def bootstrap_bridge() -> Path:
     for path in (str(bridge_src), str(MEGATRON_LM_ROOT)):
         if path not in sys.path:
             sys.path.insert(0, path)
-    install_bridge_import_shims(bridge_src)
-    install_bridge_model_exports()
-    install_megatron_training_config_compat()
     return bridge_root
-
-
-def install_bridge_import_shims(bridge_src: Path) -> None:
-    """Avoid importing Bridge's top-level registry when this tool only needs GLM4.
-
-    ``megatron.bridge.__init__`` eagerly imports all Bridge model families,
-    including optional diffusion/config dependencies.  The GLM4 converter only
-    needs the conversion modules and GLM4 bridge registration, so we install
-    lightweight package objects with the correct ``__path__`` and import the
-    needed submodules directly.
-    """
-
-    package_paths = {
-        "megatron.bridge": bridge_src / "megatron" / "bridge",
-        "megatron.bridge.models": bridge_src / "megatron" / "bridge" / "models",
-        "megatron.bridge.models.conversion": bridge_src / "megatron" / "bridge" / "models" / "conversion",
-        "megatron.bridge.models.glm": bridge_src / "megatron" / "bridge" / "models" / "glm",
-        "megatron.bridge.models.hf_pretrained": bridge_src / "megatron" / "bridge" / "models" / "hf_pretrained",
-    }
-    for name, path in package_paths.items():
-        if name in sys.modules:
-            continue
-        module = types.ModuleType(name)
-        module.__path__ = [str(path)]  # type: ignore[attr-defined]
-        module.__package__ = name
-        sys.modules[name] = module
-
-
-def install_bridge_model_exports() -> None:
-    """Populate the lightweight ``megatron.bridge.models`` package shim."""
-
-    import megatron.bridge.models as bridge_models
-
-    if getattr(bridge_models, "_blaise_lazy_exports", False):
-        return
-
-    def __getattr__(name: str) -> Any:
-        if name == "GPTModelProvider":
-            from megatron.bridge.models.gpt_provider import GPTModelProvider
-
-            bridge_models.GPTModelProvider = GPTModelProvider
-            return GPTModelProvider
-        if name == "T5ModelProvider":
-            from megatron.bridge.models.t5_provider import T5ModelProvider
-
-            bridge_models.T5ModelProvider = T5ModelProvider
-            return T5ModelProvider
-        raise AttributeError(f"module 'megatron.bridge.models' has no attribute {name!r}")
-
-    bridge_models.__getattr__ = __getattr__
-    bridge_models._blaise_lazy_exports = True
-
-
-def install_megatron_training_config_compat() -> None:
-    """Fill small Megatron-LM/Megatron-Bridge config gaps at runtime.
-
-    The local Megatron-LM checkout exposes ``megatron.training.config`` as a
-    compatibility re-export module, but this Bridge checkout expects that module
-    to also contain ``TokenizerConfig``.  Define the minimal base dataclass here
-    before Bridge imports ``megatron.bridge.training.tokenizers.config``.
-    """
-
-    import megatron.training.config as training_config
-
-    if hasattr(training_config, "TokenizerConfig"):
-        return
-
-    @dataclass(kw_only=True)
-    class TokenizerConfig:
-        tokenizer_type: str = "NullTokenizer"
-        tokenizer_model: str | Path = ""
-        vocab_file: str | Path | None = None
-        merge_file: str | Path | None = None
-        pad_vocab_size: bool = False
-        tokenizer_hf_no_use_fast: bool = False
-        tokenizer_hf_no_include_special_tokens: bool = False
-        tokenizer_sentencepiece_legacy: bool = False
-        trust_remote_code: bool = False
-
-    training_config.TokenizerConfig = TokenizerConfig
-    if hasattr(training_config, "__all__") and "TokenizerConfig" not in training_config.__all__:
-        training_config.__all__.append("TokenizerConfig")
 
 
 BRIDGE_ROOT = bootstrap_bridge()
@@ -453,66 +365,6 @@ def assert_conversion_offload_disabled(provider: Any) -> None:
         raise RuntimeError(f"Conversion import requires offload disabled; still enabled: {', '.join(enabled)}")
 
 
-def print_provider_offload_state(provider: Any) -> None:
-    fields = (
-        "cpu_offloading",
-        "cpu_offloading_num_layers",
-        "cpu_offloading_activations",
-        "cpu_offloading_weights",
-        "cpu_offloading_double_buffering",
-        "fine_grained_activation_offloading",
-        "offload_modules",
-    )
-    print("=== Import provider offload state ===")
-    for field in fields:
-        if hasattr(provider, field):
-            print(f"{field}: {getattr(provider, field)!r}")
-    print()
-
-
-def patch_disabled_te_cpu_offload_context() -> None:
-    """Avoid Transformer Engine CPU-offload setup when offload is disabled.
-
-    Some Megatron/TE version combinations still call into TE's CPU-offload
-    helper even when the final config has ``cpu_offloading=False``.  For
-    conversion, disabled offload should be a no-op context.
-    """
-
-    try:
-        import megatron.core.extensions.transformer_engine as te_ext
-        import megatron.core.transformer.transformer_block as transformer_block
-    except ImportError:
-        return
-
-    original = getattr(te_ext, "get_cpu_offload_context", None)
-    if original is None or getattr(original, "_blaise_disabled_offload_guard", False):
-        return
-
-    def guarded_get_cpu_offload_context(
-        enabled,
-        num_layers,
-        model_layers,
-        activation_offloading,
-        weight_offloading,
-        double_buffering,
-    ):
-        if not enabled:
-            return nullcontext(), None
-        return original(
-            enabled,
-            num_layers,
-            model_layers,
-            activation_offloading,
-            weight_offloading,
-            double_buffering,
-        )
-
-    guarded_get_cpu_offload_context._blaise_disabled_offload_guard = True
-    te_ext.get_cpu_offload_context = guarded_get_cpu_offload_context
-    if getattr(transformer_block, "get_cpu_offload_context", None) is original:
-        transformer_block.get_cpu_offload_context = guarded_get_cpu_offload_context
-
-
 def run_import(args: argparse.Namespace) -> int:
     run_preflight(args)
     AutoBridge = get_auto_bridge_class()
@@ -539,8 +391,6 @@ def run_import(args: argparse.Namespace) -> int:
         provider.finalize()
     disable_conversion_only_offload(provider)
     assert_conversion_offload_disabled(provider)
-    print_provider_offload_state(provider)
-    patch_disabled_te_cpu_offload_context()
     megatron_model = provider.provide_distributed_model(
         wrap_with_ddp=False,
         use_cpu_initialization=not args.use_gpu_initialization,
