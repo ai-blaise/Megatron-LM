@@ -410,6 +410,22 @@ def disable_conversion_only_offload(provider: Any) -> None:
             setattr(provider, key, value)
 
 
+def assert_conversion_offload_disabled(provider: Any) -> None:
+    enabled = [
+        key
+        for key in (
+            "cpu_offloading",
+            "cpu_offloading_activations",
+            "cpu_offloading_weights",
+            "cpu_offloading_double_buffering",
+            "fine_grained_activation_offloading",
+        )
+        if bool(getattr(provider, key, False))
+    ]
+    if enabled:
+        raise RuntimeError(f"Conversion import requires offload disabled; still enabled: {', '.join(enabled)}")
+
+
 def run_import(args: argparse.Namespace) -> int:
     run_preflight(args)
     AutoBridge = get_auto_bridge_class()
@@ -434,6 +450,8 @@ def run_import(args: argparse.Namespace) -> int:
     disable_conversion_only_offload(provider)
     if hasattr(provider, "finalize"):
         provider.finalize()
+    disable_conversion_only_offload(provider)
+    assert_conversion_offload_disabled(provider)
     megatron_model = provider.provide_distributed_model(
         wrap_with_ddp=False,
         use_cpu_initialization=not args.use_gpu_initialization,
