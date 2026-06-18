@@ -393,6 +393,23 @@ def latest_iteration_dir(path: Path) -> Path | None:
     return max(iter_dirs, key=lambda child: int(child.name.removeprefix("iter_")))
 
 
+def disable_conversion_only_offload(provider: Any) -> None:
+    """Disable training offload features that allocate CUDA streams during import."""
+
+    overrides = {
+        "cpu_offloading": False,
+        "cpu_offloading_activations": False,
+        "cpu_offloading_weights": False,
+        "cpu_offloading_double_buffering": False,
+        "cpu_offloading_num_layers": 0,
+        "fine_grained_activation_offloading": False,
+        "offload_modules": [],
+    }
+    for key, value in overrides.items():
+        if hasattr(provider, key):
+            setattr(provider, key, value)
+
+
 def run_import(args: argparse.Namespace) -> int:
     run_preflight(args)
     AutoBridge = get_auto_bridge_class()
@@ -411,11 +428,31 @@ def run_import(args: argparse.Namespace) -> int:
     print("=== HF -> Megatron import ===")
     print(f"Output checkpoint root: {output}")
     print("Import precision policy: FP8 HF source is dequantized by Bridge into normal Megatron tensors.")
-    AutoBridge.import_ckpt(
-        hf_model_id=args.hf_model,
-        megatron_path=output,
+
+    bridge = AutoBridge.from_hf_pretrained(args.hf_model, **kwargs)
+    provider = bridge.to_megatron_provider(load_weights=True)
+    disable_conversion_only_offload(provider)
+    if hasattr(provider, "finalize"):
+        provider.finalize()
+    megatron_model = provider.provide_distributed_model(
+        wrap_with_ddp=False,
         use_cpu_initialization=not args.use_gpu_initialization,
-        **kwargs,
+    )
+
+    hf_tokenizer_kwargs = {}
+    if hasattr(bridge._model_bridge, "get_hf_tokenizer_kwargs"):
+        hf_tokenizer_kwargs = bridge._model_bridge.get_hf_tokenizer_kwargs()
+    if args.trust_remote_code:
+        if hf_tokenizer_kwargs is None:
+            hf_tokenizer_kwargs = {}
+        hf_tokenizer_kwargs.setdefault("trust_remote_code", True)
+
+    bridge.save_megatron_model(
+        megatron_model,
+        output,
+        hf_tokenizer_path=args.hf_model,
+        hf_tokenizer_kwargs=hf_tokenizer_kwargs,
+        low_memory_save=True,
     )
 
     iteration_dir = latest_iteration_dir(output)
