@@ -138,11 +138,25 @@ def install_bridge_model_exports() -> None:
     """Populate the lightweight ``megatron.bridge.models`` package shim."""
 
     import megatron.bridge.models as bridge_models
-    from megatron.bridge.models.gpt_provider import GPTModelProvider
-    from megatron.bridge.models.t5_provider import T5ModelProvider
 
-    bridge_models.GPTModelProvider = GPTModelProvider
-    bridge_models.T5ModelProvider = T5ModelProvider
+    if getattr(bridge_models, "_blaise_lazy_exports", False):
+        return
+
+    def __getattr__(name: str) -> Any:
+        if name == "GPTModelProvider":
+            from megatron.bridge.models.gpt_provider import GPTModelProvider
+
+            bridge_models.GPTModelProvider = GPTModelProvider
+            return GPTModelProvider
+        if name == "T5ModelProvider":
+            from megatron.bridge.models.t5_provider import T5ModelProvider
+
+            bridge_models.T5ModelProvider = T5ModelProvider
+            return T5ModelProvider
+        raise AttributeError(f"module 'megatron.bridge.models' has no attribute {name!r}")
+
+    bridge_models.__getattr__ = __getattr__
+    bridge_models._blaise_lazy_exports = True
 
 
 def install_megatron_training_config_compat() -> None:
