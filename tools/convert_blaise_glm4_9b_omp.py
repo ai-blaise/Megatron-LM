@@ -16,6 +16,7 @@ import os
 import pathlib
 import sys
 import types
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -443,6 +444,49 @@ def print_provider_offload_state(provider: Any) -> None:
     print()
 
 
+def patch_disabled_te_cpu_offload_context() -> None:
+    """Avoid Transformer Engine CPU-offload setup when offload is disabled.
+
+    Some Megatron/TE version combinations still call into TE's CPU-offload
+    helper even when the final config has ``cpu_offloading=False``.  For
+    conversion, disabled offload should be a no-op context.
+    """
+
+    try:
+        import megatron.core.extensions.transformer_engine as te_ext
+        import megatron.core.transformer.transformer_block as transformer_block
+    except ImportError:
+        return
+
+    original = getattr(te_ext, "get_cpu_offload_context", None)
+    if original is None or getattr(original, "_blaise_disabled_offload_guard", False):
+        return
+
+    def guarded_get_cpu_offload_context(
+        enabled,
+        num_layers,
+        model_layers,
+        activation_offloading,
+        weight_offloading,
+        double_buffering,
+    ):
+        if not enabled:
+            return nullcontext(), None
+        return original(
+            enabled,
+            num_layers,
+            model_layers,
+            activation_offloading,
+            weight_offloading,
+            double_buffering,
+        )
+
+    guarded_get_cpu_offload_context._blaise_disabled_offload_guard = True
+    te_ext.get_cpu_offload_context = guarded_get_cpu_offload_context
+    if getattr(transformer_block, "get_cpu_offload_context", None) is original:
+        transformer_block.get_cpu_offload_context = guarded_get_cpu_offload_context
+
+
 def run_import(args: argparse.Namespace) -> int:
     run_preflight(args)
     AutoBridge = get_auto_bridge_class()
@@ -470,6 +514,7 @@ def run_import(args: argparse.Namespace) -> int:
     disable_conversion_only_offload(provider)
     assert_conversion_offload_disabled(provider)
     print_provider_offload_state(provider)
+    patch_disabled_te_cpu_offload_context()
     megatron_model = provider.provide_distributed_model(
         wrap_with_ddp=False,
         use_cpu_initialization=not args.use_gpu_initialization,
