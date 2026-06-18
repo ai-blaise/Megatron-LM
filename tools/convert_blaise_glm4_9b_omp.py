@@ -4,7 +4,7 @@
 """Import/export the Blaise GLM-4-9B FP8 OMP checkpoint through Megatron Bridge.
 
 This tool is intentionally self-contained under ``Megatron-LM/tools`` while
-using the sibling Megatron-Bridge checkout as the source of truth for GLM4
+using the user's Megatron-Bridge checkout as the source of truth for GLM4
 conversion mappings.
 """
 
@@ -20,7 +20,7 @@ from typing import Any
 
 
 MEGATRON_LM_ROOT = Path(__file__).resolve().parents[1]
-WORKSPACE_ROOT = MEGATRON_LM_ROOT.parent
+DEFAULT_BRIDGE_ROOT = Path.home() / "Megatron-Bridge"
 
 DEFAULT_HF_MODEL = "BlaiseAI/GLM-4-9B-0414-FP8-DeepSeekV32-OMP"
 DEFAULT_IMPORT_OUTPUT = str(Path.home() / "checkpoints/glm4_9b_omp_init")
@@ -84,7 +84,7 @@ def resolve_bridge_root() -> Path:
     bridge_root = os.environ.get("MEGATRON_BRIDGE_ROOT")
     if bridge_root:
         return expand_path(bridge_root).resolve()
-    return (WORKSPACE_ROOT / "Megatron-Bridge").resolve()
+    return DEFAULT_BRIDGE_ROOT.resolve()
 
 
 def bootstrap_bridge() -> Path:
@@ -93,7 +93,7 @@ def bootstrap_bridge() -> Path:
     if not (bridge_src / "megatron" / "bridge" / "__init__.py").exists():
         raise FileNotFoundError(
             "Megatron Bridge source tree was not found. Set MEGATRON_BRIDGE_ROOT "
-            f"or place Megatron-Bridge next to Megatron-LM. Checked: {bridge_src}"
+            f"or place Megatron-Bridge at {DEFAULT_BRIDGE_ROOT}. Checked: {bridge_src}"
         )
 
     for path in (str(bridge_src), str(MEGATRON_LM_ROOT)):

@@ -5,7 +5,7 @@ Run commands from the `Megatron-LM` repository root unless noted otherwise.
 
 Most tools assume the project environment is available through `uv run --no-sync`.
 Conversion tools that depend on Megatron Bridge also assume the local Bridge
-checkout is available at `../Megatron-Bridge`, or that `MEGATRON_BRIDGE_ROOT`
+checkout is available at `$HOME/Megatron-Bridge`, or that `MEGATRON_BRIDGE_ROOT`
 points to the intended Bridge checkout.
 
 ## Model Lifecycle
@@ -126,13 +126,13 @@ It resolves Bridge in this order:
 
 ```text
 1. MEGATRON_BRIDGE_ROOT
-2. ../Megatron-Bridge
+2. $HOME/Megatron-Bridge
 ```
 
-For the normal workspace layout:
+For the normal machine layout:
 
 ```text
-training/
+$HOME/
   Megatron-LM/
   Megatron-Bridge/
 ```
@@ -347,7 +347,7 @@ Bridge not found:
 Megatron Bridge source tree was not found
 ```
 
-Set `MEGATRON_BRIDGE_ROOT` or restore the sibling `../Megatron-Bridge` checkout.
+Set `MEGATRON_BRIDGE_ROOT` or restore the `$HOME/Megatron-Bridge` checkout.
 
 Missing Python packages:
 
