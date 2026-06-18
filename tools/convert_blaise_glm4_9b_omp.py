@@ -103,6 +103,7 @@ def bootstrap_bridge() -> Path:
         if path not in sys.path:
             sys.path.insert(0, path)
     install_bridge_import_shims(bridge_src)
+    install_bridge_model_exports()
     install_megatron_training_config_compat()
     return bridge_root
 
@@ -131,6 +132,17 @@ def install_bridge_import_shims(bridge_src: Path) -> None:
         module.__path__ = [str(path)]  # type: ignore[attr-defined]
         module.__package__ = name
         sys.modules[name] = module
+
+
+def install_bridge_model_exports() -> None:
+    """Populate the lightweight ``megatron.bridge.models`` package shim."""
+
+    import megatron.bridge.models as bridge_models
+    from megatron.bridge.models.gpt_provider import GPTModelProvider
+    from megatron.bridge.models.t5_provider import T5ModelProvider
+
+    bridge_models.GPTModelProvider = GPTModelProvider
+    bridge_models.T5ModelProvider = T5ModelProvider
 
 
 def install_megatron_training_config_compat() -> None:
