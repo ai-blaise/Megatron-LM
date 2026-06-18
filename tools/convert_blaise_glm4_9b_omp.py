@@ -244,12 +244,24 @@ def has_any_glob(hf_pretrained: PreTrainedCausalLM, patterns: tuple[str, ...]) -
 
 def validate_hf_state(hf_pretrained: PreTrainedCausalLM, *, allow_mismatch: bool) -> list[str]:
     records = []
-    if not has_any_glob(hf_pretrained, ("*.mlp.gate_up_proj.weight", "*.mlp.gate_up_proj.weight*")):
+    omp_patterns = ("*.mlp.gate_up_proj.weight", "*.mlp.gate_up_proj.weight*")
+    weight_patterns = ("*.weight", "*.weight*")
+    scale_patterns = (
+        "*.scale",
+        "*.scale*",
+        "*_scale",
+        "*_scale*",
+        "*scale_inv",
+        "*scale_inv*",
+        "*.weight_scale",
+        "*.weight_scale*",
+    )
+    if not has_any_glob(hf_pretrained, omp_patterns):
         records.append("OMP fused gate_up_proj weights were not found")
-    if not has_any_glob(hf_pretrained, ("*.weight", "*.weight*")):
+    if not has_any_glob(hf_pretrained, weight_patterns):
         records.append("HF weight tensors were not found")
-    if not has_any_glob(hf_pretrained, ("*.scale", "*.scale*")):
-        records.append("FP8 scale tensors were not found")
+    if not has_any_glob(hf_pretrained, scale_patterns):
+        records.append(f"FP8 scale tensors were not found with patterns: {', '.join(scale_patterns)}")
 
     if records and not allow_mismatch:
         detail = "\n  - ".join(records)

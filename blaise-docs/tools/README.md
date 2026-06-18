@@ -215,7 +215,7 @@ num_key_value_heads = 2
 vocab_size = 128815
 quantization_config.quant_method = fp8
 OMP fused gate_up_proj keys exist
-FP8 scale keys exist
+FP8 scale keys exist with common `.scale`, `_scale`, or `scale_inv` naming
 ```
 
 Use a non-default model or local HF directory:
