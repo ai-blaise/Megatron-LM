@@ -31,6 +31,7 @@ dependencies = [
     "pydantic",
     "pandas",
     "datasets",
+    "pyyaml>=6.0.2",
     "nvidia-cutlass-dsl==4.4.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "apex",
 ]
