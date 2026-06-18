@@ -11,7 +11,8 @@ def test_prepare_thd_packed_batch_combines_microbatches():
         "loss_mask": torch.ones((2, 4), dtype=torch.float32),
         "position_ids": torch.tensor([[0, 1, 0, 1], [0, 0, 1, 2]], dtype=torch.int64),
         "padding_mask": torch.tensor([[False, False, True, True], [False, True, True, True]]),
-        "cu_seqlens": torch.tensor([[0, 2, 4], [0, 1, 4]], dtype=torch.int32),
+        "cu_seqlens": torch.tensor([[0, 2, 3], [0, 1, 2]], dtype=torch.int32),
+        "cu_seqlens_padded": torch.tensor([[0, 2, 4], [0, 1, 4]], dtype=torch.int32),
         "max_seqlen": torch.tensor([2, 3], dtype=torch.int32),
     }
 
@@ -22,7 +23,8 @@ def test_prepare_thd_packed_batch_combines_microbatches():
     assert out["labels"].tolist() == [[1, 2, 3, 4, 11, 12, 13, 14]]
     assert out["position_ids"].tolist() == [[0, 1, 0, 1, 0, 0, 1, 2]]
     assert out["padding_mask"].tolist() == [[False, False, True, True, False, True, True, True]]
-    assert out["cu_seqlens"].tolist() == [0, 2, 4, 5, 8]
+    assert out["cu_seqlens"].tolist() == [0, 2, 3, 4, 5]
+    assert out["cu_seqlens_padded"].tolist() == [0, 2, 4, 5, 8]
     assert out["max_seqlen"].shape == (1,)
     assert out["max_seqlen"].item() == 3
 

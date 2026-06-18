@@ -32,7 +32,14 @@ class ParamGroupOverride(TypedDict, total=False):
     start_wd: float
     end_wd: float
     wd_mult: float
+    lr_mult: float
     optimizer: str
+    # FlashAdamW-only safety knobs. These are intentionally per-param-group so
+    # newly added adapter/indexer/gate weights can keep the full LR while the
+    # pretrained NVFP4 backbone gets a temporary cold-start trust cap.
+    update_cap_ratio: float
+    update_cap_steps: int
+    update_cap_param_rms_floor: float
 
 
 def get_canonical_lr_for_logging(param_groups: list[dict]) -> float | None:

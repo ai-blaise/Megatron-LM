@@ -29,5 +29,9 @@ docs/apidocs
 snapshots/*
 megatron/core/datasets/helpers_cpp
 artifacts/
+uv.lock
 
 blaise-docs/goal.md
+final_stretch.md
+run_profiling.md
+handoff/gcp-a4/wheelhouse/deep_ep-1.2.1+9af0e0d-cp312-cp312-linux_x86_64.whl

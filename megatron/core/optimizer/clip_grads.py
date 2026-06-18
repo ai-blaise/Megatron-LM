@@ -4,6 +4,7 @@
 
 import os
 import re
+import math
 from typing import List, Optional, Union
 
 import torch
@@ -203,6 +204,36 @@ def _grad_l2_norm(grads: list[torch.Tensor]) -> torch.Tensor:
     return torch.sqrt(total_sq)
 
 
+def _debug_name_for_param(param: torch.Tensor) -> str:
+    name = getattr(param, "_numeric_debug_name", None)
+    if name:
+        return str(name)
+    name = getattr(param, "_megatron_fsdp_name", None)
+    if name:
+        return str(name)
+    orig_param = getattr(param, "orig_param", None)
+    if orig_param is not None:
+        name = getattr(orig_param, "_numeric_debug_name", None) or getattr(
+            orig_param, "_megatron_fsdp_name", None
+        )
+        if name:
+            return str(name)
+    return "<unnamed>"
+
+
+def _tensor_shape_string(tensor: Optional[torch.Tensor]) -> str:
+    if tensor is None:
+        return "None"
+    try:
+        local = to_local_if_dtensor(tensor)
+    except Exception:
+        local = tensor
+    try:
+        return str(tuple(local.shape))
+    except Exception:
+        return "<unknown>"
+
+
 def _log_grad_ownership(
     parameters: Union[List[torch.Tensor], torch.Tensor],
     *,
@@ -211,20 +242,24 @@ def _log_grad_ownership(
     total_norm: float,
     clip_coeff: float,
     grad_stats_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    force: bool = False,
 ) -> None:
-    if not _env_flag("MEGATRON_GRAD_OWNERSHIP"):
+    if not force and not _env_flag("MEGATRON_GRAD_OWNERSHIP"):
         return
     if isinstance(parameters, torch.Tensor):
         parameters = [parameters]
 
     rank = int(os.getenv("RANK", "0"))
     iteration = _grad_ownership_iteration()
-    should_print = _grad_ownership_should_log()
+    should_print = force or _grad_ownership_should_log()
     owner_grads: dict[str, list[torch.Tensor]] = {label: [] for label in _GRAD_OWNER_LABELS}
     owner_tensors = torch.zeros(len(_GRAD_OWNER_LABELS), dtype=torch.float, device='cuda')
     owner_elems = torch.zeros(len(_GRAD_OWNER_LABELS), dtype=torch.float, device='cuda')
+    owner_nonfinite = torch.zeros(len(_GRAD_OWNER_LABELS), dtype=torch.float, device='cuda')
     data_parallel_group = None
     top_candidates: list[tuple[float, str, str, int]] = []
+    nonfinite_candidates: list[tuple[int, str, str, int, str, str, str]] = []
+    check_nonfinite = force or _env_flag("MEGATRON_GRAD_OWNERSHIP_CHECK_NONFINITE")
     top_param_limit = (
         int(os.getenv("MEGATRON_GRAD_OWNERSHIP_TOP_PARAMS", "0")) if should_print else 0
     )
@@ -236,13 +271,30 @@ def _log_grad_ownership(
         if grad is None:
             continue
         data_parallel_group = get_data_parallel_group_if_dtensor(grad, data_parallel_group)
-        name = getattr(param, "_numeric_debug_name", "<unnamed>")
+        name = _debug_name_for_param(param)
         owner = _grad_owner_for_name(name)
         owner_idx = _GRAD_OWNER_TO_INDEX[owner]
         owner_grads[owner].append(grad)
         owner_tensors[owner_idx] += 1.0
         owner_elems[owner_idx] += float(grad.numel())
-        if top_param_limit > 0 and stage == "preclip":
+        if check_nonfinite and grad.is_floating_point():
+            nonfinite = torch.count_nonzero(~torch.isfinite(grad))
+            owner_nonfinite[owner_idx] += nonfinite.float()
+            if should_print:
+                nonfinite_count = int(nonfinite.detach().cpu().item())
+                if nonfinite_count:
+                    nonfinite_candidates.append(
+                        (
+                            nonfinite_count,
+                            owner,
+                            name,
+                            int(grad.numel()),
+                            _tensor_shape_string(param),
+                            _tensor_shape_string(grad),
+                            str(getattr(grad, "dtype", "<unknown>")),
+                        )
+                    )
+        if top_param_limit > 0 and stage.startswith("preclip"):
             try:
                 norm = float(torch.norm(grad, 2).item())
                 top_candidates.append((norm, owner, name, int(grad.numel())))
@@ -266,6 +318,9 @@ def _log_grad_ownership(
         torch.distributed.all_reduce(
             owner_elems, op=torch.distributed.ReduceOp.SUM, group=data_parallel_group
         )
+        torch.distributed.all_reduce(
+            owner_nonfinite, op=torch.distributed.ReduceOp.SUM, group=data_parallel_group
+        )
     if grad_stats_parallel_group:
         torch.distributed.all_reduce(
             owner_sq, op=torch.distributed.ReduceOp.SUM, group=grad_stats_parallel_group
@@ -276,11 +331,15 @@ def _log_grad_ownership(
         torch.distributed.all_reduce(
             owner_elems, op=torch.distributed.ReduceOp.SUM, group=grad_stats_parallel_group
         )
+        torch.distributed.all_reduce(
+            owner_nonfinite, op=torch.distributed.ReduceOp.SUM, group=grad_stats_parallel_group
+        )
 
     owner_norms = torch.sqrt(owner_sq).detach().cpu()
     owner_sq_cpu = owner_sq.detach().cpu()
     owner_tensors_cpu = owner_tensors.detach().cpu()
     owner_elems_cpu = owner_elems.detach().cpu()
+    owner_nonfinite_cpu = owner_nonfinite.detach().cpu()
     if not should_print:
         return
 
@@ -299,17 +358,40 @@ def _log_grad_ownership(
         if owner_tensors_cpu[idx].item() == 0:
             continue
         pct = 100.0 * float(owner_sq_cpu[idx].item()) / pct_sq
-        rows.append((pct, owner, float(owner_norms[idx].item()), int(owner_tensors_cpu[idx].item()), int(owner_elems_cpu[idx].item())))
+        rows.append((
+            pct,
+            owner,
+            float(owner_norms[idx].item()),
+            int(owner_tensors_cpu[idx].item()),
+            int(owner_elems_cpu[idx].item()),
+            int(owner_nonfinite_cpu[idx].item()),
+        ))
     top_owner_limit = int(os.getenv("MEGATRON_GRAD_OWNERSHIP_TOP_OWNERS", "32"))
-    for pct, owner, norm, tensor_count, elem_count in sorted(rows, reverse=True)[:top_owner_limit]:
+    for pct, owner, norm, tensor_count, elem_count, nonfinite_count in sorted(rows, reverse=True)[:top_owner_limit]:
         print(
             "[grad_ownership.owner] "
             f"rank={rank} iter={iteration} stage={stage} owner={owner} "
-            f"norm={norm:.6e} pct_owner_sq={pct:.3f} tensors={tensor_count} elems={elem_count}",
+            f"norm={norm:.6e} pct_owner_sq={pct:.3f} tensors={tensor_count} "
+            f"elems={elem_count} nonfinite={nonfinite_count}",
             flush=True,
         )
 
-    if top_param_limit > 0 and stage == "preclip":
+    nonfinite_param_limit = int(os.getenv("MEGATRON_GRAD_OWNERSHIP_NONFINITE_PARAMS", "16"))
+    if check_nonfinite and nonfinite_param_limit > 0 and stage.startswith("preclip"):
+        for count, owner, name, elem_count, param_shape, grad_shape, grad_dtype in sorted(
+            nonfinite_candidates, reverse=True
+        )[
+            :nonfinite_param_limit
+        ]:
+            print(
+                "[grad_ownership.nonfinite_param] "
+                f"rank={rank} iter={iteration} stage={stage} owner={owner} "
+                f"nonfinite={count} elems={elem_count} param_shape={param_shape} "
+                f"grad_shape={grad_shape} grad_dtype={grad_dtype} name={name}",
+                flush=True,
+            )
+
+    if top_param_limit > 0 and stage.startswith("preclip"):
         for norm, owner, name, elem_count in sorted(
             top_candidates, key=lambda item: item[0], reverse=True
         )[:top_param_limit]:
@@ -447,6 +529,17 @@ def clip_grad_by_total_norm_fp32(
 
     # Scale.
     clip_coeff = max_norm / (total_norm + 1.0e-6)
+    if not math.isfinite(float(total_norm)):
+        _log_grad_ownership(
+            parameters,
+            stage="preclip_nonfinite",
+            max_norm=max_norm,
+            total_norm=total_norm,
+            clip_coeff=clip_coeff,
+            grad_stats_parallel_group=grad_stats_parallel_group,
+            force=_env_flag("MEGATRON_NONFINITE_GRAD_OWNERSHIP", default=True),
+        )
+        return
     _log_grad_ownership(
         parameters,
         stage="preclip",

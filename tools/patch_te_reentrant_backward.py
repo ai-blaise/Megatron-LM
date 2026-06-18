@@ -37,7 +37,13 @@ LINEAR_WGRAD_GRAD_OUTPUT_MARKER = (
 LINEAR_GRAD_OUTPUT_USAGE_MARKER = (
     "# Megatron StreamBP/DSA reentrant NVFP4 grad-output preprocess usage patch"
 )
+QUANTIZED_TENSOR_RESTORE_MARKER = (
+    "# Megatron StreamBP/DSA retained-graph restore_from_func_ctx patch"
+)
 FUSER_MARKER = "# Megatron StreamBP/DSA retained-graph fuser-range patch"
+DISTRIBUTED_CHECKPOINT_MARKER = (
+    "# Megatron StreamBP/DSA retained-graph distributed checkpoint patch"
+)
 ENABLED_VALUES = '(\"1\", \"true\", \"yes\", \"on\")'
 
 
@@ -133,12 +139,24 @@ def _patch_linear() -> None:
         f"            if os.getenv(\"{FLAG}\", \"0\").lower() not in {ENABLED_VALUES}:\n"
         "                ctx.tensor_objects = None\n"
     )
+    restore_site_new_te = (
+        "            (\n"
+        "                inputmat,\n"
+        "                weight_fp8,\n"
+        "                saved_weight,\n"
+        "                bias,\n"
+        "            ) = restore_from_func_ctx(  # pylint: disable=unbalanced-tuple-unpacking\n"
+        "                ctx\n"
+        "            )\n"
+    )
     if new in text:
         print(f"TE linear tensor_objects cleanup already patched: {path}")
     elif old_global_patch in text:
         text = text.replace(old_global_patch, new, 1)
     elif old_unpatched in text:
         text = text.replace(old_unpatched, new, 1)
+    elif restore_site_new_te in text:
+        print(f"TE linear tensor_objects cleanup handled by quantized_tensor restore patch: {path}")
     else:
         raise SystemExit(f"Could not find TE tensor_objects cleanup site in {path}")
 
@@ -191,6 +209,8 @@ def _patch_linear() -> None:
         text = text.replace(old_saved_data_patch, saved_data_patch, 1)
     elif restore_site in text:
         text = text.replace(restore_site, restore_site + saved_data_patch, 1)
+    elif restore_site_new_te in text:
+        text = text.replace(restore_site_new_te, restore_site_new_te + saved_data_patch, 1)
     else:
         raise SystemExit(f"Could not find TE restore_from_saved site in {path}")
 
@@ -397,6 +417,54 @@ def _patch_linear() -> None:
     print(f"Patched TE linear retained-graph reentry support: {path}")
 
 
+def _patch_quantized_tensor_restore() -> None:
+    spec = importlib.util.find_spec("transformer_engine.pytorch.quantized_tensor")
+    if spec is None or spec.origin is None:
+        raise SystemExit("Could not locate transformer_engine.pytorch.quantized_tensor")
+
+    path = Path(spec.origin)
+    text = path.read_text()
+    original_text = text
+
+    if "import os\n" not in text:
+        if "import warnings\n" in text:
+            text = text.replace("import warnings\n", "import warnings\nimport os\n", 1)
+        else:
+            raise SystemExit("Could not find import site in transformer_engine quantized_tensor")
+    text = _upgrade_legacy_active_conditions(text)
+
+    old = (
+        "    # Delete the references to tensor objects once they've been consumed by the `restore_from_saved` method to construct back the actual tensors.\n"
+        "    ctx.tensor_objects = None\n"
+    )
+    new = (
+        "    # Delete the references to tensor objects once they've been consumed by the `restore_from_saved` method to construct back the actual tensors.\n"
+        f"    {QUANTIZED_TENSOR_RESTORE_MARKER}\n"
+        "    if not (\n"
+        f"{_active_condition('        ')}\n"
+        "    ):\n"
+        "        ctx.tensor_objects = None\n"
+    )
+    old_global_patch = (
+        "    # Delete the references to tensor objects once they've been consumed by the `restore_from_saved` method to construct back the actual tensors.\n"
+        f"    {QUANTIZED_TENSOR_RESTORE_MARKER}\n"
+        f"    if os.getenv(\"{FLAG}\", \"0\").lower() not in {ENABLED_VALUES}:\n"
+        "        ctx.tensor_objects = None\n"
+    )
+    if new in text:
+        print(f"TE quantized_tensor restore already patched: {path}")
+    elif old_global_patch in text:
+        text = text.replace(old_global_patch, new, 1)
+    elif old in text:
+        text = text.replace(old, new, 1)
+    elif QUANTIZED_TENSOR_RESTORE_MARKER not in text:
+        raise SystemExit(f"Could not find TE restore_from_func_ctx cleanup site in {path}")
+
+    if text != original_text:
+        path.write_text(text)
+        print(f"Patched TE quantized_tensor restore retained-graph support: {path}")
+
+
 def _patch_fuser() -> None:
     spec = importlib.util.find_spec("transformer_engine.pytorch.ops.fuser")
     if spec is None or spec.origin is None:
@@ -407,10 +475,10 @@ def _patch_fuser() -> None:
     original_text = text
 
     if "import os\n" not in text:
-        text = text.replace(
-            "from typing import Any, Optional\nimport itertools\n",
-            "from typing import Any, Optional\nimport itertools\nimport os\n",
-        )
+        if "import itertools\n" in text:
+            text = text.replace("import itertools\n", "import itertools\nimport os\n", 1)
+        else:
+            raise SystemExit("Could not find import site in TE fuser")
     text = _upgrade_legacy_active_conditions(text)
     text = _ensure_retention_helper(text)
 
@@ -470,9 +538,93 @@ def _patch_fuser() -> None:
     print(f"Patched TE fuser retained-graph reentry support: {path}")
 
 
+def _patch_distributed_checkpoint() -> None:
+    spec = importlib.util.find_spec("transformer_engine.pytorch.distributed")
+    if spec is None or spec.origin is None:
+        raise SystemExit("Could not locate transformer_engine.pytorch.distributed")
+
+    path = Path(spec.origin)
+    text = path.read_text()
+    original_text = text
+
+    if "import os\n" not in text:
+        if "import warnings\n" in text:
+            text = text.replace("import warnings\n", "import warnings\nimport os\n", 1)
+        else:
+            raise SystemExit("Could not find import site in transformer_engine distributed")
+
+    old = (
+        "        # backward does not require entering autocast context because\n"
+        "        # backward implementations already retrieve fp8 recipe and\n"
+        "        # enablement from stored ctx.\n"
+        "        torch.autograd.backward(outputs_with_grad, args_with_grad)\n"
+    )
+    new = (
+        "        # backward does not require entering autocast context because\n"
+        "        # backward implementations already retrieve fp8 recipe and\n"
+        "        # enablement from stored ctx.\n"
+        f"        {DISTRIBUTED_CHECKPOINT_MARKER}\n"
+        "        retain_reentrant_graph = (\n"
+        f"            os.getenv(\"{FLAG}\", \"0\").lower() in {ENABLED_VALUES}\n"
+        "        )\n"
+        "        torch.autograd.backward(\n"
+        "            outputs_with_grad,\n"
+        "            args_with_grad,\n"
+        "            retain_graph=retain_reentrant_graph,\n"
+        "        )\n"
+    )
+    old_retain_flag_patch = (
+        "        # backward does not require entering autocast context because\n"
+        "        # backward implementations already retrieve fp8 recipe and\n"
+        "        # enablement from stored ctx.\n"
+        f"        {DISTRIBUTED_CHECKPOINT_MARKER}\n"
+        "        retain_reentrant_graph = (\n"
+        f"            os.getenv(\"{FLAG}\", \"0\").lower() in {ENABLED_VALUES}\n"
+        f"            and os.getenv(\"{ACTIVE_FLAG}\", \"0\").lower() in {ENABLED_VALUES}\n"
+        f"            and os.getenv(\"{RETAIN_FLAG}\", \"1\").lower() in {ENABLED_VALUES}\n"
+        "        )\n"
+        "        torch.autograd.backward(\n"
+        "            outputs_with_grad,\n"
+        "            args_with_grad,\n"
+        "            retain_graph=retain_reentrant_graph,\n"
+        "        )\n"
+    )
+    old_active_patch = (
+        "        # backward does not require entering autocast context because\n"
+        "        # backward implementations already retrieve fp8 recipe and\n"
+        "        # enablement from stored ctx.\n"
+        f"        {DISTRIBUTED_CHECKPOINT_MARKER}\n"
+        "        retain_reentrant_graph = (\n"
+        f"            os.getenv(\"{FLAG}\", \"0\").lower() in {ENABLED_VALUES}\n"
+        f"            and os.getenv(\"{ACTIVE_FLAG}\", \"0\").lower() in {ENABLED_VALUES}\n"
+        "        )\n"
+        "        torch.autograd.backward(\n"
+        "            outputs_with_grad,\n"
+        "            args_with_grad,\n"
+        "            retain_graph=retain_reentrant_graph,\n"
+        "        )\n"
+    )
+    if new in text:
+        print(f"TE distributed checkpoint already patched: {path}")
+    elif old_retain_flag_patch in text:
+        text = text.replace(old_retain_flag_patch, new, 1)
+    elif old_active_patch in text:
+        text = text.replace(old_active_patch, new, 1)
+    elif old in text:
+        text = text.replace(old, new, 1)
+    elif DISTRIBUTED_CHECKPOINT_MARKER not in text:
+        raise SystemExit(f"Could not find TE distributed checkpoint backward site in {path}")
+
+    if text != original_text:
+        path.write_text(text)
+        print(f"Patched TE distributed checkpoint retained-graph support: {path}")
+
+
 def main() -> None:
+    _patch_quantized_tensor_restore()
     _patch_linear()
     _patch_fuser()
+    _patch_distributed_checkpoint()
 
 
 if __name__ == "__main__":

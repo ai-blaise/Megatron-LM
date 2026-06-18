@@ -24,6 +24,18 @@ _buffer = None
 _combine_config_cache = {}
 
 
+def _grad_provenance(name: str, **tensors) -> None:
+    if not (
+        os.getenv("MEGATRON_GRAD_PROVENANCE")
+        or os.getenv("MEGATRON_NUMERIC_DEBUG_GRAD_PROVENANCE")
+    ):
+        return
+    from megatron.core import numeric_debug
+
+    if numeric_debug.grad_provenance_enabled():
+        numeric_debug.log_grad_function(name, tensors=tensors)
+
+
 def _parse_int_env(name: str) -> Optional[int]:
     value = os.getenv(name)
     if value is None or value.strip() == "":
@@ -258,6 +270,12 @@ class FusedDispatch(torch.autograd.Function):
         # Make sure current stream is synchronized
         if ctx.async_finish:
             after_event.current_stream_wait()
+        _grad_provenance(
+            "moe.fused_a2a.FusedDispatch.backward",
+            grad_output=grad_output,
+            grad_x=grad_x,
+            grad_token_probs=grad_token_probs,
+        )
         return grad_x, None, grad_token_probs, None, None, None, None
 
 
@@ -392,6 +410,15 @@ class FusedDispatchExpertMajor(torch.autograd.Function):
         )
         if ctx.async_finish:
             after_event.current_stream_wait()
+        _grad_provenance(
+            "moe.fused_a2a.FusedDispatchExpertMajor.backward",
+            grad_expert_x=grad_expert_x,
+            grad_permuted_token_probs=grad_permuted_token_probs,
+            grad_recv_x=grad_recv_x,
+            grad_recv_probs=grad_recv_probs,
+            grad_x=grad_x,
+            grad_token_probs=grad_token_probs,
+        )
         return grad_x, None, grad_token_probs, None, None, None, None, None
 
 
@@ -440,6 +467,11 @@ class FusedCombine(torch.autograd.Function):
         # Make sure current stream is synchronized
         if ctx.async_finish:
             after_event.current_stream_wait()
+        _grad_provenance(
+            "moe.fused_a2a.FusedCombine.backward",
+            grad_output=grad_output,
+            grad_x=grad_x,
+        )
         return grad_x, None, None, None, None
 
 
@@ -519,6 +551,12 @@ class FusedExpertMajorCombine(torch.autograd.Function):
         from megatron.core.extensions.hisa_indexer.kernels.build import get_ext
 
         get_ext().moe_deepep_compact_gather(grad_recv_order.contiguous(), row_map, grad_x)
+        _grad_provenance(
+            "moe.fused_a2a.FusedExpertMajorCombine.backward",
+            grad_output=grad_output,
+            grad_recv_order=grad_recv_order,
+            grad_x=grad_x,
+        )
         return grad_x, None, None, None, None, None, None, None, None
 
 
@@ -774,6 +812,13 @@ class HybridEPDispatch(torch.autograd.Function):
         combined_hidden, combined_probs = _hybrid_ep_buffer.combine_with_unpermute(
             hidden=grad_x, probs=grad_probs, handle=handle, pad_multiple=ctx.pad_multiple
         )
+        _grad_provenance(
+            "moe.fused_a2a.HybridEPDispatch.backward",
+            grad_x=grad_x,
+            grad_probs=grad_probs,
+            combined_hidden=combined_hidden,
+            combined_probs=combined_probs,
+        )
         return combined_hidden, None, combined_probs, None, None, None, None, None, None, None, None
 
 
@@ -808,6 +853,11 @@ class HybridEPCombine(torch.autograd.Function):
             handle=handle,
             pad_multiple=ctx.pad_multiple,
             num_permuted_tokens=ctx.num_permuted_tokens,
+        )
+        _grad_provenance(
+            "moe.fused_a2a.HybridEPCombine.backward",
+            grad_x=grad_x,
+            dispatched_hidden=dispatched_hidden,
         )
         return dispatched_hidden, None, None, None, None
 

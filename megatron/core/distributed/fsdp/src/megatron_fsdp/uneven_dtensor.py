@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Iterable, List, Optional, Union
+from typing import Iterable, List, Optional, Sequence, Union
 
 import torch
 import torch.distributed as dist
@@ -28,12 +28,80 @@ from torch.distributed.tensor.placement_types import Replicate, Shard, _StridedS
 from .utils import get_mesh_names
 
 
+def _get_flattened_mesh_group(device_mesh):
+    """Return a process group spanning every rank in a DTensor device mesh."""
+    if not device_mesh.mesh_dim_names:
+        return device_mesh.get_group()
+
+    full_flattened_mesh_dim_name = "_".join(device_mesh.mesh_dim_names)
+    if full_flattened_mesh_dim_name in get_mesh_names(device_mesh):
+        try:
+            return device_mesh[full_flattened_mesh_dim_name].get_group()
+        except Exception:
+            return (
+                device_mesh._get_root_mesh()
+                ._flatten_mapping[full_flattened_mesh_dim_name]
+                .get_group()
+            )
+
+    return device_mesh._flatten().get_group()
+
+
+def _maybe_compute_flat_repeated_shard_metadata(dtensor: DTensor) -> Optional[ChunkStorageMetadata]:
+    """Compute chunk metadata for flattened uneven shards on repeated shard dims.
+
+    Megatron-FSDP save-time transforms such as SWiGLU W/V splitting can create
+    DTensors whose `dp_cp` and `tp` placements both shard the same tensor dim,
+    but whose local chunks are no longer a separable 2D mesh partition. Some
+    ranks own an empty chunk for one half and later flattened ranks own the
+    data. In that case mesh-axis-by-mesh-axis offsets are the wrong model; the
+    valid checkpoint chunks are contiguous in flattened mesh rank order.
+    """
+
+    shard_dims = [
+        p.dim for p in dtensor.placements if isinstance(p, (Shard, _StridedShard))
+    ]
+    repeated_shard_dims = {dim for dim in shard_dims if shard_dims.count(dim) > 1}
+    if not repeated_shard_dims:
+        return None
+
+    local_shape = tuple(dtensor.to_local().shape)
+    process_group = _get_flattened_mesh_group(dtensor.device_mesh)
+    world_size = dist.get_world_size(process_group)
+    rank = dist.get_rank(process_group)
+    all_shapes = [None] * world_size
+    dist.all_gather_object(all_shapes, local_shape, group=process_group)
+
+    use_flat_offsets = False
+    for dim in repeated_shard_dims:
+        dim_sizes = [shape[dim] for shape in all_shapes]
+        if sum(dim_sizes) != dtensor.shape[dim]:
+            return None
+        if any(size == 0 for size in dim_sizes) or len(set(dim_sizes)) > 1:
+            use_flat_offsets = True
+
+    if not use_flat_offsets:
+        return None
+
+    offsets = [0] * len(local_shape)
+    cumulative_shape = list(local_shape)
+    for dim in repeated_shard_dims:
+        offsets[dim] = sum(shape[dim] for shape in all_shapes[:rank])
+        cumulative_shape[dim] = sum(shape[dim] for shape in all_shapes)
+
+    return ChunkStorageMetadata(offsets=tuple(offsets), sizes=local_shape)
+
+
 def gather_and_compute_chunk_metadata(dtensor: DTensor) -> ChunkStorageMetadata:
     """
     Gather chunk metadata for a DTensor across all ranks and compute the
     offsets and sizes of each chunk. This is necessary for handling uneven
     sharding in distributed tensors.
     """
+    flat_repeated_shard_meta = _maybe_compute_flat_repeated_shard_metadata(dtensor)
+    if flat_repeated_shard_meta is not None:
+        return flat_repeated_shard_meta
+
     local_tensor = dtensor.to_local()
     local_shape = local_tensor.shape
     device_mesh = dtensor.device_mesh
@@ -95,11 +163,13 @@ def gather_and_compute_chunk_metadata(dtensor: DTensor) -> ChunkStorageMetadata:
     return ChunkStorageMetadata(offsets=tuple(offsets), sizes=tuple(local_shape))
 
 
-def update_uneven_dtensor_chunk_metadata(dtensor: DTensor) -> dict:
+def set_dtensor_chunk_metadata(dtensor: DTensor, uneven_chunk_meta: ChunkStorageMetadata) -> None:
     """
-    Update the DTensor's chunk metadata to handle uneven sharding.
-    This function modifies the DTensor in-place to include chunk metadata
-    and write items closures for saving and loading.
+    Attach explicit checkpoint chunk metadata to a DTensor's local tensor.
+
+    Save-time transforms such as SWiGLU W/V splitting already know the local
+    chunk's global offset. Installing that metadata directly avoids a
+    per-tensor object collective over the full flattened mesh.
     """
 
     def _chunk_list_closure(chunk_meta):
@@ -125,6 +195,18 @@ def update_uneven_dtensor_chunk_metadata(dtensor: DTensor) -> dict:
 
         return _write_items
 
+    # Set the chunk list and write items closure for the DTensor
+    dtensor._local_tensor.__create_chunk_list__ = _chunk_list_closure([uneven_chunk_meta])
+    dtensor._local_tensor.__create_write_items__ = _write_items_closure(uneven_chunk_meta)
+
+
+def update_uneven_dtensor_chunk_metadata(dtensor: DTensor) -> dict:
+    """
+    Update the DTensor's chunk metadata to handle uneven sharding.
+    This function modifies the DTensor in-place to include chunk metadata
+    and write items closures for saving and loading.
+    """
+
     # Get uneven chunk metadata for the DTensor
     # TODO: Optimize gather_and_compute_chunk_metadata synchronization:
     # 1. Add pre-check validation to verify tensor shape consistency
@@ -132,10 +214,7 @@ def update_uneven_dtensor_chunk_metadata(dtensor: DTensor) -> dict:
     # 2. Implement batched barrier using grouped collectives
     #    to amortize synchronization overhead
     uneven_chunk_meta = gather_and_compute_chunk_metadata(dtensor)
-
-    # Set the chunk list and write items closure for the DTensor
-    dtensor._local_tensor.__create_chunk_list__ = _chunk_list_closure([uneven_chunk_meta])
-    dtensor._local_tensor.__create_write_items__ = _write_items_closure(uneven_chunk_meta)
+    set_dtensor_chunk_metadata(dtensor, uneven_chunk_meta)
 
 
 def validate_uneven_dtensor(dtensor: DTensor) -> None:
@@ -180,21 +259,33 @@ def validate_uneven_dtensor(dtensor: DTensor) -> None:
     if torch.distributed.is_initialized() and torch.distributed.get_backend() == 'fake':
         return
 
-    boundary_checks = torch.tensor(
-        [
-            [offset == 0, offset + size == dtensor.shape[dim]]
-            for (dim, (offset, size)) in enumerate(zip(chunk_meta.offsets, chunk_meta.sizes))
-        ],
-        dtype=torch.int,
-    ).cuda()
+    local_tensor = dtensor.to_local()
+    if local_tensor.numel() == 0:
+        # Empty local chunks are valid for uneven save-time transforms such as
+        # splitting a flattened SwiGLU FC1 shard into W/V halves. They should not
+        # claim any coverage boundary, but they must still join the collective.
+        boundary_checks = torch.zeros(
+            (len(dtensor.shape), 2), dtype=torch.int, device=local_tensor.device
+        )
+    else:
+        boundary_checks = torch.tensor(
+            [
+                [offset == 0, offset + size == dtensor.shape[dim]]
+                for (dim, (offset, size)) in enumerate(zip(chunk_meta.offsets, chunk_meta.sizes))
+            ],
+            dtype=torch.int,
+            device=local_tensor.device,
+        )
 
-    for i, p in enumerate(dtensor.placements):
-        if isinstance(p, Shard) or isinstance(p, _StridedShard):
-            torch.distributed.all_reduce(
-                boundary_checks,
-                op=torch.distributed.ReduceOp.MAX,
-                group=dtensor.device_mesh.get_group(i),
-            )
+    # Boundary coverage is a global property of the checkpoint write set. Reducing
+    # one mesh axis at a time is too strict when an entire coordinate along one
+    # shard axis is empty after a save-time split; a flattened mesh reduction
+    # correctly asks whether any non-empty writer touches each global boundary.
+    torch.distributed.all_reduce(
+        boundary_checks,
+        op=torch.distributed.ReduceOp.MAX,
+        group=_get_flattened_mesh_group(dtensor.device_mesh),
+    )
     assert torch.all(boundary_checks), (
         "[Megatron-FSDP] DTensor chunk metadata boundary check failed. "
         f"Offsets: {chunk_meta.offsets}, "
@@ -237,6 +328,51 @@ def get_unflattened_state_dict(state_dict, key_chain=[]):
     return current
 
 
+def _is_swiglu_split_key(key_chain: Sequence[object]) -> bool:
+    """Return true for save-time SWiGLU W/V split tensors.
+
+    `handle_swiglu_in_state_dict` rewrites `linear_fc1` tensors into `_w` and
+    `_v` halves for both model weights and optimizer states. Those synthetic
+    DTensors can have empty or uneven local chunks even when the original
+    tensor shape was evenly sharded. Ordinary DTensors should keep PyTorch
+    DCP's default write-items path; forcing all of them through object
+    collectives makes checkpointing scale with every parameter tensor.
+    """
+
+    for item in key_chain:
+        item_text = str(item)
+        if "linear_fc1" not in item_text:
+            continue
+        if item_text.endswith("_w") or item_text.endswith("_v"):
+            return True
+    return False
+
+
+def _dtensor_has_shape_uneven_sharding(dtensor: DTensor) -> bool:
+    """Cheap rank-consistent precheck for uneven sharded dimensions."""
+
+    shard_factor_by_dim = {}
+    for mesh_dim, placement in enumerate(dtensor.placements):
+        if not isinstance(placement, (Shard, _StridedShard)):
+            continue
+        try:
+            shard_world_size = dist.get_world_size(dtensor.device_mesh.get_group(mesh_dim))
+        except Exception:
+            shard_world_size = dtensor.device_mesh.size(mesh_dim)
+        shard_factor_by_dim[placement.dim] = (
+            shard_factor_by_dim.get(placement.dim, 1) * int(shard_world_size)
+        )
+
+    for dim, shard_factor in shard_factor_by_dim.items():
+        if int(dtensor.shape[dim]) % shard_factor != 0:
+            return True
+    return False
+
+
+def _needs_uneven_dtensor_metadata(key_chain: Sequence[object], dtensor: DTensor) -> bool:
+    return _is_swiglu_split_key(key_chain) or _dtensor_has_shape_uneven_sharding(dtensor)
+
+
 def preprocess_state_dict_for_uneven_dtensor(state_dict: dict) -> dict:
     """
     Preprocess the state_dict to prepare it for saving or loading unevenly sharded DTensors.
@@ -251,6 +387,21 @@ def preprocess_state_dict_for_uneven_dtensor(state_dict: dict) -> dict:
     for key_chain in sorted(visit_dtensor):
         # Get the DTensor at the key chain
         dtensor = get_unflattened_state_dict(state_dict, key_chain)
+        is_swiglu_split = _is_swiglu_split_key(key_chain)
+        if not is_swiglu_split and not _dtensor_has_shape_uneven_sharding(dtensor):
+            continue
+        if (
+            hasattr(dtensor._local_tensor, "__create_chunk_list__")
+            and hasattr(dtensor._local_tensor, "__create_write_items__")
+        ):
+            continue
+        if is_swiglu_split:
+            raise RuntimeError(
+                "SWiGLU split DTensor is missing deterministic checkpoint metadata: "
+                f"{'.'.join(str(k) for k in key_chain)}. This would otherwise enter "
+                "a full-mesh object collective and can hang when optimizer-state keys "
+                "differ across ranks."
+            )
         update_uneven_dtensor_chunk_metadata(dtensor)
     return state_dict
 

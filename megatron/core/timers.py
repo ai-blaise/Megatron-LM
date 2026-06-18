@@ -19,16 +19,6 @@ try:
 except ImportError:
     SummaryWriter = None
 
-from megatron.core.utils import is_torch_min_version
-
-try:
-    if is_torch_min_version("1.13.0"):
-        dist_all_gather_func = torch.distributed.all_gather_into_tensor
-    else:
-        dist_all_gather_func = torch.distributed._all_gather_base
-except:
-    dist_all_gather_func = torch.distributed._all_gather_base
-
 logger = logging.getLogger(__name__)
 
 
@@ -292,26 +282,23 @@ class Timers:
             torch.distributed.barrier()
 
         world_size = torch.distributed.get_world_size()
-        rank = torch.distributed.get_rank()
 
-        # Here we can use gather on the rank we want to print the
-        # timing, however, there is no gather_base support in
-        # pytorch yet. It is simpler to deal with a single tensor
-        # and since we are only gathering a small amount of data,
-        # it should be ok to use all-gather instead of gather.
-        rank_name_to_time = torch.zeros(
-            (world_size, len(names)), dtype=torch.float, device=torch.cuda.current_device()
-        )
+        rank_time = torch.zeros((len(names),), dtype=torch.float, device=torch.cuda.current_device())
         for i, name in enumerate(names):
             if name in self._timers:
                 # Here we don't need to pass the barrier flag as all
                 # the processes are already in sync. This avoids the
                 # issue of different timers having different barrier
                 # groups inside their class.
-                rank_name_to_time[rank, i] = self._timers[name].elapsed(reset=reset)
+                rank_time[i] = self._timers[name].elapsed(reset=reset)
 
-        # See the note above for why we are not using gather.
-        dist_all_gather_func(rank_name_to_time.view(-1), rank_name_to_time[rank, :].view(-1))
+        # Use list-based all_gather for this tiny payload. It avoids the
+        # NCCL all_gather_into_tensor path that can fail on some builds.
+        rank_name_to_time = [
+            torch.zeros_like(rank_time) for _ in range(world_size)
+        ]
+        torch.distributed.all_gather(rank_name_to_time, rank_time)
+        rank_name_to_time = torch.stack(rank_name_to_time, dim=0)
 
         return rank_name_to_time
 

@@ -168,6 +168,7 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
         self,
         strategy: LoadShardedStrategy,
         parallelization_group: Optional[torch.distributed.ProcessGroup] = None,
+        metadata_group: Optional[torch.distributed.ProcessGroup] = None,
         do_cache_distribution: bool = False,
         exchange_algo: str = 'broadcast',
     ):
@@ -178,6 +179,7 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
                 dist.GroupMember.WORLD
             )  # explicit group needed for torch.distributed.get_global_rank call
         self.parallelization_group = parallelization_group
+        self.metadata_group = metadata_group if metadata_group is not None else parallelization_group
         self.do_cache_distribution = do_cache_distribution
         self.exchange_algo = exchange_algo
 
@@ -271,7 +273,9 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
             with debug_time("torch.cuda.synchronize", logger):
                 torch.cuda.synchronize()
 
-        all_loaded_objects = exchange_loaded_objects_gather_object(loaded_objects)
+        all_loaded_objects = exchange_loaded_objects_gather_object(
+            loaded_objects, self.metadata_group
+        )
 
         if not set(unloaded_objects.keys()).issubset(all_loaded_objects.keys()):
             missing_object_shards = set(unloaded_objects.keys()) - all_loaded_objects.keys()
@@ -377,7 +381,7 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
         else:
             logger.debug(f'Apply load parallelization')
             precomputed_distribution = determine_main_replica_uniform_distribution(
-                sharded_state_dict, self.parallelization_group, True
+                sharded_state_dict, self.metadata_group, True
             )
 
         distribute_main_replicas_with_precomputed_distribution(

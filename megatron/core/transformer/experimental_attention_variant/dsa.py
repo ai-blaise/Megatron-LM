@@ -62,6 +62,37 @@ from megatron.core.extensions.hisa_indexer.reference import (
     hisa_unselect_grad_from_topk_to_scores,
 )
 
+
+def _grad_provenance(name: str, **tensors) -> None:
+    if not (
+        os.getenv("MEGATRON_GRAD_PROVENANCE")
+        or os.getenv("MEGATRON_NUMERIC_DEBUG_GRAD_PROVENANCE")
+    ):
+        return
+    from megatron.core import numeric_debug
+
+    if numeric_debug.grad_provenance_enabled():
+        numeric_debug.log_grad_function(name, tensors=tensors)
+
+
+def _register_grad_provenance_tensor(name: str, tensor: Optional[torch.Tensor]) -> None:
+    if tensor is None or not torch.is_tensor(tensor) or not tensor.requires_grad:
+        return
+    if not (
+        os.getenv("MEGATRON_GRAD_PROVENANCE")
+        or os.getenv("MEGATRON_NUMERIC_DEBUG_GRAD_PROVENANCE")
+    ):
+        return
+
+    def _hook(grad: torch.Tensor):
+        _grad_provenance(name, grad=grad)
+        return grad
+
+    try:
+        tensor.register_hook(_hook)
+    except RuntimeError:
+        pass
+
 try:
     from fast_hadamard_transform import hadamard_transform
 except ImportError:
@@ -1511,6 +1542,13 @@ class FusedDSAIndexerLoss(torch.autograd.Function):
             ctx.pg_collection,
         )
 
+        _grad_provenance(
+            "dsa.FusedDSAIndexerLoss.backward",
+            grad_loss=grad_loss,
+            grad_q=grad_q,
+            grad_weights=grad_weights,
+            grad_k=grad_k,
+        )
         # query and key are detached in forward, so return None for their gradients
         return grad_q, grad_weights, grad_k, None, None, None, None, None, None, None, None
 
@@ -1556,6 +1594,12 @@ class DSAIndexerLossAutoScaler(torch.autograd.Function):
             )
         indexer_loss_backward_scale = DSAIndexerLossAutoScaler.main_loss_backward_scale
         scaled_indexer_loss_grad = torch.ones_like(indexer_loss) * indexer_loss_backward_scale
+        _grad_provenance(
+            "dsa.DSAIndexerLossAutoScaler.backward",
+            grad_output=grad_output,
+            indexer_loss=indexer_loss,
+            scaled_indexer_loss_grad=scaled_indexer_loss_grad,
+        )
         return grad_output, scaled_indexer_loss_grad
 
     @staticmethod
@@ -3007,6 +3051,16 @@ class _HISAIndexerLoss(torch.autograd.Function):
         )
         grad_k = torch.stack(grad_k_by_batch, dim=1).reshape(sk, bsz, index_k_dim).to(ctx.k_dtype)
 
+        _grad_provenance(
+            "dsa._HISAIndexerLoss.backward",
+            grad_loss_sum=grad_loss_sum,
+            grad_topk_logit=grad_topk_logit,
+            grad_candidate_scores=grad_candidate_scores,
+            grad_block_scores=grad_block_scores,
+            grad_q=grad_q,
+            grad_weights=grad_weights,
+            grad_k=grad_k,
+        )
         return (
             grad_q,
             grad_weights,
@@ -3306,6 +3360,13 @@ class _HISASelectWithScores(torch.autograd.Function):
             grad_w=grad_w,
             grad_k=grad_k,
         )
+        _grad_provenance(
+            "dsa._HISASelectWithScores.backward",
+            grad_selected_scores=grad_selected_scores,
+            grad_q=grad_q,
+            grad_w=grad_w,
+            grad_k=grad_k,
+        )
         return (
             grad_q,
             grad_w,
@@ -3474,6 +3535,13 @@ class _HISASelectWithScoresBatched(torch.autograd.Function):
         _log_hisa_indexer_loss_debug(
             "select_scores.batched.backward_return",
             ctx.debug_call_id,
+            grad_q=grad_q,
+            grad_w=grad_w,
+            grad_k=grad_k,
+        )
+        _grad_provenance(
+            "dsa._HISASelectWithScoresBatched.backward",
+            grad_selected_scores=grad_selected_scores,
             grad_q=grad_q,
             grad_w=grad_w,
             grad_k=grad_k,
@@ -3718,6 +3786,19 @@ class _HISADSASplitQKFusedForward(torch.autograd.Function):
             grad_key_pe=grad_key_pe,
             grad_value=grad_value,
         )
+        _grad_provenance(
+            "dsa._HISADSASplitQKFusedForward.backward",
+            grad_output=grad_output_4d,
+            grad_selected_scores=grad_selected_scores,
+            grad_q_indexer=grad_q_indexer,
+            grad_weights=grad_weights,
+            grad_k_indexer=grad_k_indexer,
+            grad_query_nope=grad_query_nope,
+            grad_query_pe=grad_query_pe,
+            grad_key_nope=grad_key_nope,
+            grad_key_pe=grad_key_pe,
+            grad_value=grad_value,
+        )
 
         return (
             grad_q_indexer,
@@ -3825,6 +3906,11 @@ class _SelectedScoresKLLoss(torch.autograd.Function):
         _log_hisa_indexer_loss_debug(
             "selected_kl.backward",
             ctx.debug_call_id,
+            grad_output=grad_output,
+            grad_selected_scores=grad,
+        )
+        _grad_provenance(
+            "dsa._SelectedScoresKLLoss.backward",
             grad_output=grad_output,
             grad_selected_scores=grad,
         )
@@ -4023,6 +4109,14 @@ class _HISAFusedIndexerLoss(torch.autograd.Function):
         grad_q = grad_q.to(q.dtype)
         grad_weights = grad_weights.to(weights.dtype)
         grad_k = grad_k.to(k.dtype)
+        _grad_provenance(
+            "dsa._HISAFusedIndexerLoss.backward",
+            grad_loss_sum=grad_loss_sum,
+            grad_selected_scores=grad_selected_scores,
+            grad_q=grad_q,
+            grad_weights=grad_weights,
+            grad_k=grad_k,
+        )
         return (
             grad_q,
             grad_weights,
@@ -5488,6 +5582,25 @@ class DSAttention(MegatronModule):
                 query_indices=streambp_query_indices,
                 apply_indexcache=not defer_indexcache_for_cp,
             )
+        _register_grad_provenance_tensor(
+            f"dsa.DSAttention.forward.layer{self.layer_number}.query_projection_grad", query
+        )
+        _register_grad_provenance_tensor(
+            f"dsa.DSAttention.forward.layer{self.layer_number}.key_projection_grad", key
+        )
+        _register_grad_provenance_tensor(
+            f"dsa.DSAttention.forward.layer{self.layer_number}.value_projection_grad", value
+        )
+        if not callable(q):
+            _register_grad_provenance_tensor(
+                f"dsa.DSAttention.forward.layer{self.layer_number}.indexer_q_grad", q
+            )
+        _register_grad_provenance_tensor(
+            f"dsa.DSAttention.forward.layer{self.layer_number}.indexer_k_grad", k
+        )
+        _register_grad_provenance_tensor(
+            f"dsa.DSAttention.forward.layer{self.layer_number}.indexer_weights_grad", weights
+        )
         numeric_debug = None
         log_dsa_debug = False
         force_debug = False
@@ -5637,7 +5750,15 @@ class DSAttention(MegatronModule):
             hisa_log_label=f"DSAttention:{self.layer_number}",
             dsa_runtime_context=dsa_runtime_context,
         )
+        _register_grad_provenance_tensor(
+            f"dsa.DSAttention.forward.layer{self.layer_number}.selected_attention_output_grad",
+            output,
+        )
         if indexer_loss is not None:
+            _register_grad_provenance_tensor(
+                f"dsa.DSAttention.forward.layer{self.layer_number}.indexer_loss_grad",
+                indexer_loss,
+            )
             DSAIndexerLossLoggingHelper.save_loss_to_tracker(
                 loss=indexer_loss, layer_number=self.layer_number, num_layers=self.config.num_layers
             )

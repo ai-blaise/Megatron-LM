@@ -7,6 +7,8 @@ from typing import Any
 
 import torch
 
+from megatron.core.utils import to_local_if_dtensor
+
 
 @dataclass(frozen=True)
 class FusedTensorView:
@@ -94,6 +96,7 @@ class FusedOptimizerStateBuffer:
 
 class PinnedMirror:
     def __init__(self, source: torch.Tensor):
+        source = to_local_if_dtensor(source).detach()
         pin = source.is_cuda and torch.cuda.is_available()
         try:
             self.tensor = torch.empty(
@@ -106,7 +109,8 @@ class PinnedMirror:
             self.tensor = torch.empty(source.numel(), dtype=source.dtype, device="cpu")
 
     def copy_from(self, source: torch.Tensor, stream: torch.cuda.Stream | None = None) -> None:
-        source_flat = _flatten_for_copy(source.detach())
+        source = to_local_if_dtensor(source).detach()
+        source_flat = _flatten_for_copy(source)
         if stream is not None and source.is_cuda:
             with torch.cuda.stream(stream):
                 self.tensor.copy_(source_flat, non_blocking=True)

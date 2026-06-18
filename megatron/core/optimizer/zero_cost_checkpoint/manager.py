@@ -17,6 +17,7 @@ from .cuda_events import CudaEventPool
 from .persistence import atomic_torch_save, tensor_payload
 from .snapshot_spec import SnapshotPlanner, TensorSnapshotSpec, iter_torch_optimizers
 from .worker import AsyncDumpWorker, DumpTask
+from megatron.core.utils import to_local_if_dtensor
 
 
 class ZeroCostCheckpointManager:
@@ -68,7 +69,8 @@ class ZeroCostCheckpointManager:
 
         for spec in specs:
             mirror = self._mirrors[spec.name]
-            restored = mirror.tensor.view(spec.tensor.shape).to(dtype=spec.tensor.dtype)
+            local_tensor = to_local_if_dtensor(spec.tensor)
+            restored = mirror.tensor.view(local_tensor.shape).to(dtype=local_tensor.dtype)
             payload["tensors"].append(tensor_payload(spec.name, restored))
 
         flash_path = self._snapshot_path(self._flash_root(), step, durable=False)
@@ -132,15 +134,16 @@ class ZeroCostCheckpointManager:
     def _copy_specs_to_mirrors(self, specs: list[TensorSnapshotSpec]) -> None:
         event = self._event_pool.acquire()
         for spec in specs:
+            source = to_local_if_dtensor(spec.tensor)
             mirror = self._mirrors.get(spec.name)
             if (
                 mirror is None
-                or mirror.tensor.numel() != spec.tensor.numel()
-                or mirror.tensor.dtype != spec.tensor.dtype
+                or mirror.tensor.numel() != source.numel()
+                or mirror.tensor.dtype != source.dtype
             ):
-                mirror = PinnedMirror(spec.tensor.detach())
+                mirror = PinnedMirror(source.detach())
                 self._mirrors[spec.name] = mirror
-            mirror.copy_from(spec.tensor.detach(), stream=self._stream)
+            mirror.copy_from(source.detach(), stream=self._stream)
         if torch.cuda.is_available() and self._stream is not None:
             event.record(self._stream)
             event.synchronize()

@@ -25,6 +25,7 @@ from megatron.core.pipeline_parallel.utils import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import create_cudagraphs
 from megatron.core.transformer.enums import CudaGraphScope
+from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossAutoScaler
 from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler
 from megatron.core.utils import (
     drain_embedding_wgrad_compute,
@@ -54,15 +55,75 @@ def _env_flag(name: str, default: str = "0") -> bool:
     return os.environ.get(name, default).lower() in {"1", "true", "yes", "on"}
 
 
+def _first_tensor(value):
+    if isinstance(value, torch.Tensor):
+        return value
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            tensor = _first_tensor(item)
+            if tensor is not None:
+                return tensor
+    return None
+
+
+def _dsa_indexer_aux_loss_scale(
+    loss_scale: torch.Tensor,
+    cp_group_size: int,
+    num_microbatches: int,
+    calculate_per_token_loss: bool,
+    num_tokens: torch.Tensor | None = None,
+    output_tensor=None,
+) -> torch.Tensor:
+    """Return the backward scale for the DSA/HISA indexer KL auxiliary loss.
+
+    The DSA indexer loss is already a KL mean over selected query rows. It is
+    not a token-counted CE sum and should not silently inherit MoE's CP
+    amplification. The legacy MoE-compatible mode remains available only behind
+    an explicit environment value for comparison runs.
+    """
+
+    mode = os.environ.get("MEGATRON_DSA_INDEXER_AUX_LOSS_SCALE_MODE", "token_mean").lower()
+    if mode in ("token_mean", "mean", "global_mean"):
+        cp_factor = 1.0
+    elif mode in ("moe_cp", "legacy_cp"):
+        cp_factor = float(cp_group_size)
+    else:
+        raise ValueError(
+            "MEGATRON_DSA_INDEXER_AUX_LOSS_SCALE_MODE must be one of "
+            f"'token_mean' or 'moe_cp', got {mode!r}"
+        )
+
+    if calculate_per_token_loss:
+        token_count = None
+        tensor = None
+        if num_tokens is not None and num_tokens.device == loss_scale.device:
+            token_count = num_tokens.to(dtype=loss_scale.dtype)
+        else:
+            tensor = _first_tensor(output_tensor)
+        if token_count is None and tensor is not None:
+            if tensor.dim() >= 3:
+                local_tokens = tensor.shape[0] * tensor.shape[1]
+            elif tensor.dim() >= 1:
+                local_tokens = tensor.shape[0]
+            else:
+                local_tokens = 1
+            token_count = torch.tensor(
+                local_tokens, device=loss_scale.device, dtype=loss_scale.dtype
+            )
+        if token_count is None:
+            token_count = torch.ones((), device=loss_scale.device, dtype=loss_scale.dtype)
+        return loss_scale * cp_factor * token_count
+    return loss_scale * cp_factor / num_microbatches
+
+
 class _PipelineQueueOffloadedTensor:
     """Host-resident pipeline queue tensor that preserves the original Tensor object.
 
     Pipeline schedule queues keep stage input tensors alive from forward until
-    backward so the stage can retain/send input gradients.  For StreamBP runs,
-    those inputs are just replay boundaries; keeping their full CUDA storage
-    resident across the whole VPP warmup can dominate memory.  This wrapper
-    copies the tensor payload to host RAM and releases CUDA storage after
-    forward, then restores the same Tensor object before backward consumes it.
+    backward so the stage can retain/send input gradients. Keeping every queued
+    activation resident across VPP warmup/steady state can dominate memory. This
+    wrapper copies the tensor payload to host RAM and releases CUDA storage after
+    forward/P2P, then restores the same Tensor object before backward consumes it.
     """
 
     __slots__ = ("tensor", "cpu_tensor", "device", "released")
@@ -117,6 +178,13 @@ def _pipeline_queue_offload_enabled() -> bool:
     return _env_flag("MEGATRON_PIPELINE_QUEUE_OFFLOAD", "0")
 
 
+def _pipeline_queue_offload_depth() -> int:
+    try:
+        return max(1, int(os.environ.get("MEGATRON_PIPELINE_QUEUE_OFFLOAD_DEPTH", "1")))
+    except ValueError:
+        return 1
+
+
 def _pipeline_queue_offload_pin_memory(tensor: torch.Tensor) -> bool:
     mode = os.environ.get("MEGATRON_PIPELINE_QUEUE_OFFLOAD_PIN_MEMORY", "auto").lower()
     if mode in {"0", "false", "off", "no", "never"}:
@@ -149,6 +217,8 @@ def _pipeline_queue_offload_value(value):
     if isinstance(value, tuple):
         return tuple(_pipeline_queue_offload_value(item) for item in value)
     if torch.is_tensor(value):
+        if value._base is not None:
+            return value
         return _PipelineQueueOffloadedTensor(value).offload()
     return value
 
@@ -161,6 +231,44 @@ def _pipeline_queue_materialize_value(value):
     if isinstance(value, tuple):
         return tuple(_pipeline_queue_materialize_value(item) for item in value)
     return value
+
+
+def _pipeline_queue_manage_queue(queue):
+    if not _pipeline_queue_offload_enabled() or queue is None:
+        return
+    depth = _pipeline_queue_offload_depth()
+    for idx, value in enumerate(queue):
+        if idx < depth:
+            queue[idx] = _pipeline_queue_materialize_value(value)
+        else:
+            queue[idx] = _pipeline_queue_offload_value(value)
+
+
+def _pipeline_queue_manage_queues(queues):
+    if not _pipeline_queue_offload_enabled() or queues is None:
+        return
+    if len(queues) == 0:
+        return
+    if isinstance(queues[0], list):
+        for queue in queues:
+            _pipeline_queue_manage_queue(queue)
+    else:
+        _pipeline_queue_manage_queue(queues)
+
+
+def _pipeline_queue_materialize_queue_head(queue):
+    if queue:
+        queue[0] = _pipeline_queue_materialize_value(queue[0])
+
+
+def _pipeline_queue_count_offloaded(value) -> int:
+    if isinstance(value, _PipelineQueueOffloadedTensor):
+        return int(value.released)
+    if isinstance(value, list):
+        return sum(_pipeline_queue_count_offloaded(item) for item in value)
+    if isinstance(value, tuple):
+        return sum(_pipeline_queue_count_offloaded(item) for item in value)
+    return 0
 
 
 def _pipeline_progress_enabled() -> bool:
@@ -258,12 +366,25 @@ def _pipeline_progress_queue_state(input_tensors, output_tensors, output_tensor_
             return "[" + ",".join(str(len(value)) for value in values) + "]"
         return str(len(values))
 
+    def offloaded(values):
+        if values is None:
+            return 0
+        return _pipeline_queue_count_offloaded(values)
+
     parts = [
         f"in={lens(input_tensors)}",
         f"out={lens(output_tensors)}",
     ]
     if output_tensor_grads is not None:
         parts.append(f"out_grad={lens(output_tensor_grads)}")
+    if _pipeline_queue_offload_enabled():
+        parts.append(
+            "queue_offloaded="
+            f"in:{offloaded(input_tensors)}"
+            f"/out:{offloaded(output_tensors)}"
+            f"/out_grad:{offloaded(output_tensor_grads)}"
+        )
+        parts.append(f"queue_resident_depth={_pipeline_queue_offload_depth()}")
     return " ".join(parts)
 
 
@@ -570,6 +691,29 @@ def forward_step_calc_loss(
             # See https://github.com/NVIDIA/Megatron-LM/pull/2217 for detailed explanation
             # of scaling by cp_group_size
             MoEAuxLossAutoScaler.set_loss_scale(loss_scale * cp_group_size / num_microbatches)
+
+    # Set the loss scale for DSA indexer auxiliary loss. When enabled, the
+    # indexer loss is attached to the local activation graph like MoE aux loss,
+    # which keeps VPP chunks from sharing one process-global loss graph.
+    if (
+        getattr(config, 'dsa_indexer_loss_coeff', None) is not None
+        and config.dsa_indexer_loss_coeff > 0
+    ):
+        loss_scale = (
+            config.grad_scale_func(torch.ones(1, device=output_tensor.device))
+            if config.grad_scale_func is not None
+            else torch.ones(1, device=output_tensor.device)
+        )
+        DSAIndexerLossAutoScaler.set_loss_scale(
+            _dsa_indexer_aux_loss_scale(
+                loss_scale,
+                cp_group_size,
+                num_microbatches,
+                config.calculate_per_token_loss,
+                num_tokens=num_tokens,
+                output_tensor=output_tensor,
+            )
+        )
 
     # Set the loss scale for Multi-Token Prediction (MTP) loss.
     if hasattr(config, 'mtp_num_layers') and config.mtp_num_layers is not None:
@@ -1591,6 +1735,11 @@ def forward_backward_pipelining_with_interleaving(
 
         return recv, next_model_chunk_id
 
+    def maybe_manage_pipeline_queues():
+        _pipeline_queue_manage_queues(input_tensors)
+        _pipeline_queue_manage_queues(output_tensors)
+        _pipeline_queue_manage_queues(output_tensor_grads)
+
     def forward_step_helper_preprocess(virtual_microbatch_id, model_chunk_id, microbatch_id):
         """Preprocess for forward_step_helper"""
         # launch param synchronization for next model chunk
@@ -1623,7 +1772,11 @@ def forward_backward_pipelining_with_interleaving(
         # the next inputs. To index the proper buffered inputs for forword_step, we use
         # microbatch_id offset with number of released microbatches that have completed backprop.
         offset = num_released_microbatches(virtual_microbatch_id, model_chunk_id)
-        input_tensor = input_tensors[model_chunk_id][microbatch_id - offset]
+        queue_index = microbatch_id - offset
+        input_tensors[model_chunk_id][queue_index] = _pipeline_queue_materialize_value(
+            input_tensors[model_chunk_id][queue_index]
+        )
+        input_tensor = input_tensors[model_chunk_id][queue_index]
 
         return input_tensor
 
@@ -1718,9 +1871,14 @@ def forward_backward_pipelining_with_interleaving(
         if _is_vp_last_stage(vp_stage=model_chunk_id) and is_pp_last_stage(pp_group):
             if len(output_tensor_grads[model_chunk_id]) == 0:
                 output_tensor_grads[model_chunk_id].append(None)
-        input_tensor = input_tensors[model_chunk_id].pop(0)
-        output_tensor = output_tensors[model_chunk_id].pop(0)
-        output_tensor_grad = output_tensor_grads[model_chunk_id].pop(0)
+        _pipeline_queue_materialize_queue_head(input_tensors[model_chunk_id])
+        _pipeline_queue_materialize_queue_head(output_tensors[model_chunk_id])
+        _pipeline_queue_materialize_queue_head(output_tensor_grads[model_chunk_id])
+        input_tensor = _pipeline_queue_materialize_value(input_tensors[model_chunk_id].pop(0))
+        output_tensor = _pipeline_queue_materialize_value(output_tensors[model_chunk_id].pop(0))
+        output_tensor_grad = _pipeline_queue_materialize_value(
+            output_tensor_grads[model_chunk_id].pop(0)
+        )
 
         return input_tensor, output_tensor, output_tensor_grad
 
@@ -1874,6 +2032,7 @@ def forward_backward_pipelining_with_interleaving(
             tensor_shape, _is_vp_first_stage(vp_stage=0) and is_pp_first_stage(pp_group)
         )
     )
+    maybe_manage_pipeline_queues()
 
     fwd_wait_handles = None
     fwd_wait_recv_handles = None
@@ -2049,6 +2208,7 @@ def forward_backward_pipelining_with_interleaving(
 
                 if recv_next:
                     output_tensor_grads[num_model_chunks - 1].append(bwd_recv_buffer[-1])
+        maybe_manage_pipeline_queues()
     nvtx_range_pop(suffix="warmup")
 
     # Run 1F1B in steady state.
@@ -2266,6 +2426,8 @@ def forward_backward_pipelining_with_interleaving(
             if recv_next:
                 output_tensor_grads[next_backward_model_chunk_id].append(output_tensor_grad)
 
+        maybe_manage_pipeline_queues()
+
     deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
     nvtx_range_pop(suffix="steady")
 
@@ -2286,6 +2448,7 @@ def forward_backward_pipelining_with_interleaving(
                     ),
                 )
             )
+            maybe_manage_pipeline_queues()
         for k in range(num_microbatches_remaining, total_num_microbatches):
             cur_model_chunk_id = get_model_chunk_id(k, forward=False)
             if (
@@ -2374,6 +2537,8 @@ def forward_backward_pipelining_with_interleaving(
 
                 if recv_next:
                     output_tensor_grads[next_backward_model_chunk_id].append(output_tensor_grad)
+
+            maybe_manage_pipeline_queues()
 
         if send_prev_wait_handle is not None:
             send_prev_wait_handle.wait()
@@ -3028,6 +3193,10 @@ def forward_backward_pipelining_without_interleaving(
         output_tensors = []
     forward_data_store = []
 
+    def maybe_manage_pipeline_queues():
+        _pipeline_queue_manage_queue(input_tensors)
+        _pipeline_queue_manage_queue(output_tensors)
+
     # Run warmup forward passes.
     for i in range(num_warmup_microbatches):
         log_progress = _pipeline_progress_should_log(i)
@@ -3088,6 +3257,7 @@ def forward_backward_pipelining_without_interleaving(
             input_tensors.append(input_tensor)
             output_tensors.append(output_tensor)
             deallocate_output_tensor(output_tensor[0], config.deallocate_pipeline_outputs)
+            maybe_manage_pipeline_queues()
 
     # Before running 1F1B, need to receive first forward tensor.
     # If all microbatches are run in warmup / cooldown phase, then no need to
@@ -3168,11 +3338,14 @@ def forward_backward_pipelining_without_interleaving(
             input_tensors.append(input_tensor)
             output_tensors.append(output_tensor)
             deallocate_output_tensor(output_tensor[0], config.deallocate_pipeline_outputs)
+            maybe_manage_pipeline_queues()
 
             # Pop input_tensor and output_tensor from the start of the list for
             # the backward pass.
-            input_tensor = input_tensors.pop(0)
-            output_tensor = output_tensors.pop(0)
+            _pipeline_queue_materialize_queue_head(input_tensors)
+            _pipeline_queue_materialize_queue_head(output_tensors)
+            input_tensor = _pipeline_queue_materialize_value(input_tensors.pop(0))
+            output_tensor = _pipeline_queue_materialize_value(output_tensors.pop(0))
 
             # Enable grad sync for the last microbatch in the batch if the full
             # backward pass completes in the 1F1B stage.
@@ -3231,8 +3404,11 @@ def forward_backward_pipelining_without_interleaving(
                 if config.grad_sync_func is None or rank == 0:
                     enable_grad_sync()
 
-            input_tensor = input_tensors.pop(0)
-            output_tensor = output_tensors.pop(0)
+            maybe_manage_pipeline_queues()
+            _pipeline_queue_materialize_queue_head(input_tensors)
+            _pipeline_queue_materialize_queue_head(output_tensors)
+            input_tensor = _pipeline_queue_materialize_value(input_tensors.pop(0))
+            output_tensor = _pipeline_queue_materialize_value(output_tensors.pop(0))
 
             output_tensor_grad = p2p_communicator.recv_backward(
                 send_tensor_shapes, is_pp_last_stage(p2p_communicator.pp_group)

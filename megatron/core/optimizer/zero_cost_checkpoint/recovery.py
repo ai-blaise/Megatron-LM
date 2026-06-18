@@ -7,6 +7,8 @@ from typing import Any
 
 import torch
 
+from megatron.core.utils import to_local_if_dtensor
+
 from .persistence import load_atomic_torch_save
 from .snapshot_spec import SnapshotPlanner
 
@@ -56,8 +58,9 @@ def restore_zcc_state(
             spec = specs.get(name)
             if spec is None:
                 continue
-            data = item["data"].to(device=spec.tensor.device, dtype=spec.tensor.dtype)
-            spec.tensor.copy_(data.view(spec.tensor.shape), non_blocking=spec.tensor.is_cuda)
+            local_tensor = to_local_if_dtensor(spec.tensor)
+            data = item["data"].to(device=local_tensor.device, dtype=local_tensor.dtype)
+            local_tensor.copy_(data.view(local_tensor.shape), non_blocking=local_tensor.is_cuda)
 
     metadata = payload.get("metadata", {})
     if opt_param_scheduler is not None and "opt_param_scheduler" in metadata:

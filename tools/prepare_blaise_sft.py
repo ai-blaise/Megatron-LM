@@ -104,6 +104,8 @@ def normalize_conversation(row: Dict[str, Any], row_idx: int) -> Tuple[Optional[
                             call_idx=call_idx,
                         )
                     ],
+                    "_synthetic_tool_calls": True,
+                    "_synthetic_tool_call_count": 1,
                 }
             )
             stats["tool_calls"] += 1
@@ -198,6 +200,7 @@ def main() -> None:
 
             record = {
                 "messages": messages,
+                "enable_thinking": row.get("enable_thinking"),
                 "source_dataset": row.get("source_dataset"),
                 "task": row.get("task"),
                 "episode": row.get("episode"),

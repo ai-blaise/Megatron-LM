@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 import json
+import os
 from typing import Any, Dict, List, Union
 
 import numpy as np
@@ -24,6 +25,7 @@ DEEPSEEK_BOS_TOKEN = "<｜begin▁of▁sentence｜>"
 DEEPSEEK_EOS_TOKEN = "<｜end▁of▁sentence｜>"
 DEEPSEEK_USER_TOKEN = "<｜User｜>"
 DEEPSEEK_ASSISTANT_TOKEN = "<｜Assistant｜>"
+DEEPSEEK_THINKING_START_TOKEN = "<think>"
 DEEPSEEK_THINKING_END_TOKEN = "</think>"
 DEEPSEEK_DSML_TOKEN = "｜DSML｜"
 
@@ -64,6 +66,29 @@ Here are the functions available in JSONSchema format:
 
 IGNORE_INDEX = -100
 
+DEEPSEEK_MASK_SYNTHETIC_TOOL_CALLS_ENV = "MEGATRON_SFT_MASK_SYNTHETIC_TOOL_CALLS"
+DEEPSEEK_IMPLICIT_REASONING_PREFIXES = (
+    "**thought:**",
+    "thought:",
+    "- **thought:**",
+    "- thought:",
+    "* **thought:**",
+    "* thought:",
+    "**reasoning:**",
+    "reasoning:",
+    "- **reasoning:**",
+    "- reasoning:",
+    "* **reasoning:**",
+    "* reasoning:",
+)
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in ("0", "false", "no", "off")
+
 
 @dataclass
 class PromptConfig:
@@ -88,7 +113,13 @@ class PromptConfig:
 class SFTTokenizer:
     """SFT Tokenizer."""
 
-    def __init__(self, tokenizer_path: str, prompt_format: str):
+    def __init__(
+        self,
+        tokenizer_path: str,
+        prompt_format: str,
+        trust_remote_code: bool = False,
+        revision: str | None = None,
+    ):
         """
         Note: Currently, only HuggingFaceTokenizer is supported as the underlying text tokenizer.
 
@@ -98,8 +129,14 @@ class SFTTokenizer:
         """
         if HAVE_TRANSFORMERS:
             # Currently, only HuggingFace tokenizers are supported.
+            tokenizer_kwargs = {}
+            if prompt_format in ("deepseek-v3.2", "deepseek-v32"):
+                tokenizer_kwargs["fix_mistral_regex"] = True
             tokenizer = transformers.AutoTokenizer.from_pretrained(
-                pretrained_model_name_or_path=tokenizer_path
+                pretrained_model_name_or_path=tokenizer_path,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
+                **tokenizer_kwargs,
             )
         else:
             raise ImportError(
@@ -345,7 +382,7 @@ class SFTTokenizer:
 
     @classmethod
     def _deepseek_render_message(
-        cls, index: int, conversation: List[Dict[str, Any]]
+        cls, index: int, conversation: List[Dict[str, Any]], thinking_mode: str
     ) -> str:
         message = conversation[index]
         role = message.get("role")
@@ -368,14 +405,41 @@ class SFTTokenizer:
                 developer_content += "\n\n## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n"
                 developer_content += cls._json_dumps(message["response_format"])
             developer_content += f"\n\n# The user's message is: {content}"
-            return f"{DEEPSEEK_USER_TOKEN}{developer_content}{DEEPSEEK_ASSISTANT_TOKEN}{DEEPSEEK_THINKING_END_TOKEN}"
+            prompt = f"{DEEPSEEK_USER_TOKEN}{developer_content}{DEEPSEEK_ASSISTANT_TOKEN}"
+            if thinking_mode == "thinking":
+                return prompt + DEEPSEEK_THINKING_START_TOKEN
+            return prompt + DEEPSEEK_THINKING_END_TOKEN
 
         if role == "user":
-            return f"{DEEPSEEK_USER_TOKEN}{content}{DEEPSEEK_ASSISTANT_TOKEN}{DEEPSEEK_THINKING_END_TOKEN}"
+            prompt = f"{DEEPSEEK_USER_TOKEN}{content}{DEEPSEEK_ASSISTANT_TOKEN}"
+            if thinking_mode == "thinking":
+                return prompt + DEEPSEEK_THINKING_START_TOKEN
+            return prompt + DEEPSEEK_THINKING_END_TOKEN
 
         if role == "assistant":
             tool_calls = cls._deepseek_render_tool_calls(message.get("tool_calls"))
-            return f"{content}{tool_calls}{DEEPSEEK_EOS_TOKEN}"
+            if thinking_mode != "thinking":
+                return f"{content}{tool_calls}{DEEPSEEK_EOS_TOKEN}"
+
+            reasoning_content = message.get("reasoning_content")
+            if reasoning_content:
+                return f"{reasoning_content}{DEEPSEEK_THINKING_END_TOKEN}{content}{tool_calls}{DEEPSEEK_EOS_TOKEN}"
+
+            content, removed_thinking_start = cls._deepseek_strip_leading_thinking_start(content)
+            if DEEPSEEK_THINKING_END_TOKEN in content:
+                rendered = content
+            elif removed_thinking_start:
+                rendered = f"{content}{DEEPSEEK_THINKING_END_TOKEN}"
+            elif (
+                implicit_reasoning := cls._deepseek_split_implicit_reasoning_content(content)
+            ) is not None:
+                reasoning_content, answer_content = implicit_reasoning
+                rendered = (
+                    f"{reasoning_content}{DEEPSEEK_THINKING_END_TOKEN}{answer_content}"
+                )
+            else:
+                rendered = f"{DEEPSEEK_THINKING_END_TOKEN}{content}"
+            return f"{rendered}{tool_calls}{DEEPSEEK_EOS_TOKEN}"
 
         if role == "tool":
             previous_assistant_idx = index - 1
@@ -402,13 +466,79 @@ class SFTTokenizer:
                 prompt += "\n\n<function_results>"
             prompt += f"\n<result>{content}</result>"
             if tool_call_order == len(assistant_tool_calls):
-                prompt += f"\n</function_results>\n\n{DEEPSEEK_THINKING_END_TOKEN}"
+                prompt += "\n</function_results>\n\n"
+                if thinking_mode == "thinking":
+                    prompt += DEEPSEEK_THINKING_START_TOKEN
+                else:
+                    prompt += DEEPSEEK_THINKING_END_TOKEN
             return prompt
 
         raise ValueError(f"Wrong role value {role}.")
 
+    @staticmethod
+    def _deepseek_thinking_mode(conversation: List[Dict[str, Any]]) -> str:
+        for message in conversation:
+            if "_deepseek_enable_thinking" in message:
+                return "thinking" if bool(message["_deepseek_enable_thinking"]) else "chat"
+        return "thinking"
+
+    @staticmethod
+    def _deepseek_strip_leading_thinking_start(content: str) -> tuple[str, bool]:
+        stripped = content.lstrip()
+        leading_len = len(content) - len(stripped)
+        if not stripped.startswith(DEEPSEEK_THINKING_START_TOKEN):
+            return content, False
+        return (
+            content[:leading_len] + stripped[len(DEEPSEEK_THINKING_START_TOKEN) :],
+            True,
+        )
+
+    @staticmethod
+    def _deepseek_has_implicit_reasoning_prefix(content: str) -> bool:
+        stripped = content.lstrip().lower()
+        return any(
+            stripped.startswith(prefix) for prefix in DEEPSEEK_IMPLICIT_REASONING_PREFIXES
+        )
+
+    @staticmethod
+    def _deepseek_split_final_answer(content: str) -> tuple[str, str]:
+        marker = "final answer:"
+        marker_idx = content.lower().rfind(marker)
+        if marker_idx < 0:
+            return content.rstrip(), ""
+
+        answer_start = marker_idx
+        if answer_start >= 2 and content[answer_start - 2 : answer_start] == "**":
+            answer_start -= 2
+
+        line_start = content.rfind("\n", 0, answer_start) + 1
+        line_prefix = content[line_start:answer_start]
+        if line_prefix.strip() in ("-", "*"):
+            answer_start = line_start
+
+        reasoning = content[:answer_start].rstrip()
+        answer = content[answer_start:].lstrip()
+        return reasoning, answer
+
+    @classmethod
+    def _deepseek_split_implicit_reasoning_content(
+        cls, content: str
+    ) -> tuple[str, str] | None:
+        if not cls._deepseek_has_implicit_reasoning_prefix(content):
+            return None
+        return cls._deepseek_split_final_answer(content)
+
     def _encode_deepseek_segment(self, text: str) -> List[int]:
         return self._tokenizer.encode(text, add_special_tokens=False)
+
+    @staticmethod
+    def _mask_deepseek_message_from_loss(message: Dict[str, Any]) -> bool:
+        role = message.get("role")
+        if role in ("system", "user", "developer", "tool"):
+            return True
+        if role == "assistant" and message.get("_synthetic_tool_calls"):
+            return _env_flag(DEEPSEEK_MASK_SYNTHETIC_TOOL_CALLS_ENV, True)
+        return False
 
     def _tokenize_deepseek_v32_conversation(
         self, conversation: List[Dict], return_target: bool, add_generation_prompt: bool
@@ -416,6 +546,7 @@ class SFTTokenizer:
         """Tokenize DeepSeek-V3.2 chat/tool data and mask non-assistant spans."""
         all_tokens: List[int] = []
         all_targets: List[int] = []
+        thinking_mode = self._deepseek_thinking_mode(conversation)
 
         bos_tokens = self._encode_deepseek_segment(DEEPSEEK_BOS_TOKEN)
         all_tokens.extend(bos_tokens)
@@ -424,12 +555,12 @@ class SFTTokenizer:
             all_targets[: len(bos_tokens)] = [IGNORE_INDEX] * len(bos_tokens)
 
         for index, message in enumerate(conversation):
-            rendered = self._deepseek_render_message(index, conversation)
+            rendered = self._deepseek_render_message(index, conversation, thinking_mode)
             segment_tokens = self._encode_deepseek_segment(rendered)
             all_tokens.extend(segment_tokens)
 
             role = message.get("role")
-            if return_target and role in ("system", "user", "developer", "tool"):
+            if return_target and self._mask_deepseek_message_from_loss(message):
                 all_targets.extend([IGNORE_INDEX] * len(segment_tokens))
             else:
                 all_targets.extend(segment_tokens)
@@ -439,6 +570,65 @@ class SFTTokenizer:
             return tokens
 
         return tokens, np.asarray(all_targets, dtype=np.int64)
+
+    @staticmethod
+    def _deepseek_rendered_assistant_spans(text: str) -> List[tuple[int, int]]:
+        """Return character spans that belong to assistant completions in rendered text."""
+
+        spans: List[tuple[int, int]] = []
+        search_from = 0
+        while search_from < len(text):
+            assistant_idx = text.find(DEEPSEEK_ASSISTANT_TOKEN, search_from)
+            if assistant_idx < 0:
+                break
+
+            start = assistant_idx + len(DEEPSEEK_ASSISTANT_TOKEN)
+            for marker in (DEEPSEEK_THINKING_START_TOKEN, DEEPSEEK_THINKING_END_TOKEN):
+                if text.startswith(marker, start):
+                    start += len(marker)
+                    break
+
+            next_user_idx = text.find(DEEPSEEK_USER_TOKEN, start)
+            end = len(text) if next_user_idx < 0 else next_user_idx
+            if end > start:
+                spans.append((start, end))
+            search_from = end
+
+        return spans
+
+    def tokenize_rendered_deepseek_text(self, text: str, return_target: bool):
+        """Tokenize already-rendered DeepSeek text and mask non-assistant spans."""
+
+        encoded = self._tokenizer(
+            text,
+            add_special_tokens=False,
+            return_offsets_mapping=return_target,
+        )
+        tokens = np.asarray(encoded["input_ids"], dtype=np.int64)
+        if not return_target:
+            return tokens
+
+        targets = np.full(tokens.shape, IGNORE_INDEX, dtype=np.int64)
+        spans = self._deepseek_rendered_assistant_spans(text)
+        offsets = encoded["offset_mapping"]
+
+        if not spans:
+            targets[:] = tokens
+            if len(targets) > 0 and text.startswith(DEEPSEEK_BOS_TOKEN):
+                targets[0] = IGNORE_INDEX
+            return tokens, targets
+
+        span_idx = 0
+        for token_idx, (start, end) in enumerate(offsets):
+            while span_idx < len(spans) and start >= spans[span_idx][1]:
+                span_idx += 1
+            if span_idx >= len(spans):
+                break
+            span_start, span_end = spans[span_idx]
+            if end > start and start >= span_start and end <= span_end:
+                targets[token_idx] = tokens[token_idx]
+
+        return tokens, targets
 
     def text_to_ids(self, text: Union[str, List[Dict]]):
         """Tokenize conversation or string input."""

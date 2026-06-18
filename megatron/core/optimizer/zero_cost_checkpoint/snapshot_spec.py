@@ -155,7 +155,7 @@ class SnapshotPlanner:
         prefix: str,
         param: torch.Tensor,
     ) -> None:
-        if not (is_nvfp4tensor(param) or is_float8tensor(param)):
+        if not (is_nvfp4tensor(param) or is_float8tensor(param) or self._has_param_components(param)):
             self._append_tensor(specs, seen, covered_storages, f"{prefix}.data", param)
         for attr in self.param_tensor_attrs:
             tensor = getattr(param, attr, None)
@@ -228,4 +228,15 @@ class SnapshotPlanner:
     def _storage_key(tensor: torch.Tensor) -> tuple[str, int] | None:
         if tensor.numel() == 0:
             return None
-        return (str(tensor.device), tensor.untyped_storage().data_ptr())
+        try:
+            return (str(tensor.device), tensor.untyped_storage().data_ptr())
+        except RuntimeError as exc:
+            if "invalid python storage" in str(exc):
+                return None
+            raise
+
+    def _has_param_components(self, tensor: torch.Tensor) -> bool:
+        return any(
+            isinstance(getattr(tensor, attr, None), torch.Tensor)
+            for attr in self.param_tensor_attrs
+        )

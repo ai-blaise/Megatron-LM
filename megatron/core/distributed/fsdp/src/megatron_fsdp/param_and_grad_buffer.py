@@ -59,6 +59,8 @@ from .utils import (
 
 logger = logging.getLogger(__name__)
 
+_FSDP_QUANTIZED_STORAGE_SHAPE_ATTR = "_megatron_fsdp_quantized_storage_shape"
+
 
 try:
     # Default to Megatron-LM FW.
@@ -391,6 +393,37 @@ def build_data_parallel_buffer_index(
     # the bucket index with information on what items this bucket contains,
     # and the sharded bucket index.
     return item_index_map, bucket_index, shard_bucket_index
+
+
+def _chunk_size_factor_from_storage_shapes(
+    storage_shapes: List[torch.Size],
+    default_chunk_size_factor: int,
+) -> int:
+    """Infer the communication chunk factor from physical storage shapes.
+
+    Quantized tensors can have a packed physical layout. NVFP4 rowwise data, for
+    example, stores two logical elements per byte, so using the logical trailing
+    dimension as the packed-buffer chunk factor shifts DP shard boundaries.
+    """
+
+    if not storage_shapes:
+        return default_chunk_size_factor
+
+    shapes = sorted(storage_shapes, key=lambda shape: shape[1:].numel(), reverse=True)
+    chunk_size_factor = max(1, shapes[0][1:].numel())
+    for shape in shapes:
+        trailing = max(1, shape[1:].numel())
+        if (
+            trailing == chunk_size_factor
+            or (
+                chunk_size_factor % trailing == 0
+                and shape.numel() % chunk_size_factor == 0
+            )
+            or shape.numel() < chunk_size_factor
+        ):
+            continue
+        chunk_size_factor = math.lcm(chunk_size_factor, trailing)
+    return max(1, chunk_size_factor)
 
 
 def _get_dp_buffer_shard_bucket_index(
@@ -924,9 +957,14 @@ class DataParallelBuffer:
             # Build the data parallel buffer index, which contains information
             # on where each parameter / gradient tensor will be stored in this
             # distributed buffer.
+            storage_shapes = [self._get_item_storage_shape(p) for p in self.params]
+            if self.use_quantized_param_storage:
+                chunk_size_factor = _chunk_size_factor_from_storage_shapes(
+                    storage_shapes, chunk_size_factor
+                )
             (self.item_index_map, self.bucket_index, self.shard_bucket_index) = (
                 build_data_parallel_buffer_index(
-                    [self._get_item_storage_shape(p) for p in self.params],
+                    storage_shapes,
                     self.dp_rank,
                     self.dp_world_size,
                     is_data_distributed,
@@ -946,6 +984,10 @@ class DataParallelBuffer:
     def _get_item_storage_shape(self, param: torch.nn.Parameter) -> torch.Size:
         """Return the physical storage shape used by this buffer for a parameter."""
         local_param = to_local_if_dtensor(param)
+        if self.use_quantized_param_storage:
+            shape_override = getattr(param, _FSDP_QUANTIZED_STORAGE_SHAPE_ATTR, None)
+            if shape_override is not None:
+                return torch.Size(shape_override)
         if self.use_quantized_param_storage and is_float8tensor(local_param):
             return fp8_get_raw_data(local_param, self.is_transpose_buffer).shape
         return local_param.shape
@@ -1723,6 +1765,10 @@ class ParamAndGradBuffer:
                     # to determine whether this parameter is fp8 or not.
                     fp8_meta_index = m.param_init_meta[name].fp8_meta_index
                     if m.primary_weights_in_fp8 and fp8_meta_index is not None:
+                        quantizer = m.quantizers["scaling_fwd"][fp8_meta_index]
+                        if type(quantizer).__name__ == "NVFP4Quantizer":
+                            storage_shape = quantizer.convert_shape_for_fp4(tuple(param.shape))
+                            setattr(param, _FSDP_QUANTIZED_STORAGE_SHAPE_ATTR, storage_shape)
                         meta_device_init_fp8_params[self.param_to_name[param]] = (
                             True,
                             fp8_need_transpose_data_for_meta_device_init(m),
@@ -1841,6 +1887,8 @@ class ParamAndGradBuffer:
 
     def _log_parameter_groups(self):
         """Compact log of FSDP parameter groups and their parameters."""
+        if os.getenv("MEGATRON_FSDP_LOG_PARAMETER_GROUPS", "0") != "1":
+            return
 
         def _bytes_to_mb(bytes_val: int) -> str:
             return f"{bytes_val / 1_000_000:.2f} MB"
@@ -2199,6 +2247,125 @@ class ParamAndGradBuffer:
         # Specifically, replace the Torch module's parameter data with tensors
         # whose memory managed by the model weight buffer, and store a shard
         # of all the parameters across ranks in the model weight buffer.
+        def _describe_fsdp_buffer_error(stage, group, buf, bucket, item_id, param, local_param):
+            """Print enough context to identify quantized/FSDP storage mismatches."""
+
+            def _rank():
+                if torch.distributed.is_available() and torch.distributed.is_initialized():
+                    return torch.distributed.get_rank()
+                return -1
+
+            def _shape(tensor):
+                if tensor is None:
+                    return None
+                try:
+                    return tuple(tensor.shape)
+                except Exception:
+                    return "<shape-error>"
+
+            def _numel(tensor):
+                if tensor is None:
+                    return None
+                try:
+                    return tensor.numel()
+                except Exception:
+                    return "<numel-error>"
+
+            def _dtype(tensor):
+                if tensor is None:
+                    return None
+                return getattr(tensor, "dtype", None)
+
+            def _raw_shapes(tensor):
+                raw = {}
+                for attr_name in (
+                    "_rowwise_data",
+                    "_columnwise_data",
+                    "_rowwise_scale_inv",
+                    "_columnwise_scale_inv",
+                    "_amax_rowwise",
+                    "_amax_columnwise",
+                    "_data",
+                    "_scale_inv",
+                ):
+                    if hasattr(tensor, attr_name):
+                        value = getattr(tensor, attr_name)
+                        raw[attr_name] = {
+                            "shape": _shape(value),
+                            "numel": _numel(value),
+                            "dtype": _dtype(value),
+                        }
+                if is_float8tensor(tensor):
+                    try:
+                        raw["fp8_raw"] = {
+                            "shape": _shape(fp8_get_raw_data(tensor, False)),
+                            "numel": _numel(fp8_get_raw_data(tensor, False)),
+                            "dtype": _dtype(fp8_get_raw_data(tensor, False)),
+                        }
+                    except Exception as raw_exc:
+                        raw["fp8_raw_error"] = repr(raw_exc)
+                    try:
+                        raw["fp8_transpose_raw"] = {
+                            "shape": _shape(fp8_get_raw_data(tensor, True)),
+                            "numel": _numel(fp8_get_raw_data(tensor, True)),
+                            "dtype": _dtype(fp8_get_raw_data(tensor, True)),
+                        }
+                    except Exception as raw_exc:
+                        raw["fp8_transpose_raw_error"] = repr(raw_exc)
+                return raw
+
+            name = self.param_to_name.get(param, "<unknown-param>")
+            pieces = [
+                "[Megatron-FSDP][param-buffer-error]",
+                f"stage={stage}",
+                f"rank={_rank()}",
+                f"name={name}",
+                f"item_id={item_id}",
+                f"expert={group.is_expert_param}",
+                f"param_type={type(param).__name__}",
+                f"local_type={type(local_param).__name__}",
+                f"param_shape={_shape(param)}",
+                f"local_shape={_shape(local_param)}",
+                f"local_numel={_numel(local_param)}",
+                f"param_dtype={_dtype(param)}",
+                f"local_dtype={_dtype(local_param)}",
+                f"is_dtensor={isinstance(param, DTensor)}",
+                f"is_float8={is_float8tensor(local_param)}",
+                f"is_nvfp4={is_nvfp4tensor(local_param)}",
+            ]
+            if buf is not None:
+                item_index = buf.item_index_map.get(item_id)
+                try:
+                    slice_start, slice_end = buf.locate_item_in_global_item(item_id)
+                except Exception as slice_exc:
+                    slice_start, slice_end = f"<slice-error {slice_exc!r}>", None
+                try:
+                    local_start, local_end = buf._get_item_local_index(item_id)
+                except Exception as local_exc:
+                    local_start, local_end = f"<local-error {local_exc!r}>", None
+                try:
+                    bucket_item = buf.get_item_from_bucket(bucket, item_id)
+                except Exception as bucket_exc:
+                    bucket_item = f"<bucket-item-error {bucket_exc!r}>"
+                pieces.extend(
+                    [
+                        f"buf_bucket_id={buf.bucket_id}",
+                        f"buf_dtype={buf.dtype}",
+                        f"buf_data_distributed={buf.is_data_distributed}",
+                        f"buf_data_size={buf.data_size}",
+                        f"buf_bucket_size={buf.bucket_index.size}",
+                        f"buf_shard={buf.shard_bucket_index}",
+                        f"item_index={item_index}",
+                        f"item_slice=({slice_start},{slice_end})",
+                        f"local_index=({local_start},{local_end})",
+                        f"bucket_item_shape={_shape(bucket_item)}",
+                        f"bucket_item_numel={_numel(bucket_item)}",
+                        f"bucket_item_dtype={_dtype(bucket_item)}",
+                    ]
+                )
+            pieces.append(f"raw={_raw_shapes(local_param)}")
+            print(" ".join(str(piece) for piece in pieces), flush=True)
+
         for group in self.parameter_groups:
             wbuf = group.model_weight_buffer
             if wbuf:
@@ -2306,57 +2473,84 @@ class ParamAndGradBuffer:
 
                     # Copy the model weight parameter tensor into the buffer.
                     # When distributed, this shards and preserves the data across all ranks.
-                    wbuf.set_item(item_id, p_local)
+                    try:
+                        wbuf.set_item(item_id, p_local)
+                    except Exception as exc:
+                        _describe_fsdp_buffer_error(
+                            "wbuf.set_item", group, wbuf, bucket, item_id, p, p_local
+                        )
+                        raise RuntimeError(
+                            f"Megatron-FSDP failed to seed model weight buffer for "
+                            f"{self.param_to_name.get(p, '<unknown-param>')}"
+                        ) from exc
                     if tbuf:
-                        tbuf.set_item(item_id, p_local)
+                        try:
+                            tbuf.set_item(item_id, p_local)
+                        except Exception as exc:
+                            _describe_fsdp_buffer_error(
+                                "tbuf.set_item", group, tbuf, transpose_bucket, item_id, p, p_local
+                            )
+                            raise RuntimeError(
+                                f"Megatron-FSDP failed to seed transpose weight buffer for "
+                                f"{self.param_to_name.get(p, '<unknown-param>')}"
+                            ) from exc
 
-                    # Retrieve the newly allocated parameter data from the global bucket.
-                    # Attach the bucket-allocated parameter data to the module parameter,
-                    # to use the bucket-allocated data for autograd and NCCL.
-                    if is_float8tensor(p_local):
-                        old_param_data = fp8_get_raw_data(p_local)
-                        new_param_data = wbuf.get_item_from_bucket(bucket, item_id).view(
-                            old_param_data.shape
-                        )
-                        assert old_param_data._base is None
-                        new_param_data.detach().copy_(old_param_data)
-                        fp8_set_raw_data(p_local, new_param_data)
-                        del old_param_data
-                        if tbuf:
-                            old_transpose_data = fp8_get_raw_data(p_local, True)
-                            new_transpose_data = tbuf.get_item_from_bucket(
-                                transpose_bucket, item_id
-                            ).view(old_transpose_data.shape)
-                            assert old_transpose_data._base is None
-                            new_transpose_data.detach().copy_(old_transpose_data)
-                            fp8_set_raw_data(p_local, new_transpose_data, True)
-                            del old_transpose_data
-                    elif isinstance(p, DTensor):
-                        new_param_data = wbuf.get_item_from_bucket(bucket, item_id).view(
-                            p_local.shape
-                        )
-                        old_param_data = p._local_tensor.data
-                        p._local_tensor.data = new_param_data
-                        assert old_param_data._base is None
-                        p._local_tensor.data.detach().copy_(old_param_data)
-                        del old_param_data
-                    else:
-                        new_param_data = wbuf.get_item_from_bucket(bucket, item_id).view(
-                            p_local.shape
-                        )
-                        # Detach the bucket-allocated parameter data from the computational graph
-                        # before copying the old parameter data into the new parameter data
-                        # to prevent backpropagation into a deleted parameter / Tensor.
+                    try:
+                        # Retrieve the newly allocated parameter data from the global bucket.
+                        # Attach the bucket-allocated parameter data to the module parameter,
+                        # to use the bucket-allocated data for autograd and NCCL.
+                        if is_float8tensor(p_local):
+                            old_param_data = fp8_get_raw_data(p_local)
+                            new_param_data = wbuf.get_item_from_bucket(bucket, item_id).view(
+                                old_param_data.shape
+                            )
+                            assert old_param_data._base is None
+                            new_param_data.detach().copy_(old_param_data)
+                            fp8_set_raw_data(p_local, new_param_data)
+                            del old_param_data
+                            if tbuf:
+                                old_transpose_data = fp8_get_raw_data(p_local, True)
+                                new_transpose_data = tbuf.get_item_from_bucket(
+                                    transpose_bucket, item_id
+                                ).view(old_transpose_data.shape)
+                                assert old_transpose_data._base is None
+                                new_transpose_data.detach().copy_(old_transpose_data)
+                                fp8_set_raw_data(p_local, new_transpose_data, True)
+                                del old_transpose_data
+                        elif isinstance(p, DTensor):
+                            new_param_data = wbuf.get_item_from_bucket(bucket, item_id).view(
+                                p_local.shape
+                            )
+                            old_param_data = p._local_tensor.data
+                            p._local_tensor.data = new_param_data
+                            assert old_param_data._base is None
+                            p._local_tensor.data.detach().copy_(old_param_data)
+                            del old_param_data
+                        else:
+                            new_param_data = wbuf.get_item_from_bucket(bucket, item_id).view(
+                                p_local.shape
+                            )
+                            # Detach the bucket-allocated parameter data from the computational graph
+                            # before copying the old parameter data into the new parameter data
+                            # to prevent backpropagation into a deleted parameter / Tensor.
 
-                        # Copy the values of the original parameter data into the bucket-allocated
-                        # parameter data. Detach the module parameter because
-                        # parameters that require gradients in the computational
-                        # graph do not support in-place operations.
-                        old_param_data = p.data
-                        p.data = new_param_data
-                        assert old_param_data._base is None
-                        p.data.detach().copy_(old_param_data)
-                        del old_param_data
+                            # Copy the values of the original parameter data into the bucket-allocated
+                            # parameter data. Detach the module parameter because
+                            # parameters that require gradients in the computational
+                            # graph do not support in-place operations.
+                            old_param_data = p.data
+                            p.data = new_param_data
+                            assert old_param_data._base is None
+                            p.data.detach().copy_(old_param_data)
+                            del old_param_data
+                    except Exception as exc:
+                        _describe_fsdp_buffer_error(
+                            "attach_bucket_param", group, wbuf, bucket, item_id, p, p_local
+                        )
+                        raise RuntimeError(
+                            f"Megatron-FSDP failed to attach bucket storage for "
+                            f"{self.param_to_name.get(p, '<unknown-param>')}"
+                        ) from exc
 
                 # Main Weight (High-Precision) Buffer Initialization
                 if mbuf:
@@ -2793,6 +2987,10 @@ class ParamAndGradBuffer:
                 )
                 setattr(dist_param, "orig_param", orig_param)
                 setattr(dist_param, "megatron_fsdp_dist_index", self.dist_index)
+                setattr(dist_param, "_numeric_debug_name", param_name)
+                setattr(dist_param, "_megatron_fsdp_name", param_name)
+                setattr(orig_param, "_numeric_debug_name", param_name)
+                setattr(orig_param, "_megatron_fsdp_name", param_name)
 
                 # NOTE: megatron_fsdp_slice is used to solve the SwiGLU TP dist-ckpt problem in
                 # MCore.
@@ -2880,13 +3078,91 @@ class ParamAndGradBuffer:
         return len(self.parameter_groups)
 
     @torch.no_grad()
-    def copy_main_weights_to_model_weights(self):
+    def copy_main_weights_to_model_weights(
+        self,
+        optimizer: Optional[torch.optim.Optimizer] = None,
+        flash_adamw_fsdp_eco_inject: bool = False,
+    ):
         """
         Update the model weights from the main weights.
 
         If FP8 parameters are utilized, this function will quantize the high-precision
         main weights prior to installation into the model compute weight buffers.
         """
+        def _resolve_flash_adamw_optimizer(opt):
+            if opt is None:
+                return None
+            stack = [opt]
+            seen = set()
+            while stack:
+                candidate = stack.pop()
+                if candidate is None or id(candidate) in seen:
+                    continue
+                seen.add(id(candidate))
+                if hasattr(candidate, "inject_eco_error_from_nvfp4") and hasattr(
+                    candidate, "param_groups"
+                ):
+                    return candidate
+                for attr_name in ("optimizer", "inner_optimizer"):
+                    inner = getattr(candidate, attr_name, None)
+                    if inner is not None:
+                        stack.append(inner)
+                for attr_name in ("chained_optimizers", "optimizers"):
+                    inner_list = getattr(candidate, attr_name, None)
+                    if inner_list is not None:
+                        stack.extend(inner_list)
+            return None
+
+        flash_optimizer = _resolve_flash_adamw_optimizer(optimizer)
+        env_fsdp_eco = os.getenv("MEGATRON_FLASH_ADAMW_FSDP_ECO_INJECT", "0").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        fsdp_eco_config_requested = bool(
+            flash_adamw_fsdp_eco_inject
+            or env_fsdp_eco
+            or getattr(flash_optimizer, "_fsdp_eco_inject", False)
+        )
+        update_delta_debug_requested = os.getenv("MEGATRON_UPDATE_DELTA_DEBUG", "0").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        # Checkpoint load installs model weights before the optimizer exists. ECO
+        # injection is only meaningful on optimizer-step copy-back, where Adam
+        # moments are present and an optimizer object is supplied.
+        fsdp_eco_requested = fsdp_eco_config_requested and optimizer is not None
+        update_delta_debug = update_delta_debug_requested and optimizer is not None
+        if fsdp_eco_config_requested and optimizer is not None:
+            if flash_optimizer is None:
+                raise RuntimeError(
+                    "Megatron-FSDP FlashAdamW ECO injection was requested, but no "
+                    "FlashAdamW optimizer with inject_eco_error_from_nvfp4() was supplied."
+                )
+            if not getattr(flash_optimizer, "_eco", False):
+                raise RuntimeError(
+                    "Megatron-FSDP FlashAdamW ECO injection requires FlashAdamW ECO "
+                    "to be enabled on the optimizer."
+                )
+
+        optimizer_param_by_orig = {}
+        optimizer_lr_by_id = {}
+        if flash_optimizer is not None and (fsdp_eco_requested or update_delta_debug):
+            for group in getattr(flash_optimizer, "param_groups", []):
+                lr = float(group.get("lr", 0.0))
+                for optimizer_param in group.get("params", []):
+                    optimizer_lr_by_id[id(optimizer_param)] = lr
+            for _, optimizer_param in self.optimizer_named_parameters:
+                orig_param = getattr(optimizer_param, "orig_param", None)
+                if orig_param is not None:
+                    optimizer_param_by_orig[orig_param] = optimizer_param
+
+        fsdp_eco_candidates = 0
+        fsdp_eco_injected = 0
+        fsdp_eco_elements = 0
         dense_param_quantize_kwargs = {
             "model_params": [],
             "main_params": [],
@@ -2899,6 +3175,148 @@ class ParamAndGradBuffer:
         data_parallel_group = None
         expert_data_parallel_group = None
         clear_quantize_kwargs = lambda kwargs: [d.clear() for d in kwargs.values()]
+
+        def _rowwise_byte_offset_for_nvfp4_shard(
+            model_weight: torch.Tensor,
+            shard_model_param: torch.Tensor,
+            main_start: int,
+            main_numel: int,
+        ) -> int:
+            rowwise_data = getattr(model_weight, "_rowwise_data", None)
+            if rowwise_data is None:
+                raise RuntimeError(
+                    "Megatron-FSDP NVFP4 shard diagnostics require rowwise NVFP4 storage."
+                )
+            if shard_model_param.dtype != rowwise_data.dtype:
+                name = self.param_to_name.get(model_weight, "<unknown-param>")
+                raise RuntimeError(
+                    "Megatron-FSDP NVFP4 shard diagnostics require the FSDP "
+                    f"shard byte storage dtype to match rowwise NVFP4 storage for {name}: "
+                    f"shard={shard_model_param.dtype} rowwise={rowwise_data.dtype}."
+                )
+            shard_numel = int(shard_model_param.numel())
+            fragment_numel = int(shard_model_param.numel())
+            byte_start = int(main_start) // 2
+            byte_end = (int(main_start) + int(main_numel) + 1) // 2
+            needed = byte_end - byte_start
+            if needed > shard_numel:
+                raise RuntimeError(
+                    "Megatron-FSDP NVFP4 shard diagnostics found a shard smaller than "
+                    f"the required packed NVFP4 byte range: needed={needed} "
+                    f"available={shard_numel} fragment_numel={fragment_numel}."
+                )
+            return byte_start
+
+        def _inject_nvfp4_fsdp_eco(params, label: str) -> None:
+            nonlocal fsdp_eco_candidates, fsdp_eco_injected, fsdp_eco_elements
+            if not fsdp_eco_requested:
+                return
+            for model_weight, main_weight, main_start, shard_model_param in params:
+                if main_weight is None or main_weight.numel() == 0:
+                    continue
+                if not is_nvfp4tensor(model_weight):
+                    continue
+                fsdp_eco_candidates += 1
+                optimizer_param = optimizer_param_by_orig.get(model_weight)
+                if optimizer_param is None:
+                    name = self.param_to_name.get(model_weight, "<unknown-param>")
+                    raise RuntimeError(
+                        "Megatron-FSDP FlashAdamW ECO injection could not find the "
+                        f"optimizer parameter for {name}."
+                    )
+                if optimizer_param not in flash_optimizer.state:
+                    name = self.param_to_name.get(model_weight, "<unknown-param>")
+                    raise RuntimeError(
+                        "Megatron-FSDP FlashAdamW ECO injection found no optimizer "
+                        f"state for {name}; the optimizer state must be initialized "
+                        "before FSDP cast-back injection."
+                    )
+                if shard_model_param is None:
+                    name = self.param_to_name.get(model_weight, "<unknown-param>")
+                    raise RuntimeError(
+                        "Megatron-FSDP FlashAdamW ECO injection requires a sharded "
+                        f"NVFP4 model-weight fragment for {name}."
+                    )
+                rowwise_byte_offset = _rowwise_byte_offset_for_nvfp4_shard(
+                    model_weight,
+                    shard_model_param,
+                    int(main_start),
+                    int(main_weight.numel()),
+                )
+                flash_optimizer.inject_eco_error_from_nvfp4(
+                    optimizer_param,
+                    main_weight,
+                    int(main_start),
+                    model_param=model_weight,
+                    rowwise_byte_offset=rowwise_byte_offset,
+                    rowwise_data=shard_model_param,
+                )
+                fsdp_eco_injected += 1
+                fsdp_eco_elements += int(main_weight.numel())
+
+        def _optimizer_lr_and_step(optimizer_param: Optional[torch.Tensor]) -> Tuple[float, int]:
+            if flash_optimizer is None or optimizer_param is None:
+                return 0.0, 0
+            state = flash_optimizer.state.get(optimizer_param)
+            if state is None or "step" not in state:
+                return float(optimizer_lr_by_id.get(id(optimizer_param), 0.0)), 0
+            step_value = state["step"]
+            if torch.is_tensor(step_value):
+                step = int(step_value.item())
+            else:
+                step = int(step_value)
+            return float(optimizer_lr_by_id.get(id(optimizer_param), 0.0)), step
+
+        def _log_nvfp4_fsdp_cast(params, label: str) -> None:
+            if not update_delta_debug:
+                return
+            try:
+                from megatron.core.optimizer.flash_optimizers import (
+                    _update_delta_log_nvfp4_cast,
+                )
+            except Exception as exc:
+                print(
+                    "[update_delta.error] "
+                    f"rank={os.getenv('RANK', '0')} stage=nvfp4_cast "
+                    f"reason=fsdp_logger_import_failed label={label} error={exc}",
+                    flush=True,
+                )
+                return
+
+            for model_weight, main_weight, main_start, shard_model_param in params:
+                if main_weight is None or main_weight.numel() == 0:
+                    continue
+                if shard_model_param is None or shard_model_param.numel() == 0:
+                    continue
+                if not is_nvfp4tensor(model_weight):
+                    continue
+                name = self.param_to_name.get(model_weight, "<unknown-param>")
+                optimizer_param = optimizer_param_by_orig.get(model_weight)
+                lr, step = _optimizer_lr_and_step(optimizer_param)
+                try:
+                    rowwise_byte_offset = _rowwise_byte_offset_for_nvfp4_shard(
+                        model_weight,
+                        shard_model_param,
+                        int(main_start),
+                        int(main_weight.numel()),
+                    )
+                    _update_delta_log_nvfp4_cast(
+                        name=name,
+                        model_param=model_weight,
+                        rowwise_data=shard_model_param,
+                        pre_cast=main_weight,
+                        shard_offset=int(main_start),
+                        rowwise_byte_offset=rowwise_byte_offset,
+                        lr=lr,
+                        step=step,
+                    )
+                except Exception as exc:
+                    print(
+                        "[update_delta.error] "
+                        f"rank={os.getenv('RANK', '0')} stage=nvfp4_cast "
+                        f"reason=fsdp_cast_log_failed label={label} name={name} error={exc}",
+                        flush=True,
+                    )
 
         def _fp8_quantize_params(dense_param_quantize_kwargs, expert_param_quantize_kwargs):
             if len(dense_param_quantize_kwargs["model_params"]) > 0:
@@ -2927,6 +3345,8 @@ class ParamAndGradBuffer:
                     use_fsdp_shard_model_weights=True,
                     manual_post_all_gather_processing=True,
                 )
+                _log_nvfp4_fsdp_cast(dense_params, "dense")
+                _inject_nvfp4_fsdp_eco(dense_params, "dense")
                 dense_params.clear()
 
             if len(expert_params) > 0:
@@ -2936,6 +3356,8 @@ class ParamAndGradBuffer:
                     use_fsdp_shard_model_weights=True,
                     manual_post_all_gather_processing=True,
                 )
+                _log_nvfp4_fsdp_cast(expert_params, "expert")
+                _inject_nvfp4_fsdp_eco(expert_params, "expert")
                 expert_params.clear()
 
         # Special handling of blockwise FP8
@@ -3048,11 +3470,37 @@ class ParamAndGradBuffer:
                     if model_param.numel() == 0:
                         nvfp4_quantize_params.append((param, None, None, None))
                     else:
+                        if wbuf is None:
+                            raise RuntimeError(
+                                "[Megatron-FSDP][nvfp4-shard-mismatch] "
+                                "NVFP4 FSDP cast-back requires a model weight buffer; "
+                                f"name={self.param_to_name.get(param, '<unknown-param>')}"
+                            )
+                        main_start, main_end = mbuf.locate_item_in_global_item(item_id)
+                        model_start, model_end = wbuf.locate_item_in_global_item(item_id)
+                        expected_model_start = main_start // 2
+                        expected_model_end = (main_end + 1) // 2
+                        if (
+                            model_start != expected_model_start
+                            or model_end != expected_model_end
+                            or model_param.numel()
+                            != expected_model_end - expected_model_start
+                        ):
+                            raise RuntimeError(
+                                "[Megatron-FSDP][nvfp4-shard-mismatch] "
+                                f"name={self.param_to_name.get(param, '<unknown-param>')} "
+                                f"item_id={item_id} rank={torch.distributed.get_rank()} "
+                                f"main_slice=({main_start},{main_end}) "
+                                f"model_slice=({model_start},{model_end}) "
+                                f"expected_model_slice=({expected_model_start},{expected_model_end}) "
+                                f"model_numel={model_param.numel()} "
+                                f"expected_model_numel={expected_model_end - expected_model_start}"
+                            )
                         nvfp4_quantize_params.append(
                             (
                                 param,
                                 main_weight,
-                                mbuf.locate_item_in_global_item(item_id)[0],
+                                main_start,
                                 model_param,
                             )
                         )
@@ -3091,6 +3539,25 @@ class ParamAndGradBuffer:
         )
         _fp8_quantize_params(dense_param_quantize_kwargs, expert_param_quantize_kwargs)
         _nvfp4_quantize_params(dense_nvfp4_quantize_params, expert_nvfp4_quantize_params)
+        if fsdp_eco_requested and fsdp_eco_candidates > 0 and fsdp_eco_injected == 0:
+            raise RuntimeError(
+                "Megatron-FSDP FlashAdamW ECO injection was requested and saw NVFP4 "
+                "cast-back candidates, but injected zero parameters."
+            )
+        if (
+            fsdp_eco_requested
+            and fsdp_eco_injected > 0
+            and os.getenv("MEGATRON_FLASH_ADAMW_FSDP_ECO_LOG", "0").lower()
+            in ("1", "true", "yes", "on")
+        ):
+            message = (
+                "[Megatron-FSDP][FlashAdamW-ECO] injected "
+                f"params={fsdp_eco_injected} elements={fsdp_eco_elements}"
+            )
+            if "log_single_rank" in globals():
+                log_single_rank(logger, logging.INFO, message)
+            else:
+                logger.info(message)
 
     @torch.no_grad()
     def copy_model_weights_to_main_weights(self):
@@ -3268,6 +3735,39 @@ class GradReducePipeline:
     def reset(self):
         """Handle the processing tasks and reset the pipeline."""
         self.wait_for_previous_grad_reduce(0)
+
+        if os.getenv("MEGATRON_FSDP_FLUSH_READY_BUCKETS_ON_RESET", "0").strip().lower() not in {
+            "0",
+            "false",
+            "off",
+            "no",
+        }:
+            ready_bucket_ids = []
+            for bucket_id, grad_ready_params in enumerate(self.bucket_grad_ready_params):
+                if not grad_ready_params:
+                    continue
+                param_list = self.buffer.parameter_groups[bucket_id].params
+                if len(grad_ready_params) == len(param_list):
+                    ready_bucket_ids.append(bucket_id)
+
+            if ready_bucket_ids:
+                if os.getenv("MEGATRON_FSDP_LOG_READY_BUCKET_FLUSH", "0").strip().lower() not in {
+                    "0",
+                    "false",
+                    "off",
+                    "no",
+                }:
+                    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+                    logger.warning(
+                        "rank %s flushing %d complete FSDP grad buckets at reset because their "
+                        "aggregate bucket groups were incomplete: %s",
+                        rank,
+                        len(ready_bucket_ids),
+                        ready_bucket_ids[:16],
+                    )
+                for bucket_id in ready_bucket_ids:
+                    self._bucket_group_gradient_reduce([bucket_id], async_op=False)
+
         for bucket_id, grad_ready_params in enumerate(self.bucket_grad_ready_params):
             param_list = self.buffer.parameter_groups[bucket_id].params
             n_params = len(param_list)
@@ -4357,11 +4857,15 @@ def make_fsdp_dtensor(
                 global_shape[tp_dim] *= tp_mesh.mesh.numel()
 
             # Construct TP-sharded DTensor using Megatron-style placement
+            # The local tensor may already be an uneven FSDP shard. In that case some
+            # CP/DP ranks legitimately hold an empty tensor for this parameter, and the
+            # strict TP-only metadata check fires before the FSDP placement is attached.
+            # Keep the final uneven-DTensor validation below as the correctness check.
             param = DTensor.from_local(
                 local_tensor=local_tensor,
                 device_mesh=tp_mesh,
                 placements=placements,
-                run_check=run_check,
+                run_check=False,
                 shape=tuple(global_shape),
                 stride=torch.empty(global_shape).stride(),
             )
@@ -4387,11 +4891,11 @@ def make_fsdp_dtensor(
         stride=param.stride(),
     )
 
-    if run_check:
-        validate_uneven_dtensor(fsdp_tensor)
-
     # Update metadata if uneven sharding is expected
     if update_uneven_dtensor_chunk_meta:
         update_uneven_dtensor_chunk_metadata(fsdp_tensor)
+
+    if run_check:
+        validate_uneven_dtensor(fsdp_tensor)
 
     return fsdp_tensor

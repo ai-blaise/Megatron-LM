@@ -61,11 +61,30 @@ def enabled(tag: str) -> bool:
 
 
 def _format_tensor(name: str, tensor: torch.Tensor, mib: int) -> str:
-    tensor_mib = tensor.numel() * tensor.element_size() / mib
-    return (
-        f"{name}=shape{tuple(tensor.shape)}:{tensor.dtype}:"
-        f"{tensor_mib:.1f}MiB:contig={int(tensor.is_contiguous())}"
-    )
+    tensor_type = type(tensor).__name__
+    try:
+        tensor_mib = tensor.numel() * tensor.element_size() / mib
+        summary = (
+            f"{name}=shape{tuple(tensor.shape)}:{tensor.dtype}:type={tensor_type}:"
+            f"{tensor_mib:.1f}MiB:contig={int(tensor.is_contiguous())}"
+        )
+    except Exception as exc:
+        return f"{name}=tensor_meta_error:type={tensor_type}:error={exc}"
+    if any(token in tensor_type for token in ("NVFP4Tensor", "Float8Tensor", "MXFP8Tensor")):
+        return summary + ":skipped_unsupported_tensor_type=1"
+    value_limit = _env_int("MEGATRON_TENSOR_AUDIT_SMALL_TENSOR_VALUES", 32)
+    if (
+        value_limit > 0
+        and tensor.numel() <= value_limit
+        and not tensor.is_floating_point()
+        and not tensor.is_complex()
+    ):
+        try:
+            values = tensor.detach().cpu().view(-1).tolist()
+            summary += f":sum={sum(values)}:max={max(values) if values else 0}:values={values}"
+        except Exception as exc:
+            summary += f":value_error={exc}"
+    return summary
 
 
 def _format_int_sequence(name: str, values: list[int] | tuple[int, ...]) -> str:

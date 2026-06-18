@@ -494,7 +494,7 @@ def fully_shard_optimizer(
 
         # Update the raw module training parameters with optimized values.
         if install_optimized_model_weights:
-            mfsdp_model.install_optimized_model_weights()
+            mfsdp_model.install_optimized_model_weights(optimizer=optimizer)
 
     # Define a new optimizer.zero_grad() method that zeros the gradient in both
     # the optimizer as well as the Megatron-FSDP gradient buffer. These options

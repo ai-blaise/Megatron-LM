@@ -189,6 +189,7 @@ class TopKRouter(Router):
 
         self.enable_expert_bias = self.config.moe_router_enable_expert_bias
         if self.enable_expert_bias:
+            self._local_tokens_per_expert_needs_reset = True
             self.register_buffer(
                 'local_tokens_per_expert',
                 torch.zeros(
@@ -227,6 +228,7 @@ class TopKRouter(Router):
                     persistent=False,
                 )
         else:
+            self._local_tokens_per_expert_needs_reset = False
             self.local_tokens_per_expert = None
             self.expert_bias = None
 
@@ -256,14 +258,22 @@ class TopKRouter(Router):
 
     def _maintain_float32_expert_bias(self):
         """
-        Maintain the expert bias in float32.
+        Maintain dynamic expert-bias router state in float32.
 
-        When using bf16/fp16, the expert bias gets converted to lower precision in Float16Module.
-        We keep it in float32 to avoid routing errors when updating the expert_bias.
+        When using bf16/fp16, router buffers get converted to lower precision in Float16Module.
+        Keep them in float32 to avoid routing errors when updating the expert_bias.  The
+        nonpersistent token-count buffer can also be materialized from meta storage, so reset it
+        once before the first accumulation in a training run.
         """
         if hasattr(self, 'expert_bias') and self.expert_bias is not None:
             if self.expert_bias.dtype != torch.float32:
                 self.expert_bias.data = self.expert_bias.data.to(torch.float32)
+        if hasattr(self, 'local_tokens_per_expert') and self.local_tokens_per_expert is not None:
+            if self.local_tokens_per_expert.dtype != torch.float32:
+                self.local_tokens_per_expert.data = self.local_tokens_per_expert.data.to(torch.float32)
+            if getattr(self, '_local_tokens_per_expert_needs_reset', False):
+                self.local_tokens_per_expert.zero_()
+                self._local_tokens_per_expert_needs_reset = False
 
     def sinkhorn_load_balancing(self, logits: torch.Tensor):
         """Apply sinkhorn routing to the logits tensor.
@@ -743,9 +753,12 @@ class TopKRouter(Router):
             )
         ):
             with torch.no_grad():
+                self._maintain_float32_expert_bias()
                 if padding_mask is not None:
                     routing_map = routing_map & (~padding_mask).unsqueeze(-1)
-                self.local_tokens_per_expert += routing_map.sum(dim=0)
+                self.local_tokens_per_expert += routing_map.sum(dim=0).to(
+                    dtype=self.local_tokens_per_expert.dtype
+                )
 
     def _gather_valid_quantile_scores(
         self, scores: torch.Tensor, padding_mask: Optional[torch.Tensor]

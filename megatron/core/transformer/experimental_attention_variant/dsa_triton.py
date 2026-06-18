@@ -12,6 +12,18 @@ from packaging import version
 from megatron.core.tensor_audit import tensor_audit
 from megatron.core.utils import null_decorator
 
+
+def _grad_provenance(name: str, **tensors) -> None:
+    if not (
+        os.getenv("MEGATRON_GRAD_PROVENANCE")
+        or os.getenv("MEGATRON_NUMERIC_DEBUG_GRAD_PROVENANCE")
+    ):
+        return
+    from megatron.core import numeric_debug
+
+    if numeric_debug.grad_provenance_enabled():
+        numeric_debug.log_grad_function(name, tensors=tensors)
+
 try:
     import triton
     import triton.language as tl
@@ -4042,10 +4054,21 @@ class SparseDSAAttentionTriton(torch.autograd.Function):
                 num_warps=ctx.backward_num_warps,
             )
 
+        grad_query_out = grad_query.to(query.dtype)
+        grad_key_out = grad_key.to(key.dtype)
+        grad_value_out = grad_value.to(value.dtype)
+        _grad_provenance(
+            "dsa_triton.SparseDSAAttentionTriton.backward",
+            grad_output=grad_output,
+            grad_query=grad_query_out,
+            grad_key=grad_key_out,
+            grad_value=grad_value_out,
+            topk_indices=topk_indices,
+        )
         return (
-            grad_query.to(query.dtype),
-            grad_key.to(key.dtype),
-            grad_value.to(value.dtype),
+            grad_query_out,
+            grad_key_out,
+            grad_value_out,
             None,
             None,
             None,
@@ -5009,9 +5032,22 @@ class SparseDSASplitQKAttentionTriton(torch.autograd.Function):
                     num_warps=ctx.backward_num_warps,
                 )
 
+            grad_query_nope_out = (
+                grad_query_nope.to(query_nope.dtype) if ctx.needs_input_grad[0] else None
+            )
+            grad_query_pe_out = (
+                grad_query_pe.to(query_pe.dtype) if ctx.needs_input_grad[1] else None
+            )
+            _grad_provenance(
+                "dsa_triton.SparseDSASplitQKAttentionTriton.backward.reentrant",
+                grad_output=grad_output,
+                grad_query_nope=grad_query_nope_out,
+                grad_query_pe=grad_query_pe_out,
+                topk_indices=topk_indices,
+            )
             return (
-                grad_query_nope.to(query_nope.dtype) if ctx.needs_input_grad[0] else None,
-                grad_query_pe.to(query_pe.dtype) if ctx.needs_input_grad[1] else None,
+                grad_query_nope_out,
+                grad_query_pe_out,
                 None,
                 None,
                 None,
@@ -5112,12 +5148,27 @@ class SparseDSASplitQKAttentionTriton(torch.autograd.Function):
             EMIT_VALUE_GRAD=True,
             num_warps=ctx.backward_num_warps,
         )
+        grad_query_nope_out = grad_query_nope.to(query_nope.dtype)
+        grad_query_pe_out = grad_query_pe.to(query_pe.dtype)
+        grad_key_nope_out = grad_key_nope.to(key_nope.dtype)
+        grad_key_pe_out = grad_key_pe.to(key_pe.dtype)
+        grad_value_out = grad_value.to(value.dtype)
+        _grad_provenance(
+            "dsa_triton.SparseDSASplitQKAttentionTriton.backward",
+            grad_output=grad_output,
+            grad_query_nope=grad_query_nope_out,
+            grad_query_pe=grad_query_pe_out,
+            grad_key_nope=grad_key_nope_out,
+            grad_key_pe=grad_key_pe_out,
+            grad_value=grad_value_out,
+            topk_indices=topk_indices,
+        )
         return (
-            grad_query_nope.to(query_nope.dtype),
-            grad_query_pe.to(query_pe.dtype),
-            grad_key_nope.to(key_nope.dtype),
-            grad_key_pe.to(key_pe.dtype),
-            grad_value.to(value.dtype),
+            grad_query_nope_out,
+            grad_query_pe_out,
+            grad_key_nope_out,
+            grad_key_pe_out,
+            grad_value_out,
             None,
             None,
             None,

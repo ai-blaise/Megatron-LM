@@ -57,6 +57,7 @@ def build_tokenizer(args, **kwargs):
         kwargs['use_fast'] = not args.tokenizer_hf_no_use_fast
         kwargs['trust_remote_code'] = args.trust_remote_code
         kwargs['include_special_tokens'] = not args.tokenizer_hf_no_include_special_tokens
+        kwargs['revision'] = args.tokenizer_revision
     elif args.tokenizer_type == 'MultimodalTokenizer':
         tokenizer_library = 'multimodal'
         kwargs['prompt_format'] = args.tokenizer_prompt_format
@@ -67,6 +68,8 @@ def build_tokenizer(args, **kwargs):
         tokenizer_library = 'sft'
         tokenizer_path = args.tokenizer_model
         kwargs['prompt_format'] = args.sft_tokenizer_prompt_format
+        kwargs['trust_remote_code'] = args.trust_remote_code
+        kwargs['revision'] = args.tokenizer_revision
     elif args.tokenizer_type in ['NullTokenizer', 'NullMultimodalTokenizer']:
         tokenizer_library = (
             'null-text' if args.tokenizer_type == 'NullTokenizer' else 'null-multimodal'

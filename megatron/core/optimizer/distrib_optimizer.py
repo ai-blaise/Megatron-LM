@@ -3047,7 +3047,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         if self.ddp_config.use_megatron_fsdp:
             for model_chunk in self.model_chunks:
-                model_chunk.param_and_grad_buffer.copy_main_weights_to_model_weights()
+                model_chunk.param_and_grad_buffer.copy_main_weights_to_model_weights(
+                    optimizer=self.optimizer,
+                    flash_adamw_fsdp_eco_inject=bool(
+                        getattr(self.config, "flash_adamw_fsdp_eco_inject", False)
+                    ),
+                )
             return
 
         # When using precision-aware optimizer, main params are held by self.optimizer. It will also

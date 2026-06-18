@@ -63,6 +63,18 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return value.lower() in ("1", "true", "yes", "on")
 
 
+def _grad_provenance(name: str, **tensors) -> None:
+    if not (
+        os.getenv("MEGATRON_GRAD_PROVENANCE")
+        or os.getenv("MEGATRON_NUMERIC_DEBUG_GRAD_PROVENANCE")
+    ):
+        return
+    from megatron.core import numeric_debug
+
+    if numeric_debug.grad_provenance_enabled():
+        numeric_debug.log_grad_function(name, tensors=tensors)
+
+
 def _maybe_trim_cuda_cache_before_moe_sort(input: torch.Tensor, probs: Optional[torch.Tensor]) -> None:
     """Release cached allocator blocks before TE MoE sort output allocation."""
 
@@ -317,6 +329,12 @@ class MoEAuxLossAutoScaler(torch.autograd.Function):
             )
         aux_loss_backward_scale = MoEAuxLossAutoScaler.main_loss_backward_scale
         scaled_aux_loss_grad = torch.ones_like(aux_loss) * aux_loss_backward_scale
+        _grad_provenance(
+            "moe.moe_utils.MoEAuxLossAutoScaler.backward",
+            grad_output=grad_output,
+            aux_loss=aux_loss,
+            scaled_aux_loss_grad=scaled_aux_loss_grad,
+        )
         return grad_output, scaled_aux_loss_grad
 
     @staticmethod
@@ -1166,6 +1184,7 @@ class RandomSTE(torch.autograd.Function):
         Returns:
             torch.Tensor: The gradient input.
         """
+        _grad_provenance("moe.moe_utils.RandomSTE.backward", grad_output=grad_output)
         return grad_output
 
 
@@ -1213,6 +1232,7 @@ class RandomSTEShared(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         """Backward pass: pass through gradients."""
+        _grad_provenance("moe.moe_utils.RandomSTEShared.backward", grad_output=grad_output)
         return grad_output, None, None
 
 
@@ -1340,6 +1360,13 @@ class RouterGatingLinearFunction(torch.autograd.Function):
         if ctx.has_bias and needs_bias_grad:
             grad_bias = flat_grad_output.sum(dim=0).to(ctx.weight_dtype)
 
+        _grad_provenance(
+            "moe.moe_utils.RouterGatingLinearFunction.backward",
+            grad_output=grad_output,
+            grad_input=grad_input,
+            grad_weight=grad_weight,
+            grad_bias=grad_bias,
+        )
         return grad_input, grad_weight, grad_bias, None
 
 

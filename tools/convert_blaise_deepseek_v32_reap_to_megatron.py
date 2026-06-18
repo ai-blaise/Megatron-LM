@@ -22,6 +22,7 @@ import copy
 import json
 import os
 import sys
+import types
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Union
@@ -447,7 +448,7 @@ class BlaiseDeepSeekV32ReapBridge(DeepSeekV3Bridge):
         if hf_config is not None:
             setattr(hf_config, "num_nextn_predict_layers", 0)
 
-        mapping_list = get_common_mapping_list(hf_config=hf_config)
+        mapping_list = get_deepseek_common_mapping_list(hf_config)
         mapping_list.extend(
             [
                 AutoMapping(
@@ -539,20 +540,20 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--seq-length", type=int, default=int(os.environ.get("SEQ_LENGTH", "32768")))
-    parser.add_argument("--tp", type=int, default=int(os.environ.get("TP", "4")))
-    parser.add_argument("--pp", type=int, default=int(os.environ.get("PP", "2")))
+    parser.add_argument("--tp", type=int, default=int(os.environ.get("TP", "8")))
+    parser.add_argument("--pp", type=int, default=int(os.environ.get("PP", "5")))
     parser.add_argument("--cp", type=int, default=int(os.environ.get("CP", "1")))
-    parser.add_argument("--ep", type=int, default=int(os.environ.get("EP", "4")))
+    parser.add_argument("--ep", type=int, default=int(os.environ.get("EP", "8")))
     parser.add_argument("--etp", type=int, default=int(os.environ.get("ETP", "1")))
     parser.add_argument(
         "--decoder-first-pipeline-num-layers",
         type=int,
-        default=int(os.environ.get("DECODER_FIRST_PIPELINE_NUM_LAYERS", "17")),
+        default=int(os.environ.get("DECODER_FIRST_PIPELINE_NUM_LAYERS", "13")),
     )
     parser.add_argument(
         "--decoder-last-pipeline-num-layers",
         type=int,
-        default=int(os.environ.get("DECODER_LAST_PIPELINE_NUM_LAYERS", "14")),
+        default=int(os.environ.get("DECODER_LAST_PIPELINE_NUM_LAYERS", "12")),
     )
     parser.add_argument("--dsa-indexer-loss-coeff", type=float, default=float(os.environ.get("DSA_INDEXER_LOSS_COEFF", "0.01")))
     parser.add_argument("--dequant-dtype", default=os.environ.get("DEQUANT_DTYPE", "bf16"))
@@ -583,12 +584,36 @@ def configure_model_bridge(model_bridge: MegatronModelBridge, args: argparse.Nam
     )
 
 
+def get_deepseek_common_mapping_list(hf_config) -> list:
+    """Call Bridge's DeepSeek mapping helper across supported signatures."""
+
+    import inspect
+
+    if "hf_config" in inspect.signature(get_common_mapping_list).parameters:
+        return get_common_mapping_list(hf_config=hf_config)
+    return get_common_mapping_list()
+
+
+def install_bridge_model_type_compat() -> None:
+    """Adapt Bridge's model/type probes to this repo's local modules."""
+
+    from megatron.core.enums import ModelType
+
+    if not hasattr(ModelType, "encoder_and_decoder") and hasattr(ModelType, "encoder_or_decoder"):
+        ModelType.encoder_and_decoder = ModelType.encoder_or_decoder
+
+    AutoMapping.register_module_type("LinearCrossEntropyModule", "column")
+
+
 def install_bridge_checkpoint_compat() -> None:
     """Adapt Bridge's save call to this repo's MCore checkpointing signature."""
 
     import inspect
 
     from megatron.core import dist_checkpointing
+
+    install_bridge_tokenizer_compat()
+    install_bridge_save_config_compat()
 
     if "async_strategy" in inspect.signature(dist_checkpointing.save).parameters:
         return
@@ -602,9 +627,48 @@ def install_bridge_checkpoint_compat() -> None:
     dist_checkpointing.save = save_without_async_strategy
 
 
+def install_bridge_tokenizer_compat() -> None:
+    """Provide Bridge's legacy tokenizer import path for this Megatron branch."""
+
+    module_name = "megatron.core.datasets.megatron_tokenizer"
+    if module_name in sys.modules:
+        return
+
+    tokenizer_module = types.ModuleType(module_name)
+
+    class MegatronTokenizer:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+    class MegatronLegacyTokenizer(MegatronTokenizer):
+        pass
+
+    tokenizer_module.MegatronTokenizer = MegatronTokenizer
+    tokenizer_module.MegatronLegacyTokenizer = MegatronLegacyTokenizer
+    sys.modules[module_name] = tokenizer_module
+
+
+def install_bridge_save_config_compat() -> None:
+    """Avoid Bridge's fully-parallel save wrapper during one-shot conversion."""
+
+    from megatron.bridge.training import model_load_save
+
+    checkpoint_config = model_load_save.CheckpointConfig
+    if getattr(checkpoint_config, "_blaise_non_parallel_save", False):
+        return
+
+    def checkpoint_config_without_fully_parallel(*args, **kwargs):
+        kwargs.setdefault("fully_parallel_save", False)
+        return checkpoint_config(*args, **kwargs)
+
+    checkpoint_config_without_fully_parallel._blaise_non_parallel_save = True
+    model_load_save.CheckpointConfig = checkpoint_config_without_fully_parallel
+
+
 def main() -> None:
     args = parse_args()
     dequant_dtype = parse_dtype(args.dequant_dtype)
+    install_bridge_model_type_compat()
 
     hf_pretrained = PreTrainedCausalLM.from_pretrained(
         args.hf_model_id,
