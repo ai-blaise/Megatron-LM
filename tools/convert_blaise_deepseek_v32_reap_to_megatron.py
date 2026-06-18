@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+r#!/usr/bin/env python3
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 """Convert the Blaise DeepSeek-V3.2 REAP NVFP4 checkpoint to Megatron.
