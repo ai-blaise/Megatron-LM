@@ -15,6 +15,7 @@ import json
 import os
 import pathlib
 import sys
+import types
 from pathlib import Path
 from typing import Any
 
@@ -99,7 +100,34 @@ def bootstrap_bridge() -> Path:
     for path in (str(bridge_src), str(MEGATRON_LM_ROOT)):
         if path not in sys.path:
             sys.path.insert(0, path)
+    install_bridge_import_shims(bridge_src)
     return bridge_root
+
+
+def install_bridge_import_shims(bridge_src: Path) -> None:
+    """Avoid importing Bridge's top-level registry when this tool only needs GLM4.
+
+    ``megatron.bridge.__init__`` eagerly imports all Bridge model families,
+    including optional diffusion/config dependencies.  The GLM4 converter only
+    needs the conversion modules and GLM4 bridge registration, so we install
+    lightweight package objects with the correct ``__path__`` and import the
+    needed submodules directly.
+    """
+
+    package_paths = {
+        "megatron.bridge": bridge_src / "megatron" / "bridge",
+        "megatron.bridge.models": bridge_src / "megatron" / "bridge" / "models",
+        "megatron.bridge.models.conversion": bridge_src / "megatron" / "bridge" / "models" / "conversion",
+        "megatron.bridge.models.glm": bridge_src / "megatron" / "bridge" / "models" / "glm",
+        "megatron.bridge.models.hf_pretrained": bridge_src / "megatron" / "bridge" / "models" / "hf_pretrained",
+    }
+    for name, path in package_paths.items():
+        if name in sys.modules:
+            continue
+        module = types.ModuleType(name)
+        module.__path__ = [str(path)]  # type: ignore[attr-defined]
+        module.__package__ = name
+        sys.modules[name] = module
 
 
 BRIDGE_ROOT = bootstrap_bridge()
@@ -199,6 +227,13 @@ def load_hf_pretrained(hf_model: str, *, trust_remote_code: bool, torch_dtype: t
     return PreTrainedCausalLM.from_pretrained(hf_model, **kwargs)
 
 
+def get_auto_bridge_class():
+    import megatron.bridge.models.glm.glm4_bridge  # noqa: F401 - registers GLM4Bridge
+    from megatron.bridge.models.conversion.auto_bridge import AutoBridge
+
+    return AutoBridge
+
+
 def has_any_glob(hf_pretrained: PreTrainedCausalLM, patterns: tuple[str, ...]) -> bool:
     state = hf_pretrained.state
     for pattern in patterns:
@@ -234,7 +269,6 @@ def derived_export_overrides(config: Any) -> dict[str, Any]:
 
 
 def print_provenance(hf_model: str, args: argparse.Namespace) -> None:
-    import megatron.bridge
     import megatron.core
     import torch
     import transformers
@@ -243,7 +277,7 @@ def print_provenance(hf_model: str, args: argparse.Namespace) -> None:
     print(f"python:             {sys.executable}")
     print(f"torch:              {torch.__version__}")
     print(f"transformers:       {transformers.__version__}")
-    print(f"megatron.bridge:    {pathlib.Path(megatron.bridge.__file__).resolve()}")
+    print(f"megatron.bridge:    {BRIDGE_ROOT / 'src' / 'megatron' / 'bridge'}")
     print(f"megatron.core:      {pathlib.Path(megatron.core.__file__).resolve()}")
     print(f"Megatron-LM root:   {MEGATRON_LM_ROOT}")
     print(f"Megatron-Bridge:    {BRIDGE_ROOT}")
@@ -257,7 +291,7 @@ def print_provenance(hf_model: str, args: argparse.Namespace) -> None:
 
 
 def run_preflight(args: argparse.Namespace) -> tuple[Any, PreTrainedCausalLM, AutoBridge]:
-    from megatron.bridge import AutoBridge
+    AutoBridge = get_auto_bridge_class()
 
     torch_dtype = parse_dtype(args.torch_dtype)
     print_provenance(args.hf_model, args)
@@ -316,6 +350,7 @@ def latest_iteration_dir(path: Path) -> Path | None:
 
 def run_import(args: argparse.Namespace) -> int:
     run_preflight(args)
+    AutoBridge = get_auto_bridge_class()
     output = expand_path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     torch_dtype = parse_dtype(args.torch_dtype)
