@@ -16,6 +16,7 @@ import os
 import pathlib
 import sys
 import types
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -101,6 +102,7 @@ def bootstrap_bridge() -> Path:
         if path not in sys.path:
             sys.path.insert(0, path)
     install_bridge_import_shims(bridge_src)
+    install_megatron_training_config_compat()
     return bridge_root
 
 
@@ -128,6 +130,37 @@ def install_bridge_import_shims(bridge_src: Path) -> None:
         module.__path__ = [str(path)]  # type: ignore[attr-defined]
         module.__package__ = name
         sys.modules[name] = module
+
+
+def install_megatron_training_config_compat() -> None:
+    """Fill small Megatron-LM/Megatron-Bridge config gaps at runtime.
+
+    The local Megatron-LM checkout exposes ``megatron.training.config`` as a
+    compatibility re-export module, but this Bridge checkout expects that module
+    to also contain ``TokenizerConfig``.  Define the minimal base dataclass here
+    before Bridge imports ``megatron.bridge.training.tokenizers.config``.
+    """
+
+    import megatron.training.config as training_config
+
+    if hasattr(training_config, "TokenizerConfig"):
+        return
+
+    @dataclass(kw_only=True)
+    class TokenizerConfig:
+        tokenizer_type: str = "NullTokenizer"
+        tokenizer_model: str | Path = ""
+        vocab_file: str | Path | None = None
+        merge_file: str | Path | None = None
+        pad_vocab_size: bool = False
+        tokenizer_hf_no_use_fast: bool = False
+        tokenizer_hf_no_include_special_tokens: bool = False
+        tokenizer_sentencepiece_legacy: bool = False
+        trust_remote_code: bool = False
+
+    training_config.TokenizerConfig = TokenizerConfig
+    if hasattr(training_config, "__all__") and "TokenizerConfig" not in training_config.__all__:
+        training_config.__all__.append("TokenizerConfig")
 
 
 BRIDGE_ROOT = bootstrap_bridge()
