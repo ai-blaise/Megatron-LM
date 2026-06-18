@@ -578,7 +578,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--use-gpu-initialization",
         dest="use_gpu_initialization",
         action=argparse.BooleanOptionalAction,
-        default=env_bool("USE_GPU_INITIALIZATION", True),
+        default=env_bool("USE_GPU_INITIALIZATION", False),
     )
 
     export_parser = subparsers.add_parser("export", help="Export trained Megatron checkpoint to HF safetensors")

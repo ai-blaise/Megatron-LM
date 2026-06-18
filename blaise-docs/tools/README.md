@@ -171,7 +171,7 @@ TRUST_REMOTE_CODE / --trust-remote-code or --no-trust-remote-code
   true
 
 USE_GPU_INITIALIZATION / --use-gpu-initialization or --no-use-gpu-initialization
-  true
+  false
 
 TP_SIZE / --tp-size
   1
@@ -256,11 +256,12 @@ IMPORT_OUTPUT="$HOME/checkpoints/glm4_9b_omp_init" \
 uv run --no-sync python tools/convert_blaise_glm4_9b_omp.py import
 ```
 
-Use CPU initialization instead of GPU initialization:
+Plain import uses CPU initialization by default to avoid CUDA allocation during
+checkpoint conversion. To opt into GPU initialization on a free visible device:
 
 ```bash
-uv run --no-sync python tools/convert_blaise_glm4_9b_omp.py import \
-  --no-use-gpu-initialization
+CUDA_VISIBLE_DEVICES=0 uv run --no-sync python tools/convert_blaise_glm4_9b_omp.py import \
+  --use-gpu-initialization
 ```
 
 Successful import should create an iteration checkpoint under:
