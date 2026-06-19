@@ -8,6 +8,30 @@ Conversion tools that depend on Megatron Bridge also assume the local Bridge
 checkout is available at `$HOME/Megatron-Bridge`, or that `MEGATRON_BRIDGE_ROOT`
 points to the intended Bridge checkout.
 
+```
+
+```
+```
+  MODEL_PROFILE=glm4_9b_omp \
+  LOAD_CKPT="/home/jon/checkpoints/glm4_9b_omp_init" \
+  DATA_PROFILE=hf_blaise_mix \
+  DATA_PATH="BlaiseAI/blaise-distillation-mix" \
+  PARALLEL_PROFILE=single_node_8gpu \
+  MICRO_BATCH_SIZE=1 \
+  GLOBAL_BATCH_SIZE=32 \
+  TRAIN_SAMPLES=319852 \
+  LR=1.0e-5 \
+  MIN_LR=1.0e-6 \
+  LR_DECAY_STYLE=cosine \
+  LR_DECAY_SAMPLES=319852 \
+  LR_WARMUP_SAMPLES=16000 \
+  SAVE_INTERVAL=2000 \
+  NO_SAVE_OPTIM=1 \
+  EXTRA_MEGATRON_ARGS="--ffn-hidden-size 14336 --add-qkv-bias" \
+  bash examples/sft/sft.sh
+```
+
+
 ## Model Lifecycle
 
 The supported checkpoint lifecycle is:
