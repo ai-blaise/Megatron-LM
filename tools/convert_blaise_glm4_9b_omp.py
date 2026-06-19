@@ -257,6 +257,57 @@ def copy_blockwise_fp8_param(param_weight: torch.Tensor, converted_weight: torch
     copy_tensor_with_padding(rowwise_scale_inv, converted_scale, fill_value=1.0)
 
 
+def merge_qkv_scale_inv(config: Any, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """Merge Q/K/V block-scale tensors using Megatron's interleaved QKV order."""
+    head_num = config.num_attention_heads
+    num_query_groups = config.num_query_groups
+    heads_per_group = head_num // num_query_groups
+    q_head_size = getattr(config, "kv_channels", None) or (config.hidden_size // head_num)
+
+    if q.ndim != 2 or k.ndim != 2 or v.ndim != 2:
+        raise RuntimeError(f"Expected 2D QKV scale tensors, got q={q.shape}, k={k.shape}, v={v.shape}")
+    if k.shape != v.shape:
+        raise RuntimeError(f"Expected K/V scale shapes to match, got k={k.shape}, v={v.shape}")
+    if q.shape[1] != k.shape[1]:
+        raise RuntimeError(f"Expected Q/K/V scale tile columns to match, got q={q.shape}, k={k.shape}, v={v.shape}")
+    if q.shape[0] % head_num != 0 or k.shape[0] % num_query_groups != 0:
+        raise RuntimeError(f"Cannot map QKV scale rows to heads: q={q.shape}, k={k.shape}, v={v.shape}")
+
+    q_scale_rows_per_head = q.shape[0] // head_num
+    kv_scale_rows_per_group = k.shape[0] // num_query_groups
+    expected_q_rows = max(1, q_head_size // 128)
+    if q_scale_rows_per_head != expected_q_rows or kv_scale_rows_per_group != expected_q_rows:
+        raise RuntimeError(
+            "Unexpected QKV scale row layout: "
+            f"q_rows_per_head={q_scale_rows_per_head}, kv_rows_per_group={kv_scale_rows_per_group}, "
+            f"expected={expected_q_rows}, q={q.shape}, k={k.shape}, v={v.shape}"
+        )
+
+    q_reshaped = q.view(head_num, q_scale_rows_per_head, q.shape[1])
+    k_reshaped = k.view(num_query_groups, kv_scale_rows_per_group, k.shape[1])
+    v_reshaped = v.view(num_query_groups, kv_scale_rows_per_group, v.shape[1])
+
+    qkv_scales = []
+    for i in range(num_query_groups):
+        q_group = q_reshaped[i * heads_per_group : (i + 1) * heads_per_group]
+        k_group = k_reshaped[i : i + 1]
+        v_group = v_reshaped[i : i + 1]
+        qkv_scales.extend([q_group, k_group, v_group])
+
+    return torch.cat(qkv_scales, dim=0).reshape(-1, q.shape[1])
+
+
+def convert_hf_scale_to_megatron(mapping: Any, hf_scales: Any, megatron_module: Any) -> torch.Tensor:
+    if isinstance(hf_scales, dict) and {"q", "k", "v"} <= set(hf_scales):
+        config = mapping._get_config(megatron_module)
+        merged_scales = merge_qkv_scale_inv(config, hf_scales["q"], hf_scales["k"], hf_scales["v"])
+        tp_mapping = getattr(mapping, "_tp_mapping", None)
+        if tp_mapping is not None:
+            return tp_mapping.hf_to_megatron(merged_scales, megatron_module)
+        return merged_scales
+    return mapping.hf_to_megatron(hf_scales, megatron_module)
+
+
 def describe_hf_quantized_source(hf_param: Any, hf_state_dict: Any, quantization_utils: Any) -> str:
     if isinstance(hf_param, dict):
         return "; ".join(
@@ -304,7 +355,7 @@ def load_glm4_omp_fp8_weights(bridge: Any, megatron_model: Any) -> None:
                 )
             hf_weights_raw, hf_scales_raw = raw_quantized_pair
             converted_weights = task.mapping.hf_to_megatron(hf_weights_raw, task.megatron_module)
-            converted_scales = task.mapping.hf_to_megatron(hf_scales_raw, task.megatron_module)
+            converted_scales = convert_hf_scale_to_megatron(task.mapping, hf_scales_raw, task.megatron_module)
             if converted_weights is not None:
                 assert task.param_weight is not None, "param_weight is required for HF->Megatron conversion"
                 with torch.no_grad():
