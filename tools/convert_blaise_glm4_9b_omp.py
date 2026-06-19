@@ -614,7 +614,7 @@ def has_run_config(path: Path) -> bool:
 
 
 def configure_export_provider(bridge: AutoBridge, config: Any, args: argparse.Namespace) -> Any:
-    provider = bridge.provider_bridge(bridge.hf_pretrained)
+    provider = bridge.to_megatron_provider(load_weights=False)
     overrides = derived_export_overrides(config)
     overrides.update(args.model_override or {})
     for key, value in overrides.items():
