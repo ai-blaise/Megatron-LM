@@ -59,6 +59,8 @@ Profiles:
 
   PRECISION_PROFILE:
     bf16                  BF16 only
+    fp8                   BF16 base with Megatron FP8 hybrid training
+    fp8_blockwise         BF16 base with Megatron FP8 blockwise params
     nvfp4                 NVFP4 W4A4 base flags
     nvfp4_spinquant       NVFP4 + SpinQuant W/A/K/V
     nvfp4_higgs           NVFP4 + Higgs dense 2-bit KV
@@ -104,11 +106,22 @@ cd "$MEGATRON_DIR"
 MODEL_PROFILE="${MODEL_PROFILE:-deepseek_v32_reap}"
 TOKENIZER_PROFILE="${TOKENIZER_PROFILE:-auto}"
 DATA_PROFILE="${DATA_PROFILE:-jsonl_messages}"
-PRECISION_PROFILE="${PRECISION_PROFILE:-bf16}"
+PRECISION_PROFILE="${PRECISION_PROFILE:-}"
 OPTIMIZER_PROFILE="${OPTIMIZER_PROFILE:-adamw}"
 PARALLEL_PROFILE="${PARALLEL_PROFILE:-auto}"
 RUNTIME_PROFILE="${RUNTIME_PROFILE:-local}"
 DEBUG_PROFILE="${DEBUG_PROFILE:-none}"
+
+if [[ -z "$PRECISION_PROFILE" ]]; then
+    case "$MODEL_PROFILE" in
+        glm4_9b_omp|glm4_9b|glm45_air|glm|glm4_5_air)
+            PRECISION_PROFILE=fp8_blockwise
+            ;;
+        *)
+            PRECISION_PROFILE=bf16
+            ;;
+    esac
+fi
 
 case "$DEBUG_PROFILE" in
     none) ;;
@@ -311,7 +324,7 @@ case "$MODEL_PROFILE" in
             --hidden-size 4096
             --num-attention-heads 32
             --group-query-attention
-            --num-query-groups 8
+            --num-query-groups 2
             --kv-channels 128
             --max-position-embeddings 131072
             --position-embedding-type rope
@@ -493,6 +506,25 @@ esac
 case "$PRECISION_PROFILE" in
     bf16)
         MODEL_ARGS+=(--bf16)
+        ;;
+    fp8)
+        MODEL_ARGS+=(--bf16)
+        DTYPE_ARGS+=(
+            --fp8-format hybrid
+            --fp8-amax-history-len "${FP8_AMAX_HISTORY_LEN:-1024}"
+            --fp8-amax-compute-algo "${FP8_AMAX_COMPUTE_ALGO:-max}"
+            --fp8-param-gather
+        )
+        ;;
+    fp8_blockwise|fp8-blockwise)
+        MODEL_ARGS+=(--bf16)
+        DTYPE_ARGS+=(
+            --fp8-format e4m3
+            --fp8-recipe blockwise
+            --fp8-amax-history-len "${FP8_AMAX_HISTORY_LEN:-1024}"
+            --fp8-amax-compute-algo "${FP8_AMAX_COMPUTE_ALGO:-max}"
+            --fp8-param-gather
+        )
         ;;
     nvfp4|nvfp4_spinquant|nvfp4_higgs|nvfp4_turboquant|deepseek_nvfp4)
         MODEL_ARGS+=(--bf16)

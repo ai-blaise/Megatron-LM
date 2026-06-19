@@ -18,6 +18,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import torch
+
 
 MEGATRON_LM_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_BRIDGE_ROOT = Path.home() / "Megatron-Bridge"
@@ -206,6 +208,107 @@ def get_auto_bridge_class():
     return AutoBridge
 
 
+def configure_fp8_provider(provider: Any) -> None:
+    provider.perform_initialization = False
+    provider.bf16 = True
+    provider.fp16 = False
+    provider.params_dtype = torch.bfloat16
+    provider.autocast_dtype = torch.bfloat16
+    provider.fp8 = "e4m3"
+    provider.fp8_recipe = "blockwise"
+    provider.fp8_param = True
+
+
+def is_blockwise_fp8_param(param_weight: torch.Tensor | None) -> bool:
+    return bool(
+        param_weight is not None
+        and hasattr(param_weight, "_rowwise_data")
+        and hasattr(param_weight, "_rowwise_scale_inv")
+    )
+
+
+def copy_tensor_with_padding(destination: torch.Tensor, source: torch.Tensor, *, fill_value: float | int) -> None:
+    if destination.shape == source.shape:
+        destination.copy_(source.to(dtype=destination.dtype, device=destination.device))
+        return
+
+    if destination.dim() != source.dim():
+        raise ValueError(
+            f"Cannot copy tensor with rank mismatch: dest={tuple(destination.shape)} src={tuple(source.shape)}"
+        )
+    for dest_size, src_size in zip(destination.shape, source.shape):
+        if src_size > dest_size:
+            raise ValueError(
+                f"Cannot copy tensor with larger source shape: dest={tuple(destination.shape)} src={tuple(source.shape)}"
+            )
+
+    destination.fill_(fill_value)
+    slices = tuple(slice(0, size) for size in source.shape)
+    destination[slices].copy_(source.to(dtype=destination.dtype, device=destination.device))
+
+
+def copy_blockwise_fp8_param(param_weight: torch.Tensor, converted_weight: torch.Tensor, converted_scale: torch.Tensor) -> None:
+    raw_data = getattr(param_weight, "_rowwise_data")
+    rowwise_scale_inv = getattr(param_weight, "_rowwise_scale_inv")
+    raw_weight = converted_weight.contiguous()
+    if raw_data.dtype != raw_weight.dtype:
+        raw_weight = raw_weight.view(raw_data.dtype)
+    copy_tensor_with_padding(raw_data, raw_weight, fill_value=0)
+    copy_tensor_with_padding(rowwise_scale_inv, converted_scale, fill_value=1.0)
+
+
+def load_glm4_omp_fp8_weights(bridge: Any, megatron_model: Any) -> None:
+    from megatron.bridge.models.conversion import quantization_utils
+
+    model_bridge = bridge._model_bridge
+    pre_trained = bridge.hf_pretrained
+    tasks = bridge.get_conversion_tasks(megatron_model)
+    hf_state_dict = pre_trained.state if hasattr(pre_trained, "state") else {}
+
+    for task in model_bridge._with_progress_tracking(
+        tasks,
+        f"Loading from {pre_trained.model_name_or_path}",
+    ):
+        if task is None or task.megatron_module is None:
+            continue
+
+        is_fp8_target = is_blockwise_fp8_param(task.param_weight)
+        raw_quantized_pair = quantization_utils.load_hf_quantized_weight_scale_pair(
+            task.mapping.hf_param,
+            hf_state_dict,
+        )
+
+        if raw_quantized_pair is not None:
+            if not is_fp8_target:
+                raise RuntimeError(
+                    "HF FP8 weight maps to a non-FP8 Megatron parameter: "
+                    f"megatron={task.mapping.megatron_param}, hf={task.mapping.hf_param}"
+                )
+            hf_weights_raw, hf_scales_raw = raw_quantized_pair
+            converted_weights = task.mapping.hf_to_megatron(hf_weights_raw, task.megatron_module)
+            converted_scales = task.mapping.hf_to_megatron(hf_scales_raw, task.megatron_module)
+            if converted_weights is not None:
+                assert task.param_weight is not None, "param_weight is required for HF->Megatron conversion"
+                with torch.no_grad():
+                    copy_blockwise_fp8_param(task.param_weight, converted_weights, converted_scales)
+            continue
+        if is_fp8_target:
+            raise RuntimeError(
+                "Megatron FP8 parameter did not find a raw HF FP8 weight+scale pair: "
+                f"megatron={task.mapping.megatron_param}, hf={task.mapping.hf_param}"
+            )
+
+        hf_weights = model_bridge.maybe_modify_loaded_hf_weight(task.mapping.hf_param, hf_state_dict)
+        converted_weights = task.mapping.hf_to_megatron(hf_weights, task.megatron_module)
+        if converted_weights is None:
+            continue
+        assert task.param_weight is not None, "param_weight is required for HF->Megatron conversion"
+        with torch.no_grad():
+            task.param_weight.copy_(converted_weights)
+
+    model_bridge._broadcast_shared_embeddings(megatron_model)
+
+
 def has_any_glob(hf_pretrained: PreTrainedCausalLM, patterns: tuple[str, ...]) -> bool:
     state = hf_pretrained.state
     for pattern in patterns:
@@ -382,10 +485,12 @@ def run_import(args: argparse.Namespace) -> int:
 
     print("=== HF -> Megatron import ===")
     print(f"Output checkpoint root: {output}")
-    print("Import precision policy: FP8 HF source is dequantized by Bridge into normal Megatron tensors.")
+    print("Import precision policy: preserve HF FP8 weights/scales and build Megatron blockwise FP8 params.")
 
     bridge = AutoBridge.from_hf_pretrained(args.hf_model, **kwargs)
-    provider = bridge.to_megatron_provider(load_weights=True)
+    bridge.export_weight_dtype = "fp8"
+    provider = bridge.to_megatron_provider(load_weights=False)
+    configure_fp8_provider(provider)
     disable_conversion_only_offload(provider)
     if hasattr(provider, "finalize"):
         provider.finalize()
@@ -394,7 +499,9 @@ def run_import(args: argparse.Namespace) -> int:
     megatron_model = provider.provide_distributed_model(
         wrap_with_ddp=False,
         use_cpu_initialization=not args.use_gpu_initialization,
+        mixed_precision_wrapper=None,
     )
+    load_glm4_omp_fp8_weights(bridge, megatron_model)
 
     hf_tokenizer_kwargs = {}
     if hasattr(bridge._model_bridge, "get_hf_tokenizer_kwargs"):
@@ -524,6 +631,7 @@ def run_export(args: argparse.Namespace) -> int:
     print("=== Megatron -> HF export ===")
     print(f"Megatron checkpoint: {megatron_path}")
     print(f"HF output path:      {hf_output_path}")
+    bridge.export_weight_dtype = "fp8"
     bridge.export_ckpt(
         megatron_path=megatron_path,
         hf_path=hf_output_path,
