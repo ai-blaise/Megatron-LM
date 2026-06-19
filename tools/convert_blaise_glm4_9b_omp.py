@@ -257,6 +257,24 @@ def copy_blockwise_fp8_param(param_weight: torch.Tensor, converted_weight: torch
     copy_tensor_with_padding(rowwise_scale_inv, converted_scale, fill_value=1.0)
 
 
+def describe_hf_quantized_source(hf_param: Any, hf_state_dict: Any, quantization_utils: Any) -> str:
+    if isinstance(hf_param, dict):
+        return "; ".join(
+            f"{key}: {describe_hf_quantized_source(value, hf_state_dict, quantization_utils)}"
+            for key, value in hf_param.items()
+        )
+
+    try:
+        weight = hf_state_dict[hf_param]
+    except Exception as exc:
+        return f"{hf_param}: missing weight ({exc})"
+
+    existing_scale_keys = [
+        key for key in quantization_utils.hf_quantized_scale_key_candidates(hf_param) if key in hf_state_dict
+    ]
+    return f"{hf_param}: dtype={weight.dtype}, shape={tuple(weight.shape)}, scale_keys={existing_scale_keys}"
+
+
 def load_glm4_omp_fp8_weights(bridge: Any, megatron_model: Any) -> None:
     from megatron.bridge.models.conversion import quantization_utils
 
@@ -295,7 +313,8 @@ def load_glm4_omp_fp8_weights(bridge: Any, megatron_model: Any) -> None:
         if is_fp8_target:
             raise RuntimeError(
                 "Megatron FP8 parameter did not find a raw HF FP8 weight+scale pair: "
-                f"megatron={task.mapping.megatron_param}, hf={task.mapping.hf_param}"
+                f"megatron={task.mapping.megatron_param}, hf={task.mapping.hf_param}; "
+                f"{describe_hf_quantized_source(task.mapping.hf_param, hf_state_dict, quantization_utils)}"
             )
 
         hf_weights = model_bridge.maybe_modify_loaded_hf_weight(task.mapping.hf_param, hf_state_dict)
